@@ -1,0 +1,27 @@
+schema_version: 1
+
+# ticket_systems auto-detects ID format (ABC-123 → jira, gh-42/#42 → github).
+# Replace the placeholder to match your team's Jira project or GitHub repo.
+ticket_systems:
+    - type: github
+      project: tether
+
+# repos: map of known repo names under .repo/<name>/ to per-repo config.
+# Exactly one must have `role: primary`. Add `role: config` for the repo
+# that overlay phases (deploy/e2e) will bump / commit to.
+# `role: reference` is for read-only OSS clones used as study references
+# (NOT auto-attached, skipped by commit/rebase). Optional pin field for
+# reproducibility; default is origin/<default>.
+repos:
+    tether:
+        role: primary
+        git_url: https://github.com/GMISWE/ieops-v2.git
+    happy:
+        role: reference
+        git_url: https://github.com/slopus/happy.git
+    # CHANGEME-config:
+    #   role: config
+    # vllm-upstream:                          # example reference repo
+    #   role: reference
+    #   git_url: https://github.com/vllm-project/vllm
+    #   pin: v0.6.4

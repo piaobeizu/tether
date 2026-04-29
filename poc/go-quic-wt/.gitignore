@@ -1,0 +1,9 @@
+# Build artifacts — go build outputs.
+# `bin-*` covers the legacy explicit `go build -o bin-stepN` naming used during
+# PoC-2 (see ../../tether-doc/wiki/specs/2026-04-28-poc2-retro.md).
+# `go-quic-wt` covers the default `go build` output (module name).
+bin-*
+go-quic-wt
+
+# Go test artifacts
+*.test

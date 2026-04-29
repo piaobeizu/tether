@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tether PoC-2 step 3 — Browser ↔ Go WT</title>
+<style>
+  body {
+    font-family: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+    margin: 0; padding: 16px;
+    background: #0e0e0e; color: #e8e8e8;
+    font-size: 14px; line-height: 1.5;
+  }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  .card {
+    background: #1a1a1a; border: 1px solid #2a2a2a;
+    border-radius: 6px; padding: 12px; margin-bottom: 12px;
+  }
+  .row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+  input {
+    background: #0e0e0e; color: #e8e8e8; border: 1px solid #333;
+    border-radius: 4px; padding: 6px 8px; font: inherit; min-width: 220px;
+  }
+  button {
+    background: #2563eb; color: white; border: none; border-radius: 4px;
+    padding: 8px 14px; font: inherit; cursor: pointer;
+  }
+  button:disabled { background: #333; cursor: not-allowed; }
+  .status { font-weight: 600; }
+  .ok    { color: #4ade80; }
+  .fail  { color: #f87171; }
+  .pending { color: #fbbf24; }
+  pre {
+    margin: 0; white-space: pre-wrap; word-break: break-all;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px;
+    background: #0a0a0a; border-radius: 4px; padding: 8px;
+    max-height: 320px; overflow: auto;
+  }
+  .test-row {
+    display: grid; grid-template-columns: 100px 1fr;
+    gap: 8px; padding: 6px 0; border-top: 1px solid #2a2a2a;
+  }
+  .test-row:first-child { border-top: none; }
+  small { color: #888; }
+</style>
+</head>
+<body>
+  <h1>tether PoC-2 step 3 — Browser ↔ Go WebTransport</h1>
+
+  <div class="card">
+    <div class="row">
+      <label>WT host:port</label>
+      <input id="wtHost" value="" placeholder="auto-fill from window.location" />
+    </div>
+    <div class="row">
+      <label>cert hash (hex)</label>
+      <input id="certHash" value="" placeholder="auto from /cert-hash" />
+    </div>
+    <div class="row">
+      <button id="runBtn">Run tests</button>
+      <button id="reloadHashBtn">Reload cert-hash</button>
+      <span class="status" id="overall">idle</span>
+    </div>
+    <small>
+      Page must be a <strong>secure context</strong>: localhost works as-is;
+      remote-IP HTTP needs Chrome flag <code>chrome://flags/#unsafely-treat-insecure-origin-as-secure</code>
+      with this origin allowlisted, OR served over HTTPS. See README.
+    </small>
+  </div>
+
+  <div class="card">
+    <div class="test-row"><span>1. dial</span>           <span class="status pending" id="t1">…</span></div>
+    <div class="test-row"><span>2. bidi stream</span>    <span class="status pending" id="t2">…</span></div>
+    <div class="test-row"><span>3. datagram</span>       <span class="status pending" id="t3">…</span></div>
+    <div class="test-row"><span>4. multi stream</span>   <span class="status pending" id="t4">…</span></div>
+    <div class="test-row"><span>5. close clean</span>    <span class="status pending" id="t5">…</span></div>
+  </div>
+
+  <div class="card">
+    <strong>Log</strong>
+    <pre id="log"></pre>
+  </div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const logEl = $("log");
+function log(...xs) {
+  logEl.textContent += xs.map(x => typeof x === "string" ? x : JSON.stringify(x)).join(" ") + "\n";
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function setStatus(id, text, cls) {
+  const el = $(id);
+  el.textContent = text;
+  el.className = "status " + (cls || "pending");
+}
+
+// auto-fill WT host based on page origin (replace 8002 with 4433)
+(function autoFillHost() {
+  const host = window.location.hostname || "127.0.0.1";
+  $("wtHost").value = `${host}:4433`;
+})();
+
+async function fetchHashes() {
+  setStatus("overall", "fetching cert hashes…", "pending");
+  const out = {};
+  for (const [k, path] of [["der", "/cert-hash"], ["spki", "/cert-hash-spki"]]) {
+    try {
+      const r = await fetch(path, { cache: "no-store" });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const hex = (await r.text()).trim();
+      if (!/^[0-9a-fA-F]{64}$/.test(hex)) throw new Error(`bad format: ${hex.slice(0, 80)}`);
+      out[k] = hex;
+    } catch (e) {
+      log(`ERR fetching ${path}: ${e}`);
+    }
+  }
+  if (out.der) {
+    $("certHash").value = out.der;  // default to DER
+    log("DER hash:", out.der);
+  }
+  if (out.spki) {
+    log("SPKI hash:", out.spki);
+  }
+  setStatus("overall", "ready (DER pre-filled; SPKI logged)", "ok");
+  return out;
+}
+
+async function fetchCertHash() { return (await fetchHashes()).der; }
+
+function hexToBytes(hex) {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+async function readAll(stream, expectBytes) {
+  const reader = stream.getReader();
+  const chunks = [];
+  let total = 0;
+  while (total < expectBytes) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (value) {
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  }
+  reader.releaseLock();
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+  return out;
+}
+
+async function bidiEcho(session, label, payload) {
+  const stream = await session.createBidirectionalStream();
+  const writer = stream.writable.getWriter();
+  await writer.write(new TextEncoder().encode(payload));
+  await writer.close();
+  const got = await readAll(stream.readable, payload.length);
+  const text = new TextDecoder().decode(got);
+  if (text !== payload) throw new Error(`${label} echo mismatch: want ${payload} got ${text}`);
+  return text;
+}
+
+async function runTests() {
+  $("runBtn").disabled = true;
+  ["t1", "t2", "t3", "t4", "t5"].forEach(t => setStatus(t, "…", "pending"));
+  setStatus("overall", "running…", "pending");
+  logEl.textContent = "";
+
+  if (!window.WebTransport) {
+    setStatus("overall", "WebTransport API not available (is this a secure context?)", "fail");
+    setStatus("t1", "no WebTransport API", "fail");
+    $("runBtn").disabled = false;
+    return;
+  }
+
+  const host = $("wtHost").value.trim();
+  let hashHex = $("certHash").value.trim();
+  if (!hashHex) {
+    try { hashHex = await fetchCertHash(); }
+    catch { $("runBtn").disabled = false; return; }
+  }
+  const url = `https://${host}/wt`;
+
+  // Try with multiple hashes — Chrome impl historically alternated between
+  // DER cert hash and SPKI hash. Pass BOTH and let Chrome match either.
+  const allHashes = await fetchHashes();
+  const hashEntries = [];
+  if (allHashes.der)  hashEntries.push({ algorithm: "sha-256", value: hexToBytes(allHashes.der).buffer  });
+  if (allHashes.spki) hashEntries.push({ algorithm: "sha-256", value: hexToBytes(allHashes.spki).buffer });
+  log(`dialing ${url} with ${hashEntries.length} hash(es): DER=${allHashes.der?.slice(0,16)}… SPKI=${allHashes.spki?.slice(0,16)}…`);
+
+  let session;
+  try {
+    session = new WebTransport(url, { serverCertificateHashes: hashEntries });
+    await session.ready;
+    setStatus("t1", "ok", "ok");
+    log("✓ session ready");
+  } catch (e) {
+    setStatus("t1", `dial failed: ${e.message || e}`, "fail");
+    setStatus("overall", "FAIL at dial", "fail");
+    log("✗ dial:", String(e));
+    log("  hash list passed:", JSON.stringify({der: allHashes.der, spki: allHashes.spki}));
+    $("runBtn").disabled = false;
+    return;
+  }
+
+  // 2. bidi stream echo
+  try {
+    const got = await bidiEcho(session, "bidi", "hello-from-browser");
+    setStatus("t2", `ok (echoed "${got}")`, "ok");
+    log("✓ bidi echo");
+  } catch (e) {
+    setStatus("t2", `fail: ${e.message || e}`, "fail");
+    log("✗ bidi:", String(e));
+  }
+
+  // 3. datagram echo
+  try {
+    const dpayload = new TextEncoder().encode("hb-browser-1");
+    const writer = session.datagrams.writable.getWriter();
+    await writer.write(dpayload);
+    writer.releaseLock();
+
+    // wait for echo with timeout
+    const reader = session.datagrams.readable.getReader();
+    const recvPromise = (async () => {
+      const { value } = await reader.read();
+      reader.releaseLock();
+      return value;
+    })();
+    const recv = await Promise.race([
+      recvPromise,
+      new Promise((_, rej) => setTimeout(() => rej(new Error("datagram timeout 3s")), 3000)),
+    ]);
+    const text = new TextDecoder().decode(recv);
+    if (text !== "hb-browser-1") throw new Error(`echo mismatch: ${text}`);
+    setStatus("t3", `ok (echoed "${text}")`, "ok");
+    log("✓ datagram echo");
+  } catch (e) {
+    setStatus("t3", `fail: ${e.message || e}`, "fail");
+    log("✗ datagram:", String(e));
+  }
+
+  // 4. multi-stream parallel: 3 streams concurrent, distinct payloads
+  try {
+    const results = await Promise.all([
+      bidiEcho(session, "ctrl", "ctrl-msg"),
+      bidiEcho(session, "evt",  "evt-msg-12345"),
+      bidiEcho(session, "abz",  "agent-bytes-payload-x"),
+    ]);
+    setStatus("t4", `ok (${results.length} streams parallel)`, "ok");
+    log("✓ multi-stream:", results);
+  } catch (e) {
+    setStatus("t4", `fail: ${e.message || e}`, "fail");
+    log("✗ multi-stream:", String(e));
+  }
+
+  // 5. close clean
+  try {
+    session.close({ closeCode: 0, reason: "browser-test-done" });
+    await session.closed;
+    setStatus("t5", "ok", "ok");
+    log("✓ closed cleanly");
+  } catch (e) {
+    setStatus("t5", `fail: ${e.message || e}`, "fail");
+    log("✗ close:", String(e));
+  }
+
+  // overall
+  const states = ["t1", "t2", "t3", "t4", "t5"].map(id => $(id).className);
+  if (states.every(s => s.includes("ok"))) {
+    setStatus("overall", "✓ STEP 3 PASS", "ok");
+  } else {
+    setStatus("overall", "✗ STEP 3 FAIL (see per-test status)", "fail");
+  }
+
+  $("runBtn").disabled = false;
+}
+
+$("runBtn").addEventListener("click", runTests);
+$("reloadHashBtn").addEventListener("click", () => fetchCertHash().catch(() => {}));
+
+// auto-load cert hash on page open
+fetchCertHash().catch(() => {});
+</script>
+</body>
+</html>

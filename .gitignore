@@ -1,0 +1,24 @@
+# Go build artifacts
+*.test
+*.out
+/bin/
+/dist/
+
+# Spike output (per .plans Step 7) — runtime files only.
+# Curated artifacts (the dated spike-report and verification-report from
+# .plans Step 7 + Step 9) ARE checked in as evidence; everything else in
+# spike-out/ is regenerated and gitignored.
+/cmd/*/spike-out/*
+!/cmd/spike/spike-out/2026-04-30-spike-report.md
+!/cmd/spike/spike-out/2026-04-30-verification-report.md
+
+# Editor/IDE
+.vscode/
+.idea/
+
+# Local env
+.env
+.env.local
+
+# OS
+.DS_Store

@@ -11,9 +11,39 @@ import (
 	"time"
 )
 
-// helper: create a Controller wired to a bytes.Buffer for stdin captures.
-func newTestController(auth ToolAuthorizer) (*Controller, *bytes.Buffer) {
-	buf := &bytes.Buffer{}
+// lockedBuffer is a goroutine-safe wrapper around bytes.Buffer.
+// Required because Controller writes from inbound + outbound goroutines
+// while tests read concurrently — bare bytes.Buffer is not thread-safe
+// (race detector flags it).
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) Bytes() []byte {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]byte, l.b.Len())
+	copy(out, l.b.Bytes())
+	return out
+}
+
+func (l *lockedBuffer) Len() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Len()
+}
+
+// helper: create a Controller wired to a thread-safe buffer for stdin
+// captures.
+func newTestController(auth ToolAuthorizer) (*Controller, *lockedBuffer) {
+	buf := &lockedBuffer{}
 	c := NewController(buf, auth)
 	return c, buf
 }

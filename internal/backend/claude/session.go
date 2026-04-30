@@ -180,6 +180,10 @@ func (s *Session) Start(ctx context.Context, initialMessage string) error {
 }
 
 // startWithInitTimeout is the test seam for A.4 timeout verification.
+//
+// L1: every error path Close()s the Session — otherwise the caller leaks
+// subprocess + 3 pipes + 2 goroutines. The most common failure
+// (ErrSubprocessGone on first Send) was previously the leakiest path.
 func (s *Session) startWithInitTimeout(ctx context.Context, initialMessage string, initTimeout time.Duration) error {
 	if s.SessionID() != "" {
 		// Already initialized — Start is being called as a "send first
@@ -188,6 +192,7 @@ func (s *Session) startWithInitTimeout(ctx context.Context, initialMessage strin
 	}
 
 	if err := s.Send(initialMessage); err != nil {
+		_ = s.Close()
 		return err
 	}
 
@@ -204,6 +209,7 @@ func (s *Session) startWithInitTimeout(ctx context.Context, initialMessage strin
 		_ = s.Close()
 		return ErrInitTimeout
 	case <-ctx.Done():
+		_ = s.Close()
 		return ctx.Err()
 	}
 }
@@ -235,9 +241,12 @@ func (s *Session) Events() <-chan Envelope {
 // ErrSessionClosed if the session was already closed, and other I/O errors
 // otherwise.
 func (s *Session) Send(text string) error {
+	// C2: snapshot mutable session pointers under RLock; do I/O outside
+	// the lock so we don't hold mu across a syscall.
 	s.mu.RLock()
 	sid := s.sessionID
 	closed := s.closed
+	sub := s.sub
 	s.mu.RUnlock()
 	if closed {
 		return ErrSessionClosed
@@ -250,7 +259,7 @@ func (s *Session) Send(text string) error {
 	}
 	b = append(b, '\n')
 
-	if _, err := s.sub.Stdin.Write(b); err != nil {
+	if _, err := sub.Stdin.Write(b); err != nil {
 		if isSubprocessGone(err) {
 			return ErrSubprocessGone
 		}
@@ -268,7 +277,11 @@ func (s *Session) Send(text string) error {
 // SendInterrupt issues an outbound control_request interrupt to cc.
 // Convenience wrapper around s.control.SendInterrupt.
 func (s *Session) SendInterrupt(ctx context.Context) error {
-	_, err := s.control.SendInterrupt(ctx)
+	// C2: snapshot the controller pointer — Recover may swap it.
+	s.mu.RLock()
+	ctrl := s.control
+	s.mu.RUnlock()
+	_, err := ctrl.SendInterrupt(ctx)
 	return err
 }
 
@@ -286,6 +299,11 @@ func (s *Session) StderrSnapshot() []byte {
 // CloseTimeout) and waits for all background goroutines to exit. Safe to
 // call multiple times — subsequent calls return the cached error from the
 // first call.
+//
+// C6: dispatchDone wait is unbounded. dispatch's inner select includes
+// `<-dispatchCtx.Done()` and we cancel above, so dispatch ALWAYS exits
+// shortly after — a timeout here would mask a real bug and risk
+// closing s.events while dispatch is still sending to it (panic).
 func (s *Session) Close() error {
 	s.closeOnce.Do(func() {
 		s.mu.Lock()
@@ -295,21 +313,24 @@ func (s *Session) Close() error {
 		s.closeErr = s.terminateAndWait()
 		s.cancel() // tear down spawn ctx + parser
 
-		// Wait for background goroutines (with a sanity bound).
 		s.mu.RLock()
 		dDone := s.dispatchDone
 		eDone := s.stderrDone
 		s.mu.RUnlock()
-		select {
-		case <-dDone:
-		case <-time.After(2 * time.Second):
-		}
+
+		// dispatch must exit (its select includes <-dispatchCtx.Done(),
+		// canceled above). Wait unconditionally — see C6 above.
+		<-dDone
+
+		// stderr drain may take a moment after pipe close; small bounded
+		// wait is fine since stderrBuf is best-effort and not a panic
+		// path.
 		select {
 		case <-eDone:
 		case <-time.After(2 * time.Second):
 		}
 
-		// Now safe to close events — dispatch is done writing to it.
+		// Safe to close events — dispatch is done writing to it.
 		close(s.events)
 	})
 	return s.closeErr
@@ -338,6 +359,11 @@ func (s *Session) Recover(ctx context.Context) error {
 	enteredAt := s.stateEnteredAt
 	sid := s.sessionID
 	closed := s.closed
+	oldSub := s.sub
+	oldControl := s.control
+	oldCancel := s.cancel
+	oldDispatchDone := s.dispatchDone
+	oldStderrDone := s.stderrDone
 	s.mu.RUnlock()
 
 	if closed {
@@ -350,31 +376,37 @@ func (s *Session) Recover(ctx context.Context) error {
 		return ErrUnsafeToReload
 	}
 
-	// Drain in-flight outbound control_request callers (C.6).
-	s.control.AbortPending(ErrRecoverInterrupted)
-
-	// Tear down old subprocess + goroutines.
-	s.mu.RLock()
-	oldSub := s.sub
-	oldCancel := s.cancel
-	oldDispatchDone := s.dispatchDone
-	oldStderrDone := s.stderrDone
-	s.mu.RUnlock()
-
+	// C5: kill subprocess BEFORE AbortPending. Order matters — if we
+	// abort first, a racing outbound() can register in the freshly-empty
+	// pending map, write to the still-live stdin, then block forever
+	// waiting for a response from a soon-to-be-dead process.
 	if proc := oldSub.Cmd.Process; proc != nil {
 		_ = proc.Kill()
 	}
+	oldControl.AbortPending(ErrRecoverInterrupted)
 	oldCancel()
 
-	select {
-	case <-oldDispatchDone:
-	case <-time.After(5 * time.Second):
-	}
+	// C3: dispatch always exits via its <-dispatchCtx.Done() arm
+	// (canceled above) — wait unbounded. A timeout here masks bugs and
+	// risks the new dispatch starting alongside an old one stuck in
+	// `s.events <- env` (concurrent writes / data interleave).
+	<-oldDispatchDone
 	select {
 	case <-oldStderrDone:
 	case <-time.After(5 * time.Second):
 	}
 	_ = oldSub.WaitOnce()
+
+	// C4: re-check closed after teardown — Close() may have run
+	// concurrently. Without this we'd Spawn a new subprocess that
+	// nobody owns, then Close() would later close(s.events) on a live
+	// dispatcher (panic).
+	s.mu.RLock()
+	closedNow := s.closed
+	s.mu.RUnlock()
+	if closedNow {
+		return ErrSessionClosed
+	}
 
 	// Spawn a fresh subprocess against the same session_id.
 	subCtx, cancel := context.WithCancel(s.parentCtx)
@@ -384,7 +416,11 @@ func (s *Session) Recover(ctx context.Context) error {
 	sub, err := Spawn(subCtx, opts)
 	if err != nil {
 		cancel()
-		return fmt.Errorf("recover: spawn: %w", err)
+		// L2: spawn-failure during Recover leaves the Session in an
+		// incoherent half-replaced state. Mark it closed so callers
+		// can observe ErrSessionClosed on subsequent operations.
+		s.markUnrecoverable()
+		return fmt.Errorf("recover: spawn (session unrecoverable): %w", err)
 	}
 
 	// Replace internals atomically.
@@ -410,8 +446,29 @@ func (s *Session) Recover(ctx context.Context) error {
 	return nil
 }
 
+// markUnrecoverable marks the session closed and closes the events
+// channel exactly once. Used by Recover when re-Spawn fails after the
+// old subprocess has already been torn down — the Session is no longer
+// in a coherent state, so we surface ErrSessionClosed on subsequent
+// operations rather than letting callers act on a half-replaced struct.
+func (s *Session) markUnrecoverable() {
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
+		close(s.events)
+	})
+}
+
 func (s *Session) terminateAndWait() error {
-	proc := s.sub.Cmd.Process
+	// C2: snapshot s.sub under RLock — Recover may swap it concurrently
+	// (though Close + Recover both should be racing-incompatible, the
+	// race detector still flags the unprotected read).
+	s.mu.RLock()
+	sub := s.sub
+	s.mu.RUnlock()
+
+	proc := sub.Cmd.Process
 	if proc == nil {
 		return nil
 	}
@@ -421,7 +478,7 @@ func (s *Session) terminateAndWait() error {
 
 	done := make(chan struct{})
 	go func() {
-		_ = s.sub.WaitOnce()
+		_ = sub.WaitOnce()
 		close(done)
 	}()
 
@@ -577,11 +634,22 @@ func hasToolResult(env Envelope) bool {
 
 // drainStderr continuously reads stderr into a capped buffer so the
 // subprocess pipe never blocks on a full kernel buffer (spec §6.A.5).
+//
+// C1: snapshot s.sub.Stderr and s.stderrDone at start of the goroutine.
+// Recover replaces both fields wholesale; without snapshotting, the
+// `defer close(s.stderrDone)` would fire on the NEW channel (created by
+// Recover) — a double-close panic when the new drainStderr also closes
+// it — and Read() would race between the old and new pipe.
 func (s *Session) drainStderr() {
-	defer close(s.stderrDone)
+	s.mu.RLock()
+	stderr := s.sub.Stderr
+	done := s.stderrDone
+	s.mu.RUnlock()
+	defer close(done)
+
 	chunk := make([]byte, 4096)
 	for {
-		n, err := s.sub.Stderr.Read(chunk)
+		n, err := stderr.Read(chunk)
 		if n > 0 {
 			s.appendStderr(chunk[:n])
 		}

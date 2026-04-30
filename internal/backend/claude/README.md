@@ -61,21 +61,39 @@ from spec §8.
 
 ## Verified behavior contracts (v0.1 spike)
 
-| contract | mechanism |
-|---|---|
-| A.1 no fd 3 | `cmd.ExtraFiles == nil` (TestSpawn_RealClaude) |
-| A.2 graceful-degrade | unknown type/subtype passes through; verified across 4 cc versions |
-| A.3 typed `ErrSubprocessGone` | TestSession_SendAfterKill_RealClaude |
-| A.4 `ErrInitTimeout` 10s | TestSession_InitTimeout |
-| A.5 stderr drained continuously | 64KB ring buffer; TestSession_StderrDrain_RealClaude |
-| C.1–C.3 safe-to-reload gate | recover_test.go state-guard tests |
-| C.6 AbortPending on Recover | TestSession_Recover_AbortsPendingControl |
-| C.5 reload cost ~$0.05–0.15 | Haiku $0.11, Sonnet $0.05 (verification-report.md) |
-| D.1 JuiceFS path | cwd-default → bucket verified locally |
-| D.2 unified Recover primitive | TestSession_Recover_RealClaude_Scenario5 |
-| E.5 cwd-policy strategy (a) | TestSpawn_DefaultCwdLandsInHomeBucket_RealClaude |
-| F.2 typed `ErrBinaryNotFound` | TestSpawn_BinaryNotFound |
-| §10.5 multi-session independence | TestSessions_TwoConcurrent_Independent |
+Three columns: contract / what verifies it / verification kind.
+Verification kinds: **go-test** (an automated Go test asserts the
+contract); **structural** (verified by code-review reading; e.g.
+"absence of X" cannot be expressed as a test); **manual** (one-shot
+report or measurement, not regression-tested); **deferred** (contract
+defined but implementation/verification belongs to a follow-up
+ticket).
+
+| contract | mechanism | kind |
+|---|---|---|
+| A.1 no fd 3 | TestSpawn_RealClaude (`cmd.ExtraFiles == nil`) + TestSpec_A1_NoFd3Dependency (static guard against future ExtraFiles writes) | go-test |
+| A.2 graceful-degrade | TestParseLine_UnknownType_NoError + cross-version probe (4 cc versions, all parse without changes) | go-test + manual |
+| A.3 typed `ErrSubprocessGone` | TestSession_SendAfterKill_RealClaude | go-test |
+| A.4 `ErrInitTimeout` 10s | TestSession_InitTimeout | go-test |
+| A.5 stderr drained continuously | 64KB ring buffer; TestSession_StderrDrain_RealClaude (smoke); A.5 flood-stress test deferred to follow-up #9 | go-test (smoke) |
+| C.1–C.3 safe-to-reload gate | recover_test.go state-guard tests | go-test |
+| C.4 hooks idempotent | v0.1 ships no tether-owned hooks → vacuously satisfied; test infra in follow-up #3 | deferred |
+| C.5 reload cost ~$0.05–0.15 | Haiku $0.11, Sonnet $0.05 (one-shot measurement in verification-report.md) | manual |
+| C.6 AbortPending on Recover | TestSession_Recover_AbortsPendingControl | go-test |
+| D.1 JuiceFS path | cwd-default → bucket verified locally; full PV remount test in follow-up #4 | partial (local verified, cluster deferred) |
+| D.2 unified Recover primitive | TestSession_Recover_RealClaude_Scenario5 | go-test |
+| D.3 container provisioning out-of-scope | spec §3 explicitly | structural |
+| E.1 tether read-only on jsonl | TestSpec_E1_NoJsonlWrites (static source scan) | go-test |
+| E.2 projection model on stable subset | v0.1 ships no projection model — forward-looking; verified at Epic #6 | deferred |
+| E.3 GC stub session | rule defined in spec; sweeper implementation in follow-up #5 | deferred |
+| E.4 cross-device cc resume | spec §3 declares unsupported — "all devices use tether client" | structural |
+| E.5 cwd-policy strategy (a) | TestSpawn_DefaultCwdLandsInHomeBucket_RealClaude | go-test |
+| F.1 no Node embed | structural — Spawn calls `exec.Command("claude", ...)` directly; absence of any Node-related import | structural |
+| F.2 typed `ErrBinaryNotFound` | TestSpawn_BinaryNotFound | go-test |
+| G.1–G.3 no Backend interface | structural — absence of `type Backend interface` in package; package only references claude types | structural |
+| §10.5 multi-session independence | TestSessions_TwoConcurrent_Independent | go-test |
+
+**Count by kind**: 12 go-test direct, 1 go-test + manual (A.2), 1 go-test smoke (A.5), 4 structural (D.3 / E.4 / F.1 / G.1-3), 1 manual (C.5), 1 partial (D.1), 4 deferred (C.4 / E.2 / E.3, plus the deferred half of D.1 + A.5 stress). Race detector clean (`go test -race`) including all real-claude integration tests.
 
 ## v0.1 follow-up sub-tickets (per plan §10 Step 10)
 

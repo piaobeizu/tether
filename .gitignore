@@ -1,0 +1,19 @@
+# Go build artifacts
+*.test
+*.out
+/bin/
+/dist/
+
+# Spike output (per .plans Step 7)
+/cmd/*/spike-out/
+
+# Editor/IDE
+.vscode/
+.idea/
+
+# Local env
+.env
+.env.local
+
+# OS
+.DS_Store

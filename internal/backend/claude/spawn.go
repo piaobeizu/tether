@@ -15,6 +15,16 @@ import (
 // so deploys can diagnose binary-missing failures quickly.
 var ErrBinaryNotFound = errors.New("claude binary not found")
 
+// CwdEnvHome is the environment variable consulted when SpawnOpts.ProjectCwd
+// is empty. cc encodes the cwd into ~/.claude/projects/<encoded>/, so the
+// tether-wide default of $HOME makes every tether-spawned session land in
+// a single bucket — the "(a) fixed cwd" choice from spec §10.4. v0.1.
+//
+// Sub-ticket #1 (per plan §9 v0.1 follow-up) tracks the alternative (c)
+// `tether resume` wrapper that lets users address sessions by id with
+// per-project cwd transparency.
+const CwdEnvHome = "HOME"
+
 // SpawnOpts configures a single claude subprocess invocation.
 type SpawnOpts struct {
 	// ProjectCwd is the working directory passed to claude. Sessions are
@@ -106,7 +116,7 @@ func Spawn(ctx context.Context, opts SpawnOpts) (*Subprocess, error) {
 	}
 
 	cmd := exec.CommandContext(ctx, resolved, BuildArgs(opts)...)
-	cmd.Dir = opts.ProjectCwd
+	cmd.Dir = effectiveCwd(opts.ProjectCwd)
 	cmd.ExtraFiles = nil // A.1: no fd 3 / extra channels
 
 	stdin, err := cmd.StdinPipe()
@@ -138,4 +148,22 @@ func Spawn(ctx context.Context, opts SpawnOpts) (*Subprocess, error) {
 		Stdout: stdout,
 		Stderr: stderr,
 	}, nil
+}
+
+// effectiveCwd resolves SpawnOpts.ProjectCwd into the cwd actually passed
+// to the subprocess. Empty → $HOME (spec §10.4 strategy "a"); otherwise
+// the caller-supplied path is used verbatim.
+//
+// If $HOME is also unset (highly unusual on linux/mac), fall back to
+// /tmp — better than passing "" which exec.Cmd interprets as "inherit
+// parent cwd" (which in our case would be the daemon's own cwd, jumbling
+// sessions across deployments).
+func effectiveCwd(opt string) string {
+	if opt != "" {
+		return opt
+	}
+	if h := os.Getenv(CwdEnvHome); h != "" {
+		return h
+	}
+	return "/tmp"
 }

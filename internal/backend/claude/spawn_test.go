@@ -3,7 +3,9 @@ package claude
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -186,3 +188,90 @@ func TestSubprocess_WaitOnce_Concurrent(t *testing.T) {
 
 // Pipe interface types are enforced statically by the struct field
 // declarations in spawn.go — no extra guard needed.
+
+// effectiveCwd defaults to $HOME when ProjectCwd is empty (§10.4
+// strategy "a"). Verified deterministically — no subprocess involved.
+func TestEffectiveCwd_DefaultsToHome(t *testing.T) {
+	t.Setenv("HOME", "/some/home/dir")
+	if got := effectiveCwd(""); got != "/some/home/dir" {
+		t.Errorf("empty ProjectCwd: want $HOME (/some/home/dir), got %q", got)
+	}
+}
+
+func TestEffectiveCwd_ExplicitOverride(t *testing.T) {
+	t.Setenv("HOME", "/some/home/dir")
+	if got := effectiveCwd("/explicit/path"); got != "/explicit/path" {
+		t.Errorf("explicit ProjectCwd should win, got %q", got)
+	}
+}
+
+func TestEffectiveCwd_NoHomeFallsBackToTmp(t *testing.T) {
+	t.Setenv("HOME", "")
+	if got := effectiveCwd(""); got != "/tmp" {
+		t.Errorf("no HOME: want /tmp, got %q", got)
+	}
+}
+
+// Real-claude verification of the cwd policy: a Session created with
+// an empty ProjectCwd must result in cc writing the session jsonl
+// under ~/.claude/projects/-root/<sid>.jsonl (because $HOME=/root).
+func TestSpawn_DefaultCwdLandsInHomeBucket_RealClaude(t *testing.T) {
+	if _, err := exec.LookPath("claude"); err != nil {
+		t.Skip("claude not in PATH")
+	}
+	if testing.Short() {
+		t.Skip("skipping real-claude test in -short mode")
+	}
+
+	home := os.Getenv("HOME")
+	if home == "" {
+		t.Skip("HOME unset; cwd-policy verification needs a real $HOME")
+	}
+	expectedBucket := filepath.Join(home, ".claude", "projects", encodeCwdAsBucket(home))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	sess, err := New(ctx, SpawnOpts{Model: "haiku"}, nil) // empty ProjectCwd
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer sess.Close()
+	go func() {
+		for range sess.Events() {
+		}
+	}()
+
+	if err := sess.Start(ctx, "Reply with just 'ok'."); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	sid := sess.SessionID()
+	if sid == "" {
+		t.Fatal("SessionID empty after Start")
+	}
+
+	// Wait briefly for cc to flush the jsonl (it writes lazily).
+	expectedPath := filepath.Join(expectedBucket, sid+".jsonl")
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(expectedPath); err == nil {
+			t.Logf("verified: %s", expectedPath)
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Errorf("expected jsonl at %s, not found within 20s", expectedPath)
+}
+
+// encodeCwdAsBucket mirrors cc's path-to-bucket encoding: replace `/`
+// with `-` and prefix with `-`. /root → -root; /home/u/p → -home-u-p.
+// Used by the test above to predict the bucket directory.
+func encodeCwdAsBucket(p string) string {
+	out := []byte(p)
+	for i := range out {
+		if out[i] == '/' {
+			out[i] = '-'
+		}
+	}
+	return string(out)
+}

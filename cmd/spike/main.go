@@ -60,11 +60,19 @@ var scenarios = map[int]struct {
 	7: {"hook idempotency", scenarioDeferred("hook idempotency requires a tether-owned hook; v0.1 ships none — deferred to sub-ticket #3 in plan §9")},
 }
 
+// binaryPath is a package-level seam so scenarios can pin a specific cc
+// version (used by the B' cross-version verification). Empty = default
+// PATH lookup.
+var binaryPath string
+
 func main() {
 	scenariosFlag := flag.String("scenarios", "1,2,3,4,5,6,7", "comma-separated scenario IDs to run")
 	model := flag.String("model", "haiku", "claude model alias (haiku / sonnet / opus)")
 	reportPath := flag.String("report", "", "if set, write a markdown report here")
+	binaryFlag := flag.String("binary", "", "explicit path to claude binary (default: PATH lookup)")
 	flag.Parse()
+
+	binaryPath = *binaryFlag
 
 	ids, err := parseIDs(*scenariosFlag)
 	if err != nil {
@@ -114,7 +122,7 @@ func main() {
 // result, assert no error and assistant produced text.
 func scenario1(ctx context.Context, model string) *scenarioResult {
 	r := &scenarioResult{}
-	sess, err := claude.New(ctx, claude.SpawnOpts{Model: model}, nil)
+	sess, err := claude.New(ctx, claude.SpawnOpts{Model: model, BinaryPath: binaryPath}, nil)
 	if err != nil {
 		r.Err = fmt.Errorf("New: %w", err)
 		return r
@@ -181,7 +189,7 @@ func runToolScenario(ctx context.Context, model string, behavior claude.Permissi
 		}
 	})
 
-	sess, err := claude.New(ctx, claude.SpawnOpts{Model: model}, auth)
+	sess, err := claude.New(ctx, claude.SpawnOpts{Model: model, BinaryPath: binaryPath}, auth)
 	if err != nil {
 		r.Err = fmt.Errorf("New: %w", err)
 		return r
@@ -231,7 +239,7 @@ func runToolScenario(ctx context.Context, model string, behavior claude.Permissi
 // streaming. Expect the result event to indicate the turn was interrupted.
 func scenario4(ctx context.Context, model string) *scenarioResult {
 	r := &scenarioResult{}
-	sess, err := claude.New(ctx, claude.SpawnOpts{Model: model}, nil)
+	sess, err := claude.New(ctx, claude.SpawnOpts{Model: model, BinaryPath: binaryPath}, nil)
 	if err != nil {
 		r.Err = fmt.Errorf("New: %w", err)
 		return r
@@ -297,7 +305,7 @@ func scenario6(ctx context.Context, model string) *scenarioResult {
 	auth := claude.ToolAuthorizerFunc(func(_ context.Context, _ string, _ json.RawMessage) (claude.PermissionResult, error) {
 		return claude.PermissionResult{Behavior: claude.PermissionAllow}, nil
 	})
-	sess, err := claude.New(ctx, claude.SpawnOpts{Model: model}, auth)
+	sess, err := claude.New(ctx, claude.SpawnOpts{Model: model, BinaryPath: binaryPath}, auth)
 	if err != nil {
 		r.Err = fmt.Errorf("New: %w", err)
 		return r

@@ -68,12 +68,18 @@ func (s *Subprocess) WaitOnce() error {
 // BuildArgs produces the argv (excluding argv[0]) for a given SpawnOpts.
 // Pure function — exported for tests so they can assert flag wiring without
 // touching the OS.
+//
+// `--include-partial-messages` is required to receive stream_event token
+// deltas + message_delta events; without it claude only emits assistant /
+// user / result envelopes and the state machine in session.go can't detect
+// ToolPending (which is keyed on message_delta.stop_reason=tool_use).
 func BuildArgs(opts SpawnOpts) []string {
 	args := []string{
 		"--print",
 		"--output-format", "stream-json",
 		"--input-format", "stream-json",
 		"--verbose",
+		"--include-partial-messages",
 		"--permission-prompt-tool", "stdio",
 	}
 	if opts.SessionID != "" {

@@ -17,6 +17,7 @@ func TestBuildArgs_Defaults(t *testing.T) {
 		"--output-format", "stream-json",
 		"--input-format", "stream-json",
 		"--verbose",
+		"--include-partial-messages",
 		"--permission-prompt-tool", "stdio",
 	}
 	if !reflect.DeepEqual(got, want) {

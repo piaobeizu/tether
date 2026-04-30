@@ -15,13 +15,15 @@ import (
 
 // Default timeouts. Per spec §6.A.4 the system/init wait MUST have a hard
 // upper bound — without it a bogus --resume can leave the daemon hanging
-// forever. Step 6 (Recover) reuses InitTimeout when re-establishing.
+// forever. IdleWaitTimeout is the watchdog used by Recover (§6.C.x) to
+// decide a stuck non-idle state can be forced past.
 const (
-	InitTimeout  = 10 * time.Second
-	CloseTimeout = 10 * time.Second
+	InitTimeout     = 10 * time.Second
+	CloseTimeout    = 10 * time.Second
+	IdleWaitTimeout = 120 * time.Second
 )
 
-// ErrInitTimeout is returned by New when the subprocess does not emit
+// ErrInitTimeout is returned by Start when the subprocess does not emit
 // system/init within InitTimeout. Spec §6.A.4.
 var ErrInitTimeout = errors.New("claude: timed out waiting for system/init")
 
@@ -33,6 +35,15 @@ var ErrSubprocessGone = errors.New("claude: subprocess gone (stdin closed)")
 // ErrSessionClosed is returned when operations are attempted on a Session
 // that has already been Close()'d.
 var ErrSessionClosed = errors.New("claude: session closed")
+
+// ErrUnsafeToReload is returned by Recover when the session is in a
+// non-idle state and has not been stuck long enough to qualify for the
+// stale-state override. Spec §6.C.1–C.3.
+var ErrUnsafeToReload = errors.New("claude: recover refused — session not idle (C.1–C.3)")
+
+// ErrSessionNotStarted is returned by Recover when called before any
+// system/init has populated SessionID — there's nothing to --resume.
+var ErrSessionNotStarted = errors.New("claude: recover requires a started session (no session_id captured)")
 
 // SessionState models where the conversation is in the turn lifecycle.
 // Used by Step 6's RecoverGate to decide whether Recover() is safe.
@@ -73,23 +84,33 @@ const stderrCap = 64 * 1024
 type Session struct {
 	ProjectCwd string
 
+	// Mutable subprocess + per-spawn lifecycle. Replaced wholesale by
+	// Recover. Guarded by mu for cross-goroutine reads (control writes go
+	// through control which has its own stdinMu).
 	sub      *Subprocess
 	control  *Controller
 	parserCh <-chan Envelope
 
-	// Mutable state — guarded by mu.
-	mu        sync.RWMutex
-	sessionID string
-	state     SessionState
-	closed    bool
+	// Retained for Recover to re-spawn with the same configuration.
+	spawnOpts SpawnOpts
+	auth      ToolAuthorizer
+	parentCtx context.Context
 
-	events chan Envelope // forwarded to consumer (control_* not included)
-	initCh chan string   // first system/init session_id lands here
+	// Mutable state — guarded by mu.
+	mu             sync.RWMutex
+	sessionID      string
+	state          SessionState
+	stateEnteredAt time.Time
+	closed         bool
+	sentInit       bool // whether initCh has already been signaled
+
+	events chan Envelope // long-lived; only Close() closes it
+	initCh chan string   // first system/init in *current* dispatcher lands here
 
 	stderrMu  sync.Mutex
 	stderrBuf bytes.Buffer
 
-	// Background goroutine signals.
+	// Background goroutine signals — replaced on each Recover.
 	dispatchDone chan struct{}
 	stderrDone   chan struct{}
 
@@ -124,15 +145,20 @@ func New(ctx context.Context, opts SpawnOpts, auth ToolAuthorizer) (*Session, er
 	}
 
 	s := &Session{
-		ProjectCwd:   opts.ProjectCwd,
-		sub:          sub,
-		control:      NewController(sub.Stdin, auth),
-		events:       make(chan Envelope, 64),
-		initCh:       make(chan string, 1),
-		dispatchDone: make(chan struct{}),
-		stderrDone:   make(chan struct{}),
-		ctx:          subCtx,
-		cancel:       cancel,
+		ProjectCwd:     opts.ProjectCwd,
+		sub:            sub,
+		control:        NewController(sub.Stdin, auth),
+		spawnOpts:      opts,
+		auth:           auth,
+		parentCtx:      ctx,
+		events:         make(chan Envelope, 64),
+		initCh:         make(chan string, 1),
+		dispatchDone:   make(chan struct{}),
+		stderrDone:     make(chan struct{}),
+		ctx:            subCtx,
+		cancel:         cancel,
+		state:          StateIdle,
+		stateEnteredAt: time.Now(),
 	}
 	s.parserCh = Parse(subCtx, sub.Stdout, ParseOpts{})
 
@@ -270,16 +296,118 @@ func (s *Session) Close() error {
 		s.cancel() // tear down spawn ctx + parser
 
 		// Wait for background goroutines (with a sanity bound).
+		s.mu.RLock()
+		dDone := s.dispatchDone
+		eDone := s.stderrDone
+		s.mu.RUnlock()
 		select {
-		case <-s.dispatchDone:
+		case <-dDone:
 		case <-time.After(2 * time.Second):
 		}
 		select {
-		case <-s.stderrDone:
+		case <-eDone:
 		case <-time.After(2 * time.Second):
 		}
+
+		// Now safe to close events — dispatch is done writing to it.
+		close(s.events)
 	})
 	return s.closeErr
+}
+
+// Recover terminates the current subprocess and re-spawns claude with
+// `--resume <SessionID>`, preserving the event stream continuity.
+//
+// Spec §6.D.2: this is the unified primitive used by all four
+// recovery callers (plugin reload / pod restart / daemon crash / WT
+// reconnect). Spec §6.C.1–C.3 require the session to be idle before
+// reload; if the state is non-idle, Recover returns ErrUnsafeToReload —
+// UNLESS the state has been stuck for ≥ IdleWaitTimeout, in which case
+// Recover proceeds (treating the stream as stale / dead).
+//
+// The events channel persists across Recover; consumers continue
+// reading from the same channel. SessionID is preserved (we resume to
+// the same conversation). State transitions to Idle.
+//
+// IMPORTANT: like New, the new subprocess will NOT emit system/init
+// until the next Send. Callers should expect to Send a user message
+// after Recover to drive the session forward.
+func (s *Session) Recover(ctx context.Context) error {
+	s.mu.RLock()
+	state := s.state
+	enteredAt := s.stateEnteredAt
+	sid := s.sessionID
+	closed := s.closed
+	s.mu.RUnlock()
+
+	if closed {
+		return ErrSessionClosed
+	}
+	if sid == "" {
+		return ErrSessionNotStarted
+	}
+	if state != StateIdle && time.Since(enteredAt) < IdleWaitTimeout {
+		return ErrUnsafeToReload
+	}
+
+	// Drain in-flight outbound control_request callers (C.6).
+	s.control.AbortPending(ErrRecoverInterrupted)
+
+	// Tear down old subprocess + goroutines.
+	s.mu.RLock()
+	oldSub := s.sub
+	oldCancel := s.cancel
+	oldDispatchDone := s.dispatchDone
+	oldStderrDone := s.stderrDone
+	s.mu.RUnlock()
+
+	if proc := oldSub.Cmd.Process; proc != nil {
+		_ = proc.Kill()
+	}
+	oldCancel()
+
+	select {
+	case <-oldDispatchDone:
+	case <-time.After(5 * time.Second):
+	}
+	select {
+	case <-oldStderrDone:
+	case <-time.After(5 * time.Second):
+	}
+	_ = oldSub.WaitOnce()
+
+	// Spawn a fresh subprocess against the same session_id.
+	subCtx, cancel := context.WithCancel(s.parentCtx)
+	opts := s.spawnOpts
+	opts.SessionID = sid
+
+	sub, err := Spawn(subCtx, opts)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("recover: spawn: %w", err)
+	}
+
+	// Replace internals atomically.
+	s.mu.Lock()
+	s.sub = sub
+	s.control = NewController(sub.Stdin, s.auth)
+	s.parserCh = Parse(subCtx, sub.Stdout, ParseOpts{})
+	s.dispatchDone = make(chan struct{})
+	s.stderrDone = make(chan struct{})
+	s.initCh = make(chan string, 1)
+	s.ctx = subCtx
+	s.cancel = cancel
+	s.state = StateIdle
+	s.stateEnteredAt = time.Now()
+	s.sentInit = false // next system/init will signal again
+	s.stderrBuf.Reset()
+	s.mu.Unlock()
+
+	// Restart goroutines.
+	go s.drainStderr()
+	go s.dispatch()
+
+	return nil
 }
 
 func (s *Session) terminateAndWait() error {
@@ -311,14 +439,23 @@ func (s *Session) terminateAndWait() error {
 // captures sessionID, result/stream_event drive the state machine, and
 // everything else (assistant/user/result/system/* etc.) is forwarded on
 // the events channel for UI consumption.
+//
+// dispatch does NOT close the events channel — that's Close()'s job.
+// Recover() restarts dispatch on a fresh parser channel; events stay
+// continuous across restarts so consumers don't see a re-key.
 func (s *Session) dispatch() {
-	defer close(s.dispatchDone)
-	defer close(s.events)
+	// Snapshot parser channel + ctx — Recover replaces these wholesale.
+	s.mu.RLock()
+	parserCh := s.parserCh
+	dispatchCtx := s.ctx
+	control := s.control
+	dispatchDone := s.dispatchDone
+	s.mu.RUnlock()
+	defer close(dispatchDone)
 
-	sentInit := false
-	for env := range s.parserCh {
+	for env := range parserCh {
 		// Controller eats control_request / control_response.
-		if s.control.Dispatch(s.ctx, env) {
+		if control.Dispatch(dispatchCtx, env) {
 			continue
 		}
 
@@ -327,9 +464,12 @@ func (s *Session) dispatch() {
 		if env.Type == EventSystem && env.Subtype == "init" && env.SessionID != "" {
 			s.mu.Lock()
 			s.sessionID = env.SessionID
+			alreadySignaled := s.sentInit
+			if !alreadySignaled {
+				s.sentInit = true
+			}
 			s.mu.Unlock()
-			if !sentInit {
-				sentInit = true
+			if !alreadySignaled {
 				select {
 				case s.initCh <- env.SessionID:
 				default:
@@ -339,33 +479,100 @@ func (s *Session) dispatch() {
 
 		select {
 		case s.events <- env:
-		case <-s.ctx.Done():
+		case <-dispatchCtx.Done():
 			return
 		}
 	}
 }
 
 // applyStateTransition updates the SessionState based on incoming events.
-// Coarse for v0.1 — Step 6 elaborates with mid-text / tool-pending
-// distinctions for the RecoverGate.
+//
+// State machine (spec §6.C.1–C.3):
+//
+//	Idle           after `result` event (default initial state)
+//	Streaming      assistant is producing tokens
+//	ToolPending    assistant emitted tool_use, awaiting tool_result echo
+//
+// Transitions tracked here gate Recover() in Step 6 — see safetyToReload.
 func (s *Session) applyStateTransition(env Envelope) {
 	switch env.Type {
 	case EventResult:
-		s.mu.Lock()
-		s.state = StateIdle
-		s.mu.Unlock()
+		s.setState(StateIdle)
 	case EventStreamEvent:
+		// Look at the inner stream_event for tool_use stop reason.
+		if isToolUseStop(env) {
+			s.setState(StateToolPending)
+			return
+		}
+		// Generic streaming token / message_stop / etc.
 		s.mu.RLock()
 		st := s.state
 		s.mu.RUnlock()
-		// Only transition to Streaming if currently Idle — preserve
-		// ToolPending / Streaming once set.
 		if st == StateIdle {
-			s.mu.Lock()
-			s.state = StateStreaming
-			s.mu.Unlock()
+			s.setState(StateStreaming)
+		}
+	case EventUser:
+		// A `user` event carrying tool_result transitions back to streaming.
+		if hasToolResult(env) {
+			s.setState(StateStreaming)
 		}
 	}
+}
+
+// setState updates state + records the transition timestamp for the
+// stale-state watchdog in Recover.
+func (s *Session) setState(next SessionState) {
+	s.mu.Lock()
+	if s.state != next {
+		s.state = next
+		s.stateEnteredAt = time.Now()
+	}
+	s.mu.Unlock()
+}
+
+// isToolUseStop returns true when env is a stream_event whose nested
+// `delta.stop_reason == "tool_use"`. We re-decode the raw bytes since the
+// stream_event payload is not in our typed union.
+func isToolUseStop(env Envelope) bool {
+	if env.Type != EventStreamEvent {
+		return false
+	}
+	var probe struct {
+		Event struct {
+			Type  string `json:"type"`
+			Delta struct {
+				StopReason string `json:"stop_reason"`
+			} `json:"delta"`
+		} `json:"event"`
+	}
+	if err := json.Unmarshal(env.Raw, &probe); err != nil {
+		return false
+	}
+	return probe.Event.Type == "message_delta" && probe.Event.Delta.StopReason == "tool_use"
+}
+
+// hasToolResult returns true when env is a `user` envelope containing a
+// tool_result content block.
+func hasToolResult(env Envelope) bool {
+	if env.Type != EventUser {
+		return false
+	}
+	var probe struct {
+		Message struct {
+			Content []struct {
+				Type string `json:"type"`
+			} `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(env.Raw, &probe); err != nil {
+		return false
+	}
+	for _, c := range probe.Message.Content {
+		if c.Type == "tool_result" {
+			return true
+		}
+	}
+	return false
 }
 
 // drainStderr continuously reads stderr into a capped buffer so the

@@ -126,6 +126,13 @@ type Session struct {
 	hasRateLimit     bool
 	lastRateLimitAt  time.Time // wall-clock when last RL was recorded
 
+	// OOM circuit-breaker (ops-concerns subitem #2). Timestamps of recent
+	// SIGKILL-attributed exits (i.e., subprocess died on its own with
+	// SIGKILL — likely OOM-killer or external `kill -9`). Old timestamps
+	// outside the policy window are pruned by recordOOMEventLocked. See
+	// oom_circuit.go for policy + ErrOOMCircuitOpen contract.
+	oomEvents []time.Time
+
 	events chan Envelope // long-lived; only Close() closes it
 	initCh chan string   // first system/init in *current* dispatcher lands here
 
@@ -491,12 +498,33 @@ func (s *Session) Recover(ctx context.Context) error {
 		return ErrUnsafeToReload
 	}
 
+	// OOM circuit-breaker (ops-concerns subitem #2). If too many SIGKILL
+	// exits have been attributed to this Session within the policy window,
+	// refuse to re-spawn — surface ErrOOMCircuitOpen so the daemon can
+	// degrade gracefully instead of looping forever.
+	s.mu.RLock()
+	tripped := s.oomCircuitTrippedLocked(time.Now())
+	s.mu.RUnlock()
+	if tripped {
+		return ErrOOMCircuitOpen
+	}
+
 	// C5: kill subprocess BEFORE AbortPending. Order matters — if we
 	// abort first, a racing outbound() can register in the freshly-empty
 	// pending map, write to the still-live stdin, then block forever
 	// waiting for a response from a soon-to-be-dead process.
+	//
+	// ops-concerns subitem #2: liveness probe via signal(0) BEFORE the
+	// kill so we can later distinguish "OOM-killer killed it" from "we
+	// killed it during teardown" — only the former counts toward the
+	// circuit-breaker. signal(0) returns nil if proc is alive, error if
+	// already gone.
+	preKilledByUs := false
 	if proc := oldSub.Cmd.Process; proc != nil {
-		_ = proc.Kill()
+		if err := proc.Signal(syscall.Signal(0)); err == nil {
+			_ = proc.Kill()
+			preKilledByUs = true
+		}
 	}
 	oldControl.AbortPending(ErrRecoverInterrupted)
 	oldCancel()
@@ -510,7 +538,18 @@ func (s *Session) Recover(ctx context.Context) error {
 	case <-oldStderrDone:
 	case <-time.After(5 * time.Second):
 	}
-	_ = oldSub.WaitOnce()
+	waitErr := oldSub.WaitOnce()
+
+	// ops-concerns subitem #2: if we did NOT kill the subprocess (i.e.
+	// it died on its own before our liveness probe) and its exit was a
+	// SIGKILL, attribute to OOM-killer (or external kill -9) and record
+	// the event. The next Recover invocation will check the circuit at
+	// the top and refuse if we've crossed the threshold.
+	if !preKilledByUs && isOOMExit(waitErr) {
+		s.mu.Lock()
+		s.recordOOMEventLocked(time.Now())
+		s.mu.Unlock()
+	}
 
 	// C4: re-check closed after teardown — Close() may have run
 	// concurrently. Without this we'd Spawn a new subprocess that

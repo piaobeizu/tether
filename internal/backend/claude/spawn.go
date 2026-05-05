@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"time"
 )
 
 // ErrBinaryNotFound is returned by Spawn when the claude binary cannot be
@@ -43,6 +44,19 @@ type SpawnOpts struct {
 	// BinaryPath overrides the default "claude" lookup. For tests / pinned
 	// installs.
 	BinaryPath string
+
+	// OOMCircuitMaxExits is the maximum number of SIGKILL-induced exits
+	// (attributed to the OOM-killer or external `kill -9`) tolerated within
+	// OOMCircuitWindow before Recover returns ErrOOMCircuitOpen. Zero (the
+	// default) means use DefaultOOMCircuitMaxExits (=3). Negative disables
+	// the circuit-breaker entirely (Recover will keep re-spawning).
+	//
+	// ops-concerns subitem #2 (gh-13 round-1 Tier-4).
+	OOMCircuitMaxExits int
+
+	// OOMCircuitWindow is the rolling window in which OOMCircuitMaxExits is
+	// counted. Zero means use DefaultOOMCircuitWindow (=60s).
+	OOMCircuitWindow time.Duration
 }
 
 // Subprocess is a running claude subprocess with stdio pipes.

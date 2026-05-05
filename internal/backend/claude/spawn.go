@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 )
@@ -57,6 +58,28 @@ type SpawnOpts struct {
 	// OOMCircuitWindow is the rolling window in which OOMCircuitMaxExits is
 	// counted. Zero means use DefaultOOMCircuitWindow (=60s).
 	OOMCircuitWindow time.Duration
+
+	// Env adds / overrides environment variables for the spawned subprocess
+	// on top of the parent process's environment. Nil (or empty map)
+	// inherits the parent's env unchanged — the v0 default.
+	//
+	// Per spec §10.3 (creds-injection / piaobeizu/tether#21): v0.1 cc
+	// authentication flows via env-var injection (ANTHROPIC_API_KEY or
+	// equivalent) at spawn time. The caller (daemon, when it exists; CLI
+	// for now) decides where the credential comes from — direct env, k8s
+	// Secret, vault, OAuth-derived token. Session.Spawn does NOT enforce
+	// any credential storage policy; it only forwards what the caller
+	// passes here.
+	//
+	// v0.2+ may add OAuth flow + secret store + token rotation; that work
+	// lives daemon-side and ultimately funnels into this same Env field —
+	// the shape is forward-compatible.
+	//
+	// Semantics: a key in Env replaces any same-named entry from the
+	// parent env. Keys not in Env are inherited as-is. To explicitly set
+	// an inherited variable to empty (vs unset), include it with value
+	// "" — subprocess sees the empty string.
+	Env map[string]string
 }
 
 // Subprocess is a running claude subprocess with stdio pipes.
@@ -132,6 +155,12 @@ func Spawn(ctx context.Context, opts SpawnOpts) (*Subprocess, error) {
 	cmd := exec.CommandContext(ctx, resolved, BuildArgs(opts)...)
 	cmd.Dir = effectiveCwd(opts.ProjectCwd)
 	cmd.ExtraFiles = nil // A.1: no fd 3 / extra channels
+	if env := effectiveEnv(opts.Env); env != nil {
+		cmd.Env = env
+	}
+	// nil cmd.Env preserves the historical default: cmd inherits the
+	// parent's env wholesale. Only callers who pass non-empty Env opt
+	// into the merge path.
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -180,4 +209,38 @@ func effectiveCwd(opt string) string {
 		return h
 	}
 	return "/tmp"
+}
+
+// effectiveEnv builds the cmd.Env slice from parent env + caller overrides
+// per SpawnOpts.Env semantics (creds-injection / piaobeizu/tether#21):
+//
+//   - nil / empty map → return nil (caller of Spawn leaves cmd.Env as nil
+//     so cmd.Run inherits the parent env wholesale; preserves v0 default).
+//   - non-empty map → start from os.Environ(); for each (k,v) in
+//     overrides, replace the existing "k=*" entry if present, else append.
+//
+// Pure function; testable without a subprocess.
+func effectiveEnv(overrides map[string]string) []string {
+	if len(overrides) == 0 {
+		return nil
+	}
+	base := os.Environ()
+	// Index existing keys for O(1) replace.
+	idx := make(map[string]int, len(base))
+	for i, kv := range base {
+		eq := strings.IndexByte(kv, '=')
+		if eq <= 0 {
+			continue // malformed entry; leave alone
+		}
+		idx[kv[:eq]] = i
+	}
+	for k, v := range overrides {
+		entry := k + "=" + v
+		if i, ok := idx[k]; ok {
+			base[i] = entry
+		} else {
+			base = append(base, entry)
+		}
+	}
+	return base
 }

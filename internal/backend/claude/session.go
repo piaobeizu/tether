@@ -729,19 +729,35 @@ func (s *Session) drainStderr() {
 	}
 }
 
+// appendStderr appends p to the bounded stderr ring buffer per spec §A.5.
+//
+// Invariant: after this call, s.stderrBuf.Len() <= stderrCap. We always keep
+// the last stderrCap bytes; older content is dropped (front trim).
+//
+// ops-concerns subitem #1 fix: previously, when len(p) alone exceeded
+// stderrCap the existing buffer was Reset() but the entire oversized p was
+// then appended, leaving the buffer >stderrCap (contract violation). With
+// 4KB read chunks in drainStderr this never bit in practice, but it would
+// trigger the moment a single Read returned more bytes than the cap.
 func (s *Session) appendStderr(p []byte) {
 	s.stderrMu.Lock()
 	defer s.stderrMu.Unlock()
+
+	// Case A: single write itself meets/exceeds cap → drop everything we had,
+	// keep only the last stderrCap bytes of p.
+	if len(p) >= stderrCap {
+		s.stderrBuf.Reset()
+		s.stderrBuf.Write(p[len(p)-stderrCap:])
+		return
+	}
+
+	// Case B: combined would exceed cap → trim front of existing buffer
+	// to make room while keeping len ≤ cap after the upcoming Write(p).
 	if s.stderrBuf.Len()+len(p) > stderrCap {
-		// Trim from the front to keep last stderrCap bytes.
 		excess := s.stderrBuf.Len() + len(p) - stderrCap
-		if excess >= s.stderrBuf.Len() {
-			s.stderrBuf.Reset()
-		} else {
-			rest := s.stderrBuf.Bytes()[excess:]
-			s.stderrBuf.Reset()
-			s.stderrBuf.Write(rest)
-		}
+		rest := s.stderrBuf.Bytes()[excess:]
+		s.stderrBuf.Reset()
+		s.stderrBuf.Write(rest)
 	}
 	s.stderrBuf.Write(p)
 }

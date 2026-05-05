@@ -104,6 +104,19 @@ type Session struct {
 	closed         bool
 	sentInit       bool // whether initCh has already been signaled
 
+	// Version drift detection (gh-13 round-1 review Tier-4 / ops-concerns
+	// subitem #3). claude_code_version SHOULD be stable across all
+	// system/init events of the same session — if it changes mid-session
+	// (e.g., user upgraded `claude` binary while a Recover happened), the
+	// daemon needs to know so it can refuse-or-warn.
+	//
+	// recordedClaudeVersion captures the FIRST non-empty version seen and
+	// is never overwritten by drift; versionDrifts accumulates each
+	// subsequent mismatch. Higher layers (daemon supervisor) decide policy
+	// (warn vs refuse) by polling VersionDrifts() after Recover.
+	recordedClaudeVersion string
+	versionDrifts         []VersionDrift
+
 	events chan Envelope // long-lived; only Close() closes it
 	initCh chan string   // first system/init in *current* dispatcher lands here
 
@@ -221,6 +234,70 @@ func (s *Session) SessionID() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.sessionID
+}
+
+// VersionDrift records one mismatch between claude_code_version values seen
+// in successive system/init events. See Session.versionDrifts.
+type VersionDrift struct {
+	From string    // recorded version before the drift event
+	To   string    // version observed in the new system/init
+	At   time.Time // wall-clock when the drift was recorded
+}
+
+// ClaudeCodeVersion returns the claude_code_version recorded from the FIRST
+// non-empty system/init seen on this Session. Subsequent drifts do NOT
+// overwrite this — see VersionDrifts() for those.
+func (s *Session) ClaudeCodeVersion() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.recordedClaudeVersion
+}
+
+// VersionDrifts returns a copy of all observed claude_code_version mismatches
+// for this Session. Empty slice = no drift; >0 = the binary has changed
+// underneath us at least once. Higher layers (daemon supervisor) decide what
+// to do (warn-only / refuse Recover / surface to user).
+func (s *Session) VersionDrifts() []VersionDrift {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.versionDrifts) == 0 {
+		return nil
+	}
+	out := make([]VersionDrift, len(s.versionDrifts))
+	copy(out, s.versionDrifts)
+	return out
+}
+
+// recordSystemInit captures session_id + claude_code_version from a
+// system/init envelope. Returns true iff initCh has not yet been signaled
+// for this Session (caller should forward the session_id to initCh).
+//
+// Centralized so version drift logic stays in one place and is unit-testable
+// without spinning a real subprocess.
+func (s *Session) recordSystemInit(env Envelope) bool {
+	var newVer string
+	if si, err := env.DecodeSystemInit(); err == nil {
+		newVer = si.ClaudeCodeVersion
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessionID = env.SessionID
+	if s.recordedClaudeVersion == "" {
+		// First non-empty observation wins; empty observations don't count.
+		s.recordedClaudeVersion = newVer
+	} else if newVer != "" && newVer != s.recordedClaudeVersion {
+		// Subsequent mismatch — record but DO NOT overwrite recorded.
+		s.versionDrifts = append(s.versionDrifts, VersionDrift{
+			From: s.recordedClaudeVersion,
+			To:   newVer,
+			At:   time.Now(),
+		})
+	}
+	if s.sentInit {
+		return false
+	}
+	s.sentInit = true
+	return true
 }
 
 // State returns the current SessionState. Used by RecoverGate (Step 6).
@@ -519,14 +596,7 @@ func (s *Session) dispatch() {
 		s.applyStateTransition(env)
 
 		if env.Type == EventSystem && env.Subtype == "init" && env.SessionID != "" {
-			s.mu.Lock()
-			s.sessionID = env.SessionID
-			alreadySignaled := s.sentInit
-			if !alreadySignaled {
-				s.sentInit = true
-			}
-			s.mu.Unlock()
-			if !alreadySignaled {
+			if shouldSignal := s.recordSystemInit(env); shouldSignal {
 				select {
 				case s.initCh <- env.SessionID:
 				default:

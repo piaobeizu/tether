@@ -117,6 +117,15 @@ type Session struct {
 	recordedClaudeVersion string
 	versionDrifts         []VersionDrift
 
+	// Latest rate_limit_event observed (ops-concerns subitem #4). cc emits
+	// this periodically; we cache it so the daemon can pre-flight check
+	// "is the user about to hit a limit" before forwarding new user
+	// messages. Session itself does NOT enforce — that's a daemon-level
+	// policy via EvaluateRateLimit + LastRateLimit().
+	lastRateLimit    RateLimitInfo
+	hasRateLimit     bool
+	lastRateLimitAt  time.Time // wall-clock when last RL was recorded
+
 	events chan Envelope // long-lived; only Close() closes it
 	initCh chan string   // first system/init in *current* dispatcher lands here
 
@@ -266,6 +275,35 @@ func (s *Session) VersionDrifts() []VersionDrift {
 	out := make([]VersionDrift, len(s.versionDrifts))
 	copy(out, s.versionDrifts)
 	return out
+}
+
+// LastRateLimit returns the latest rate_limit_info recorded from a
+// rate_limit_event, plus a bool indicating whether any has been seen. When
+// ok is false, the returned RateLimitInfo is zero-valued.
+//
+// Used by daemon-level pre-flight checks (see EvaluateRateLimit). Session
+// itself does NOT enforce on Send — keeping the layering: Session records,
+// daemon supervisor decides policy.
+func (s *Session) LastRateLimit() (info RateLimitInfo, recordedAt time.Time, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastRateLimit, s.lastRateLimitAt, s.hasRateLimit
+}
+
+// recordRateLimit captures a rate_limit_event into Session state. Centralized
+// so dispatch can call it and unit tests can drive it without a subprocess.
+// Bad envelopes (decode errors) are silently ignored — rate-limit observation
+// is best-effort.
+func (s *Session) recordRateLimit(env Envelope) {
+	r, err := env.DecodeRateLimit()
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastRateLimit = r.RateLimitInfo
+	s.hasRateLimit = true
+	s.lastRateLimitAt = time.Now()
 }
 
 // recordSystemInit captures session_id + claude_code_version from a
@@ -602,6 +640,10 @@ func (s *Session) dispatch() {
 				default:
 				}
 			}
+		}
+
+		if env.Type == EventRateLimit {
+			s.recordRateLimit(env)
 		}
 
 		select {

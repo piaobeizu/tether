@@ -104,6 +104,35 @@ type Session struct {
 	closed         bool
 	sentInit       bool // whether initCh has already been signaled
 
+	// Version drift detection (gh-13 round-1 review Tier-4 / ops-concerns
+	// subitem #3). claude_code_version SHOULD be stable across all
+	// system/init events of the same session — if it changes mid-session
+	// (e.g., user upgraded `claude` binary while a Recover happened), the
+	// daemon needs to know so it can refuse-or-warn.
+	//
+	// recordedClaudeVersion captures the FIRST non-empty version seen and
+	// is never overwritten by drift; versionDrifts accumulates each
+	// subsequent mismatch. Higher layers (daemon supervisor) decide policy
+	// (warn vs refuse) by polling VersionDrifts() after Recover.
+	recordedClaudeVersion string
+	versionDrifts         []VersionDrift
+
+	// Latest rate_limit_event observed (ops-concerns subitem #4). cc emits
+	// this periodically; we cache it so the daemon can pre-flight check
+	// "is the user about to hit a limit" before forwarding new user
+	// messages. Session itself does NOT enforce — that's a daemon-level
+	// policy via EvaluateRateLimit + LastRateLimit().
+	lastRateLimit    RateLimitInfo
+	hasRateLimit     bool
+	lastRateLimitAt  time.Time // wall-clock when last RL was recorded
+
+	// OOM circuit-breaker (ops-concerns subitem #2). Timestamps of recent
+	// SIGKILL-attributed exits (i.e., subprocess died on its own with
+	// SIGKILL — likely OOM-killer or external `kill -9`). Old timestamps
+	// outside the policy window are pruned by recordOOMEventLocked. See
+	// oom_circuit.go for policy + ErrOOMCircuitOpen contract.
+	oomEvents []time.Time
+
 	events chan Envelope // long-lived; only Close() closes it
 	initCh chan string   // first system/init in *current* dispatcher lands here
 
@@ -221,6 +250,99 @@ func (s *Session) SessionID() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.sessionID
+}
+
+// VersionDrift records one mismatch between claude_code_version values seen
+// in successive system/init events. See Session.versionDrifts.
+type VersionDrift struct {
+	From string    // recorded version before the drift event
+	To   string    // version observed in the new system/init
+	At   time.Time // wall-clock when the drift was recorded
+}
+
+// ClaudeCodeVersion returns the claude_code_version recorded from the FIRST
+// non-empty system/init seen on this Session. Subsequent drifts do NOT
+// overwrite this — see VersionDrifts() for those.
+func (s *Session) ClaudeCodeVersion() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.recordedClaudeVersion
+}
+
+// VersionDrifts returns a copy of all observed claude_code_version mismatches
+// for this Session. Empty slice = no drift; >0 = the binary has changed
+// underneath us at least once. Higher layers (daemon supervisor) decide what
+// to do (warn-only / refuse Recover / surface to user).
+func (s *Session) VersionDrifts() []VersionDrift {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.versionDrifts) == 0 {
+		return nil
+	}
+	out := make([]VersionDrift, len(s.versionDrifts))
+	copy(out, s.versionDrifts)
+	return out
+}
+
+// LastRateLimit returns the latest rate_limit_info recorded from a
+// rate_limit_event, plus a bool indicating whether any has been seen. When
+// ok is false, the returned RateLimitInfo is zero-valued.
+//
+// Used by daemon-level pre-flight checks (see EvaluateRateLimit). Session
+// itself does NOT enforce on Send — keeping the layering: Session records,
+// daemon supervisor decides policy.
+func (s *Session) LastRateLimit() (info RateLimitInfo, recordedAt time.Time, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastRateLimit, s.lastRateLimitAt, s.hasRateLimit
+}
+
+// recordRateLimit captures a rate_limit_event into Session state. Centralized
+// so dispatch can call it and unit tests can drive it without a subprocess.
+// Bad envelopes (decode errors) are silently ignored — rate-limit observation
+// is best-effort.
+func (s *Session) recordRateLimit(env Envelope) {
+	r, err := env.DecodeRateLimit()
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastRateLimit = r.RateLimitInfo
+	s.hasRateLimit = true
+	s.lastRateLimitAt = time.Now()
+}
+
+// recordSystemInit captures session_id + claude_code_version from a
+// system/init envelope. Returns true iff initCh has not yet been signaled
+// for this Session (caller should forward the session_id to initCh).
+//
+// Centralized so version drift logic stays in one place and is unit-testable
+// without spinning a real subprocess.
+func (s *Session) recordSystemInit(env Envelope) bool {
+	var newVer string
+	if si, err := env.DecodeSystemInit(); err == nil {
+		newVer = si.ClaudeCodeVersion
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessionID = env.SessionID
+	if s.recordedClaudeVersion == "" {
+		// First non-empty observation wins; empty observations don't count.
+		s.recordedClaudeVersion = newVer
+	} else if newVer != "" && newVer != s.recordedClaudeVersion {
+		// Subsequent mismatch — record but DO NOT overwrite recorded.
+		s.versionDrifts = append(s.versionDrifts, VersionDrift{
+			From: s.recordedClaudeVersion,
+			To:   newVer,
+			At:   time.Now(),
+		})
+	}
+	if s.sentInit {
+		return false
+	}
+	s.sentInit = true
+	return true
 }
 
 // State returns the current SessionState. Used by RecoverGate (Step 6).
@@ -376,12 +498,33 @@ func (s *Session) Recover(ctx context.Context) error {
 		return ErrUnsafeToReload
 	}
 
+	// OOM circuit-breaker (ops-concerns subitem #2). If too many SIGKILL
+	// exits have been attributed to this Session within the policy window,
+	// refuse to re-spawn — surface ErrOOMCircuitOpen so the daemon can
+	// degrade gracefully instead of looping forever.
+	s.mu.RLock()
+	tripped := s.oomCircuitTrippedLocked(time.Now())
+	s.mu.RUnlock()
+	if tripped {
+		return ErrOOMCircuitOpen
+	}
+
 	// C5: kill subprocess BEFORE AbortPending. Order matters — if we
 	// abort first, a racing outbound() can register in the freshly-empty
 	// pending map, write to the still-live stdin, then block forever
 	// waiting for a response from a soon-to-be-dead process.
+	//
+	// ops-concerns subitem #2: liveness probe via signal(0) BEFORE the
+	// kill so we can later distinguish "OOM-killer killed it" from "we
+	// killed it during teardown" — only the former counts toward the
+	// circuit-breaker. signal(0) returns nil if proc is alive, error if
+	// already gone.
+	preKilledByUs := false
 	if proc := oldSub.Cmd.Process; proc != nil {
-		_ = proc.Kill()
+		if err := proc.Signal(syscall.Signal(0)); err == nil {
+			_ = proc.Kill()
+			preKilledByUs = true
+		}
 	}
 	oldControl.AbortPending(ErrRecoverInterrupted)
 	oldCancel()
@@ -395,7 +538,18 @@ func (s *Session) Recover(ctx context.Context) error {
 	case <-oldStderrDone:
 	case <-time.After(5 * time.Second):
 	}
-	_ = oldSub.WaitOnce()
+	waitErr := oldSub.WaitOnce()
+
+	// ops-concerns subitem #2: if we did NOT kill the subprocess (i.e.
+	// it died on its own before our liveness probe) and its exit was a
+	// SIGKILL, attribute to OOM-killer (or external kill -9) and record
+	// the event. The next Recover invocation will check the circuit at
+	// the top and refuse if we've crossed the threshold.
+	if !preKilledByUs && isOOMExit(waitErr) {
+		s.mu.Lock()
+		s.recordOOMEventLocked(time.Now())
+		s.mu.Unlock()
+	}
 
 	// C4: re-check closed after teardown — Close() may have run
 	// concurrently. Without this we'd Spawn a new subprocess that
@@ -519,19 +673,16 @@ func (s *Session) dispatch() {
 		s.applyStateTransition(env)
 
 		if env.Type == EventSystem && env.Subtype == "init" && env.SessionID != "" {
-			s.mu.Lock()
-			s.sessionID = env.SessionID
-			alreadySignaled := s.sentInit
-			if !alreadySignaled {
-				s.sentInit = true
-			}
-			s.mu.Unlock()
-			if !alreadySignaled {
+			if shouldSignal := s.recordSystemInit(env); shouldSignal {
 				select {
 				case s.initCh <- env.SessionID:
 				default:
 				}
 			}
+		}
+
+		if env.Type == EventRateLimit {
+			s.recordRateLimit(env)
 		}
 
 		select {
@@ -659,19 +810,35 @@ func (s *Session) drainStderr() {
 	}
 }
 
+// appendStderr appends p to the bounded stderr ring buffer per spec §A.5.
+//
+// Invariant: after this call, s.stderrBuf.Len() <= stderrCap. We always keep
+// the last stderrCap bytes; older content is dropped (front trim).
+//
+// ops-concerns subitem #1 fix: previously, when len(p) alone exceeded
+// stderrCap the existing buffer was Reset() but the entire oversized p was
+// then appended, leaving the buffer >stderrCap (contract violation). With
+// 4KB read chunks in drainStderr this never bit in practice, but it would
+// trigger the moment a single Read returned more bytes than the cap.
 func (s *Session) appendStderr(p []byte) {
 	s.stderrMu.Lock()
 	defer s.stderrMu.Unlock()
+
+	// Case A: single write itself meets/exceeds cap → drop everything we had,
+	// keep only the last stderrCap bytes of p.
+	if len(p) >= stderrCap {
+		s.stderrBuf.Reset()
+		s.stderrBuf.Write(p[len(p)-stderrCap:])
+		return
+	}
+
+	// Case B: combined would exceed cap → trim front of existing buffer
+	// to make room while keeping len ≤ cap after the upcoming Write(p).
 	if s.stderrBuf.Len()+len(p) > stderrCap {
-		// Trim from the front to keep last stderrCap bytes.
 		excess := s.stderrBuf.Len() + len(p) - stderrCap
-		if excess >= s.stderrBuf.Len() {
-			s.stderrBuf.Reset()
-		} else {
-			rest := s.stderrBuf.Bytes()[excess:]
-			s.stderrBuf.Reset()
-			s.stderrBuf.Write(rest)
-		}
+		rest := s.stderrBuf.Bytes()[excess:]
+		s.stderrBuf.Reset()
+		s.stderrBuf.Write(rest)
 	}
 	s.stderrBuf.Write(p)
 }

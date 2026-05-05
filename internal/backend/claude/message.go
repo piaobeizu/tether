@@ -75,6 +75,58 @@ func (e Envelope) DecodeSystemInit() (SystemInit, error) {
 	return s, nil
 }
 
+// RateLimitInfo is the `rate_limit_info` object inside a `type=rate_limit_event`
+// envelope. Schema observed in cc SDK NDJSON stream (sample in
+// testdata/stream1.ndjson).
+//
+// All fields are JSON-tagged with the cc SDK's exact wire names (camelCase),
+// not Go-idiomatic names. resetsAt / overageResetsAt are unix epoch seconds.
+type RateLimitInfo struct {
+	// Status of the primary rate limit. Observed values: "allowed". Other
+	// statuses (e.g. "exceeded") are inferred from semantics; treat any
+	// non-"allowed" value as a refuse signal in EvaluateRateLimit.
+	Status string `json:"status,omitempty"`
+
+	// ResetsAt is when the primary limit resets (unix seconds).
+	ResetsAt int64 `json:"resetsAt,omitempty"`
+
+	// RateLimitType describes which tier this event refers to. Observed:
+	// "overage". Distinguishes primary vs overage budget reports.
+	RateLimitType string `json:"rateLimitType,omitempty"`
+
+	// OverageStatus is the status of the overage tier. Observed: "allowed".
+	OverageStatus string `json:"overageStatus,omitempty"`
+
+	// OverageResetsAt is when the overage tier resets (unix seconds).
+	OverageResetsAt int64 `json:"overageResetsAt,omitempty"`
+
+	// IsUsingOverage is true when the user is currently consuming overage
+	// budget (primary already exhausted for this window).
+	IsUsingOverage bool `json:"isUsingOverage,omitempty"`
+}
+
+// RateLimit is `type=rate_limit_event`. Fired periodically by cc to report
+// the user's current rate-limit status. The daemon caches the latest one
+// on the Session and uses it for pre-flight degrade-gracefully decisions
+// (ops-concerns subitem #4).
+type RateLimit struct {
+	Envelope
+	RateLimitInfo RateLimitInfo `json:"rate_limit_info"`
+}
+
+// DecodeRateLimit re-parses the envelope as a RateLimit. Returns an error
+// if Type doesn't match.
+func (e Envelope) DecodeRateLimit() (RateLimit, error) {
+	if e.Type != EventRateLimit {
+		return RateLimit{}, fmt.Errorf("not a rate_limit_event: type=%s", e.Type)
+	}
+	var r RateLimit
+	if err := json.Unmarshal(e.Raw, &r); err != nil {
+		return r, fmt.Errorf("rate_limit_event decode: %w", err)
+	}
+	return r, nil
+}
+
 // Result is `type=result, subtype=success` (sometimes with is_error=true).
 // Fired at end of every turn.
 type Result struct {

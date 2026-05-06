@@ -43,6 +43,12 @@ func defaultProjectsDir() (string, error) {
 //
 // On a multi-bucket collision the error message lists all candidates and
 // instructs the user to re-run with --bucket.
+//
+// On a single-bucket-but-ambiguous-decode collision (two distinct on-disk
+// paths both decode-to-existence — e.g. /parent/foo/bar AND /parent/foo-bar
+// both real), the error lists every candidate cwd and instructs the user to
+// pass --cwd. This is a separate failure mode from multi-bucket: the bucket
+// is unique but its `/` ↔ `-` reversal isn't.
 func ResolveSession(projectsRoot, sid, forceBucket string) (*ResolveResult, error) {
 	if sid == "" {
 		return nil, errors.New("session id is empty")
@@ -53,10 +59,14 @@ func ResolveSession(projectsRoot, sid, forceBucket string) (*ResolveResult, erro
 		if _, err := os.Stat(jsonl); err != nil {
 			return nil, fmt.Errorf("--bucket %q has no %s.jsonl: %w", forceBucket, sid, err)
 		}
+		cwd, alts := decodeBucket(forceBucket)
+		if len(alts) > 0 {
+			return nil, ambiguousCwdError(forceBucket, alts)
+		}
 		return &ResolveResult{
 			Bucket:    forceBucket,
 			JsonlPath: jsonl,
-			Cwd:       decodeBucket(forceBucket),
+			Cwd:       cwd,
 		}, nil
 	}
 
@@ -69,25 +79,78 @@ func ResolveSession(projectsRoot, sid, forceBucket string) (*ResolveResult, erro
 		return nil, fmt.Errorf("%w: sid=%s root=%s", ErrSidNotFound, sid, projectsRoot)
 	case 1:
 		b := matches[0]
+		cwd, alts := decodeBucket(b)
+		if len(alts) > 0 {
+			return nil, ambiguousCwdError(b, alts)
+		}
 		return &ResolveResult{
 			Bucket:    b,
 			JsonlPath: filepath.Join(projectsRoot, b, sid+".jsonl"),
-			Cwd:       decodeBucket(b),
+			Cwd:       cwd,
 		}, nil
 	default:
 		var lines []string
 		for _, b := range matches {
-			lines = append(lines, fmt.Sprintf("  --bucket %s   (cwd: %s)", b, decodeBucket(b)))
+			cwd, _ := decodeBucket(b)
+			lines = append(lines, fmt.Sprintf("  --bucket %s   (cwd: %s)", b, cwd))
 		}
 		return nil, fmt.Errorf("session %s found in %d buckets; pick one:\n%s",
 			sid, len(matches), strings.Join(lines, "\n"))
 	}
 }
 
+// ambiguousCwdError formats the prefix-collision error message for the
+// single-bucket-multiple-decodes case. Listed candidates are pre-sorted by
+// decodeBucket so the message is deterministic across runs.
+func ambiguousCwdError(bucket string, alternates []string) error {
+	var lines []string
+	for _, p := range alternates {
+		lines = append(lines, "  --cwd "+p)
+	}
+	return fmt.Errorf("bucket %s decodes to multiple existing paths; pass --cwd to pick:\n%s",
+		bucket, strings.Join(lines, "\n"))
+}
+
+// ResolveSessionWithCwd is the manual-disambiguation entry point: caller has
+// already chosen the cwd (via --cwd), we just locate the jsonl and skip the
+// lossy decode entirely. The cwd is validated for existence.
+func ResolveSessionWithCwd(projectsRoot, sid, explicitCwd string) (*ResolveResult, error) {
+	if sid == "" {
+		return nil, errors.New("session id is empty")
+	}
+	if explicitCwd == "" {
+		return nil, errors.New("--cwd is empty")
+	}
+	cleaned := filepath.Clean(explicitCwd)
+	if !filepath.IsAbs(cleaned) {
+		return nil, fmt.Errorf("--cwd %q must be absolute", explicitCwd)
+	}
+	if hasDotDot(cleaned) {
+		return nil, fmt.Errorf("--cwd %q contains .. segments after Clean", explicitCwd)
+	}
+	if !pathExists(cleaned) {
+		return nil, fmt.Errorf("--cwd %q does not exist", explicitCwd)
+	}
+	bucket := EncodeBucket(cleaned)
+	jsonl := filepath.Join(projectsRoot, bucket, sid+".jsonl")
+	if _, err := os.Stat(jsonl); err != nil {
+		return nil, fmt.Errorf("no %s.jsonl under encoded bucket %s for --cwd %s: %w",
+			sid, bucket, cleaned, err)
+	}
+	return &ResolveResult{
+		Bucket:    bucket,
+		JsonlPath: jsonl,
+		Cwd:       cleaned,
+	}, nil
+}
+
 // findSidBuckets returns bucket names (relative to projectsRoot) that contain
 // <sid>.jsonl, sorted by the jsonl's modtime descending (most recent first)
 // so that single-result callers get the freshest copy and multi-result
-// callers see the most-likely-intended candidate at the top.
+// callers see the most-likely-intended candidate at the top. Equal-mtime
+// ties (possible on second-resolution filesystems like FAT or some NFS
+// mounts) break by bucket name ascending so collision messages are
+// deterministic across runs.
 func findSidBuckets(projectsRoot, sid string) ([]string, error) {
 	entries, err := os.ReadDir(projectsRoot)
 	if err != nil {
@@ -110,7 +173,14 @@ func findSidBuckets(projectsRoot, sid string) ([]string, error) {
 		}
 		hits = append(hits, hit{name: e.Name(), mod: st.ModTime().UnixNano()})
 	}
-	sort.Slice(hits, func(i, j int) bool { return hits[i].mod > hits[j].mod })
+	// SliceStable + composite less so the order is fully determined even when
+	// modtimes tie at fs resolution.
+	sort.SliceStable(hits, func(i, j int) bool {
+		if hits[i].mod != hits[j].mod {
+			return hits[i].mod > hits[j].mod
+		}
+		return hits[i].name < hits[j].name
+	})
 
 	out := make([]string, len(hits))
 	for i, h := range hits {
@@ -120,81 +190,99 @@ func findSidBuckets(projectsRoot, sid string) ([]string, error) {
 }
 
 // decodeBucket reverses cc's `/` → `-` encoding to a plausible filesystem
-// path, picking the longest existing prefix-match on disk to disambiguate
-// the lossy mapping.
+// path. Returns (cwd, ambiguousAlternates):
 //
-// Lossiness: `/foo/bar` and `/foo-bar` both encode to `-foo-bar`. Decoder
-// strategy: walk left-to-right deciding for each `-` boundary whether it's
-// a path separator or a literal hyphen. We only commit a `/` boundary when
-// the path *up to that boundary* exists on disk; ties break in favor of
-// the interpretation whose final assembled path actually exists.
+//   - When EXACTLY ONE decoding fully exists on disk, returns (that path, nil).
+//   - When MULTIPLE distinct decodings all fully exist on disk (the
+//     prefix-collision case: both `/parent/foo/bar` and `/parent/foo-bar`
+//     are real directories), returns ("", [all candidates sorted asc]).
+//     The caller is expected to surface this as a user-facing error and
+//     prompt for explicit `--cwd` disambiguation.
+//   - When NO decoding exists on disk, falls back to the naive
+//     `/`-everywhere substitution and returns (that path, nil). Treat as
+//     best-effort: the wrapper may pick a sibling location for buckets
+//     whose original cwd has been deleted/moved.
 //
-// This is best-effort — if no path on disk matches, we fall back to the
-// naive `/`-everywhere substitution. Callers should treat the result as
-// "the cwd to pass to claude --resume" and accept that for buckets whose
-// original path no longer exists the wrapper may pick a sibling location.
-func decodeBucket(bucket string) string {
+// Lossiness recap: `/foo/bar` and `/foo-bar` both encode to `-foo-bar`. The
+// previous version of this function silently picked branchA on tied length —
+// see PR #35 review feedback. Collecting all fully-existing decodes and
+// surfacing ambiguity to the caller is the safe behavior.
+func decodeBucket(bucket string) (string, []string) {
 	if bucket == "" {
-		return ""
+		return "", nil
 	}
 	// cc encoding always prefixes with `-` (the leading `/` of an absolute
 	// path). Strip the prefix; what remains is `-`-separated segments.
 	rest := strings.TrimPrefix(bucket, "-")
 	tokens := strings.Split(rest, "-")
 
-	// Try existence-aware decode first.
-	if best := bestExistingDecode("/", tokens, 0); best != "" {
-		return best
+	var existing []string
+	collectExistingDecodes("/", tokens, 0, &existing)
+
+	// Deduplicate (the recursion can produce the same path through different
+	// branch orderings only in pathological cases, but normalize anyway) and
+	// sort for deterministic ambiguity messages.
+	uniq := dedupSortedAsc(existing)
+
+	switch len(uniq) {
+	case 0:
+		// No on-disk match → naive fallback.
+		return "/" + strings.Join(tokens, "/"), nil
+	case 1:
+		return uniq[0], nil
+	default:
+		return "", uniq
 	}
-	// Fallback: naive — every `-` becomes `/`.
-	return "/" + strings.Join(tokens, "/")
 }
 
-// bestExistingDecode picks the longest assembled path that exists on disk by
-// branching at each token boundary on "is this a path separator or literal
-// hyphen". Returns "" when no full assembly exists.
-//
-// We only prune (gate recursion on `pathExists`) when the accumulated
-// prefix ends at a segment boundary (`/`). Mid-segment prefixes are never
-// directories, so checking them would prune valid branches like
-// `/foo` → `/foo-bar` where only the merged form exists.
-func bestExistingDecode(prefix string, tokens []string, i int) string {
+// collectExistingDecodes walks the decode-tree appending every fully-existing
+// assembled path to *out. Branch semantics mirror the previous
+// bestExistingDecode: at each `-` token boundary, branchA treats it as `/`
+// (new segment) and branchB treats it as a literal `-` (glue onto current
+// segment). Pruning at directory boundaries keeps cost O(real-paths).
+func collectExistingDecodes(prefix string, tokens []string, i int, out *[]string) {
 	if i == len(tokens) {
-		// Leaf: accept iff the assembled path exists.
 		if pathExists(prefix) {
-			return prefix
+			*out = append(*out, prefix)
 		}
-		return ""
+		return
 	}
 
 	atBoundary := strings.HasSuffix(prefix, "/")
 	if atBoundary && !pathExists(prefix) {
-		// Pruning is safe at boundaries: if `/a/b/` doesn't exist, no
-		// extension of it can.
-		return ""
+		// Safe prune: if `/a/b/` doesn't exist, no extension of it can.
+		return
 	}
 
-	// Branch A: treat the next `-` as a path separator → start a new
-	// segment with this token.
+	// Branch A: `-` is a path separator → start a new segment.
 	sep := "/"
 	if atBoundary {
 		sep = ""
 	}
-	branchA := bestExistingDecode(prefix+sep+tokens[i], tokens, i+1)
+	collectExistingDecodes(prefix+sep+tokens[i], tokens, i+1, out)
 
-	// Branch B: treat the next `-` as a literal hyphen → glue token onto
-	// the current segment. Only meaningful mid-segment (not right after `/`).
-	var branchB string
+	// Branch B: `-` is literal → glue token to current segment. Only
+	// meaningful mid-segment.
 	if !atBoundary {
-		branchB = bestExistingDecode(prefix+"-"+tokens[i], tokens, i+1)
+		collectExistingDecodes(prefix+"-"+tokens[i], tokens, i+1, out)
 	}
+}
 
-	// Prefer the branch with the longer assembled path. Both being non-empty
-	// means both fully exist; tie-break by length (deeper paths preferred).
-	if len(branchA) >= len(branchB) {
-		return branchA
+// dedupSortedAsc returns the unique elements of in, sorted ascending.
+func dedupSortedAsc(in []string) []string {
+	if len(in) == 0 {
+		return nil
 	}
-	return branchB
+	cp := make([]string, len(in))
+	copy(cp, in)
+	sort.Strings(cp)
+	out := cp[:1]
+	for _, s := range cp[1:] {
+		if s != out[len(out)-1] {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func pathExists(p string) bool {
@@ -221,7 +309,17 @@ func EncodeBucket(cwd string) string {
 // We use syscall.Exec rather than exec.Command + Run so that the user gets a
 // PTY-attached claude with no Go process in the middle — clean signal
 // handling, no extra fd, no process tree noise.
+//
+// Defense-in-depth on the cwd input: we always Clean the path and reject
+// any residual `..` segments. The decoder shouldn't produce `..` (it
+// only emits paths that exist on disk), but a malformed bucket name like
+// `-tmp-..-etc` could in principle slip through the naive fallback —
+// hard-fail here rather than silently chdir'ing to an unintended location.
 func ExecClaude(binary, cwd, sid string) error {
+	cwd = filepath.Clean(cwd)
+	if hasDotDot(cwd) {
+		return fmt.Errorf("refusing to chdir: %q contains .. segments after Clean", cwd)
+	}
 	resolvedBin, err := exec.LookPath(binary)
 	if err != nil {
 		return fmt.Errorf("locate %q: %w", binary, err)
@@ -231,4 +329,18 @@ func ExecClaude(binary, cwd, sid string) error {
 	}
 	argv := []string{resolvedBin, "--resume", sid}
 	return syscall.Exec(resolvedBin, argv, os.Environ())
+}
+
+// hasDotDot reports whether p has any `..` segment after splitting on the
+// OS path separator. filepath.Clean reduces redundant separators but does
+// NOT eliminate leading-or-internal `..` (e.g. `Clean("/a/../b")` is `/b`,
+// but `Clean("../b")` stays `../b`). Combined with our absolute-path
+// invariant, any residual `..` is a defect.
+func hasDotDot(p string) bool {
+	for _, seg := range strings.Split(p, string(filepath.Separator)) {
+		if seg == ".." {
+			return true
+		}
+	}
+	return false
 }

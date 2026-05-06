@@ -96,12 +96,13 @@ func runResume(argv []string) int {
 	fs := flag.NewFlagSet("resume", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	bucket := fs.String("bucket", "", "disambiguate when sid is found in multiple buckets")
+	cwd := fs.String("cwd", "", "manually specify the cwd (skips bucket-name decoding; required when the bucket decodes to multiple existing paths)")
 	dryRun := fs.Bool("dry-run", false, "print resolved cwd + argv, do not exec claude")
 	binary := fs.String("binary", "claude", "path/name of the claude binary to exec")
 	projectsDir := fs.String("projects-dir", "", "override ~/.claude/projects (for tests)")
 
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: tether resume <sid> [--bucket B] [--dry-run] [--binary PATH]")
+		fmt.Fprintln(os.Stderr, "usage: tether resume <sid> [--bucket B] [--cwd PATH] [--dry-run] [--binary PATH]")
 		fmt.Fprintln(os.Stderr, "")
 		fs.PrintDefaults()
 	}
@@ -125,7 +126,15 @@ func runResume(argv []string) int {
 		}
 	}
 
-	res, err := ResolveSession(root, sid, *bucket)
+	var res *ResolveResult
+	var err error
+	if *cwd != "" {
+		// Manual disambiguation path: caller has already chosen the cwd, we
+		// just verify the jsonl exists under EncodeBucket(cwd).
+		res, err = ResolveSessionWithCwd(root, sid, *cwd)
+	} else {
+		res, err = ResolveSession(root, sid, *bucket)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "tether resume: %v\n", err)
 		return 1

@@ -1,0 +1,7 @@
+# Tether blessed skill list — embedded into the binary at build time
+# via internal/skill/blessed_embed.go. Edit this file and rebuild to
+# update the default short-name → git URL mapping.
+#
+# Empty for v0.1 — entries land per-skill via PR. See spec §11.Z.6.
+
+[skills]

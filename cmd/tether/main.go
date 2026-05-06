@@ -66,6 +66,11 @@ func runDaemon(args []string) int {
 		"cc projects directory to tail (default $HOME/.claude/projects)")
 	attachSocket := fs.String("attach-socket", "",
 		"path for the local attach Unix socket (default $HOME/.tether/attach.sock)")
+	lockAuditLog := fs.String("lock-audit-log", "",
+		"override path for the lock audit log JSONL "+
+			"(default $HOME/.tether/users/default/sessions/default/lock.log; spec §11.D)")
+	noAudit := fs.Bool("no-audit", false,
+		"disable persistent lock audit log (in-memory History only)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -88,6 +93,8 @@ func runDaemon(args []string) int {
 		Stderr:           os.Stderr,
 		ProjectsDir:      *projectsDir,
 		AttachSocketPath: *attachSocket,
+		LockAuditLogPath: *lockAuditLog,
+		DisableLockAudit: *noAudit,
 	}
 	if err := daemon.Run(ctx, cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "tether daemon: %v\n", err)

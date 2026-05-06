@@ -79,6 +79,35 @@ type Config struct {
 	// of the real daemon/client. nil → use defaultSubsystems with
 	// the components built from this Config.
 	SubsystemFactories []SubsystemFactory
+
+	// LockAuditLogPath is the path the lock state-machine's JSONL
+	// audit log is written to (spec §11.D "audit log" row). Empty
+	// resolves to
+	// `$HOME/.tether/users/default/sessions/<sid>/lock.log`, where
+	// `<sid>` is derived from LockSessionID (or "default" if also
+	// empty — v0.1 has no real per-session lock yet).
+	//
+	// Tests override to keep filesystem state hermetic.
+	LockAuditLogPath string
+
+	// LockSessionID names the session bucket the lock audit log
+	// lives under. v0.1 has a single process-wide lock (the daemon
+	// hasn't been split per-session yet — see follow-up §11.D), so
+	// this is effectively a stable label. Empty → "default".
+	LockSessionID string
+
+	// LockUser names the user bucket. Empty → "default" — v0.1 is
+	// single-user (xiaokang.w@gmicloud.ai per env), and the spec
+	// path under `~/.tether/users/default/...` is the documented
+	// placeholder. Multi-user is a follow-up tracked in §11.D.
+	LockUser string
+
+	// DisableLockAudit disables persistent audit-log writing even
+	// when LockAuditLogPath could be resolved. Useful for `tether
+	// daemon --no-audit` scenarios + tests that don't want the
+	// fixture filesystem touched. Default false (audit log is on
+	// for production).
+	DisableLockAudit bool
 }
 
 // SubsystemFactory is a deferred constructor for a Subsystem. The
@@ -163,7 +192,33 @@ func Run(ctx context.Context, cfg Config) error {
 			return fmt.Errorf("daemon: envelope emitter: %w", err)
 		}
 
-		lockSM := lock.New()
+		// Resolve audit-log path per §11.D and wire the JSONL sink.
+		// On any resolution / open error we degrade to in-memory-
+		// only History and surface a verbose log line — the daemon
+		// MUST stay up even if the audit-log path is unwritable.
+		lockOpts := []lock.Option{}
+		var lockSink *lock.JSONLLogSink
+		if !cfg.DisableLockAudit {
+			auditPath, perr := resolveLockAuditPath(cfg)
+			if perr != nil {
+				logf("[daemon] lock audit log: resolve path: %v (continuing in-memory only)", perr)
+			} else {
+				sink, serr := lock.NewJSONLLogSink(auditPath)
+				if serr != nil {
+					logf("[daemon] lock audit log: open %q: %v (continuing in-memory only)", auditPath, serr)
+				} else {
+					lockSink = sink
+					lockOpts = append(lockOpts,
+						lock.WithLogSink(sink),
+						lock.WithSinkErrorHandler(func(err error) {
+							logf("[daemon] lock audit log: append: %v", err)
+						}),
+					)
+					logf("[daemon] lock audit log → %s", auditPath)
+				}
+			}
+		}
+		lockSM := lock.New(lockOpts...)
 
 		var broker *agent.AuthBroker
 		if cfg.EnableAuthBroker {
@@ -207,12 +262,16 @@ func Run(ctx context.Context, cfg Config) error {
 		factories = realSubsystems(socketPath, emitter, lockSM, cfg.InputSink, broker, logf)
 		// emitter lives for the daemon's full lifetime; clean up
 		// on Run exit. clientSubsystem owns its per-run AttachServer
-		// and closes it inside Run's defer.
+		// and closes it inside Run's defer. lockSink (if any) flushes
+		// + releases its file handle here.
 		defer func() {
 			if broker != nil {
 				broker.Close()
 			}
 			_ = emitter.Close()
+			if lockSink != nil {
+				_ = lockSink.Close()
+			}
 		}()
 	}
 
@@ -220,6 +279,33 @@ func Run(ctx context.Context, cfg Config) error {
 		wd.Supervise(f())
 	}
 	return wd.Run(ctx)
+}
+
+// resolveLockAuditPath maps daemon Config to the spec §11.D audit log
+// path:
+//
+//	~/.tether/users/<user>/sessions/<sid>/lock.log
+//
+// Empty `LockAuditLogPath` → resolves $HOME and uses the default
+// layout. Empty user/sid default to "default" (v0.1 is single-user,
+// single-session-bucket; multi-tenant is a §11.D follow-up).
+func resolveLockAuditPath(cfg Config) (string, error) {
+	if cfg.LockAuditLogPath != "" {
+		return cfg.LockAuditLogPath, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve $HOME: %w", err)
+	}
+	user := cfg.LockUser
+	if user == "" {
+		user = "default"
+	}
+	sid := cfg.LockSessionID
+	if sid == "" {
+		sid = "default"
+	}
+	return filepath.Join(home, ".tether", "users", user, "sessions", sid, "lock.log"), nil
 }
 
 // realSubsystems assembles the production daemon + client subsystems.

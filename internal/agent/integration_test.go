@@ -48,6 +48,7 @@ func TestIntegration_DaemonAttachJSONLToEnvelopes(t *testing.T) {
 		done <- daemon.Run(ctx, daemon.Config{
 			ProjectsDir:      projectsDir,
 			AttachSocketPath: attachSocket,
+			LockAuditLogPath: filepath.Join(tmp, "lock.log"),
 		})
 	}()
 
@@ -220,6 +221,7 @@ func TestIntegration_AttachLockGate(t *testing.T) {
 	cfg := daemon.Config{
 		ProjectsDir:      projectsDir,
 		AttachSocketPath: attachSocket,
+		LockAuditLogPath: filepath.Join(tmp, "lock.log"),
 		InputSink: func(sid string, data []byte) error {
 			sinkCh <- sinkEvent{sid: sid, data: append([]byte(nil), data...)}
 			return nil
@@ -313,6 +315,19 @@ func TestIntegration_AttachLockGate(t *testing.T) {
 		t.Errorf("sink received unexpected event from B: %q", string(ev.data))
 	case <-time.After(150 * time.Millisecond):
 		// good — gated.
+	}
+
+	// Spec §11.D audit log: A's implicit acquire MUST have persisted to
+	// the configured lock.log. We don't assert exact line content (the
+	// JSONL schema is covered in lock package tests); just that the
+	// file exists and is non-empty by the time B is denied.
+	auditPath := filepath.Join(tmp, "lock.log")
+	if st, statErr := os.Stat(auditPath); statErr != nil {
+		t.Errorf("expected lock audit log at %q after acquire: %v", auditPath, statErr)
+	} else if st.Size() == 0 {
+		t.Errorf("lock audit log %q is empty after acquire", auditPath)
+	} else if mode := st.Mode().Perm(); mode != 0o600 {
+		t.Errorf("lock audit log mode: got %o want 0600", mode)
 	}
 
 	cancel()

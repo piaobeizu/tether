@@ -31,11 +31,21 @@
 // Concurrency: Lock is safe for concurrent use. All mutating methods take
 // an internal mutex; History returns a defensive copy.
 //
+// Persistence (spec §11.D "audit log" row): callers wire a LogSink via
+// WithLogSink to persist every TakeoverEvent past process lifetime.
+// The package ships NewJSONLLogSink which implements the on-disk JSONL
+// format at `~/.tether/users/<user>/sessions/<sid>/lock.log` (path
+// resolution is the caller's responsibility). Sink Append errors are
+// best-effort — the in-memory state machine never blocks or rolls back
+// on a sink failure; callers can route the error via
+// WithSinkErrorHandler. v0.1 has no rotation (write forever); rotation
+// is a §11.D follow-up (operator-managed for now).
+//
 // Out-of-scope (deferred):
-//   - persisting the audit log to ~/.tether/.../lock.log (daemon's job)
 //   - mode switching RPC (separate from lock; only the current holder is
 //     allowed but that policy lives at the daemon RPC handler — this
 //     package exposes IsHolder so the handler can enforce it cleanly)
 //   - view-only attach / multi-holder fan-out (v0.1 not in scope per
 //     §11.D)
+//   - audit-log rotation/retention (none in v0.1; operator-managed)
 package lock

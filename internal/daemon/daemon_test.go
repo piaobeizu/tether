@@ -37,6 +37,7 @@ func TestRun_StartsAndDrainsOnCancel(t *testing.T) {
 		Stderr:           &stderr,
 		ProjectsDir:      projectsDir,
 		AttachSocketPath: attachSocket,
+		LockAuditLogPath: filepath.Join(tmp, "lock.log"),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -147,6 +148,7 @@ func TestRun_RealComposition_SocketAcceptsAttach(t *testing.T) {
 		Verbose:          false, // quiet — assertion is on socket behavior
 		ProjectsDir:      projectsDir,
 		AttachSocketPath: attachSocket,
+		LockAuditLogPath: filepath.Join(tmp, "lock.log"),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

@@ -213,6 +213,26 @@ func (e *EnvelopeEmitter) Close() error {
 	return e.watcher.Close()
 }
 
+// HasSubscribers reports whether at least one live subscriber is
+// registered for `sid` (i.e. a daemon attach connection is currently
+// streaming envelopes for that session). Returns false if the emitter
+// is closed.
+//
+// Used by the GC stub-session sweeper (internal/daemon) to refuse
+// deletion of any JSONL file whose session is currently being watched
+// by a live attach client. Advisory — callers must combine with file-
+// stat predicates (mtime old, line count low) so a subscriber
+// attaching mid-sweep does not race against an already-stale file.
+func (e *EnvelopeEmitter) HasSubscribers(sid string) bool {
+	e.mu.Lock()
+	closed := e.closed
+	e.mu.Unlock()
+	if closed {
+		return false
+	}
+	return e.watcher.HasSubscribers(sid)
+}
+
 // Stats returns a snapshot of the watcher's counters. Useful for
 // tests + the health endpoint (eventually).
 func (e *EnvelopeEmitter) Stats() (linesParsed, envelopesEmit, envelopesDrop int64) {

@@ -345,6 +345,25 @@ func (w *Watcher) Unsubscribe(sid string, ch <-chan Envelope) {
 	}
 }
 
+// HasSubscribers reports whether at least one live subscriber is
+// registered for `sid`. Used by external sweepers that need to know
+// "is anyone currently listening to this session?" before deciding
+// to delete its on-disk JSONL. Returns false if the watcher is closed.
+//
+// Concurrency: safe to call from any goroutine. The returned bool is
+// a point-in-time read — callers MUST treat it as advisory and combine
+// it with their own ordering (e.g. delete only files older than M
+// minutes, so a subscriber attaching mid-sweep is racing against an
+// already-stale file).
+func (w *Watcher) HasSubscribers(sid string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return false
+	}
+	return len(w.subs[sid]) > 0
+}
+
 // Close stops the watcher, closes all subscriber channels, and
 // releases fsnotify resources. Idempotent.
 func (w *Watcher) Close() error {

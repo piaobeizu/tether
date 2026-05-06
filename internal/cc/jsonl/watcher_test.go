@@ -227,6 +227,63 @@ func TestWatcher_MultipleSubscribers_FanOut(t *testing.T) {
 	}
 }
 
+// TestWatcher_Unsubscribe_PreventsLeak verifies the leak-stop fix:
+// Subscribe + Unsubscribe in a tight loop should leave w.subs[sid]
+// empty (no orphaned subscribers building up). Without the fix, every
+// Subscribe appended to the slice and nothing removed entries → grows
+// unboundedly until Close().
+//
+// We poke at internals here because the leak manifests as a slice
+// length, not via any public observable; safer to assert directly than
+// to derive it indirectly via memory growth or OnDrop firing rates.
+func TestWatcher_Unsubscribe_PreventsLeak(t *testing.T) {
+	dir := t.TempDir()
+	w, err := New(context.Background(), dir, Options{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer w.Close()
+
+	const sid = "sess-leak-test"
+	const N = 100
+	for i := 0; i < N; i++ {
+		ch := w.Subscribe(sid)
+		w.Unsubscribe(sid, ch)
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if got := len(w.subs[sid]); got != 0 {
+		t.Errorf("Subscribe+Unsubscribe loop leaked: w.subs[%q] has %d entries (want 0)", sid, got)
+	}
+	// After all subs removed, the map entry itself should be cleaned
+	// up too (deliver wastes a map lookup otherwise).
+	if _, present := w.subs[sid]; present {
+		t.Errorf("w.subs[%q] map key not cleaned up after last Unsubscribe", sid)
+	}
+}
+
+// TestWatcher_Unsubscribe_Idempotent ensures double-Unsubscribe and
+// Unsubscribe-on-closed-watcher are both no-ops, not panics.
+func TestWatcher_Unsubscribe_Idempotent(t *testing.T) {
+	dir := t.TempDir()
+	w, err := New(context.Background(), dir, Options{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ch := w.Subscribe("sid-a")
+	w.Unsubscribe("sid-a", ch) // first
+	w.Unsubscribe("sid-a", ch) // second — must not panic
+	w.Unsubscribe("nonexistent-sid", ch)
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// Post-Close Unsubscribe must also no-op.
+	w.Unsubscribe("sid-a", ch)
+}
+
 func TestWatcher_Subscribe_AfterClose_ReturnsClosedChan(t *testing.T) {
 	dir := t.TempDir()
 	w, err := New(context.Background(), dir, Options{})

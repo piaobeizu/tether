@@ -294,6 +294,57 @@ func (w *Watcher) SubscribeFromOffset(sid string, fromOffset int64) (<-chan Enve
 	return sub.ch, nil
 }
 
+// Unsubscribe removes the subscriber registered for sid whose channel
+// matches ch from the watcher's dispatch list. Idempotent: no-op if
+// the watcher is closed (Close already drained everyone) or if (sid,
+// ch) doesn't match a live subscriber.
+//
+// This is the leak-stopper for callers that subscribe and unsubscribe
+// repeatedly during the watcher's lifetime (e.g. one Subscribe per
+// attach connection on the daemon's Unix socket). Without it, every
+// Subscribe call appends to w.subs[sid] indefinitely; this method
+// removes the entry so dispatch stops doing wasted work + firing
+// OnDrop on a dead consumer, and the channel becomes eligible for GC
+// once the caller drops its reference.
+//
+// Receiver termination contract (important): Unsubscribe DOES NOT
+// close the channel. Closing it would race against `deliver()`, which
+// snapshots `w.subs[sid]` under mu and then sends non-blockingly
+// outside mu — sending to a closed chan panics even inside a select.
+// The receiver goroutine must therefore terminate on its OWN signal
+// (ctx cancellation, a sibling done channel, etc.), not on a channel-
+// close from this side. After Unsubscribe returns, no further
+// envelopes will be delivered (subsequent deliver() calls see a fresh
+// snapshot without this subscriber); a small number of in-flight
+// envelopes already buffered in the channel may still be present
+// from a deliver() that copied the slice just before Unsubscribe ran,
+// but they will be GC'd when the receiver exits.
+//
+// Channel-identity match: pass the SAME `<-chan Envelope` value
+// Subscribe returned. Equality is the underlying chan-header
+// identity; assigning through `chan Envelope` aliases or wrapping in
+// a goroutine indirection that hides the identity will not match.
+func (w *Watcher) Unsubscribe(sid string, ch <-chan Envelope) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return
+	}
+	list := w.subs[sid]
+	for i, s := range list {
+		// `(<-chan Envelope)(s.ch) == ch` compares the channel header
+		// pointer; two channels are equal iff they refer to the same
+		// underlying make()'d chan.
+		if (<-chan Envelope)(s.ch) == ch {
+			w.subs[sid] = append(list[:i], list[i+1:]...)
+			if len(w.subs[sid]) == 0 {
+				delete(w.subs, sid)
+			}
+			return
+		}
+	}
+}
+
 // Close stops the watcher, closes all subscriber channels, and
 // releases fsnotify resources. Idempotent.
 func (w *Watcher) Close() error {

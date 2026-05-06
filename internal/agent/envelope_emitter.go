@@ -27,12 +27,25 @@ import (
 	"github.com/piaobeizu/tether/internal/cc/jsonl"
 )
 
-// WireEnvelope is the in-process projection of jsonl.Envelope that the
-// attach socket / WT client subscribers consume. Identity-mapped from
-// jsonl.Envelope today; kept as a separate type so future plumbing
-// (rate-limit-event injection, daemon-broadcast catch-up cache) has a
-// home that doesn't pollute the JSONL package.
-type WireEnvelope struct {
+// LocalEnvelope is the in-process projection of jsonl.Envelope that the
+// daemon's local consumers (attach socket, eventually a daemon-side
+// catch-up cache, etc.) receive. Identity-mapped from jsonl.Envelope
+// today; kept as a separate type so future plumbing (rate-limit-event
+// injection, daemon-broadcast catch-up cache) has a home that doesn't
+// pollute the JSONL package.
+//
+// IMPORTANT — NOT THE SPEC §3.3.1 WIRE ENVELOPE.
+// This struct is the SHAPE THE DAEMON SERVES TO LOCAL CLIENTS over the
+// Unix attach socket. It carries plaintext metadata + (eventually)
+// ciphertext payload but does NOT include the §3.3.1 fields needed for
+// over-network delivery: id, fromDeviceId, toDeviceId, ts, keyVersion,
+// nonce, AD-bound kind, transport-layer ciphertext binding. When
+// QUIC/WT lands, the cross-device wire envelope is a separate type
+// (provisional name: agent.WireEnvelope or transport.OutboundEnvelope)
+// that wraps + signs/encrypts a LocalEnvelope. Code that reads "Local"
+// here must not assume the bytes are wire-ready for the public
+// internet.
+type LocalEnvelope struct {
 	Kind              string                 `json:"kind"`
 	ProviderType      string                 `json:"providerType"`
 	SessionID         string                 `json:"sessionId"`
@@ -43,8 +56,8 @@ type WireEnvelope struct {
 }
 
 // fromJSONL converts a jsonl.Envelope to the wire-facing shape.
-func fromJSONL(e jsonl.Envelope) WireEnvelope {
-	return WireEnvelope{
+func fromJSONL(e jsonl.Envelope) LocalEnvelope {
+	return LocalEnvelope{
 		Kind:              string(e.Kind),
 		ProviderType:      e.ProviderType,
 		SessionID:         e.SessionID,
@@ -97,11 +110,12 @@ type EmitterConfig struct {
 // emitterSub is one Subscribe registration with its own JSONL channel
 // + outbound wire channel.
 type emitterSub struct {
-	sid    string
-	in     <-chan jsonl.Envelope
-	out    chan WireEnvelope
-	cancel context.CancelFunc
-	done   chan struct{}
+	sid     string
+	in      <-chan jsonl.Envelope
+	out     chan LocalEnvelope
+	cancel  context.CancelFunc
+	done    chan struct{}
+	watcher *jsonl.Watcher // back-ref for self-deregistration on exit
 }
 
 // ErrEmitterClosed is returned by Subscribe after Close has run.
@@ -140,7 +154,7 @@ func NewEnvelopeEmitter(ctx context.Context, cfg EmitterConfig) (*EnvelopeEmitte
 // (closes the channel; safe to call multiple times).
 //
 // Empty sid is rejected — callers must supply the cc session_id.
-func (e *EnvelopeEmitter) Subscribe(sid string) (<-chan WireEnvelope, func(), error) {
+func (e *EnvelopeEmitter) Subscribe(sid string) (<-chan LocalEnvelope, func(), error) {
 	if sid == "" {
 		return nil, nil, errors.New("agent: Subscribe requires non-empty session id")
 	}
@@ -151,7 +165,7 @@ func (e *EnvelopeEmitter) Subscribe(sid string) (<-chan WireEnvelope, func(), er
 		return nil, nil, ErrEmitterClosed
 	}
 	in := e.watcher.Subscribe(sid)
-	out := make(chan WireEnvelope, 64)
+	out := make(chan LocalEnvelope, 64)
 	subCtx, cancel := context.WithCancel(context.Background())
 	sub := &emitterSub{
 		sid:    sid,
@@ -159,6 +173,13 @@ func (e *EnvelopeEmitter) Subscribe(sid string) (<-chan WireEnvelope, func(), er
 		out:    out,
 		cancel: cancel,
 		done:   make(chan struct{}),
+		// Capture the watcher so relay can deregister itself on exit.
+		// Without this, every Subscribe leaves a stale *subscriber in
+		// jsonl.Watcher.subs[sid] until Watcher.Close — i.e. a leak per
+		// attach connection. See watcher.Unsubscribe doc on the
+		// receiver-termination contract (close-race rationale for why
+		// we deregister but don't expect a channel-close signal).
+		watcher: e.watcher,
 	}
 	e.subs = append(e.subs, sub)
 	e.mu.Unlock()
@@ -200,11 +221,17 @@ func (e *EnvelopeEmitter) Stats() (linesParsed, envelopesEmit, envelopesDrop int
 }
 
 // relay is the per-subscriber goroutine: pulls jsonl.Envelopes from the
-// watcher, projects to WireEnvelope, sends to out. Exits on ctx.Done()
+// watcher, projects to LocalEnvelope, sends to out. Exits on ctx.Done()
 // or when the watcher channel closes.
+//
+// On exit, deregisters from the underlying jsonl.Watcher so the
+// watcher's subs map doesn't grow unboundedly across attach
+// connect/disconnect cycles. See jsonl.Watcher.Unsubscribe for the
+// non-close contract this relies on.
 func (s *emitterSub) relay(ctx context.Context) {
 	defer close(s.done)
 	defer close(s.out)
+	defer s.watcher.Unsubscribe(s.sid, s.in)
 	for {
 		select {
 		case <-ctx.Done():

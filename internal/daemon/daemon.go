@@ -154,12 +154,18 @@ func Run(ctx context.Context, cfg Config) error {
 			return fmt.Errorf("daemon: attach server: %w", err)
 		}
 
-		factories = realSubsystems(emitter, attach)
-		// Best-effort cleanup on Run exit. Watchdog blocks on ctx
-		// cancel anyway, so we install the cleanup here right before
-		// supervising — it fires even if Run returns early below.
+		// Tear down the priming AttachServer immediately — it served
+		// only to fail-fast on bind errors at daemon startup. The
+		// supervised clientSubsystem will create its own listener on
+		// each Run (so panics / errors don't leave the watchdog
+		// permanently disabled, see clientSubsystem doc).
+		_ = attach.Close()
+
+		factories = realSubsystems(socketPath, emitter, lockSM, cfg.InputSink, logf)
+		// emitter lives for the daemon's full lifetime; clean up
+		// on Run exit. clientSubsystem owns its per-run AttachServer
+		// and closes it inside Run's defer.
 		defer func() {
-			_ = attach.Close()
 			_ = emitter.Close()
 		}()
 	}
@@ -174,13 +180,35 @@ func Run(ctx context.Context, cfg Config) error {
 //
 // daemon subsystem responsibility: envelope emitter health + lock
 // state housekeeping (lock.Sweep on a periodic timer so audit-log
-// entries fire promptly, not just lazily on next acquire).
+// entries fire promptly, not just lazily on next acquire). Owns
+// long-lived state shared across attach restarts.
 //
 // client subsystem responsibility: serve the attach Unix socket.
-func realSubsystems(em *agent.EnvelopeEmitter, attach *agent.AttachServer) []SubsystemFactory {
+// CRITICALLY, the client subsystem does NOT capture a pre-built
+// *AttachServer — it captures the *config* needed to build one. Each
+// supervised Run() constructs a fresh AttachServer, serves it, and
+// tears it down on exit. This is the spec-aligned fix for the
+// "watchdog restart leaves a permanently-disabled stub" bug: a
+// restartable Subsystem MUST NOT depend on per-Run state stored on
+// the receiver.
+func realSubsystems(
+	socketPath string,
+	em *agent.EnvelopeEmitter,
+	lockSM *lock.Lock,
+	inputSink func(string, []byte) error,
+	logf func(format string, args ...any),
+) []SubsystemFactory {
 	return []SubsystemFactory{
 		func() watchdog.Subsystem { return &daemonSubsystem{emitter: em} },
-		func() watchdog.Subsystem { return &clientSubsystem{attach: attach} },
+		func() watchdog.Subsystem {
+			return &clientSubsystem{
+				socketPath: socketPath,
+				emitter:    em,
+				lock:       lockSM,
+				inputSink:  inputSink,
+				logf:       logf,
+			}
+		},
 	}
 }
 
@@ -220,14 +248,42 @@ func (d *daemonSubsystem) Run(ctx context.Context, hb func()) error {
 }
 
 // clientSubsystem runs the attach Unix socket Serve loop.
+//
+// Restart-safety: stores config, NOT a built *AttachServer. Each
+// Run() builds a fresh AttachServer (binds the socket, accepts) and
+// closes it on exit. A restart by the watchdog therefore re-binds the
+// socket, recovering from any failure that left the prior listener
+// in a closed state. Without this pattern, the watchdog's restart
+// loop would re-Run a closed AttachServer and the daemon would
+// silently disable its attach surface while still beating heartbeats.
 type clientSubsystem struct {
-	attach *agent.AttachServer
+	socketPath string
+	emitter    *agent.EnvelopeEmitter
+	lock       *lock.Lock
+	inputSink  func(sessionID string, data []byte) error
+	logf       func(format string, args ...any)
 }
 
 func (c *clientSubsystem) Name() string { return "client" }
 
 func (c *clientSubsystem) Run(ctx context.Context, hb func()) error {
 	hb()
+	attach, err := agent.NewAttachServer(agent.AttachServerConfig{
+		SocketPath: c.socketPath,
+		Emitter:    c.emitter,
+		Lock:       c.lock,
+		InputSink:  c.inputSink,
+		OnError: func(err error) {
+			if c.logf != nil {
+				c.logf("[daemon] attach: %v", err)
+			}
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("client subsystem: build attach server: %w", err)
+	}
+	defer func() { _ = attach.Close() }()
+
 	// Heartbeat from a side goroutine so a slow accept doesn't
 	// trigger the watchdog deadlock detector.
 	hbDone := make(chan struct{})
@@ -245,9 +301,8 @@ func (c *clientSubsystem) Run(ctx context.Context, hb func()) error {
 			}
 		}
 	}()
-	err := c.attach.Serve(ctx)
-	if err != nil && !errors.Is(err, context.Canceled) {
-		return err
+	if serveErr := attach.Serve(ctx); serveErr != nil && !errors.Is(serveErr, context.Canceled) {
+		return serveErr
 	}
 	return nil
 }

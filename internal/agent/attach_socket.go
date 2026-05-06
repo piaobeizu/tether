@@ -141,6 +141,7 @@ type attachConn struct {
 	sid      string
 	mode     AttachMode
 	client   lock.ClientID
+	heldLock bool // true once Lock.TryAcquire has succeeded for this client
 	cancelEm func() // tear down envelope subscription
 	done     chan struct{}
 }
@@ -285,8 +286,11 @@ func (s *AttachServer) handleNewConn(ctx context.Context, c net.Conn) {
 			if conn.cancelEm != nil {
 				conn.cancelEm()
 			}
-			// On rw disconnect, release the lock if we still hold it.
-			if conn.mode == AttachModeReadWrite && conn.client != (lock.ClientID{}) {
+			// On rw disconnect, release the lock only if THIS conn
+			// actually acquired it (heldLock=true). Otherwise Release
+			// would return ErrNotHolder (silently dropped today, but
+			// noisy when we eventually log lock errors).
+			if conn.mode == AttachModeReadWrite && conn.heldLock {
 				_ = s.cfg.Lock.Release(conn.client)
 			}
 		}()
@@ -294,10 +298,25 @@ func (s *AttachServer) handleNewConn(ctx context.Context, c net.Conn) {
 	}()
 }
 
+// MaxHeaderBytes caps the size of the newline-terminated JSON header
+// line a client may send on connect. The legitimate header is well
+// under 1KB (sessionId + mode + client kind/deviceId); 64KB is a
+// generous ceiling that still bounds memory growth from a malicious
+// or buggy local client that opens a connection and streams bytes
+// without ever sending '\n'. Without this bound, bufio.Reader's
+// ReadBytes('\n') grows its internal slice unboundedly via repeated
+// ReadSlice + concat, OOMing the daemon.
+const MaxHeaderBytes = 64 * 1024
+
 // serveConn implements the framed protocol for one client.
 func (s *AttachServer) serveConn(ctx context.Context, conn *attachConn) {
 	br := bufio.NewReader(conn.c)
-	headerLine, err := br.ReadBytes('\n')
+	// Bound the header read at MaxHeaderBytes. We use a LimitReader
+	// wrapped around the same underlying conn for just the header
+	// read — once we're past the header we go back to using br
+	// directly, so this doesn't constrain frame reads (which have
+	// their own ErrFrameTooLarge cap below).
+	headerLine, err := readBoundedLine(br, MaxHeaderBytes)
 	if err != nil {
 		s.reportError(fmt.Errorf("attach: read header: %w", err))
 		return
@@ -419,6 +438,10 @@ func (s *AttachServer) readInputs(_ context.Context, conn *attachConn, br *bufio
 			// frame; v0.1 of this socket wires that as a follow-up).
 			continue
 		}
+		// Mark held so the disconnect path's Release fires only when
+		// we actually acquired (avoids noisy ErrNotHolder for clients
+		// that never sent a byte).
+		conn.heldLock = true
 
 		if err := s.cfg.InputSink(conn.sid, buf); err != nil {
 			s.reportError(fmt.Errorf("attach: input sink: %w", err))
@@ -484,6 +507,30 @@ func WriteInputFrame(w io.Writer, payload []byte) error {
 // ErrFrameTooLarge is returned by ReadFrame when the length prefix
 // exceeds the 1MB safety cap.
 var ErrFrameTooLarge = errors.New("agent: attach frame > 1MB")
+
+// ErrHeaderTooLarge is returned by serveConn when the newline-
+// terminated header read exceeds MaxHeaderBytes.
+var ErrHeaderTooLarge = errors.New("agent: attach header > MaxHeaderBytes")
+
+// readBoundedLine reads bytes up to and including the next '\n', or
+// up to limit bytes (whichever comes first). Returns ErrHeaderTooLarge
+// if limit is hit without seeing a newline. Implementation pulls one
+// byte at a time from the bufio.Reader so we don't grow an unbounded
+// internal slice the way bufio.Reader.ReadBytes('\n') would.
+func readBoundedLine(br *bufio.Reader, limit int) ([]byte, error) {
+	buf := make([]byte, 0, 256)
+	for len(buf) < limit {
+		b, err := br.ReadByte()
+		if err != nil {
+			return buf, err
+		}
+		buf = append(buf, b)
+		if b == '\n' {
+			return buf, nil
+		}
+	}
+	return buf, ErrHeaderTooLarge
+}
 
 // isClosedConn matches typical "use of closed network connection"
 // error variants we want to swallow rather than log.

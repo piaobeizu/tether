@@ -375,6 +375,131 @@ func TestWatcher_Integration_CCSessionSequence(t *testing.T) {
 	}
 }
 
+// TestWatcher_UUIDDedupBounded ensures the per-session UUID dedup ring
+// caps at maxUUIDPerSession instead of growing without bound.
+func TestWatcher_UUIDDedupBounded(t *testing.T) {
+	dir := t.TempDir()
+	sid := "sess-bounded"
+	path := filepath.Join(dir, sid+".jsonl")
+	must(t, os.WriteFile(path, nil, 0o644))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w, err := New(ctx, dir, Options{SubscriberBuffer: 16384})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer w.Close()
+
+	ch := w.Subscribe(sid)
+
+	// Feed (cap+200) records — well past the bound — to force eviction.
+	overshoot := maxUUIDPerSession + 200
+	for i := 0; i < overshoot; i++ {
+		line := fmt.Sprintf(
+			`{"type":"user","uuid":"u-%d","sessionId":"%s","message":{"role":"user","content":[]}}`,
+			i, sid,
+		)
+		must(t, appendLine(path, line))
+	}
+
+	// Drain whatever the subscriber receives (best-effort; we only
+	// care about the ring state).
+	_ = drainFor(ch, 1500*time.Millisecond)
+
+	w.mu.Lock()
+	ring := w.uuidSeen[sid]
+	w.mu.Unlock()
+	if ring == nil {
+		t.Fatal("expected uuidSeen ring for session")
+	}
+	if got := ring.Len(); got > maxUUIDPerSession {
+		t.Errorf("ring size unbounded: got %d, want <= %d", got, maxUUIDPerSession)
+	}
+	if got := ring.Len(); got == 0 {
+		t.Errorf("ring empty after %d inserts", overshoot)
+	}
+}
+
+// TestWatcher_BackPressureDoesNotBlock verifies that under a slow
+// subscriber, the watcher's deliver() does NOT block — fsnotify drain
+// stays responsive, EVENT-class envelopes drop into the EnvelopesDrop
+// counter rather than back-pressuring the kernel inotify queue.
+func TestWatcher_BackPressureDoesNotBlock(t *testing.T) {
+	dir := t.TempDir()
+	sid := "sess-bp"
+	path := filepath.Join(dir, sid+".jsonl")
+	must(t, os.WriteFile(path, nil, 0o644))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w, err := New(ctx, dir, Options{SubscriberBuffer: 1})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer w.Close()
+
+	// Subscribe but do NOT drain — buffer fills after the first
+	// envelope, all subsequent EVENTs must drop, NOT block.
+	_ = w.Subscribe(sid)
+
+	// Feed many EVENT-class records (type=user produces ClassEvent).
+	const N = 200
+	for i := 0; i < N; i++ {
+		line := fmt.Sprintf(
+			`{"type":"user","uuid":"u-%d","sessionId":"%s","message":{"role":"user","content":[]}}`,
+			i, sid,
+		)
+		must(t, appendLine(path, line))
+	}
+
+	// Wait for fsnotify to drive parses through.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		stats := w.StatsSnapshot()
+		if stats.LinesParsed >= int64(N) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	stats := w.StatsSnapshot()
+	if stats.LinesParsed < int64(N) {
+		// fsnotify drain blocked — the bug we are guarding against.
+		t.Fatalf("fsnotify drain stalled under back-pressure: parsed %d / %d", stats.LinesParsed, N)
+	}
+	if stats.EnvelopesDrop == 0 {
+		t.Errorf("expected EVENT drops under buffer=1 + N=%d, got 0", N)
+	}
+}
+
+// TestSubscribeFromOffset_RejectsUnsupported locks the v0.1 contract:
+// only OffsetLiveOnly is accepted; arbitrary offsets return an error
+// so callers fail fast instead of silently receiving an empty stream.
+func TestSubscribeFromOffset_RejectsUnsupported(t *testing.T) {
+	dir := t.TempDir()
+	w, err := New(context.Background(), dir, Options{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer w.Close()
+
+	if _, err := w.SubscribeFromOffset("any", 0); err == nil {
+		t.Error("SubscribeFromOffset(0) should error in v0.1, got nil")
+	}
+	if _, err := w.SubscribeFromOffset("any", 12345); err == nil {
+		t.Error("SubscribeFromOffset(12345) should error in v0.1, got nil")
+	}
+	ch, err := w.SubscribeFromOffset("any", OffsetLiveOnly)
+	if err != nil {
+		t.Errorf("SubscribeFromOffset(OffsetLiveOnly) should succeed, got %v", err)
+	}
+	if ch == nil {
+		t.Error("OffsetLiveOnly subscribe returned nil channel")
+	}
+}
+
 // --- helpers ---
 
 func must(t *testing.T, err error) {

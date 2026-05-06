@@ -83,14 +83,25 @@
 // Subscribe() returns a buffered channel (default 256 envelopes) per
 // subscriber. When the buffer fills the watcher does NOT block on the
 // reader (that would propagate back to the fsnotify drain loop and
-// eventually drop kernel-level events). Instead the watcher uses a
-// non-blocking send and increments a per-subscriber "dropped" counter.
-// EVENT-class envelopes are never dropped on the path-watcher side
-// because the daemon broadcaster reads them synchronously and Stream 2
-// (events) is "永不丢" per spec §3.3.3 — drops here would be a contract
-// violation. STATE/HOOK envelopes are best-effort; subscribers that
-// care must drain promptly. The drop policy is "drop-newest" (preserve
-// causal order of what subscribers do see). See watcherSubscriber.
+// eventually drop kernel-level events at a layer where we cannot count
+// or recover them). Instead the watcher uses non-blocking sends for
+// ALL classes and increments a per-subscriber "dropped" counter +
+// Stats.EnvelopesDrop. The drop policy is "drop-newest" (preserve
+// causal order of what subscribers do see).
+//
+// "Stream 2 永不丢" per spec §3.3.3 is the daemon broadcaster's
+// contract, NOT the watcher's. This watcher is a derived view; the
+// JSONL file ITSELF is the source of truth. Late-attach / lossy
+// delivery is recovered upstream via either:
+//   - the daemon broadcaster's catch-up cache (Epic #3 follow-up:
+//     daemon-side LRU per (session, skill)), or
+//   - SubscribeFromOffset(sid, fromOffset) — currently only accepts
+//     OffsetLiveOnly (-1); arbitrary fromOffset replay is a follow-up.
+//
+// Per-session UUID dedup is a bounded FIFO ring at maxUUIDPerSession
+// entries (8192). Sessions older than the ring window may briefly
+// allow a re-emission — acceptable because the daemon broadcaster
+// is the system-of-record for "永不重".
 //
 // # Fence-tag suffix grep (sub-task #11 hook)
 //

@@ -25,6 +25,12 @@ const DefaultSubscriberBuffer = 256
 // KB to consume; we read in this-sized chunks until EOF.
 const readChunkSize = 64 * 1024
 
+// maxUUIDPerSession caps the per-session UUID dedup ring. ~10x typical
+// session record count so collisions are vanishingly rare in practice
+// while bounding memory at len * (avg uuid len) ≈ 8K * 36 bytes ≈ 288KB
+// per active session.
+const maxUUIDPerSession = 8192
+
 // Options tunes the Watcher.
 type Options struct {
 	// SubscriberBuffer is the per-subscriber channel buffer. Zero
@@ -39,10 +45,19 @@ type Options struct {
 	// typically log + count these.
 	OnError func(path string, err error)
 
-	// OnDrop, if non-nil, is invoked each time a STATE/HOOK
-	// envelope is dropped because a subscriber's buffer was full.
-	// EVENT envelopes are never silently dropped — they block the
-	// per-file reader (see watcherSubscriber.deliver).
+	// OnDrop, if non-nil, is invoked each time an envelope (any
+	// class) is dropped because a subscriber's buffer was full.
+	//
+	// Back-pressure model: the JSONL file ITSELF is the source of
+	// truth. The watcher is a derived view; subscribers attaching
+	// late or under back-pressure must replay from the file (see
+	// SubscribeFromOffset) or rely on the daemon broadcaster's
+	// catch-up cache. Blocking this layer would back-pressure the
+	// fsnotify drain goroutine and cause the kernel inotify queue to
+	// overflow, dropping fs events at a layer where we cannot count
+	// or recover them — strictly worse than counted in-flight drops
+	// here. Hence: ALL classes use non-blocking drop-newest with
+	// EnvelopesDrop counter.
 	OnDrop func(sessionID string, kind EnvelopeKind)
 }
 
@@ -66,14 +81,55 @@ type Watcher struct {
 	ctx   context.Context
 	cancel context.CancelFunc
 
-	mu         sync.Mutex
-	files      map[string]*fileState     // path → state
-	subs       map[string][]*subscriber  // sessionID → subscribers
-	uuidSeen   map[string]map[string]struct{} // sessionID → uuid set (dedup)
-	closed     bool
-	wg         sync.WaitGroup
-	stats      Stats
+	mu       sync.Mutex
+	files    map[string]*fileState    // path → state
+	subs     map[string][]*subscriber // sessionID → subscribers
+	uuidSeen map[string]*uuidRing     // sessionID → bounded FIFO ring (dedup)
+	closed   bool
+	wg       sync.WaitGroup
+	stats    Stats
 }
+
+// uuidRing is a bounded FIFO ring of recently-seen UUIDs. Older entries
+// evict on insert once at capacity. Caller must hold the parent lock.
+type uuidRing struct {
+	capacity int
+	seen     map[string]struct{}
+	order    []string // FIFO ring
+	head     int      // next eviction index
+}
+
+func newUUIDRing(capacity int) *uuidRing {
+	return &uuidRing{
+		capacity: capacity,
+		seen:     make(map[string]struct{}, capacity),
+		order:    make([]string, 0, capacity),
+	}
+}
+
+// AddIfNew returns true if the uuid was not previously seen; in that
+// case the ring records it (evicting the oldest if at capacity). False
+// means duplicate.
+func (r *uuidRing) AddIfNew(uuid string) bool {
+	if _, dup := r.seen[uuid]; dup {
+		return false
+	}
+	if len(r.order) < r.capacity {
+		r.order = append(r.order, uuid)
+		r.seen[uuid] = struct{}{}
+		return true
+	}
+	// Evict oldest.
+	old := r.order[r.head]
+	delete(r.seen, old)
+	r.order[r.head] = uuid
+	r.head = (r.head + 1) % r.capacity
+	r.seen[uuid] = struct{}{}
+	return true
+}
+
+// Len returns the current number of tracked UUIDs (≤ capacity).
+func (r *uuidRing) Len() int { return len(r.seen) }
 
 // Stats are read with atomic loads via the matching getters.
 type Stats struct {
@@ -130,7 +186,7 @@ func New(parent context.Context, root string, opts Options) (*Watcher, error) {
 		cancel:   cancel,
 		files:    make(map[string]*fileState),
 		subs:     make(map[string][]*subscriber),
-		uuidSeen: make(map[string]map[string]struct{}),
+		uuidSeen: make(map[string]*uuidRing),
 	}
 
 	st, err := os.Stat(root)
@@ -186,21 +242,56 @@ func New(parent context.Context, root string, opts Options) (*Watcher, error) {
 // cc session id. Multiple Subscribe calls for the same sid each get
 // their own channel (fan-out to multiple consumers). The channel is
 // closed by Close().
+//
+// Equivalent to SubscribeFromOffset(sid, OffsetLiveOnly).
 func (w *Watcher) Subscribe(sid string) <-chan Envelope {
+	ch, _ := w.SubscribeFromOffset(sid, OffsetLiveOnly)
+	return ch
+}
+
+// OffsetLiveOnly is the only fromOffset supported in v0.1 — the
+// subscriber receives only envelopes the watcher emits AFTER subscribe.
+// Pre-existing file content is NOT replayed.
+//
+// Full file replay (e.g. fromOffset=0) is a follow-up tracked in the
+// PR description; the daemon broadcaster's catch-up cache fills the
+// gap for v0.1.
+const OffsetLiveOnly int64 = -1
+
+// SubscribeFromOffset returns a channel like Subscribe with explicit
+// offset semantics. v0.1 only supports OffsetLiveOnly (-1); any other
+// value returns an error so callers fail fast instead of silently
+// receiving an empty stream.
+//
+// The full file-replay implementation requires per-subscriber file
+// readers + careful interleave with the live drain to avoid races
+// between historical parse and live append; tracked as a follow-up.
+// Callers that need full replay should:
+//  1. Subscribe BEFORE the watcher starts emitting (e.g. immediately
+//     after New()), or
+//  2. Use the daemon broadcaster's catch-up cache (Epic #3 sub-task —
+//     daemon-side LRU per (session, skill)).
+func (w *Watcher) SubscribeFromOffset(sid string, fromOffset int64) (<-chan Envelope, error) {
+	if fromOffset != OffsetLiveOnly {
+		return nil, fmt.Errorf(
+			"jsonl watcher: SubscribeFromOffset(fromOffset=%d) not supported in v0.1; pass OffsetLiveOnly (-1) or use the daemon broadcaster's catch-up cache for resume / late-attach",
+			fromOffset,
+		)
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
 		// Closed-watcher contract: hand out a closed channel.
 		ch := make(chan Envelope)
 		close(ch)
-		return ch
+		return ch, nil
 	}
 	sub := &subscriber{
 		sid: sid,
 		ch:  make(chan Envelope, w.opts.SubscriberBuffer),
 	}
 	w.subs[sid] = append(w.subs[sid], sub)
-	return sub.ch
+	return sub.ch, nil
 }
 
 // Close stops the watcher, closes all subscriber channels, and
@@ -438,21 +529,20 @@ func (w *Watcher) dispatch(fs *fileState, rec Record) {
 		sid = fs.sid
 	}
 
-	// UUID dedup (per session).
+	// UUID dedup (per session, bounded FIFO ring).
 	if rec.UUID != "" {
 		w.mu.Lock()
-		seen, ok := w.uuidSeen[sid]
+		ring, ok := w.uuidSeen[sid]
 		if !ok {
-			seen = make(map[string]struct{})
-			w.uuidSeen[sid] = seen
+			ring = newUUIDRing(maxUUIDPerSession)
+			w.uuidSeen[sid] = ring
 		}
-		if _, dup := seen[rec.UUID]; dup {
+		isNew := ring.AddIfNew(rec.UUID)
+		w.mu.Unlock()
+		if !isNew {
 			w.stats.UUIDDuped.Add(1)
-			w.mu.Unlock()
 			return
 		}
-		seen[rec.UUID] = struct{}{}
-		w.mu.Unlock()
 	}
 
 	class := Classify(rec)
@@ -468,11 +558,17 @@ func (w *Watcher) dispatch(fs *fileState, rec Record) {
 }
 
 // deliver hands the envelope to every subscriber of env.SessionID.
-// Drop policy:
-//   - EVENT class: never drop. Block the per-file reader until at
-//     least one subscriber has buffer room. (Stream 2 永不丢, §3.3.3.)
-//   - HOOK / STATE class: best-effort non-blocking send. On full
-//     buffer, drop-newest and increment counters.
+//
+// Drop policy: ALL classes use non-blocking drop-newest with the
+// EnvelopesDrop counter. Rationale (see Options.OnDrop docstring):
+// blocking would back-pressure the fsnotify drain goroutine into
+// dropping kernel-level inotify events, which we cannot count or
+// recover. The JSONL file is the source of truth; the daemon
+// broadcaster's catch-up cache (and a future SubscribeFromOffset
+// replay) handles late-attach / lossy delivery, NOT this layer.
+//
+// "Stream 2 永不丢" (§3.3.3) is the daemon broadcaster's contract,
+// not the watcher's — this layer is a derived view.
 func (w *Watcher) deliver(env Envelope) {
 	w.mu.Lock()
 	subs := append([]*subscriber(nil), w.subs[env.SessionID]...)
@@ -481,24 +577,13 @@ func (w *Watcher) deliver(env Envelope) {
 	w.stats.EnvelopesEmit.Add(1)
 
 	for _, s := range subs {
-		switch env.Class {
-		case ClassEvent:
-			// Blocking send (with ctx cancellation).
-			select {
-			case s.ch <- env:
-			case <-w.ctx.Done():
-				return
-			}
+		select {
+		case s.ch <- env:
 		default:
-			// Non-blocking, drop-newest.
-			select {
-			case s.ch <- env:
-			default:
-				s.dropped.Add(1)
-				w.stats.EnvelopesDrop.Add(1)
-				if w.opts.OnDrop != nil {
-					w.opts.OnDrop(env.SessionID, env.Kind)
-				}
+			s.dropped.Add(1)
+			w.stats.EnvelopesDrop.Add(1)
+			if w.opts.OnDrop != nil {
+				w.opts.OnDrop(env.SessionID, env.Kind)
 			}
 		}
 	}

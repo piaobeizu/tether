@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -84,11 +85,43 @@ func skillInstall(args []string) int {
 	return 0
 }
 
+// skillListJSONRow is the shape emitted when `--json` is passed.
+// Field names are the wire contract for the tether-app Tauri bridge
+// (Phase 9): mapped to {name, v, on, desc, update} in
+// tether-app/src/store/loadSkills.ts. DO NOT rename without updating
+// the TS-side translator.
+//
+// Note for the Rust bridge: `json.NewEncoder(...).Encode(rows)` appends
+// a trailing '\n'. Use `serde_json::from_slice` or `from_str`, both of
+// which tolerate trailing whitespace; do not byte-equality-check raw
+// stdout.
+type skillListJSONRow struct {
+	Name        string `json:"name"`
+	Version     string `json:"version"`
+	Description string `json:"description"`
+	// Optional. v0.1: never set — `internal/skill.SkillSection` has no
+	// `Enabled` field, so `pool.Info(n)` cannot populate it. Reserved
+	// for the workspace-level resolver follow-up (when tether.toml
+	// learns to express per-workspace enablement). The TS side
+	// defaults `on=true` when omitted.
+	Enabled *bool `json:"enabled,omitempty"`
+	// Optional — populated when an update channel reports a newer
+	// release. v0.1: never set (no registry probe).
+	UpdateAvailable string `json:"updateAvailable,omitempty"`
+}
+
 func skillList(args []string) int {
-	if len(args) > 0 {
-		fmt.Fprintln(os.Stderr, "usage: tether skill list")
+	fs := flag.NewFlagSet("tether skill list", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	asJSON := fs.Bool("json", false, "emit a JSON array (machine-readable; consumed by the tether-app UI)")
+	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "usage: tether skill list [--json]")
+		return 2
+	}
+
 	pool, err := skill.DefaultPool()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -99,6 +132,28 @@ func skillList(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
+
+	if *asJSON {
+		rows := make([]skillListJSONRow, 0, len(names))
+		for _, n := range names {
+			m, _ := pool.Info(n)
+			row := skillListJSONRow{Name: n}
+			if m != nil {
+				row.Version = m.Skill.Version
+				row.Description = m.Skill.Description
+			}
+			rows = append(rows, row)
+		}
+		// Always emit a JSON array even when empty — callers parse
+		// stdout as JSON without looking at exit code or stderr.
+		enc := json.NewEncoder(os.Stdout)
+		if err := enc.Encode(rows); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		return 0
+	}
+
 	if len(names) == 0 {
 		fmt.Printf("(no skills installed in %s)\n", pool.Root)
 		return 0

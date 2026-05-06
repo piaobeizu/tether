@@ -62,6 +62,10 @@ func runDaemon(args []string) int {
 	fs := flag.NewFlagSet("tether daemon", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	verbose := fs.Bool("v", false, "verbose supervisor logging")
+	projectsDir := fs.String("projects-dir", "",
+		"cc projects directory to tail (default $HOME/.claude/projects)")
+	attachSocket := fs.String("attach-socket", "",
+		"path for the local attach Unix socket (default $HOME/.tether/attach.sock)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -80,8 +84,10 @@ func runDaemon(args []string) int {
 	}()
 
 	cfg := daemon.Config{
-		Verbose: *verbose,
-		Stderr:  os.Stderr,
+		Verbose:          *verbose,
+		Stderr:           os.Stderr,
+		ProjectsDir:      *projectsDir,
+		AttachSocketPath: *attachSocket,
 	}
 	if err := daemon.Run(ctx, cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "tether daemon: %v\n", err)

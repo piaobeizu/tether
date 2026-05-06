@@ -84,6 +84,10 @@ type AckFrame struct {
 
 // LockDeniedFrame is sent in response to a write that the server can't
 // authorize because the lock is held.
+//
+// Wire shape pinned in spec §11.D.1 "attach.lock-denied frame shape".
+// Field changes here MUST be mirrored there (and vice versa) — this is
+// the stable contract third-party / mobile attach clients code against.
 type LockDeniedFrame struct {
 	Type   string `json:"type"`
 	Reason string `json:"reason"`

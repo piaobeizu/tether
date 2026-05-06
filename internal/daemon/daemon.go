@@ -108,6 +108,15 @@ type Config struct {
 	// fixture filesystem touched. Default false (audit log is on
 	// for production).
 	DisableLockAudit bool
+
+	// EnableStubSweeper opts in to the GC stub-session sweeper
+	// (internal/daemon/sweeper.go). Default false for v0.1: ship
+	// behind a flag, validate on real workloads, then flip default.
+	// When true, the sweeper subsystem joins daemon + client under
+	// the watchdog and periodically deletes idle, low-line-count
+	// JSONL files in ProjectsDir whose sessions have no live
+	// subscribers. See sweeper.go for threshold rationale.
+	EnableStubSweeper bool
 }
 
 // SubsystemFactory is a deferred constructor for a Subsystem. The
@@ -260,6 +269,13 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 
 		factories = realSubsystems(socketPath, emitter, lockSM, cfg.InputSink, broker, logf)
+		if cfg.EnableStubSweeper {
+			factories = append(factories, gcSubsystemFactory(stubSweeperConfig{
+				ProjectsDir: projectsDir,
+				Emitter:     emitter,
+				Logf:        logf,
+			}))
+		}
 		// emitter lives for the daemon's full lifetime; clean up
 		// on Run exit. clientSubsystem owns its per-run AttachServer
 		// and closes it inside Run's defer. lockSink (if any) flushes

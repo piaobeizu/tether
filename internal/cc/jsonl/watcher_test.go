@@ -304,6 +304,41 @@ func TestWatcher_Subscribe_AfterClose_ReturnsClosedChan(t *testing.T) {
 	}
 }
 
+func TestWatcher_HasSubscribers(t *testing.T) {
+	dir := t.TempDir()
+	w, err := New(context.Background(), dir, Options{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer w.Close()
+
+	if w.HasSubscribers("nobody") {
+		t.Errorf("expected HasSubscribers=false for unknown sid")
+	}
+	ch := w.Subscribe("sid-1")
+	if !w.HasSubscribers("sid-1") {
+		t.Errorf("expected HasSubscribers=true after Subscribe")
+	}
+	w.Unsubscribe("sid-1", ch)
+	if w.HasSubscribers("sid-1") {
+		t.Errorf("expected HasSubscribers=false after Unsubscribe")
+	}
+
+	// Two subscribers — one Unsubscribe leaves one live.
+	ch1 := w.Subscribe("sid-2")
+	_ = w.Subscribe("sid-2")
+	w.Unsubscribe("sid-2", ch1)
+	if !w.HasSubscribers("sid-2") {
+		t.Errorf("expected HasSubscribers=true with one remaining sub")
+	}
+
+	// After Close, HasSubscribers=false regardless.
+	_ = w.Close()
+	if w.HasSubscribers("sid-2") {
+		t.Errorf("expected HasSubscribers=false after Close")
+	}
+}
+
 func TestWatcher_HookEvent_NotDroppedOnSlowSubscriber(t *testing.T) {
 	// HOOK / STATE envelopes are best-effort drop-newest. Verify
 	// that filling the buffer triggers OnDrop and increments

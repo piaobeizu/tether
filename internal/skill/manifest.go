@@ -21,16 +21,16 @@ var SkillNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 // to a "plain cc plugin" — still installable, just no tether-specific
 // hints).
 type Manifest struct {
-	Skill         SkillSection         `toml:"skill"`
-	Tether        TetherSection        `toml:"tether"`
+	Skill  SkillSection  `toml:"skill"`
+	Tether TetherSection `toml:"tether"`
 }
 
 // SkillSection is the required identity block.
 type SkillSection struct {
-	Name        string       `toml:"name"`
-	Version     string       `toml:"version"`
-	Description string       `toml:"description"`
-	Agents      AgentsBlock  `toml:"agents"`
+	Name        string      `toml:"name"`
+	Version     string      `toml:"version"`
+	Description string      `toml:"description"`
+	Agents      AgentsBlock `toml:"agents"`
 }
 
 // AgentsBlock declares which agent backends a skill is authored for.

@@ -6,12 +6,14 @@
 //	                               per spec §4.1 / D-11).
 //	tether skill {install|list|remove|info}   manage the global skill pool
 //	                                          (Epic #8, spec §11.Z).
+//	tether resume <sid>            cwd-aware wrapper around `claude --resume`
+//	                               (spec §10.4 strategy c).
 //	tether tether-blob-register <path>   D-18 #3 forward-compat stub
 //	                                     (returns "not implemented in v0.1";
 //	                                     reserved for the v0.2 blob proxy).
 //
-// Other subcommands (attach, spawn, resume, doctor, …) land in later
-// slices and plug into the same dispatch table.
+// Other subcommands (attach, spawn, doctor, …) land in later slices and
+// plug into the same dispatch table.
 //
 // Exit codes (spec §6 / §4.1):
 //
@@ -19,10 +21,6 @@
 //	1   daemon failed to bootstrap (config / I/O error before watchdog
 //	    started), or subcommand reported a runtime error
 //	2   misuse (unknown subcommand, bad flags)
-//
-// Anything stronger (panic that escapes the supervisor — should never
-// happen because every supervised goroutine routes through safeRun) is
-// the Go runtime's default "exit 2 with a stack trace" path.
 package main
 
 import (
@@ -46,6 +44,8 @@ func main() {
 		os.Exit(runDaemon(os.Args[2:]))
 	case "skill":
 		os.Exit(skillCmd(os.Args[2:]))
+	case "resume":
+		os.Exit(runResume(os.Args[2:]))
 	case "tether-blob-register":
 		os.Exit(blobRegisterCmd(os.Args[2:]))
 	case "-h", "--help", "help":
@@ -90,6 +90,61 @@ func runDaemon(args []string) int {
 	return 0
 }
 
+// runResume parses flags + dispatches to the resume wrapper. Returns an
+// exit code.
+func runResume(argv []string) int {
+	fs := flag.NewFlagSet("resume", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	bucket := fs.String("bucket", "", "disambiguate when sid is found in multiple buckets")
+	dryRun := fs.Bool("dry-run", false, "print resolved cwd + argv, do not exec claude")
+	binary := fs.String("binary", "claude", "path/name of the claude binary to exec")
+	projectsDir := fs.String("projects-dir", "", "override ~/.claude/projects (for tests)")
+
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: tether resume <sid> [--bucket B] [--dry-run] [--binary PATH]")
+		fmt.Fprintln(os.Stderr, "")
+		fs.PrintDefaults()
+	}
+
+	if err := fs.Parse(argv); err != nil {
+		return 2
+	}
+	if fs.NArg() != 1 {
+		fs.Usage()
+		return 2
+	}
+	sid := fs.Arg(0)
+
+	root := *projectsDir
+	if root == "" {
+		var err error
+		root, err = defaultProjectsDir()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "tether resume: %v\n", err)
+			return 1
+		}
+	}
+
+	res, err := ResolveSession(root, sid, *bucket)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "tether resume: %v\n", err)
+		return 1
+	}
+
+	if *dryRun {
+		fmt.Printf("cwd:    %s\n", res.Cwd)
+		fmt.Printf("bucket: %s\n", res.Bucket)
+		fmt.Printf("exec:   %s --resume %s\n", *binary, sid)
+		return 0
+	}
+
+	if err := ExecClaude(*binary, res.Cwd, sid); err != nil {
+		fmt.Fprintf(os.Stderr, "tether resume: %v\n", err)
+		return 1
+	}
+	return 0 // unreachable when ExecClaude succeeds (it execve's)
+}
+
 func usage(w *os.File) {
 	fmt.Fprintln(w, "usage: tether <subcommand> [flags]")
 	fmt.Fprintln(w, "")
@@ -99,6 +154,9 @@ func usage(w *os.File) {
 	fmt.Fprintln(w, "  skill list                     list installed skills")
 	fmt.Fprintln(w, "  skill remove <name>            uninstall a skill")
 	fmt.Fprintln(w, "  skill info <name>              print manifest details for an installed skill")
+	fmt.Fprintln(w, "  resume <sid>                   resume a claude session by id (spec §10.4 strategy c)")
 	fmt.Fprintln(w, "  tether-blob-register <path>    (v0.1 stub) reserve blob URL for a workspace path")
 	fmt.Fprintln(w, "  help                           show this message")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Run `tether <subcommand> -h` for subcommand-specific flags.")
 }

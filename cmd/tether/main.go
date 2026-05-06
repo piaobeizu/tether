@@ -166,7 +166,7 @@ func usage(w *os.File) {
 	fmt.Fprintln(w, "Subcommands:")
 	fmt.Fprintln(w, "  daemon                         start the supervised daemon (watchdog + daemon + client)")
 	fmt.Fprintln(w, "  skill install <name|git-url>   install a skill into the global pool")
-	fmt.Fprintln(w, "  skill list                     list installed skills")
+	fmt.Fprintln(w, "  skill list [--json]            list installed skills (--json: machine-readable, consumed by tether-app UI)")
 	fmt.Fprintln(w, "  skill remove <name>            uninstall a skill")
 	fmt.Fprintln(w, "  skill info <name>              print manifest details for an installed skill")
 	fmt.Fprintln(w, "  resume <sid>                   resume a claude session by id (spec §10.4 strategy c)")

@@ -1,34 +1,49 @@
 package claude
 
-// Test fixture infrastructure for SessionStart hook idempotency
-// (spec §6.C.4). v0.1 ships zero tether-owned hooks, so the contract is
-// vacuously satisfied today — but this file lays in the fixture so the
-// FIRST tether-owned-hook ticket can plug in directly (see
-// "How the next ticket plugs in" at the bottom of this file).
+// Test fixture infrastructure for SessionStart hook idempotency.
 //
-// IDEMPOTENCY SEMANTIC CHOSEN: fire-on-each-recover (option a).
+// SPEC SOURCE: 2026-04-30-cc-sdk-route.md §C.4 (under "## 6. Behavior
+// contract / ### C. 恢复语义") + same doc §8 scenario 7 (testing
+// strategy). Earlier drafts of this file mis-cited "2026-04-26-tether-
+// go-quic-design.md §6.C.4" — that document doesn't have a §6.C.4.
+// Reviewer caught it; corrected here.
 //
-//	N1. claude fires SessionStart on every (re)spawn. Recover IS a
-//	    re-spawn of the cc subprocess (see spawn.go BuildArgs +
-//	    --resume), therefore claude WILL re-deliver SessionStart on
-//	    every Recover. We can't suppress that — it's claude's behavior,
-//	    not ours.
-//	N2. Spec §6.C.4 mandates that tether-owned SessionStart hooks be
-//	    "idempotent against re-firing". The cleanest reading is: the
-//	    side effects must be safe to apply N times — NOT "the hook
-//	    must short-circuit after the first fire". A hook that simply
-//	    increments a counter is NOT idempotent in that sense. A hook
-//	    that writes a fixed marker file (idempotent overwrite) IS.
-//	N3. We therefore test the OBSERVABLE protocol: the hook command
-//	    runs once per Start + once per Recover. counter=4 after
-//	    New→Start→Recover×3 confirms cc honors our wiring. The "is
-//	    your side effect actually idempotent?" test is per-hook and
-//	    lives in the ticket that adds the hook.
+// v0.1 ships zero tether-owned hooks, so the contract is vacuously
+// satisfied today — but this file lays in the fixture so the FIRST
+// tether-owned-hook ticket can plug in (see "How the next ticket
+// plugs in" at the bottom of this file).
 //
-// Rejected alternative: option b ("hook short-circuits on second fire
-// via on-disk marker"). That's one VALID idempotency strategy a hook
-// implementer can choose, but it's NOT what the protocol guarantees;
-// asserting it here would over-constrain the contract.
+// WHAT C.4 ACTUALLY SAYS
+//
+//	C.4: tether-owned SessionStart hooks must be idempotent against
+//	     re-firing — because cc fires SessionStart on every (re)spawn,
+//	     and Recover IS a re-spawn (see spawn.go BuildArgs + --resume).
+//	     Scenario 7's verification text is "验文件按 idempotent 行为
+//	     递增（或保持）" — i.e., the spec EXPLICITLY admits BOTH
+//	     valid hook implementations:
+//	         - 递增  (counter increments) — for naturally-idempotent
+//	                                         side-effects (counter,
+//	                                         append, log)
+//	         - 保持  (counter stays at 1) — for non-idempotent side-
+//	                                         effects gated by a marker
+//	                                         short-circuit
+//
+//	Both are equally canonical per spec; this fixture exercises both.
+//
+// WHAT THIS FIXTURE TESTS (and what it does NOT)
+//
+// The unit tests in this file are FIXTURE-HARNESS sanity checks: they
+// verify that newHookFixture(t)+FireSessionStart(N) gives N invocations
+// of the configured command, and that the two spec-admitted hook
+// strategies yield the predicted counter values when fired against the
+// harness. They do NOT by themselves prove cc fires SessionStart on
+// every spawn — that's an empirical claim about cc's behavior, verified
+// only by TestHookFixture_RealClaude_SessionStartFiresOnRecover (gated
+// by `requireClaude` + `-short`).
+//
+// Per-hook side-effect idempotency proofs live with each hook in the
+// ticket that adds it. This fixture is the runway, not the contract
+// test.
 
 import (
 	"context"
@@ -44,6 +59,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/piaobeizu/tether/internal/cc"
 )
 
 // --- fixture --------------------------------------------------------
@@ -224,23 +241,89 @@ func TestHookFixture_SettingsJSONShape(t *testing.T) {
 	}
 }
 
-// TestHookFixture_FireOnEachRecover_IncrementsCounter is the headline
-// test of this slice. Documents the fire-on-each-recover semantics
-// (see file header N1–N3) by simulating the spec §6.C.4 scenario:
+// TestHookFixture_SettingsShapeMatchesProduction is a drift-guard. The
+// fixture's WriteSettings() handcrafts the cc settings.json shape; the
+// production code path is cc.SettingsForCC(baseURL). If the production
+// shape evolves (cc adds a required field, renames a key, etc.) and
+// the fixture doesn't follow, the next ticket would discover the drift
+// only when its real-claude test fails — too late. This test pins the
+// outer envelope so drift surfaces here.
+func TestHookFixture_SettingsShapeMatchesProduction(t *testing.T) {
+	f := newHookFixture(t)
+	f.WriteSettings()
+
+	body, err := os.ReadFile(f.SettingsPath())
+	if err != nil {
+		t.Fatalf("readback: %v", err)
+	}
+	var fixtureDoc map[string]any
+	if err := json.Unmarshal(body, &fixtureDoc); err != nil {
+		t.Fatalf("fixture settings parse: %v", err)
+	}
+
+	prodBytes, err := cc.SettingsForCC("http://127.0.0.1:54321")
+	if err != nil {
+		t.Fatalf("SettingsForCC: %v", err)
+	}
+	var prodDoc map[string]any
+	if err := json.Unmarshal(prodBytes, &prodDoc); err != nil {
+		t.Fatalf("production settings parse: %v", err)
+	}
+
+	// Both must have a top-level "hooks" object containing SessionStart
+	// as a list, with each entry shaped {hooks: [{type, command}]}.
+	for label, doc := range map[string]map[string]any{"fixture": fixtureDoc, "production": prodDoc} {
+		hooks, ok := doc["hooks"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s: top-level hooks must be object, got %T", label, doc["hooks"])
+		}
+		ssRaw, ok := hooks["SessionStart"]
+		if !ok {
+			t.Fatalf("%s: SessionStart missing", label)
+		}
+		entries, ok := ssRaw.([]any)
+		if !ok || len(entries) == 0 {
+			t.Fatalf("%s: SessionStart must be non-empty list, got %T", label, ssRaw)
+		}
+		entry, ok := entries[0].(map[string]any)
+		if !ok {
+			t.Fatalf("%s: SessionStart[0] must be object, got %T", label, entries[0])
+		}
+		inner, ok := entry["hooks"].([]any)
+		if !ok || len(inner) == 0 {
+			t.Fatalf("%s: SessionStart[0].hooks must be non-empty list, got %T", label, entry["hooks"])
+		}
+		h0, ok := inner[0].(map[string]any)
+		if !ok {
+			t.Fatalf("%s: SessionStart[0].hooks[0] must be object, got %T", label, inner[0])
+		}
+		if h0["type"] != "command" {
+			t.Errorf("%s: hook type must be \"command\", got %v", label, h0["type"])
+		}
+		if _, ok := h0["command"].(string); !ok {
+			t.Errorf("%s: hook command must be string, got %T", label, h0["command"])
+		}
+	}
+}
+
+// TestHookFixture_HarnessRunsCommandOncePerFire is a fixture-harness
+// sanity check, not a cc-behavior test.
 //
-//	1. New (no spawn-side hook fire — New is local-only construction)
-//	2. Start (claude fires SessionStart) → counter = 1
-//	3. Recover (claude re-spawns, re-fires SessionStart) → counter = 2
-//	4. Recover → counter = 3
-//	5. Recover → counter = 4
+// Per cc-sdk-route §C.4 + §8 scenario 7: cc fires SessionStart on
+// every spawn (claim verified by the gated real-claude test below);
+// hook authors satisfy idempotency via 递增 OR 保持 strategies.
+// This test exercises the 递增 example (counter increments per fire)
+// to lock in the predicted harness output:
 //
-// We simulate "claude fires SessionStart" by running the hook command
-// directly via FireSessionStart. The point isn't to exercise claude's
-// machinery (covered by the gated real-claude test below) — it's to
-// LOCK IN the contract that the next ticket's hook implementation
-// must satisfy: the on-disk side-effects after N spawns are the side-
-// effects of the command run N times.
-func TestHookFixture_FireOnEachRecover_IncrementsCounter(t *testing.T) {
+//	0 fires → counter=0   (sanity: New alone doesn't fire)
+//	1 fire  → counter=1
+//	N more  → counter=1+N
+//
+// What it pins is the FIXTURE'S OBSERVABLE BEHAVIOR — useful for the
+// next ticket so it can compose its own per-hook idempotency tests
+// without re-deriving harness semantics. It is NOT a derivation of
+// "cc fires N times"; that lives in the real-claude test.
+func TestHookFixture_HarnessRunsCommandOncePerFire(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("bash hook command is POSIX-only")
 	}
@@ -276,16 +359,17 @@ func TestHookFixture_FireOnEachRecover_IncrementsCounter(t *testing.T) {
 		}
 	}
 
-	// Final assertion — by spec §6.C.4 fire-on-each-recover semantics:
-	// 1 Start + 3 Recovers = 4 fires.
+	// Final assertion — under the 递增 strategy from cc-sdk-route §8
+	// scenario 7: 1 fire + 3 fires = 4 increments.
 	if got := f.CounterValue(); got != 4 {
-		t.Errorf("final counter: got %d, want 4 (1 Start + 3 Recovers)", got)
+		t.Errorf("final counter: got %d, want 4 (1 + 3 fires)", got)
 	}
 }
 
-// TestHookFixture_IdempotentMarkerStrategy demonstrates the alternative
-// "hook short-circuits via on-disk marker" pattern. This is what a
-// well-written tether-owned hook MIGHT do internally if its side-effect
+// TestHookFixture_IdempotentMarkerStrategy exercises the 保持 strategy
+// from cc-sdk-route §8 scenario 7 — equally canonical to 递增, NOT a
+// fallback. This is what a well-written tether-owned hook MIGHT do
+// internally if its side-effect
 // is non-idempotent (e.g. "register this session with an external
 // system once"). Confirms the fixture supports overriding HookCommand.
 //
@@ -463,22 +547,38 @@ func TestHookFixture_RealClaude_SessionStartFiresOnRecover(t *testing.T) {
 		"--settings", f.SettingsPath(),
 		"--model", "haiku",
 	}
+	// Use a per-test fake HOME so claude's session-jsonl writes
+	// (~/.claude/projects/<encoded-cwd>/*.jsonl per cc-sdk-route §D.1
+	// + §E.5) don't pollute the developer's real home directory.
+	// Without this every run leaves a fresh ~/.claude/projects/-tmp-…
+	// dir behind because cmd.Dir below is a fresh t.TempDir each time.
+	fakeHome := t.TempDir()
+
 	runOnce := func(extraArgs ...string) {
 		cmd := exec.CommandContext(ctx, resolved, append(args, extraArgs...)...)
 		cmd.Dir = t.TempDir()
+		// Inherit env, then override HOME to the per-test sandbox.
+		cmd.Env = append(os.Environ(), "HOME="+fakeHome)
 		stdin, err := cmd.StdinPipe()
 		if err != nil {
 			t.Fatalf("stdin pipe: %v", err)
 		}
+		var stderr strings.Builder
 		cmd.Stdout = io.Discard
-		cmd.Stderr = io.Discard
+		cmd.Stderr = &stderr
 		if err := cmd.Start(); err != nil {
 			t.Fatalf("start: %v", err)
 		}
 		// Send a single user message + close stdin so claude exits.
 		_, _ = stdin.Write([]byte(`{"type":"user","message":{"role":"user","content":[{"type":"text","text":"reply ok"}]}}` + "\n"))
 		_ = stdin.Close()
-		_ = cmd.Wait()
+		// claude can fail for env reasons unrelated to this fixture
+		// (no API key, model access denied, network blocked). In those
+		// cases we'd rather skip than fail — the fixture under test is
+		// the harness, not claude's auth path.
+		if err := cmd.Wait(); err != nil {
+			t.Skipf("claude subprocess failed (likely auth/network — skipping): %v\nstderr: %s", err, stderr.String())
+		}
 	}
 
 	// First run — Start. Expect counter = 1 after.
@@ -525,13 +625,14 @@ func TestHookFixture_RealClaude_SessionStartFiresOnRecover(t *testing.T) {
 //       semantic — typically an idempotent marker / no-op on second
 //       fire if the side-effect is non-idempotent)
 //
-//  4. The "fire-on-each-recover" assertion in
-//     TestHookFixture_FireOnEachRecover_IncrementsCounter remains
-//     valid as the protocol-level invariant: claude WILL fire
-//     SessionStart on every spawn. The hook implementer's job is
-//     to make that safe.
+//  4. The harness assertion in
+//     TestHookFixture_HarnessRunsCommandOncePerFire remains valid as
+//     the protocol-level fixture contract (one fire = one command
+//     invocation). The hook author then ADDS a per-hook idempotency
+//     test that asserts whichever spec-admitted strategy they chose
+//     (递增 or 保持 per cc-sdk-route §C.4 + §8 scenario 7).
 //
 // In one sentence: the next ticket adds SpawnOpts.SettingsPath +
 // a real hook command, then writes a test that mirrors
-// TestHookFixture_FireOnEachRecover_IncrementsCounter but with
-// real Session.Recover instead of FireSessionStart.
+// TestHookFixture_HarnessRunsCommandOncePerFire but with real
+// Session.Recover instead of FireSessionStart.

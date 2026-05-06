@@ -1,3 +1,3 @@
 module github.com/piaobeizu/tether
 
-go 1.24.6
+go 1.25.0

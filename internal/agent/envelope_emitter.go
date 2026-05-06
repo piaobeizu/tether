@@ -220,6 +220,43 @@ func (e *EnvelopeEmitter) Stats() (linesParsed, envelopesEmit, envelopesDrop int
 	return st.LinesParsed, st.EnvelopesEmit, st.EnvelopesDrop
 }
 
+// Inject pushes a daemon-originated envelope to all subscribers of
+// env.SessionID. Used by AuthBroker (and any future server-side event
+// source) to fan a non-JSONL envelope into the same delivery path as
+// watcher events.
+//
+// Best-effort delivery: if a subscriber's outbound channel is full, the
+// envelope is dropped for that subscriber (the channel buffer of 64 is
+// the same back-pressure model as the watcher relay). Returns
+// ErrEmitterClosed only if the emitter has been Close()'d.
+func (e *EnvelopeEmitter) Inject(env LocalEnvelope) error {
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return ErrEmitterClosed
+	}
+	// Snapshot subs to avoid holding the lock while sending. New
+	// subscribers added concurrently won't see this envelope; that's
+	// fine — Inject is a fan-out broadcast, not a replay log.
+	subs := make([]*emitterSub, 0, len(e.subs))
+	for _, s := range e.subs {
+		if s.sid == env.SessionID {
+			subs = append(subs, s)
+		}
+	}
+	e.mu.Unlock()
+	for _, s := range subs {
+		select {
+		case s.out <- env:
+		default:
+			// Subscriber slow / disconnected; drop. The watcher's
+			// OnDrop reporting only fires on JSONL drops, so we don't
+			// double-count here.
+		}
+	}
+	return nil
+}
+
 // relay is the per-subscriber goroutine: pulls jsonl.Envelopes from the
 // watcher, projects to LocalEnvelope, sends to out. Exits on ctx.Done()
 // or when the watcher channel closes.

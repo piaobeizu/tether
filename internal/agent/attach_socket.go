@@ -116,6 +116,15 @@ type AttachServerConfig struct {
 	// message).
 	InputSink func(sessionID string, data []byte) error
 
+	// AuthBroker, when non-nil, intercepts rw-mode input frames whose
+	// payload parses as an auth.tool-decision JSON envelope and routes
+	// them to the broker instead of the PTY InputSink. All other input
+	// frames are passed through unchanged. Optional — leaving nil
+	// disables tool-authorization decisions over the attach socket
+	// (the PreToolUse handler then either has no UI surface or uses
+	// some other transport; v0.1 wires it here only).
+	AuthBroker *AuthBroker
+
 	// OnError surfaces accept-loop / per-conn errors to the daemon
 	// log. Optional.
 	OnError func(err error)
@@ -424,6 +433,24 @@ func (s *AttachServer) readInputs(_ context.Context, conn *attachConn, br *bufio
 			return err
 		}
 
+		// Auth decision frames are control plane — intercept BEFORE the
+		// lock check so a UI tab that doesn't hold the writer lock can
+		// still answer "may I run this tool?" prompts. The decision
+		// router is keyed by requestId so cross-tab traffic is fine.
+		if s.cfg.AuthBroker != nil && looksLikeAuthDecisionFrame(buf) {
+			var frame AuthDecisionFrame
+			if err := json.Unmarshal(buf, &frame); err == nil &&
+				frame.Type == KindAuthToolDecision {
+				if subErr := s.cfg.AuthBroker.SubmitDecision(frame); subErr != nil {
+					s.reportError(fmt.Errorf("attach: auth decision: %w", subErr))
+				}
+				continue
+			}
+			// JSON-shaped but not a valid decision frame — fall through
+			// to PTY input so we don't accidentally swallow payloads
+			// that legitimately start with '{'.
+		}
+
 		// TryAcquire — first byte from this client wins if lock is
 		// free; touches forward the auto-release timer otherwise.
 		if err := s.cfg.Lock.TryAcquire(conn.client); err != nil {
@@ -507,6 +534,30 @@ func WriteInputFrame(w io.Writer, payload []byte) error {
 // ErrFrameTooLarge is returned by ReadFrame when the length prefix
 // exceeds the 1MB safety cap.
 var ErrFrameTooLarge = errors.New("agent: attach frame > 1MB")
+
+// looksLikeAuthDecisionFrame is a fast pre-filter that avoids json.Unmarshal
+// cost on every PTY input keystroke. We only attempt JSON parsing when the
+// payload looks like a top-level JSON object that contains the literal
+// "auth.tool-decision". A malicious user typing the substring into a PTY
+// would still hit the unmarshal path but fall through (Type field check)
+// without consequence.
+func looksLikeAuthDecisionFrame(buf []byte) bool {
+	if len(buf) < 2 || buf[0] != '{' {
+		return false
+	}
+	// Cheap substring scan; bounded — buf is ≤1MB by frame cap.
+	const needle = "\"auth.tool-decision\""
+	if len(buf) < len(needle) {
+		return false
+	}
+	// Tiny inlined search to avoid pulling in `bytes` here for one match.
+	for i := 0; i+len(needle) <= len(buf); i++ {
+		if buf[i] == '"' && string(buf[i:i+len(needle)]) == needle {
+			return true
+		}
+	}
+	return false
+}
 
 // ErrHeaderTooLarge is returned by serveConn when the newline-
 // terminated header read exceeds MaxHeaderBytes.

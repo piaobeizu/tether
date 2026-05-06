@@ -61,6 +61,20 @@ type Config struct {
 	// rw mode (clients are auto-downgraded to ro).
 	InputSink func(sessionID string, data []byte) error
 
+	// EnableAuthBroker, when true, constructs an AuthBroker bound to
+	// the daemon's envelope emitter and wires it into the attach
+	// socket so auth.tool-decision input frames route through the
+	// broker. Callers that integrate the cc HookServer can fetch
+	// the broker via the OnReady hook to build a BrokerHookHandlers.
+	EnableAuthBroker bool
+
+	// OnReady, when non-nil, is invoked once after the daemon's
+	// shared components (emitter, broker, lock state) are constructed
+	// and BEFORE the supervisor begins running subsystems. Callers
+	// use it as the wiring seam to plumb cc.NewHookServer with a
+	// BrokerHookHandlers driven by daemon.AuthBroker. Optional.
+	OnReady func(DaemonComponents)
+
 	// SubsystemFactories lets tests install fake subsystems in place
 	// of the real daemon/client. nil → use defaultSubsystems with
 	// the components built from this Config.
@@ -73,6 +87,17 @@ type Config struct {
 // context, but the same instance — implementations must NOT keep
 // per-run state on the receiver).
 type SubsystemFactory func() watchdog.Subsystem
+
+// DaemonComponents bundles the shared state the daemon constructs
+// before supervising subsystems. Surfaced via Config.OnReady so
+// callers can wire follow-on integrations (e.g. cc.HookServer with
+// BrokerHookHandlers driven by AuthBroker) without forcing those
+// dependencies into this package's import graph.
+type DaemonComponents struct {
+	Emitter    *agent.EnvelopeEmitter
+	Lock       *lock.Lock
+	AuthBroker *agent.AuthBroker // nil when EnableAuthBroker = false
+}
 
 // Run constructs a Watchdog, registers the configured subsystems,
 // and blocks until ctx is canceled. Returns nil on clean shutdown,
@@ -140,11 +165,21 @@ func Run(ctx context.Context, cfg Config) error {
 
 		lockSM := lock.New()
 
+		var broker *agent.AuthBroker
+		if cfg.EnableAuthBroker {
+			broker, err = agent.NewAuthBroker(emitter)
+			if err != nil {
+				_ = emitter.Close()
+				return fmt.Errorf("daemon: auth broker: %w", err)
+			}
+		}
+
 		attach, err := agent.NewAttachServer(agent.AttachServerConfig{
 			SocketPath: socketPath,
 			Emitter:    emitter,
 			Lock:       lockSM,
 			InputSink:  cfg.InputSink,
+			AuthBroker: broker,
 			OnError: func(err error) {
 				logf("[daemon] attach: %v", err)
 			},
@@ -161,11 +196,22 @@ func Run(ctx context.Context, cfg Config) error {
 		// permanently disabled, see clientSubsystem doc).
 		_ = attach.Close()
 
-		factories = realSubsystems(socketPath, emitter, lockSM, cfg.InputSink, logf)
+		if cfg.OnReady != nil {
+			cfg.OnReady(DaemonComponents{
+				Emitter:    emitter,
+				Lock:       lockSM,
+				AuthBroker: broker,
+			})
+		}
+
+		factories = realSubsystems(socketPath, emitter, lockSM, cfg.InputSink, broker, logf)
 		// emitter lives for the daemon's full lifetime; clean up
 		// on Run exit. clientSubsystem owns its per-run AttachServer
 		// and closes it inside Run's defer.
 		defer func() {
+			if broker != nil {
+				broker.Close()
+			}
 			_ = emitter.Close()
 		}()
 	}
@@ -196,6 +242,7 @@ func realSubsystems(
 	em *agent.EnvelopeEmitter,
 	lockSM *lock.Lock,
 	inputSink func(string, []byte) error,
+	broker *agent.AuthBroker,
 	logf func(format string, args ...any),
 ) []SubsystemFactory {
 	return []SubsystemFactory{
@@ -206,6 +253,7 @@ func realSubsystems(
 				emitter:    em,
 				lock:       lockSM,
 				inputSink:  inputSink,
+				broker:     broker,
 				logf:       logf,
 			}
 		},
@@ -261,6 +309,7 @@ type clientSubsystem struct {
 	emitter    *agent.EnvelopeEmitter
 	lock       *lock.Lock
 	inputSink  func(sessionID string, data []byte) error
+	broker     *agent.AuthBroker // nil unless EnableAuthBroker=true
 	logf       func(format string, args ...any)
 }
 
@@ -273,6 +322,7 @@ func (c *clientSubsystem) Run(ctx context.Context, hb func()) error {
 		Emitter:    c.emitter,
 		Lock:       c.lock,
 		InputSink:  c.inputSink,
+		AuthBroker: c.broker,
 		OnError: func(err error) {
 			if c.logf != nil {
 				c.logf("[daemon] attach: %v", err)

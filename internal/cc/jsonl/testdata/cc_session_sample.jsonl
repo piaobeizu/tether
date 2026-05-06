@@ -1,0 +1,9 @@
+{"type":"last-prompt","leafUuid":"c7c987a9-14e6-465c-80cd-7de1e5b4b1b6","sessionId":"sess-1"}
+{"type":"permission-mode","permissionMode":"auto","sessionId":"sess-1"}
+{"parentUuid":null,"isSidechain":false,"attachment":{"type":"hook_success","hookName":"SessionStart:startup","toolUseID":"tu-1","hookEvent":"SessionStart","content":"","stdout":"hello","stderr":"","exitCode":0,"command":"echo hi","durationMs":1},"type":"attachment","uuid":"u-att-1","timestamp":"2026-04-30T06:54:45.874Z","userType":"external","sessionId":"sess-1"}
+{"parentUuid":null,"isSidechain":false,"type":"user","uuid":"u-user-1","timestamp":"2026-04-30T06:55:00.000Z","sessionId":"sess-1","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}
+{"parentUuid":"u-user-1","isSidechain":false,"type":"assistant","uuid":"u-asst-1","timestamp":"2026-04-30T06:55:01.000Z","sessionId":"sess-1","message":{"role":"assistant","content":[{"type":"text","text":"hello back"}]}}
+{"parentUuid":"u-asst-1","isSidechain":false,"type":"assistant","uuid":"u-asst-2","timestamp":"2026-04-30T06:55:02.000Z","sessionId":"sess-1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/tmp/x"}}]}}
+{"parentUuid":"u-asst-2","isSidechain":false,"type":"user","uuid":"u-user-2","timestamp":"2026-04-30T06:55:03.000Z","sessionId":"sess-1","message":{"role":"user","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":"file contents"}]}}
+{"type":"file-history-snapshot","sessionId":"sess-1"}
+{"type":"ai-title","title":"chat about hi","sessionId":"sess-1"}

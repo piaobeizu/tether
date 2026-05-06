@@ -80,6 +80,19 @@ type SpawnOpts struct {
 	// an inherited variable to empty (vs unset), include it with value
 	// "" — subprocess sees the empty string.
 	Env map[string]string
+
+	// SettingsPath, when non-empty, is forwarded to claude as
+	// `--settings <path>` so cc loads its settings.json (hook wiring,
+	// permission routing, etc.) from a daemon-owned file rather than the
+	// user's `~/.claude/settings.json`. This is the seam the daemon uses
+	// to point cc at the loopback HookServer (see internal/cc/hooks.go::
+	// WriteSettingsFile + internal/daemon HookSettingsDir).
+	//
+	// Empty preserves the legacy behavior (cc reads its default
+	// settings location). Callers that don't run a daemon (e.g. the
+	// `tether resume` exec wrapper without the daemon attached) leave
+	// this empty.
+	SettingsPath string
 }
 
 // Subprocess is a running claude subprocess with stdio pipes.
@@ -134,6 +147,9 @@ func BuildArgs(opts SpawnOpts) []string {
 	}
 	if opts.Model != "" {
 		args = append(args, "--model", opts.Model)
+	}
+	if opts.SettingsPath != "" {
+		args = append(args, "--settings", opts.SettingsPath)
 	}
 	return args
 }

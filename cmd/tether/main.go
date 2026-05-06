@@ -71,6 +71,13 @@ func runDaemon(args []string) int {
 			"(default $HOME/.tether/users/default/sessions/default/lock.log; spec §11.D)")
 	noAudit := fs.Bool("no-audit", false,
 		"disable persistent lock audit log (in-memory History only)")
+	enableAuth := fs.Bool("auth-broker", false,
+		"enable the tool-authorization broker + cc hookserver "+
+			"(PreToolUse → UI prompt → decision; "+
+			"writes <hook-settings-dir>/settings.json that cc spawns must point at via --settings)")
+	hookSettingsDir := fs.String("hook-settings-dir", "",
+		"directory for the cc settings.json the daemon generates "+
+			"(default $HOME/.tether/cc-settings; only used when --auth-broker is set)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -95,6 +102,16 @@ func runDaemon(args []string) int {
 		AttachSocketPath: *attachSocket,
 		LockAuditLogPath: *lockAuditLog,
 		DisableLockAudit: *noAudit,
+		EnableAuthBroker: *enableAuth,
+		HookSettingsDir:  *hookSettingsDir,
+		// Surface the resolved settings.json path on stdout so
+		// downstream tooling (the future `tether resume` integration,
+		// or a session-spawning sidecar) can read it without poking
+		// at the filesystem default. v0.1 daemon doesn't itself spawn
+		// cc — that's intentional; see PR description.
+		OnHookSettingsReady: func(path string) {
+			fmt.Fprintf(os.Stderr, "tether daemon: cc settings → %s\n", path)
+		},
 	}
 	if err := daemon.Run(ctx, cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "tether daemon: %v\n", err)

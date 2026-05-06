@@ -90,12 +90,20 @@ func skillInstall(args []string) int {
 // (Phase 9): mapped to {name, v, on, desc, update} in
 // tether-app/src/store/loadSkills.ts. DO NOT rename without updating
 // the TS-side translator.
+//
+// Note for the Rust bridge: `json.NewEncoder(...).Encode(rows)` appends
+// a trailing '\n'. Use `serde_json::from_slice` or `from_str`, both of
+// which tolerate trailing whitespace; do not byte-equality-check raw
+// stdout.
 type skillListJSONRow struct {
 	Name        string `json:"name"`
 	Version     string `json:"version"`
 	Description string `json:"description"`
-	// Optional — omitted when the skill ships no tether.toml or no
-	// enablement field. The TS side defaults `on=true` for omitted.
+	// Optional. v0.1: never set — `internal/skill.SkillSection` has no
+	// `Enabled` field, so `pool.Info(n)` cannot populate it. Reserved
+	// for the workspace-level resolver follow-up (when tether.toml
+	// learns to express per-workspace enablement). The TS side
+	// defaults `on=true` when omitted.
 	Enabled *bool `json:"enabled,omitempty"`
 	// Optional — populated when an update channel reports a newer
 	// release. v0.1: never set (no registry probe).

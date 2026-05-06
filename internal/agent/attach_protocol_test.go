@@ -15,9 +15,12 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -127,7 +130,7 @@ func TestAttachProtocol_FrameSizePrefix(t *testing.T) {
 
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	var lenBuf [4]byte
-	if _, err := readFull(conn, lenBuf[:]); err != nil {
+	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
 		t.Fatalf("read length prefix: %v", err)
 	}
 	n := binary.BigEndian.Uint32(lenBuf[:])
@@ -138,7 +141,7 @@ func TestAttachProtocol_FrameSizePrefix(t *testing.T) {
 		t.Errorf("ack length prefix = %d, want 0 < n <= 65536", n)
 	}
 	payload := make([]byte, n)
-	if _, err := readFull(conn, payload); err != nil {
+	if _, err := io.ReadFull(conn, payload); err != nil {
 		t.Fatalf("read payload: %v", err)
 	}
 	var v map[string]any
@@ -161,7 +164,23 @@ func TestAttachProtocol_FrameSizePrefix(t *testing.T) {
 func TestAttachProtocol_HeaderTooLargeIsRejected(t *testing.T) {
 	t.Parallel()
 
-	srv, sockPath := newTestAttachServer(t)
+	// Capture daemon-side errors so we can assert the daemon rejected
+	// for the SPECIFIC reason we expect (ErrHeaderTooLarge), not just
+	// "conn dropped for any reason" — a buggy daemon panic would also
+	// drop the conn.
+	var (
+		errMu     sync.Mutex
+		caughtErr error
+	)
+	srv, sockPath := newTestAttachServerWithOpts(t, func(err error) {
+		errMu.Lock()
+		defer errMu.Unlock()
+		// First error wins — subsequent close-related errors get
+		// folded so we keep the root cause.
+		if caughtErr == nil {
+			caughtErr = err
+		}
+	})
 	ctx, cancel := context.WithCancel(context.Background())
 	srvDone := make(chan error, 1)
 	go func() { srvDone <- srv.Serve(ctx) }()
@@ -184,8 +203,8 @@ func TestAttachProtocol_HeaderTooLargeIsRejected(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Send 65KB of garbage with no newline. The daemon should bail
-	// somewhere around byte 65536 and close the conn.
+	// Send 65KB+1024 of garbage with no newline. The daemon should bail
+	// at byte MaxHeaderBytes and close the conn.
 	junk := make([]byte, agent.MaxHeaderBytes+1024)
 	for i := range junk {
 		junk[i] = 'x'
@@ -203,11 +222,37 @@ func TestAttachProtocol_HeaderTooLargeIsRejected(t *testing.T) {
 	if err == nil && n > 0 {
 		t.Errorf("daemon kept conn open after oversized header (got %d bytes: %q)", n, buf[:n])
 	}
+
+	// Hard assertion: the OnError callback fired with ErrHeaderTooLarge.
+	// Conn-level close events arrive before serveConn's reportError on
+	// some kernels — wait briefly for the error to land.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		errMu.Lock()
+		got := caughtErr
+		errMu.Unlock()
+		if got != nil {
+			if !errors.Is(got, agent.ErrHeaderTooLarge) {
+				t.Errorf("expected ErrHeaderTooLarge, got %v", got)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Error("OnError never fired — daemon dropped the conn for some other reason")
 }
 
 // --- helpers ---
 
 func newTestAttachServer(t *testing.T) (*agent.AttachServer, string) {
+	return newTestAttachServerWithOpts(t, nil)
+}
+
+// newTestAttachServerWithOpts is the variant for tests that need to
+// observe daemon-side errors (e.g. asserting ErrHeaderTooLarge fires
+// for the right reason, not just "conn dropped"). Pass nil for
+// onError to get the bare-bones server.
+func newTestAttachServerWithOpts(t *testing.T, onError func(error)) (*agent.AttachServer, string) {
 	t.Helper()
 	tmp := t.TempDir()
 	sockPath := filepath.Join(tmp, "attach.sock")
@@ -229,6 +274,7 @@ func newTestAttachServer(t *testing.T) (*agent.AttachServer, string) {
 		Emitter:    em,
 		Lock:       lk,
 		SocketPerm: 0o600,
+		OnError:    onError,
 	})
 	if err != nil {
 		_ = em.Close()
@@ -240,18 +286,4 @@ func newTestAttachServer(t *testing.T) (*agent.AttachServer, string) {
 		_ = os.Remove(sockPath)
 	})
 	return srv, sockPath
-}
-
-// readFull is io.ReadFull inlined (avoids an io import-cycle warning
-// from the linter when we have only one consumer).
-func readFull(c net.Conn, buf []byte) (int, error) {
-	total := 0
-	for total < len(buf) {
-		n, err := c.Read(buf[total:])
-		total += n
-		if err != nil {
-			return total, err
-		}
-	}
-	return total, nil
 }

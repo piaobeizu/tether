@@ -47,6 +47,36 @@ import (
 // full (drop oldest).
 const DefaultPTYRingSize = 64 * 1024
 
+// F-07 cancel-in-flight pacing. Spec §5.3 + Appendix B/F-07 require the
+// daemon to space the two cancel keystrokes so cc can react to each one
+// before the next arrives:
+//
+//  1. Esc (0x1b)              — tells cc to abort the in-flight turn;
+//     cc then re-renders the input box with
+//     the original prompt restored.
+//  2. sleep CancelEscToCtrlUDelay (500–800 ms per spec)
+//  3. Ctrl+U (0x15)           — clears whatever cc put back into the
+//     input line.
+//  4. sleep CancelCtrlUSettleDelay (200–500 ms per spec) before the
+//     caller is allowed to write a new prompt.
+//
+// We pick the lower bound of each range as the default — long enough to
+// be safe per PoC-1, short enough that the user sees a snappy "stop"
+// button. Exported so callers / tests can override if cc upstream
+// changes timing.
+const (
+	CancelEscToCtrlUDelay  = 500 * time.Millisecond
+	CancelCtrlUSettleDelay = 200 * time.Millisecond
+)
+
+// Cancel byte literals — kept as named constants so the byte-order
+// requirement (Esc THEN Ctrl+U, never the other way) is grep-able and
+// not buried in a magic-number slice. See §5.3 / F-07.
+const (
+	cancelByteEsc   byte = 0x1b // Esc — cancels cc's in-flight generation.
+	cancelByteCtrlU byte = 0x15 // Ctrl+U — clears the input line cc restores.
+)
+
 // SpawnMode names which subprocess flavor a caller wants for cc.
 //
 //   - SpawnModeStdio: the existing NDJSON stream-json mode. Used by the
@@ -192,6 +222,13 @@ type PTYSession struct {
 	closeOnce sync.Once
 	closeErr  error
 	doneCh    chan struct{}
+
+	// cancelWriter / cancelSleep are test seams for verifying the F-07
+	// cancel sequence (byte order + sleep durations) without spawning a
+	// real cc PTY. Production code leaves both nil — CancelInFlight
+	// then writes through s.sub.Master and calls time.Sleep directly.
+	cancelWriter io.Writer
+	cancelSleep  func(time.Duration)
 }
 
 // ptySubscriber is one consumer registered via Subscribe. The buffered
@@ -314,18 +351,53 @@ func (s *PTYSession) SendInput(p []byte) error {
 	return err
 }
 
-// CancelInFlight writes the F-07 input-cancel sequence to the PTY:
-// Ctrl+U (clear current line) followed by Esc (cancel any pending
-// composition). Matches what a human pressing Esc in cc would do.
+// CancelInFlight writes the F-07 input-cancel sequence to the PTY in
+// the order spec §5.3 mandates:
 //
-// Returns ErrSessionClosed if the session is closed.
+//	Esc (0x1b)  →  sleep CancelEscToCtrlUDelay  →  Ctrl+U (0x15)  →  sleep CancelCtrlUSettleDelay
+//
+// Esc MUST go first: it tells cc to abort the in-flight turn, after
+// which cc restores the original prompt into the input box. Ctrl+U
+// then clears that restored line so the caller can compose a new
+// prompt on a clean buffer. Sending them back-to-back (or in reverse
+// order) sometimes wins the race but loses it under load — cc may not
+// have processed the Esc before the line-clear arrives, leaving the
+// turn still generating.
+//
+// The two sleeps are blocking on purpose: a `tether stop` UX is OK
+// taking ~700ms, and the alternative (kicking the timing into the
+// caller) just relocates the same bug. Total wall time ≤ ~1s with
+// the lower-bound defaults.
+//
+// Returns ErrSessionClosed if the session is closed. A short-write or
+// I/O error from either keystroke is returned; the second keystroke is
+// skipped if the first fails.
 func (s *PTYSession) CancelInFlight() error {
 	if s.isClosed() {
 		return ErrSessionClosed
 	}
-	// Ctrl+U = 0x15, Esc = 0x1b.
-	_, err := s.sub.Master.Write([]byte{0x15, 0x1b})
-	return err
+	w := s.cancelWriter
+	if w == nil {
+		w = s.sub.Master
+	}
+	sleep := s.cancelSleep
+	if sleep == nil {
+		sleep = time.Sleep
+	}
+
+	// 1. Esc — cancel cc's in-flight generation.
+	if _, err := w.Write([]byte{cancelByteEsc}); err != nil {
+		return err
+	}
+	// 2. Wait for cc to process Esc and restore the prompt.
+	sleep(CancelEscToCtrlUDelay)
+	// 3. Ctrl+U — clear the restored input line.
+	if _, err := w.Write([]byte{cancelByteCtrlU}); err != nil {
+		return err
+	}
+	// 4. Settle delay before the caller may write a new prompt.
+	sleep(CancelCtrlUSettleDelay)
+	return nil
 }
 
 // Resize updates the PTY winsize. Idempotent on identical inputs.

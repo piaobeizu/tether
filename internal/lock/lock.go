@@ -91,6 +91,27 @@ var ErrNotHolder = errors.New("lock: caller is not current holder")
 // uses time.Now.
 type nowFunc func() time.Time
 
+// LogSink is the durable-audit-log seam. Lock calls Append on every
+// state change (acquire / release / takeover) so the caller can
+// persist the event past process lifetime. Production wires this to
+// NewJSONLLogSink; tests may use a recording fake; nil sink (default
+// constructor with no WithLogSink) means in-memory History only,
+// matching pre-§11.D-persistence behavior.
+//
+// Implementations MUST be safe for concurrent Append. Append is called
+// under the Lock's internal mutex, so a slow sink will serialize
+// state-machine progress — keep it cheap; spec §11.D anticipates low
+// volume (a handful of events per session).
+//
+// An Append error is logged via the sink-error callback (if any, see
+// JSONLLogSinkConfig) but does NOT roll back the state-machine
+// transition: the in-memory state is the source of truth for the
+// current session; the on-disk log is best-effort durability for
+// post-mortem audit.
+type LogSink interface {
+	Append(ev TakeoverEvent) error
+}
+
 // Lock is the per-session writer-lock state machine. It's safe for
 // concurrent use. Construct via New.
 //
@@ -106,6 +127,8 @@ type Lock struct {
 	autoReleaseWindow time.Duration
 	now               nowFunc
 	history           []TakeoverEvent
+	sink              LogSink
+	onSinkErr         func(error)
 }
 
 // Option configures Lock at construction time.
@@ -128,6 +151,33 @@ func WithClock(now func() time.Time) Option {
 		if now != nil {
 			l.now = now
 		}
+	}
+}
+
+// WithLogSink installs a durable LogSink. nil sink is silently ignored
+// (back-compat with tests + the in-memory-only constructor). The sink
+// receives one Append call per emitted TakeoverEvent, in event order.
+//
+// Append is called while the Lock's internal mutex is held — the sink
+// MUST NOT call back into the same Lock or it will deadlock. JSONL
+// file sinks (NewJSONLLogSink) only touch their own file lock, so
+// they're safe.
+func WithLogSink(sink LogSink) Option {
+	return func(l *Lock) {
+		if sink != nil {
+			l.sink = sink
+		}
+	}
+}
+
+// WithSinkErrorHandler installs a callback invoked when LogSink.Append
+// returns an error. Passing nil disables the callback (errors are
+// silently dropped). Production wires this to a logger; the lock state
+// machine never blocks or rolls back on sink errors — durability is
+// best-effort, the in-memory state is authoritative.
+func WithSinkErrorHandler(fn func(error)) Option {
+	return func(l *Lock) {
+		l.onSinkErr = fn
 	}
 }
 
@@ -297,12 +347,14 @@ func (l *Lock) Release(c ClientID) error {
 	prev := l.holder
 	l.holder = ClientID{}
 	l.lastWriteAt = time.Time{}
-	l.history = append(l.history, TakeoverEvent{
+	ev := TakeoverEvent{
 		At:         l.now(),
 		Reason:     ReleaseExplicit,
 		PrevHolder: prev,
 		NewHolder:  ClientID{},
-	})
+	}
+	l.history = append(l.history, ev)
+	l.emitLocked(ev)
 	return nil
 }
 
@@ -348,12 +400,14 @@ func (l *Lock) grantLocked(c ClientID, at time.Time, reason AcquireReason) {
 	prev := l.holder
 	l.holder = c
 	l.lastWriteAt = at
-	l.history = append(l.history, TakeoverEvent{
+	ev := TakeoverEvent{
 		At:         at,
 		Reason:     reason,
 		PrevHolder: prev,
 		NewHolder:  c,
-	})
+	}
+	l.history = append(l.history, ev)
+	l.emitLocked(ev)
 }
 
 // reapStaleLocked checks staleness of the current holder and releases if
@@ -368,11 +422,30 @@ func (l *Lock) reapStaleLocked() bool {
 	prev := l.holder
 	l.holder = ClientID{}
 	l.lastWriteAt = time.Time{}
-	l.history = append(l.history, TakeoverEvent{
+	ev := TakeoverEvent{
 		At:         l.now(),
 		Reason:     ReleaseAuto,
 		PrevHolder: prev,
 		NewHolder:  ClientID{},
-	})
+	}
+	l.history = append(l.history, ev)
+	l.emitLocked(ev)
 	return true
+}
+
+// emitLocked dispatches a freshly-recorded event to the configured
+// LogSink (if any). Caller MUST already hold l.mu. Errors are routed
+// to the sink-error handler (or dropped) — never bubble up.
+//
+// Synchronous on purpose: §11.D audit log is meant to be durable, so a
+// crash immediately after the in-memory transition should still find
+// the event on disk. The throughput cost is negligible (a few events
+// per session). If profiling later shows otherwise we can buffer.
+func (l *Lock) emitLocked(ev TakeoverEvent) {
+	if l.sink == nil {
+		return
+	}
+	if err := l.sink.Append(ev); err != nil && l.onSinkErr != nil {
+		l.onSinkErr(err)
+	}
 }

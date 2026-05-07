@@ -135,6 +135,20 @@ type SpawnOpts struct {
 	// ProviderConfig is a provider-specific escape hatch. Keys outside the
 	// provider's known set must be silently ignored.
 	ProviderConfig map[string]any
+
+	// SettingsPath, when non-empty, points the agent at a daemon-owned
+	// settings.json (cc: hook wiring + permission routing). Empty means
+	// the agent reads its default user-level config — the legacy
+	// behavior preserved for callers that don't run a daemon.
+	//
+	// For ClaudeCodeProvider this forwards to claude.SpawnOpts.SettingsPath
+	// → cc's `--settings <path>` flag. Other providers may ignore.
+	//
+	// Callers (cmd/tether/*) typically populate this via
+	// resolveCCSettings(); see cmd/tether/cc_settings.go for the
+	// precedence chain. v0.1 daemon doesn't itself spawn cc — once it
+	// does, this is the seam it'll use.
+	SettingsPath string
 }
 
 // HookCap describes one hook event the provider can fire toward tether.

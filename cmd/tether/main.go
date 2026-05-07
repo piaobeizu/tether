@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/piaobeizu/tether/internal/daemon"
@@ -122,6 +123,15 @@ func runDaemon(args []string) int {
 
 // runResume parses flags + dispatches to the resume wrapper. Returns an
 // exit code.
+//
+// cc settings precedence (highest first):
+//
+//  1. --settings flag
+//  2. TETHER_HOOK_SETTINGS env var
+//  3. $HOME/.tether/cc-settings/settings.json (only when present on disk)
+//
+// When all three resolve to empty, no `--settings` arg is passed to cc —
+// preserving legacy behavior for users running without `--auth-broker`.
 func runResume(argv []string) int {
 	fs := flag.NewFlagSet("resume", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -130,9 +140,12 @@ func runResume(argv []string) int {
 	dryRun := fs.Bool("dry-run", false, "print resolved cwd + argv, do not exec claude")
 	binary := fs.String("binary", "claude", "path/name of the claude binary to exec")
 	projectsDir := fs.String("projects-dir", "", "override ~/.claude/projects (for tests)")
+	settings := fs.String("settings", "",
+		"path to cc settings.json (overrides TETHER_HOOK_SETTINGS env + the "+
+			"$HOME/.tether/cc-settings/settings.json default; empty means rely on the precedence chain)")
 
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: tether resume <sid> [--bucket B] [--cwd PATH] [--dry-run] [--binary PATH]")
+		fmt.Fprintln(os.Stderr, "usage: tether resume <sid> [--bucket B] [--cwd PATH] [--dry-run] [--binary PATH] [--settings PATH]")
 		fmt.Fprintln(os.Stderr, "")
 		fs.PrintDefaults()
 	}
@@ -170,14 +183,20 @@ func runResume(argv []string) int {
 		return 1
 	}
 
+	settingsPath := *settings
+	if settingsPath == "" {
+		settingsPath = resolveCCSettings(defaultHomeProvider)
+	}
+
 	if *dryRun {
 		fmt.Printf("cwd:    %s\n", res.Cwd)
 		fmt.Printf("bucket: %s\n", res.Bucket)
-		fmt.Printf("exec:   %s --resume %s\n", *binary, sid)
+		argv := BuildResumeArgv(*binary, sid, settingsPath)
+		fmt.Printf("exec:   %s\n", strings.Join(argv, " "))
 		return 0
 	}
 
-	if err := ExecClaude(*binary, res.Cwd, sid); err != nil {
+	if err := ExecClaude(*binary, res.Cwd, sid, settingsPath); err != nil {
 		fmt.Fprintf(os.Stderr, "tether resume: %v\n", err)
 		return 1
 	}

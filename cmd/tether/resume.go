@@ -303,8 +303,33 @@ func EncodeBucket(cwd string) string {
 	return strings.ReplaceAll(cwd, "/", "-")
 }
 
-// ExecClaude execve's into `claude --resume <sid>` after chdir'ing to cwd.
-// On success this never returns. Returns an error only if chdir or exec fail.
+// BuildResumeArgv produces the argv (including argv[0]) for the claude
+// invocation `tether resume` execve's into. Pure helper, exported for
+// tests so they can assert flag wiring without exercising the full
+// process replacement.
+//
+// settingsPath, when non-empty, appends `--settings <path>` so cc loads
+// its hook config from the daemon-owned settings.json (PR #44 hookserver
+// integration). Empty preserves legacy behavior — cc reads its default
+// `~/.claude/settings.json`.
+func BuildResumeArgv(binary, sid, settingsPath string) []string {
+	argv := []string{binary, "--resume", sid}
+	if settingsPath != "" {
+		argv = append(argv, "--settings", settingsPath)
+	}
+	return argv
+}
+
+// execClaudeSyscall is the production execve path. It's a package-level
+// var so tests can stub it with a recorder that captures argv without
+// actually replacing the test process. Production code MUST NOT mutate.
+var execClaudeSyscall = func(argv0 string, argv []string, env []string) error {
+	return syscall.Exec(argv0, argv, env)
+}
+
+// ExecClaude execve's into `claude --resume <sid> [--settings <p>]` after
+// chdir'ing to cwd. On success this never returns. Returns an error only
+// if chdir or exec fail.
 //
 // We use syscall.Exec rather than exec.Command + Run so that the user gets a
 // PTY-attached claude with no Go process in the middle — clean signal
@@ -315,7 +340,11 @@ func EncodeBucket(cwd string) string {
 // only emits paths that exist on disk), but a malformed bucket name like
 // `-tmp-..-etc` could in principle slip through the naive fallback —
 // hard-fail here rather than silently chdir'ing to an unintended location.
-func ExecClaude(binary, cwd, sid string) error {
+//
+// settingsPath, when non-empty, is forwarded to cc as `--settings <path>`
+// so the daemon's hookserver wiring (PR #44) actually fires. Empty
+// preserves the pre-PR behavior (cc reads ~/.claude/settings.json).
+func ExecClaude(binary, cwd, sid, settingsPath string) error {
 	cwd = filepath.Clean(cwd)
 	if hasDotDot(cwd) {
 		return fmt.Errorf("refusing to chdir: %q contains .. segments after Clean", cwd)
@@ -327,8 +356,8 @@ func ExecClaude(binary, cwd, sid string) error {
 	if err := os.Chdir(cwd); err != nil {
 		return fmt.Errorf("chdir %s: %w", cwd, err)
 	}
-	argv := []string{resolvedBin, "--resume", sid}
-	return syscall.Exec(resolvedBin, argv, os.Environ())
+	argv := BuildResumeArgv(resolvedBin, sid, settingsPath)
+	return execClaudeSyscall(resolvedBin, argv, os.Environ())
 }
 
 // hasDotDot reports whether p has any `..` segment after splitting on the

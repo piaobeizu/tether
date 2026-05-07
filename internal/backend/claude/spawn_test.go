@@ -54,6 +54,29 @@ func TestBuildArgs_ResumeAndModel(t *testing.T) {
 	}
 }
 
+// TestBuildArgs_WithSettings exercises the seam PR #44 added: SettingsPath
+// → `--settings <path>`. Empty omits the flag entirely (covered by
+// TestBuildArgs_Defaults). pf2.resume-settings-wire is the consumer side
+// of this seam — populate the field from the resolver in cmd/tether and
+// cc finally honors the daemon-owned settings.json.
+func TestBuildArgs_WithSettings(t *testing.T) {
+	args := BuildArgs(SpawnOpts{SettingsPath: "/tmp/cc-settings/settings.json"})
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--settings /tmp/cc-settings/settings.json") {
+		t.Errorf("settings flag missing: %q", joined)
+	}
+}
+
+// TestBuildArgs_NoSettingsWhenEmpty asserts the negative complement —
+// empty SettingsPath emits no `--settings` token.
+func TestBuildArgs_NoSettingsWhenEmpty(t *testing.T) {
+	args := BuildArgs(SpawnOpts{SettingsPath: ""})
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "--settings") {
+		t.Errorf("--settings should be omitted when SettingsPath empty: %q", joined)
+	}
+}
+
 // F.2 verification: empty PATH + missing binary → ErrBinaryNotFound carrying PATH.
 func TestSpawn_BinaryNotFound(t *testing.T) {
 	t.Setenv("PATH", "/this/path/intentionally/empty")

@@ -475,6 +475,15 @@ func (s *AttachServer) readInputs(_ context.Context, conn *attachConn, br *bufio
 		// still reach this point for non-auth-decision frames; drop
 		// them silently — a ro client has no business sending PTY
 		// bytes, and there's no InputSink to receive them anyway.
+		//
+		// **v0.1 reality check**: the daemon never wires InputSink
+		// (per spec D-04 / §11.W: daemon supervises, session owners
+		// spawn cc), so this entire `if InputSink != nil` block is
+		// effectively unreachable in production v0.1 — the lock
+		// state machine + lock.log audit trail are running
+		// infrastructure but receive no traffic. Tests exercise this
+		// branch with a recorder InputSink, which is the right shape
+		// for the eventual v0.2 daemon-side cc spawn integration.
 		if conn.mode != AttachModeReadWrite || s.cfg.InputSink == nil {
 			continue
 		}

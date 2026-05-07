@@ -592,6 +592,195 @@ func TestSubscribeFromOffset_RejectsUnsupported(t *testing.T) {
 	}
 }
 
+// --- bucket-layout tests (cc's per-cwd subdir structure) ---
+
+// TestWatcher_BucketSubdir_PicksUpExistingFile verifies that at startup
+// the watcher walks one level into root and registers .jsonl files
+// inside bucket subdirs (cc-sdk-route §D.1 layout: root/<encoded-cwd>/<sid>.jsonl).
+func TestWatcher_BucketSubdir_PicksUpExistingFile(t *testing.T) {
+	root := t.TempDir()
+	bucket := filepath.Join(root, "bucket-A")
+	must(t, os.MkdirAll(bucket, 0o755))
+	sid := "sess-bucket-existing"
+	path := filepath.Join(bucket, sid+".jsonl")
+	must(t, os.WriteFile(path, []byte(
+		`{"type":"user","uuid":"u1","sessionId":"`+sid+`","message":{"role":"user","content":[]}}`+"\n"), 0o644))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w, err := New(ctx, root, Options{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer w.Close()
+
+	ch := w.Subscribe(sid)
+
+	// Trigger a re-read by appending another line.
+	must(t, appendLine(path,
+		`{"type":"assistant","uuid":"a1","sessionId":"`+sid+`","message":{"role":"assistant","content":[]}}`))
+
+	envs := readWithTimeout(t, ch, 2, 3*time.Second)
+	if len(envs) != 2 {
+		t.Fatalf("got %d envelopes, want 2", len(envs))
+	}
+	if envs[0].SourceUUID != "u1" || envs[1].SourceUUID != "a1" {
+		t.Errorf("envelope order/uuid: got %q, %q", envs[0].SourceUUID, envs[1].SourceUUID)
+	}
+}
+
+// TestWatcher_BucketCreatedAtRuntime_NewFile verifies that a bucket
+// directory created AFTER the watcher starts is discovered, watched,
+// and its newly-written .jsonl is tracked.
+func TestWatcher_BucketCreatedAtRuntime_NewFile(t *testing.T) {
+	root := t.TempDir()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w, err := New(ctx, root, Options{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer w.Close()
+
+	sid := "sess-bucket-runtime"
+	ch := w.Subscribe(sid)
+
+	bucket := filepath.Join(root, "bucket-B")
+	must(t, os.MkdirAll(bucket, 0o755))
+
+	// Give fsnotify a moment to deliver the bucket Create + addBucket
+	// to register the inner watch before the file write fires.
+	time.Sleep(100 * time.Millisecond)
+
+	path := filepath.Join(bucket, sid+".jsonl")
+	must(t, os.WriteFile(path, []byte(
+		`{"type":"user","uuid":"u1","sessionId":"`+sid+`","message":{"role":"user","content":[]}}`+"\n"), 0o644))
+
+	envs := readWithTimeout(t, ch, 1, 3*time.Second)
+	if envs[0].SourceUUID != "u1" {
+		t.Errorf("uuid = %q", envs[0].SourceUUID)
+	}
+}
+
+// TestWatcher_BucketRemoved_StopsLeaking verifies that removing a
+// bucket directory causes its file state to be dropped — w.files no
+// longer holds entries for files under that bucket, and w.buckets no
+// longer holds the bucket itself.
+func TestWatcher_BucketRemoved_StopsLeaking(t *testing.T) {
+	root := t.TempDir()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w, err := New(ctx, root, Options{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer w.Close()
+
+	sid := "sess-bucket-remove"
+	_ = w.Subscribe(sid)
+
+	bucket := filepath.Join(root, "bucket-C")
+	must(t, os.MkdirAll(bucket, 0o755))
+	time.Sleep(100 * time.Millisecond)
+
+	path := filepath.Join(bucket, sid+".jsonl")
+	must(t, os.WriteFile(path, []byte(
+		`{"type":"user","uuid":"u1","sessionId":"`+sid+`","message":{"role":"user","content":[]}}`+"\n"), 0o644))
+
+	// Wait for openFile to register the file.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		w.mu.Lock()
+		_, present := w.files[path]
+		w.mu.Unlock()
+		if present {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	w.mu.Lock()
+	if _, present := w.files[path]; !present {
+		w.mu.Unlock()
+		t.Fatalf("expected w.files[%q] to be registered before removal", path)
+	}
+	w.mu.Unlock()
+
+	// Now remove the bucket entirely.
+	must(t, os.RemoveAll(bucket))
+
+	// Wait for cleanup to land.
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		w.mu.Lock()
+		_, fileLeft := w.files[path]
+		_, bucketLeft := w.buckets[bucket]
+		w.mu.Unlock()
+		if !fileLeft && !bucketLeft {
+			return // success
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, present := w.files[path]; present {
+		t.Errorf("w.files[%q] leaked after bucket RemoveAll", path)
+	}
+	if _, present := w.buckets[bucket]; present {
+		t.Errorf("w.buckets[%q] leaked after bucket RemoveAll", bucket)
+	}
+}
+
+// TestWatcher_HiddenDirSkipped verifies that a hidden directory at
+// startup (e.g. `.git`) is NOT registered as a bucket — avoids inotify
+// churn from VCS / OS metadata dirs that may sit alongside cc buckets.
+func TestWatcher_HiddenDirSkipped(t *testing.T) {
+	root := t.TempDir()
+	hidden := filepath.Join(root, ".git")
+	must(t, os.MkdirAll(hidden, 0o755))
+	// Drop a fake .jsonl inside; watcher must NOT pick it up.
+	must(t, os.WriteFile(filepath.Join(hidden, "should-not-track.jsonl"),
+		[]byte(`{"type":"user","uuid":"x","sessionId":"x","message":{"role":"user","content":[]}}`+"\n"), 0o644))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w, err := New(ctx, root, Options{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer w.Close()
+
+	w.mu.Lock()
+	if _, present := w.buckets[hidden]; present {
+		w.mu.Unlock()
+		t.Fatalf("hidden dir %q was registered as a bucket; should be skipped", hidden)
+	}
+	for fp := range w.files {
+		if filepath.Dir(fp) == hidden {
+			w.mu.Unlock()
+			t.Fatalf("file under hidden dir %q was registered: %q", hidden, fp)
+		}
+	}
+	w.mu.Unlock()
+
+	// Also verify a runtime-created hidden dir is ignored.
+	hidden2 := filepath.Join(root, ".DS_Store")
+	must(t, os.MkdirAll(hidden2, 0o755))
+	time.Sleep(150 * time.Millisecond)
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, present := w.buckets[hidden2]; present {
+		t.Fatalf("runtime hidden dir %q was registered as a bucket", hidden2)
+	}
+}
+
 // --- helpers ---
 
 func must(t *testing.T, err error) {

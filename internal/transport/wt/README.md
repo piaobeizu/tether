@@ -4,10 +4,14 @@ This package is the daemon-side **WebTransport-over-HTTP/3** server that
 the desktop and mobile apps will dial into per spec
 [`2026-04-26-tether-go-quic-design.md`] §3.3 / §11.V (D-13 / D-21).
 
-## Status: SLICE #2 — channel multiplex layered onto the slice #1 listener
+## Status: SLICE #3 (envelope dispatch) wired into the daemon
 
-Slice #1 shipped the listener skeleton + a single-stream JSON echo handler.
-Slice #2 replaces that with the real **5-channel router** from §3.3.3.
+- Slice #1 shipped the listener skeleton.
+- Slice #2 added the 5-channel router from §3.3.3.
+- Slice #3 added `WireEnvelope` + `Seal` / `Open` + `PushEnvelopeStream`.
+- **This wire-up slice** plugs slice #3's dispatcher into the daemon
+  via `daemon.Config.WTKeySource` + a real `Config.SessionHandler`
+  (see [v0.1 wire-up](#v01-wire-up) below).
 
 ### What this slice ships
 
@@ -175,6 +179,56 @@ the full 5-channel surface.
    already on in the server's `quic.Config`; the test client and
    `wt.Dial` set it explicitly. Forgetting it on a custom client
    silently turns `SendDatagram` into a no-op.
+
+## v0.1 wire-up
+
+The daemon's `wtSubsystem` (in `internal/daemon/wtsubsystem.go`) wires
+`PushEnvelopeStream` into production via a real `Config.SessionHandler`.
+Per accepted WT session:
+
+1. **Accept the control stream** (`sess.Control(ctx)`).
+2. **Read the v0.1 sid header** — `wt.ReadSessionIDHeader(ctrl)`. The
+   client sends one JSON line: `{"sessionId":"..."}\n`. This is a
+   PLACEHOLDER pre-protocol — slice #4's `pair.invite` carries the sid
+   inside the real device-pairing handshake. Migration plan:
+   - slice #4 lands `pair.invite` with `attachToSession` (or whatever
+     the spec §11.AB names it).
+   - The daemon's SessionHandler tries `pair.invite` first and falls
+     back to `SessionIDHeader` if the peer is a pre-pair build.
+   - After all clients ship pair, `header.go` is deleted.
+3. **Resolve the per-session shared key** via `daemon.Config.WTKeySource(sid)`.
+   Default (nil) returns `wt.DevSharedKey[:]`. Slice #4 swaps in a
+   `pair.Registry` lookup.
+4. **Subscribe to the daemon's envelope emitter** for that sid
+   (`emitter.Subscribe(sid)`).
+5. **Open the events bidi stream** (`sess.Events(ctx)`) and call
+   `wt.PushEnvelopeStream` until ctx cancels, the subscriber closes,
+   or the write side errors.
+
+### Architectural decisions baked into the wire-up
+
+| Decision | v0.1 choice | Migration |
+|---|---|---|
+| **sid header format** | `{"sessionId":"..."}\n` JSON line on control | superseded by `pair.invite` (slice #4) |
+| **`fromDeviceId`** | hardcoded `"daemon-default"` | real device-id from pair handshake |
+| **`toDeviceId`** | the WT session's `RemoteAddr` | pair-handshake-supplied device-id |
+| **Shared key** | `wt.DevSharedKey` (constant 32B) | per-pair ECDH-negotiated key via `WTKeySource` |
+| **Backpressure** | `PushEnvelopeStream`'s drop-newest-on-full + emitter's per-sub buffer (cap 64, see `agent.envelope_emitter.go`) — drops at the WT write side surface as a stream error and tear the session down | tunable per-channel buffers + flow control once we have real traffic to measure |
+
+### `WTKeySource` shape
+
+```go
+// daemon.Config:
+WTKeySource func(sid string) ([]byte, error)
+```
+
+- Called once per accepted WT session, AFTER the sid header arrives.
+- Must return a 32-byte (`wt.SharedKeySize`) key or an error. A non-32
+  return is rejected with `wt key source returned N bytes (want 32)`.
+- Nil callback → daemon defaults to `wt.DevSharedKey[:]` so the
+  default boot path works without pair plumbing.
+- Slice #4 (pair) re-implements this against `pair.Registry`. The WT
+  subsystem itself does not change.
 
 ## Spec cross-references
 

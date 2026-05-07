@@ -149,6 +149,32 @@ type Config struct {
 	// leaves it nil and lets WTListenAddr drive the bind.
 	WTListener net.PacketConn
 
+	// OnEmitterReady, when non-nil, is invoked once after the daemon
+	// constructs the envelope emitter (before the supervisor starts).
+	// Tests use this to obtain a handle for `emitter.Inject(...)`
+	// without touching the JSONL filesystem (cc would normally drive
+	// the watcher; tests inject envelopes directly to keep the test
+	// hermetic). Production callers leave this nil.
+	OnEmitterReady func(*agent.EnvelopeEmitter)
+
+	// WTKeySource resolves the per-session shared key for envelope
+	// sealing. Called once per WT session AFTER the control-stream
+	// header identifies the cc session id (slice #4 pair lookup will
+	// extend this to a real device-id keyed lookup).
+	//
+	// `sid` is the cc session id learned from the v0.1 control header
+	// (see wt.SessionIDHeader). Implementations return the 32-byte
+	// AEAD shared key used to seal envelopes pushed onto the events
+	// stream of this WT session.
+	//
+	// If nil, the daemon defaults to wt.DevSharedKey[:] for every
+	// session — i.e. the same key the cross-stack tests exercise. This
+	// keeps the v0.1 default working without any pair plumbing.
+	//
+	// Slice #4 swaps this for a pair.Registry lookup; the WT subsystem
+	// will continue to call WTKeySource with no behavioral change.
+	WTKeySource func(sid string) ([]byte, error)
+
 	// EnableStubSweeper opts in to the GC stub-session sweeper
 	// (internal/daemon/sweeper.go). Default false for v0.1: ship
 	// behind a flag, validate on real workloads, then flip default.
@@ -243,6 +269,9 @@ func Run(ctx context.Context, cfg Config) error {
 		})
 		if err != nil {
 			return fmt.Errorf("daemon: envelope emitter: %w", err)
+		}
+		if cfg.OnEmitterReady != nil {
+			cfg.OnEmitterReady(emitter)
 		}
 
 		// Resolve audit-log path per §11.D and wire the JSONL sink.
@@ -362,15 +391,24 @@ func Run(ctx context.Context, cfg Config) error {
 				Logf:        logf,
 			}))
 		}
-		// WT subsystem — opt-in via WTListenAddr (slice #2 of WT block).
-		// In v0.1 this just accepts sessions and logs; envelope dispatch
-		// is slice #3.
+		// WT subsystem — opt-in via WTListenAddr (slice #2 + #3 of WT
+		// block). When opted in, the wtSubsystem also wires real
+		// envelope dispatch: each session reads a v0.1 sid header off
+		// the control stream, subscribes to the emitter, and pushes
+		// envelopes via wt.PushEnvelopeStream onto the events channel.
 		if cfg.WTListenAddr != "" || cfg.WTListener != nil {
 			addr := cfg.WTListenAddr
 			if addr == "" && cfg.WTListener != nil {
 				addr = cfg.WTListener.LocalAddr().String()
 			}
-			factories = append(factories, wtSubsystemFactory(addr, cfg.WTListener, logf))
+			factories = append(factories, wtSubsystemFactory(wtSubsystemConfig{
+				addr:      addr,
+				listener:  cfg.WTListener,
+				emitter:   emitter,
+				keySource: cfg.WTKeySource,
+				logf:      logf,
+				warnf:     warnf,
+			}))
 		}
 		// emitter lives for the daemon's full lifetime; clean up
 		// on Run exit. clientSubsystem owns its per-run AttachServer

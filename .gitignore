@@ -22,3 +22,6 @@
 
 # OS
 .DS_Store
+
+# Local dev runtime state from scripts/dev.sh
+.dev/

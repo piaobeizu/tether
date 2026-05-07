@@ -31,6 +31,11 @@ type Result struct {
 	// SAS is the 6-character display string both endpoints saw. Used
 	// in tests + UX confirmation; not security-relevant after pairing.
 	SAS string
+
+	// LongTermKeyID is the daemon-assigned record id from pair.complete
+	// (spec §3.4). Echoed back to the UI for display. Empty on the
+	// responder side (the responder ASSIGNS it; the initiator OBSERVES it).
+	LongTermKeyID string
 }
 
 // SASConfirmer is the user-confirm hook. The driver calls Confirm with
@@ -52,10 +57,22 @@ var AutoConfirm SASConfirmer = SASConfirmFunc(func(string) error { return nil })
 
 // Identity carries the local device's stable metadata that gets baked
 // into pair.invite / pair.accept frames.
+//
+// Model / OSVersion / AppVersion are spec §3.1/§3.2 OPTIONAL deviceMetadata
+// fields. They MUST be included in the canonical body (and thus the
+// transcript) when non-empty. The Rust client already populates these on
+// the wire (e.g. tether-app's UI passes appVersion="tether 0.1.0-dev"
+// through), so the Go side needs to (a) accept them on inbound and (b)
+// include them in canonical body for cross-stack transcript-hash parity.
 type Identity struct {
 	DeviceID    DeviceID
 	Kind        DeviceKind
 	DisplayName string
+	// Optional spec §3.1/§3.2 deviceMetadata fields. Empty string =>
+	// omit from canonical body / wire.
+	Model      string
+	OSVersion  string
+	AppVersion string
 	// PushToken is meaningful only when Kind == KindMobile (responder).
 	PushToken string
 }
@@ -122,6 +139,9 @@ func (c *Client) Run(ctx context.Context, stream io.ReadWriter) (Result, error) 
 		DeviceID:        c.identity.DeviceID,
 		Kind_:           c.identity.Kind,
 		DisplayName:     c.identity.DisplayName,
+		Model:           c.identity.Model,
+		OSVersion:       c.identity.OSVersion,
+		AppVersion:      c.identity.AppVersion,
 		TS_:             c.now().UnixMilli(),
 		Nonce:           mustRandomNonce(c.rand, 16),
 	}
@@ -258,13 +278,24 @@ func (c *Client) Run(ctx context.Context, stream io.ReadWriter) (Result, error) 
 	if _, _, err := fsm.Step(Event{Kind: EventRecvFrame, Frame: frame}); err != nil {
 		return Result{}, err
 	}
-	if frame.Kind() != KindComplete {
-		return Result{}, fmt.Errorf("pair: expected pair.complete, got %s", frame.Kind())
+	complete, ok := frame.(CompleteFrame)
+	if !ok {
+		return Result{}, fmt.Errorf("pair: expected pair.complete, got %T", frame)
 	}
 
-	// 8. Derive long-term keys.
+	// 8. Derive long-term keys, then verify the §3.4 AEAD tag. A rogue
+	//    daemon (or any in-path actor that survived TLS) cannot forge
+	//    this tag without sharing our derived ltk + the same
+	//    transcript_hash. Mismatch ⇒ pair.abort{cert-error}, do NOT
+	//    persist the registry record.
 	ltk, tbk, err := DeriveLongTermKey(shared, thash)
 	if err != nil {
+		return Result{}, err
+	}
+	if err := OpenCompleteTag(ltk, thash, complete.Nonce, complete.Tag); err != nil {
+		ab := abortNow(ReasonCertError, "pair.complete AEAD tag verification failed")
+		ab.TS_ = c.now().UnixMilli()
+		_ = w.writeFrame(ab)
 		return Result{}, err
 	}
 	return Result{
@@ -277,6 +308,7 @@ func (c *Client) Run(ctx context.Context, stream io.ReadWriter) (Result, error) 
 		TransportBindingKey: tbk,
 		TranscriptHash:      thash,
 		SAS:                 sas,
+		LongTermKeyID:       complete.LongTermKeyID,
 	}, nil
 }
 

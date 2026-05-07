@@ -266,6 +266,194 @@ func TestIntegration_HookServerWireup_PreToolUse_AllowOnce(t *testing.T) {
 	}
 }
 
+// TestIntegration_HookServerWireup_NoInputSink_AuthDecisionFlows is
+// the regression test for the dogfood-smoke bug: `tether daemon
+// --auth-broker` runs with InputSink=nil (the daemon doesn't spawn
+// cc itself), which auto-downgrades rw → ro on attach. Before the
+// fix, that downgrade caused readInputs to never start, so the UI's
+// auth.tool-decision frame was never read and the broker timed out
+// at 60s with fail-closed deny — making the entire auth flow inert
+// in production.
+//
+// Fix (attach_socket.go::serveConn): when AuthBroker is wired,
+// readInputs spawns even on ro mode; non-decision frames just drop
+// silently inside readInputs.
+//
+// This test mirrors the AllowOnce test above but explicitly leaves
+// InputSink nil to lock in the production scenario.
+func TestIntegration_HookServerWireup_NoInputSink_AuthDecisionFlows(t *testing.T) {
+	t.Parallel()
+
+	tmp := t.TempDir()
+	projectsDir := filepath.Join(tmp, "projects")
+	attachSocket := filepath.Join(tmp, "attach.sock")
+	hookSettingsDir := filepath.Join(tmp, "cc-settings")
+	if err := os.MkdirAll(projectsDir, 0o700); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	settingsCh := make(chan string, 1)
+	var stderr bytes.Buffer
+	cfg := daemon.Config{
+		Verbose:          true,
+		Stderr:           &stderr,
+		ProjectsDir:      projectsDir,
+		AttachSocketPath: attachSocket,
+		LockAuditLogPath: filepath.Join(tmp, "lock.log"),
+		EnableAuthBroker: true,
+		HookSettingsDir:  hookSettingsDir,
+		// IMPORTANT: NO InputSink. Mirrors `tether daemon --auth-broker`
+		// in production — daemon doesn't spawn cc, so there's no PTY
+		// to feed bytes into.
+		OnHookSettingsReady: func(p string) { settingsCh <- p },
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- daemon.Run(ctx, cfg) }()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Errorf("daemon shutdown stalled; logs:\n%s", stderr.String())
+		}
+	}()
+
+	var settingsPath string
+	select {
+	case settingsPath = <-settingsCh:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("OnHookSettingsReady never fired; logs:\n%s", stderr.String())
+	}
+	baseURL := assertSettingsFile(t, settingsPath)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(attachSocket); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	const sid = "no-sink-sid"
+	conn, err := net.Dial("unix", attachSocket)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	hdr := agent.AttachHeader{SessionID: sid, Mode: string(agent.AttachModeReadWrite)}
+	hdr.Client.Kind = "terminal"
+	hdr.Client.DeviceID = "no-sink-client"
+	body, _ := json.Marshal(hdr)
+	if _, err := conn.Write(append(body, '\n')); err != nil {
+		t.Fatalf("write header: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	ackBuf, err := agent.ReadFrame(conn)
+	if err != nil {
+		t.Fatalf("read ack: %v", err)
+	}
+	var ack agent.AckFrame
+	if err := json.Unmarshal(ackBuf, &ack); err != nil {
+		t.Fatalf("decode ack: %v", err)
+	}
+	// Daemon downgrades rw → ro because InputSink is nil — that's
+	// expected. The point of this test is that auth-decision frames
+	// STILL flow despite the downgrade.
+	if ack.Mode != "ro" {
+		t.Fatalf("ack.Mode=%q; expected ro (rw should downgrade with no InputSink)", ack.Mode)
+	}
+
+	// POST PreToolUse to hookserver.
+	preBody := fmt.Sprintf(`{"session_id":%q,"tool_name":"Bash","tool_input":{"command":"echo hi"}}`, sid)
+	type postResult struct {
+		status int
+		body   []byte
+		err    error
+	}
+	resCh := make(chan postResult, 1)
+	go func() {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+			baseURL+"/hooks/pre-tool-use", strings.NewReader(preBody))
+		req.Header.Set("Content-Type", "application/json")
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			resCh <- postResult{err: err}
+			return
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		resCh <- postResult{status: resp.StatusCode, body: b}
+	}()
+
+	// Read the auth.tool-request envelope.
+	var reqID string
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	for {
+		buf, err := agent.ReadFrame(conn)
+		if err != nil {
+			t.Fatalf("read auth.tool-request: %v\nlogs:\n%s", err, stderr.String())
+		}
+		var env struct {
+			Kind              string         `json:"kind"`
+			SessionID         string         `json:"sessionId"`
+			PlaintextMetadata map[string]any `json:"plaintextMetadata"`
+		}
+		if err := json.Unmarshal(buf, &env); err != nil {
+			continue
+		}
+		if env.Kind != agent.KindAuthToolRequest {
+			continue
+		}
+		reqID, _ = env.PlaintextMetadata["requestId"].(string)
+		if reqID == "" {
+			t.Fatalf("missing requestId: %s", buf)
+		}
+		break
+	}
+
+	// THIS is what the original bug broke: send back a decision frame
+	// despite being downgraded to ro. The fix means readInputs is
+	// running anyway (because AuthBroker is wired) and intercepts.
+	dec := agent.AuthDecisionFrame{
+		Type:      agent.KindAuthToolDecision,
+		RequestID: reqID,
+		Decision:  agent.AuthDecisionAllowOnce,
+	}
+	decBytes, _ := json.Marshal(dec)
+	if err := agent.WriteInputFrame(conn, decBytes); err != nil {
+		t.Fatalf("write decision: %v", err)
+	}
+
+	select {
+	case r := <-resCh:
+		if r.err != nil {
+			t.Fatalf("POST failed: %v\nlogs:\n%s", r.err, stderr.String())
+		}
+		if r.status != http.StatusOK {
+			t.Fatalf("POST status=%d body=%s want 200", r.status, r.body)
+		}
+		var doc struct {
+			HookSpecificOutput struct {
+				PermissionDecision string `json:"permissionDecision"`
+			} `json:"hookSpecificOutput"`
+		}
+		if err := json.Unmarshal(r.body, &doc); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if doc.HookSpecificOutput.PermissionDecision != "allow" {
+			t.Fatalf("permissionDecision=%q want allow — broker did not receive the decision frame; the ro-mode readInputs spawn fix is broken",
+				doc.HookSpecificOutput.PermissionDecision)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("POST timed out — broker likely never received the decision; logs:\n%s", stderr.String())
+	}
+}
+
 // assertSettingsFile verifies <HookSettingsDir>/settings.json exists,
 // parses, and has all 5 hook events pointing at the same
 // http://127.0.0.1:N baseURL. Returns that baseURL for the caller.

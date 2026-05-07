@@ -389,9 +389,24 @@ func (s *AttachServer) serveConn(ctx context.Context, conn *attachConn) {
 		return
 	}
 
-	// Spawn input reader if rw.
+	// Spawn input reader for rw, OR for ro when an AuthBroker is wired.
+	//
+	// Why ro+AuthBroker still needs an input reader:
+	// `auth.tool-decision` frames are CONTROL-PLANE (see readInputs's
+	// pre-lock intercept). When the daemon has no PTY input sink (the
+	// v0.1 default — daemon doesn't spawn cc itself), rw mode auto-
+	// downgrades to ro via the InputSink-nil check above. But the UI
+	// MUST still be able to send auth decisions back, otherwise every
+	// PreToolUse hook hits the broker's 60s timeout and fail-closed
+	// deny — making the auth flow architecturally inert.
+	//
+	// In ro+AuthBroker mode, readInputs's existing branching only fires
+	// the auth-decision intercept; non-decision frames fall through to
+	// the lock-gated PTY path, where TryAcquire succeeds (no holder
+	// yet) but the InputSink-nil call would panic — so we also gate
+	// that block on InputSink presence inside readInputs (see below).
 	inputErr := make(chan error, 1)
-	if desired == AttachModeReadWrite {
+	if desired == AttachModeReadWrite || s.cfg.AuthBroker != nil {
 		go func() { inputErr <- s.readInputs(ctx, conn, br) }()
 	}
 
@@ -453,6 +468,15 @@ func (s *AttachServer) readInputs(_ context.Context, conn *attachConn, br *bufio
 			// JSON-shaped but not a valid decision frame — fall through
 			// to PTY input so we don't accidentally swallow payloads
 			// that legitimately start with '{'.
+		}
+
+		// PTY input path. Skipped when the conn is ro (no InputSink
+		// wired, OR client requested ro). In ro+AuthBroker mode we
+		// still reach this point for non-auth-decision frames; drop
+		// them silently — a ro client has no business sending PTY
+		// bytes, and there's no InputSink to receive them anyway.
+		if conn.mode != AttachModeReadWrite || s.cfg.InputSink == nil {
+			continue
 		}
 
 		// TryAcquire — first byte from this client wins if lock is

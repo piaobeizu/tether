@@ -80,8 +80,15 @@ type wtSubsystemConfig struct {
 	// disables inbound pair entirely (control-channel pair.invite is
 	// rejected).
 	pairServerFactory func() *pair.Server
-	logf              func(format string, args ...any)
-	warnf             func(format string, args ...any)
+	// authBroker is the per-daemon AuthBroker. When non-nil, the
+	// per-session control-stream dispatcher (post-header) routes
+	// incoming JSON lines whose `type == "auth.tool-decision"` to
+	// authBroker.SubmitDecision. Nil disables control-frame
+	// interception — non-decision lines (and all lines when nil) are
+	// dropped silently to keep the wire forward-compatible.
+	authBroker *agent.AuthBroker
+	logf       func(format string, args ...any)
+	warnf      func(format string, args ...any)
 }
 
 // wtSubsystem owns the lifetime of the WT listener under the watchdog.
@@ -189,7 +196,7 @@ func (w *wtSubsystem) handleSession(parentCtx context.Context, sess *wt.Session)
 		w.warnSession("parse session header: %v", err)
 		return
 	}
-	w.handleSessionDispatch(ctx, sess, hdr)
+	w.handleSessionDispatch(ctx, sess, hdr, br)
 }
 
 // handlePairInvite drives the responder-side pair flow over the control
@@ -241,7 +248,13 @@ func (w *wtSubsystem) handlePairInvite(ctx context.Context, ctrl io.ReadWriter, 
 // handleSessionDispatch is the v0.1 envelope-dispatch path. Resolves
 // the AEAD key (per-device via Registry or legacy fallback), subscribes
 // to the emitter, and pushes envelopes onto the events stream.
-func (w *wtSubsystem) handleSessionDispatch(ctx context.Context, sess *wt.Session, hdr wt.SessionIDHeader) {
+//
+// `ctrlReader` is the post-header control-stream reader (bufio.Reader
+// wrapped around the WT control bidi). It's tied through here so the
+// post-header control-frame dispatcher (auth.tool-decision routing →
+// AuthBroker) consumes exactly what handleSession peeked off, with no
+// risk of byte-stealing on a separate reader.
+func (w *wtSubsystem) handleSessionDispatch(ctx context.Context, sess *wt.Session, hdr wt.SessionIDHeader, ctrlReader *bufio.Reader) {
 	key, err := w.resolveKeyForSession(hdr)
 	if err != nil {
 		w.warnSession("key resolve sid=%s deviceId=%s: %v", hdr.SessionID, hdr.DeviceID, err)
@@ -279,6 +292,24 @@ func (w *wtSubsystem) handleSessionDispatch(ctx context.Context, sess *wt.Sessio
 		w.cfg.logf("[daemon] wt session sid=%s peer=%s dispatching", hdr.SessionID, toDevice)
 	}
 
+	// Spawn the post-header control-frame dispatcher (C1).
+	//
+	// AppShell sends `auth.tool-decision` JSON lines on the WT control
+	// stream after the SessionIDHeader. Without this loop the daemon
+	// reads the header once and never the rest of the stream, so the
+	// AuthBroker's Ask() call sits its full timeout (60s) and fail-
+	// closes — every cc tool gets denied. This mirrors the UDS
+	// dispatcher in attach_socket.go::readInputs (which already routes
+	// auth.tool-decision pre-lock).
+	//
+	// Lifecycle: scanner exits when the control stream closes (peer
+	// half-closes) OR ctx (the session ctx) is cancelled. We don't
+	// block the dispatcher Run on this goroutine — the events push
+	// loop exit drives session shutdown via teardown + evStream.Close.
+	if w.cfg.authBroker != nil {
+		go w.runControlDispatcher(ctx, hdr.SessionID, ctrlReader)
+	}
+
 	pushErr := wt.PushEnvelopeStream(ctx, evStream, envCh, wt.PushEnvelopeOptions{
 		SharedKey:    key,
 		FromDeviceID: "daemon-default",
@@ -286,6 +317,70 @@ func (w *wtSubsystem) handleSessionDispatch(ctx context.Context, sess *wt.Sessio
 	})
 	if pushErr != nil && w.cfg.warnf != nil {
 		w.cfg.warnf("[daemon] wt session sid=%s push: %v", hdr.SessionID, pushErr)
+	}
+}
+
+// runControlDispatcher loops over the post-header control stream,
+// decoding each \n-delimited JSON line and routing recognized
+// control-frame kinds to the daemon's broker. Today only
+// `auth.tool-decision` is wired; future control-frame kinds (e.g.
+// reauthenticate, resume) extend the switch.
+//
+// Tolerant on failure: a malformed/non-matching line is dropped
+// silently — we never tear the session down because a peer sent garbage
+// on the control stream. Real errors (stream EOF, ctx done) exit the
+// goroutine cleanly.
+func (w *wtSubsystem) runControlDispatcher(ctx context.Context, sid string, br *bufio.Reader) {
+	scanner := bufio.NewScanner(br)
+	// Cap each control frame at 64 KiB. Auth-decision frames are
+	// ~150 bytes today; a 64 KiB cap leaves ample slack for future
+	// control kinds while preventing a hostile peer from forcing
+	// unbounded buffer growth via a never-newline-terminated line.
+	scanner.Buffer(make([]byte, 0, 64*1024), 64*1024)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			if len(line) == 0 {
+				continue
+			}
+			// Mirror attach_socket.go::readInputs (lines 459-471) — try
+			// to decode as the v0.1 control-frame envelope; on failure
+			// drop the line silently. Non-JSON garbage and JSON-shaped
+			// non-decision frames both fall through.
+			var frame agent.AuthDecisionFrame
+			if err := json.Unmarshal(line, &frame); err != nil {
+				continue
+			}
+			if frame.Type != agent.KindAuthToolDecision {
+				continue
+			}
+			if w.cfg.authBroker == nil {
+				continue
+			}
+			if subErr := w.cfg.authBroker.SubmitDecision(frame); subErr != nil {
+				if w.cfg.warnf != nil {
+					w.cfg.warnf("[daemon] wt control sid=%s: auth decision: %v", sid, subErr)
+				}
+			}
+		}
+		// scanner.Err() may be the WT stream-close error or a deadline
+		// hit; both are normal session-end signals. Surface only at
+		// debug level (logf, not warnf) to avoid log spam on routine
+		// disconnects.
+		if err := scanner.Err(); err != nil && w.cfg.logf != nil {
+			w.cfg.logf("[daemon] wt control sid=%s: scanner exit: %v", sid, err)
+		}
+	}()
+	select {
+	case <-ctx.Done():
+		// Session ctx cancelled — the underlying stream Read will
+		// unblock when wt.Server tears the session down. We just stop
+		// waiting; the goroutine exits on its own once Read returns.
+		return
+	case <-done:
+		return
 	}
 }
 

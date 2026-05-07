@@ -350,11 +350,15 @@ func WriteFrame(w io.Writer, env *WireEnvelope) (int, error) {
 	}
 	var hdr [4]byte
 	binary.BigEndian.PutUint32(hdr[:], uint32(len(body)))
+	// Wrap with %w so callers (dispatch.go::PushEnvelopeStream) can
+	// errors.Is(err, io.EOF) / io.ErrClosedPipe / context.Canceled to
+	// distinguish clean peer-close from session-fatal write failures.
+	// %v stripped the chain and broke that classification (R1 #4).
 	if _, err := w.Write(hdr[:]); err != nil {
-		return 0, fmt.Errorf("%w: write length: %v", ErrWireEnvelope, err)
+		return 0, fmt.Errorf("%w: write length: %w", ErrWireEnvelope, err)
 	}
 	if _, err := w.Write(body); err != nil {
-		return 0, fmt.Errorf("%w: write body: %v", ErrWireEnvelope, err)
+		return 0, fmt.Errorf("%w: write body: %w", ErrWireEnvelope, err)
 	}
 	return len(body), nil
 }
@@ -379,8 +383,10 @@ func ReadFrame(r io.Reader) (*WireEnvelope, error) {
 		return nil, fmt.Errorf("%w: frame size %d exceeds max %d", ErrWireEnvelope, n, FrameSizeMax)
 	}
 	body := make([]byte, n)
+	// Wrap underlying read error with %w so callers can errors.Is
+	// against io.EOF / io.ErrUnexpectedEOF / context.Canceled.
 	if _, err := io.ReadFull(r, body); err != nil {
-		return nil, fmt.Errorf("%w: read body: %v", ErrWireEnvelope, err)
+		return nil, fmt.Errorf("%w: read body: %w", ErrWireEnvelope, err)
 	}
 	var env WireEnvelope
 	if err := json.Unmarshal(body, &env); err != nil {

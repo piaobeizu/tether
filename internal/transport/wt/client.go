@@ -262,7 +262,10 @@ func (c *Client) acceptUniLoop() {
 }
 
 func (c *Client) routeIncomingBidi(str *webtransport.Stream) {
-	tag, err := readChannelID(str)
+	// Same DoS guard as the server side (M1) — bound the time we wait
+	// for the channel-id byte so a hostile/abandoned server can't pin
+	// per-stream goroutines.
+	tag, err := readChannelID(str, defaultChannelIDDeadline)
 	if err != nil {
 		c.logger.Printf("wt-client: bidi stream tag read: %v", err)
 		str.CancelRead(streamErrorCodeBadChannelID)
@@ -291,7 +294,7 @@ func (c *Client) routeIncomingBidi(str *webtransport.Stream) {
 }
 
 func (c *Client) routeIncomingUni(str *webtransport.ReceiveStream) {
-	tag, err := readChannelID(str)
+	tag, err := readChannelID(str, defaultChannelIDDeadline)
 	if err != nil {
 		c.logger.Printf("wt-client: uni stream tag read: %v", err)
 		str.CancelRead(streamErrorCodeBadChannelID)

@@ -151,8 +151,13 @@ func TestPushEnvelopeStream_WriteErrorPropagates(t *testing.T) {
 
 	in := make(chan fakeLocalEnvelope, 1)
 	in <- fakeLocalEnvelope{Kind: "output.agent-event", SessionID: "sess", Body: "x"}
-	w := &blockingWriter{}
-	w.Close() // pre-closed → first write fails
+	// brokenWriter returns a non-clean-close error (io.ErrShortWrite) so
+	// PushEnvelopeStream's classifier (R1 #4) treats it as session-fatal
+	// and returns the wrapped error to the caller. io.EOF / ErrClosedPipe
+	// / ctx.Canceled are now intentionally swallowed as clean shutdown
+	// signals — the regression bar for this test is "non-clean errors
+	// still propagate".
+	w := &brokenWriter{err: io.ErrShortWrite}
 
 	err := PushEnvelopeStream(ctx, w, in, PushEnvelopeOptions{
 		SharedKey:    DevSharedKey[:],
@@ -165,7 +170,51 @@ func TestPushEnvelopeStream_WriteErrorPropagates(t *testing.T) {
 	if !strings.Contains(err.Error(), "write frame") {
 		t.Errorf("expected 'write frame' in error, got %v", err)
 	}
+	if !errors.Is(err, io.ErrShortWrite) {
+		t.Errorf("expected errors.Is(err, io.ErrShortWrite), got %v", err)
+	}
 }
+
+// TestPushEnvelopeStream_CleanCloseSwallowed pins the R1 #4 fix from
+// the dispatcher's perspective: when WriteFrame fails with io.EOF /
+// io.ErrClosedPipe / context.Canceled (a clean peer disconnect), the
+// dispatcher must return nil instead of treating it as a session-fatal
+// error. Pre-fix WriteFrame wrapped the inner error with %v so
+// errors.Is never matched and the dispatcher returned a noisy error.
+func TestPushEnvelopeStream_CleanCloseSwallowed(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"eof", io.EOF},
+		{"closed-pipe", io.ErrClosedPipe},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			in := make(chan fakeLocalEnvelope, 1)
+			in <- fakeLocalEnvelope{Kind: "output.agent-event", SessionID: "sess", Body: "x"}
+			w := &brokenWriter{err: tc.err}
+			err := PushEnvelopeStream(ctx, w, in, PushEnvelopeOptions{
+				SharedKey:    DevSharedKey[:],
+				FromDeviceID: "from",
+				ToDeviceID:   "to",
+			})
+			if err != nil {
+				t.Fatalf("PushEnvelopeStream returned %v on clean peer-close error %v; want nil (R1 #4)", err, tc.err)
+			}
+		})
+	}
+}
+
+// brokenWriter is an EventsWriter that always fails Write with a
+// caller-supplied error.
+type brokenWriter struct{ err error }
+
+func (b *brokenWriter) Write(_ []byte) (int, error) { return 0, b.err }
+func (b *brokenWriter) Close() error                { return nil }
 
 // TestEnvelopeFrameReader_RoundTrip — Reader-side helper consumes a
 // framed stream produced by PushEnvelopeStream + decrypts each.

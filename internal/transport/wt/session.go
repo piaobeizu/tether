@@ -32,6 +32,7 @@ import (
 	"io"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/quic-go/webtransport-go"
 )
@@ -291,8 +292,13 @@ func (s *Session) acceptUniLoop() {
 
 // routeIncomingBidi reads one byte of channel-id then enqueues to the
 // matching per-channel queue. Bad byte → reset stream + log.
+//
+// A peer that opens a bidi stream and never writes the leading byte
+// would otherwise pin this goroutine forever — readChannelID applies
+// defaultChannelIDDeadline so a stalled / hostile peer is evicted
+// within ~5s instead of leaking a goroutine per opened stream (M1).
 func (s *Session) routeIncomingBidi(str *webtransport.Stream) {
-	tag, err := readChannelID(str)
+	tag, err := readChannelID(str, defaultChannelIDDeadline)
 	if err != nil {
 		s.logger.Printf("wt: bidi stream tag read: %v", err)
 		str.CancelRead(streamErrorCodeBadChannelID)
@@ -320,9 +326,11 @@ func (s *Session) routeIncomingBidi(str *webtransport.Stream) {
 	}
 }
 
-// routeIncomingUni mirrors routeIncomingBidi for uni-streams.
+// routeIncomingUni mirrors routeIncomingBidi for uni-streams. Uses the
+// same defaultChannelIDDeadline so an abandoned uni stream cannot leak
+// a goroutine (M1).
 func (s *Session) routeIncomingUni(str *webtransport.ReceiveStream) {
-	tag, err := readChannelID(str)
+	tag, err := readChannelID(str, defaultChannelIDDeadline)
 	if err != nil {
 		s.logger.Printf("wt: uni stream tag read: %v", err)
 		str.CancelRead(streamErrorCodeBadChannelID)
@@ -346,10 +354,30 @@ func (s *Session) routeIncomingUni(str *webtransport.ReceiveStream) {
 	}
 }
 
+// channelIDDeadliner is the subset of *webtransport.Stream /
+// *webtransport.ReceiveStream we touch to bound readChannelID. Both
+// concrete types satisfy this; tests can stub with an in-memory pipe
+// that no-ops SetReadDeadline.
+type channelIDDeadliner interface {
+	io.Reader
+	SetReadDeadline(time.Time) error
+}
+
 // readChannelID reads exactly one byte from r and validates it as a
 // known channel-id. The returned ChannelID may still be ChannelDatagram
 // — caller must check streamCapable().
-func readChannelID(r io.Reader) (ChannelID, error) {
+//
+// deadline > 0 caps how long we wait for the byte; a misbehaving peer
+// that opens a stream and never writes the tag would otherwise pin a
+// goroutine forever (M1). Pass 0 to disable the deadline (e.g. tests
+// against an io.Reader that doesn't support SetReadDeadline).
+func readChannelID(r channelIDDeadliner, deadline time.Duration) (ChannelID, error) {
+	if deadline > 0 {
+		// Best-effort — if SetReadDeadline isn't supported by this
+		// reader (test stubs), fall through and read without a cap.
+		_ = r.SetReadDeadline(time.Now().Add(deadline))
+		defer func() { _ = r.SetReadDeadline(time.Time{}) }()
+	}
 	var buf [1]byte
 	if _, err := io.ReadFull(r, buf[:]); err != nil {
 		return 0, err

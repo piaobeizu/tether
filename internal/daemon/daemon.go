@@ -158,6 +158,14 @@ type Config struct {
 	// hermetic). Production callers leave this nil.
 	OnEmitterReady func(*agent.EnvelopeEmitter)
 
+	// OnAuthBrokerReady, when non-nil, is invoked once after the
+	// daemon constructs the AuthBroker (only fires when
+	// EnableAuthBroker=true). Tests use this to drive broker.Ask()
+	// directly so they can assert end-to-end decision routing without
+	// having to POST through the hookserver. Production callers leave
+	// this nil.
+	OnAuthBrokerReady func(*agent.AuthBroker)
+
 	// WTKeySource is the LEGACY (pre-pair) hook for resolving the per-
 	// session shared key. Slice #4 (pair-glue) now resolves keys via
 	// pair.Registry by deviceId WHEN the peer announces a DeviceID in
@@ -340,6 +348,9 @@ func Run(ctx context.Context, cfg Config) error {
 			if err != nil {
 				_ = emitter.Close()
 				return fmt.Errorf("daemon: auth broker: %w", err)
+			}
+			if cfg.OnAuthBrokerReady != nil {
+				cfg.OnAuthBrokerReady(broker)
 			}
 		}
 
@@ -528,8 +539,13 @@ func Run(ctx context.Context, cfg Config) error {
 				legacyKeySource:   cfg.WTKeySource,
 				registry:          pairRegistry,
 				pairServerFactory: pairFactory,
-				logf:              logf,
-				warnf:             warnf,
+				// authBroker — when EnableAuthBroker is on, wire the
+				// broker through so the per-session control-stream
+				// dispatcher can route auth.tool-decision frames (C1).
+				// Nil when broker disabled — control loop is a no-op.
+				authBroker: broker,
+				logf:       logf,
+				warnf:      warnf,
 			}))
 		}
 		// emitter lives for the daemon's full lifetime; clean up

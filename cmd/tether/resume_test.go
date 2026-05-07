@@ -238,7 +238,7 @@ func TestResolveSessionWithCwd_RejectsDotDot(t *testing.T) {
 // path containing `..` segments. Uses a non-absolute relative path so
 // Clean preserves the `..` (Clean of an absolute path collapses `..`).
 func TestExecClaude_RejectsDotDot(t *testing.T) {
-	err := ExecClaude("claude", "../escape", "sid")
+	err := ExecClaude("claude", "../escape", "sid", "")
 	if err == nil {
 		t.Fatal("expected error rejecting .. in cwd")
 	}
@@ -264,7 +264,7 @@ func TestExecClaude_RejectsDotDotFromBucket(t *testing.T) {
 		"foo/../../escape", // Clean → ../escape
 	}
 	for _, c := range cases {
-		err := ExecClaude("claude", c, "sid")
+		err := ExecClaude("claude", c, "sid", "")
 		if err == nil {
 			t.Errorf("ExecClaude should reject %q (contains .. after Clean=%q)",
 				c, filepath.Clean(c))

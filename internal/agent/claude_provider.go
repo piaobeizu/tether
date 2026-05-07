@@ -86,9 +86,10 @@ func (p *ClaudeCodeProvider) Spawn(ctx context.Context, opts SpawnOpts) (*AgentS
 	}
 
 	sess, err := claude.New(ctx, claude.SpawnOpts{
-		ProjectCwd: opts.ProjectCwd,
-		Model:      opts.Model,
-		BinaryPath: binPath,
+		ProjectCwd:   opts.ProjectCwd,
+		Model:        opts.Model,
+		BinaryPath:   binPath,
+		SettingsPath: opts.SettingsPath,
 	}, p.auth)
 	if err != nil {
 		return nil, err

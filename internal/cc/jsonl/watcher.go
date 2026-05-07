@@ -75,16 +75,18 @@ type Options struct {
 // Concurrency: New starts one drain goroutine. Subscribe is safe to
 // call from any goroutine. Close is idempotent.
 type Watcher struct {
-	root  string
-	fsw   *fsnotify.Watcher
-	opts  Options
-	ctx   context.Context
-	cancel context.CancelFunc
+	root    string
+	dirMode bool // true if root is a directory (vs single-file mode)
+	fsw     *fsnotify.Watcher
+	opts    Options
+	ctx     context.Context
+	cancel  context.CancelFunc
 
 	mu       sync.Mutex
 	files    map[string]*fileState    // path → state
 	subs     map[string][]*subscriber // sessionID → subscribers
 	uuidSeen map[string]*uuidRing     // sessionID → bounded FIFO ring (dedup)
+	buckets  map[string]struct{}      // bucket dir paths registered with fsnotify
 	closed   bool
 	wg       sync.WaitGroup
 	stats    Stats
@@ -159,10 +161,22 @@ type subscriber struct {
 	dropped atomic.Int64
 }
 
-// New creates a Watcher rooted at `root`. If `root` is a directory
-// the watcher follows `<root>/*.jsonl` (and any new files matching
-// that pattern that appear). If `root` is a single .jsonl file the
-// watcher follows just that file.
+// New creates a Watcher rooted at `root`.
+//
+// If `root` is a directory the watcher follows `<root>/*.jsonl` AND
+// `<root>/<bucket>/*.jsonl` — exactly one level of subdirectory ("bucket")
+// is walked. This matches cc's per-cwd bucket layout
+// (`$HOME/.claude/projects/<encoded-cwd>/<sid>.jsonl`, see cc-sdk-route
+// §D.1 + §E.5) while remaining bounded — a misconfigured
+// `--projects-dir=/` will not walk the whole filesystem. Hidden
+// directories (name starts with `.`) are skipped to avoid inotify churn
+// from VCS / OS metadata dirs (`.git/`, `.DS_Store/`, ...).
+//
+// New bucket directories that appear AFTER startup are picked up via
+// the Create event on `root` and registered + scanned on the fly.
+//
+// If `root` is a single .jsonl file the watcher follows just that file
+// (single-file mode, behavior unchanged).
 //
 // New does not block — fsnotify and the drain loop run in goroutines.
 // Errors during Setup (root unreadable, fsnotify init fail) return
@@ -187,6 +201,7 @@ func New(parent context.Context, root string, opts Options) (*Watcher, error) {
 		files:    make(map[string]*fileState),
 		subs:     make(map[string][]*subscriber),
 		uuidSeen: make(map[string]*uuidRing),
+		buckets:  make(map[string]struct{}),
 	}
 
 	st, err := os.Stat(root)
@@ -196,10 +211,16 @@ func New(parent context.Context, root string, opts Options) (*Watcher, error) {
 		return nil, fmt.Errorf("jsonl watcher: stat root: %w", err)
 	}
 
-	var watchTarget string
 	if st.IsDir() {
-		watchTarget = root
-		// Pick up files already present.
+		w.dirMode = true
+		// Watch root for new bucket dirs + flat .jsonl files.
+		if err := fsw.Add(root); err != nil {
+			fsw.Close()
+			cancel()
+			return nil, fmt.Errorf("jsonl watcher: fsnotify add %q: %w", root, err)
+		}
+		// Pick up flat .jsonl files (legacy single-bucket layout) and
+		// register one-level-deep bucket subdirs (cc's actual layout).
 		entries, err := os.ReadDir(root)
 		if err != nil {
 			fsw.Close()
@@ -207,10 +228,20 @@ func New(parent context.Context, root string, opts Options) (*Watcher, error) {
 			return nil, fmt.Errorf("jsonl watcher: read root: %w", err)
 		}
 		for _, e := range entries {
-			if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			name := e.Name()
+			if strings.HasPrefix(name, ".") {
+				continue // skip .git, .DS_Store, etc.
+			}
+			path := filepath.Join(root, name)
+			if e.IsDir() {
+				if err := w.addBucket(path); err != nil {
+					w.reportError(path, err)
+				}
 				continue
 			}
-			path := filepath.Join(root, e.Name())
+			if !strings.HasSuffix(name, ".jsonl") {
+				continue
+			}
 			if err := w.openFile(path); err != nil {
 				w.reportError(path, err)
 			}
@@ -218,24 +249,98 @@ func New(parent context.Context, root string, opts Options) (*Watcher, error) {
 	} else {
 		// Single-file mode. fsnotify needs the *parent* directory
 		// to detect rename / replace; we filter to this one path.
-		watchTarget = filepath.Dir(root)
+		watchTarget := filepath.Dir(root)
 		if err := w.openFile(root); err != nil {
 			fsw.Close()
 			cancel()
 			return nil, err
 		}
-	}
-
-	if err := fsw.Add(watchTarget); err != nil {
-		fsw.Close()
-		cancel()
-		return nil, fmt.Errorf("jsonl watcher: fsnotify add %q: %w", watchTarget, err)
+		if err := fsw.Add(watchTarget); err != nil {
+			fsw.Close()
+			cancel()
+			return nil, fmt.Errorf("jsonl watcher: fsnotify add %q: %w", watchTarget, err)
+		}
 	}
 
 	w.wg.Add(1)
 	go w.drain()
 
 	return w, nil
+}
+
+// addBucket registers a one-level subdir of root as an additional
+// fsnotify watch + scans its existing .jsonl files. Used at startup and
+// at runtime when a new bucket Create event fires.
+//
+// Bounded recursion: we walk subdirs of `root` only. If the bucket
+// itself contains nested subdirectories, those are NOT recursed —
+// cc-sdk-route §D.1/§E.5 do not promise nested buckets, and unbounded
+// recursion would let a misconfigured `--projects-dir=/` hang the
+// daemon walking the whole filesystem. Nested dirs are reported via
+// OnError and otherwise ignored.
+func (w *Watcher) addBucket(path string) error {
+	w.mu.Lock()
+	if _, exists := w.buckets[path]; exists {
+		w.mu.Unlock()
+		return nil
+	}
+	w.buckets[path] = struct{}{}
+	w.mu.Unlock()
+
+	if err := w.fsw.Add(path); err != nil {
+		// roll back so a future Create can retry
+		w.mu.Lock()
+		delete(w.buckets, path)
+		w.mu.Unlock()
+		return fmt.Errorf("jsonl watcher: fsnotify add bucket %q: %w", path, err)
+	}
+
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return fmt.Errorf("jsonl watcher: read bucket %q: %w", path, err)
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		if e.IsDir() {
+			// Reject multi-level structure with a clear error so a
+			// misconfigured projects-dir surfaces fast instead of
+			// silently dropping records.
+			w.reportError(filepath.Join(path, name), fmt.Errorf(
+				"jsonl watcher: nested directory under bucket not supported (cc layout is exactly one level: root/<bucket>/<sid>.jsonl)",
+			))
+			continue
+		}
+		if !strings.HasSuffix(name, ".jsonl") {
+			continue
+		}
+		fp := filepath.Join(path, name)
+		if err := w.openFile(fp); err != nil {
+			w.reportError(fp, err)
+		}
+	}
+	return nil
+}
+
+// dropBucket removes a bucket from tracking when its directory is
+// removed/renamed: drops fileState for any files under that bucket and
+// forgets the bucket itself. fsnotify automatically removes the watch
+// for a deleted directory, so we don't call fsw.Remove here.
+func (w *Watcher) dropBucket(path string) {
+	prefix := path + string(os.PathSeparator)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, ok := w.buckets[path]; !ok {
+		return
+	}
+	delete(w.buckets, path)
+	for fp := range w.files {
+		if strings.HasPrefix(fp, prefix) {
+			delete(w.files, fp)
+		}
+	}
 }
 
 // Subscribe returns a channel that receives Envelopes for the given
@@ -444,7 +549,38 @@ func (w *Watcher) drain() {
 }
 
 func (w *Watcher) handleEvent(ev fsnotify.Event) {
-	// Filter on .jsonl suffix early.
+	// In dir mode, Create events at the root level may be either a new
+	// .jsonl file (legacy flat layout) OR a new bucket subdirectory
+	// (cc's actual layout). Rename/Remove on a tracked bucket dir
+	// triggers cleanup. We only do these checks in dir mode.
+	if w.dirMode {
+		// Skip hidden entries (.git, .DS_Store, ...) regardless of op.
+		if strings.HasPrefix(filepath.Base(ev.Name), ".") {
+			return
+		}
+		if ev.Op&fsnotify.Create != 0 {
+			// stat may race a Remove; ignore ENOENT.
+			if st, err := os.Stat(ev.Name); err == nil && st.IsDir() {
+				// Only register subdirs of root as buckets; nested
+				// dirs (would be under an existing bucket) are
+				// rejected by addBucket via the OnError path.
+				if filepath.Dir(ev.Name) == w.root {
+					if err := w.addBucket(ev.Name); err != nil {
+						w.reportError(ev.Name, err)
+					}
+				}
+				return
+			}
+		}
+		if ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+			// If a tracked bucket dir was removed/renamed, drop its
+			// file state. Cheap: dropBucket no-ops when the path
+			// isn't a registered bucket.
+			w.dropBucket(ev.Name)
+		}
+	}
+
+	// Filter on .jsonl suffix for the file-level branches.
 	if !strings.HasSuffix(ev.Name, ".jsonl") {
 		return
 	}

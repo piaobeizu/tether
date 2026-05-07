@@ -18,10 +18,15 @@
 //     credential if it leaks.
 //   - SAN includes 127.0.0.1 + ::1 + "localhost" so loopback dialers
 //     pass RFC 6125 hostname verification. Extra hosts are configurable.
-//   - Returns BOTH the raw DER bytes and the SHA-256 of SubjectPublicKeyInfo
-//     so callers (future client-side cert pinning or
-//     `serverCertificateHashes` browser handoff) can compute the
-//     fingerprint without re-parsing.
+//   - Returns BOTH the raw DER bytes and the SHA-256 of the full DER-
+//     encoded certificate so callers (future client-side cert pinning
+//     or `serverCertificateHashes` browser handoff) can compute the
+//     fingerprint without re-parsing. We hash DER (not SPKI) to match
+//     the W3C WebTransport `serverCertificateHashes` algorithm — that
+//     dictionary's `value` field is the SHA-256 of the DER cert, and
+//     web-transport-quinn's `with_server_certificate_hashes` consumes
+//     the same. Pinning by SPKI does NOT interop with the browser-API
+//     (or quinn-API) form, so we expose DER hash only.
 
 package wt
 
@@ -53,13 +58,18 @@ type devCertOptions struct {
 }
 
 // devCert is the result of generateDevCert: the wired-up tls.Certificate
-// (cert chain + private key) plus the parsed certificate and SPKI
+// (cert chain + private key) plus the parsed certificate and DER
 // fingerprint for downstream pinning.
+//
+// DERSHA256 is sha256 over the FULL DER-encoded x509 leaf (Leaf.Raw),
+// matching the W3C `serverCertificateHashes.value` algorithm — so the
+// Rust web-transport-quinn client can pin via
+// `with_server_certificate_hashes` against this exact value.
 type devCert struct {
-	TLS         tls.Certificate
-	Leaf        *x509.Certificate
-	DER         []byte
-	SPKISHA256  [32]byte
+	TLS       tls.Certificate
+	Leaf      *x509.Certificate
+	DER       []byte
+	DERSHA256 [32]byte
 }
 
 // generateDevCert mints a fresh self-signed ECDSA P-256 cert valid for
@@ -123,9 +133,9 @@ func generateDevCert(opts devCertOptions) (devCert, error) {
 	tlsCert.Leaf = leaf
 
 	return devCert{
-		TLS:        tlsCert,
-		Leaf:       leaf,
-		DER:        der,
-		SPKISHA256: sha256.Sum256(leaf.RawSubjectPublicKeyInfo),
+		TLS:       tlsCert,
+		Leaf:      leaf,
+		DER:       der,
+		DERSHA256: sha256.Sum256(der),
 	}, nil
 }

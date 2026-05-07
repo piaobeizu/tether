@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"time"
@@ -131,6 +132,22 @@ type Config struct {
 	// fixture filesystem touched. Default false (audit log is on
 	// for production).
 	DisableLockAudit bool
+
+	// WTListenAddr, when non-empty, opts in to the WebTransport
+	// listener subsystem (slice #2 of the WT block, spec §3.3 / §11.V).
+	// Format is host:port (e.g. ":4444"); empty disables the WT
+	// subsystem entirely (v0.1 default — desktop / mobile clients still
+	// route through the local UDS attach socket until slice #5 lands).
+	//
+	// The wtSubsystem just accepts sessions in slice #2; envelope
+	// dispatch off the events channel is slice #3.
+	WTListenAddr string
+
+	// WTListener, when non-nil, hands the wtSubsystem a pre-bound UDP
+	// socket instead of binding via ListenAndServe. Tests use this to
+	// pick a free :0 port and learn the actual address; production
+	// leaves it nil and lets WTListenAddr drive the bind.
+	WTListener net.PacketConn
 
 	// EnableStubSweeper opts in to the GC stub-session sweeper
 	// (internal/daemon/sweeper.go). Default false for v0.1: ship
@@ -344,6 +361,16 @@ func Run(ctx context.Context, cfg Config) error {
 				Emitter:     emitter,
 				Logf:        logf,
 			}))
+		}
+		// WT subsystem — opt-in via WTListenAddr (slice #2 of WT block).
+		// In v0.1 this just accepts sessions and logs; envelope dispatch
+		// is slice #3.
+		if cfg.WTListenAddr != "" || cfg.WTListener != nil {
+			addr := cfg.WTListenAddr
+			if addr == "" && cfg.WTListener != nil {
+				addr = cfg.WTListener.LocalAddr().String()
+			}
+			factories = append(factories, wtSubsystemFactory(addr, cfg.WTListener, logf))
 		}
 		// emitter lives for the daemon's full lifetime; clean up
 		// on Run exit. clientSubsystem owns its per-run AttachServer

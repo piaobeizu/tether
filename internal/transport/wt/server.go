@@ -1,40 +1,49 @@
-// Package wt is the WebTransport-over-HTTP/3 server skeleton for the
-// tether daemon's cross-device transport (spec §3.3 / §11.V / D-13 /
-// D-21).
+// Package wt is the WebTransport-over-HTTP/3 server for the tether
+// daemon's cross-device transport (spec §3.3 / §11.V / D-13 / D-21).
 //
-// Status — slice #1 (server skeleton):
+// Status — slice #2 (channel multiplex layered onto slice #1's listener):
 //
 //   - Boots a webtransport-go server on a configurable UDP port.
 //   - Accepts WT sessions at a single endpoint path ("/wt").
-//   - Per session, opens ONE control bidi stream that JSON-echoes
-//     incoming envelopes back to the client (smoke surface for the v0.1
-//     wire).
+//   - Each Session runs a per-session accept loop demuxing incoming
+//     bidi/uni streams onto per-channel queues using the §3.3.3 1-byte
+//     channel-id wire convention:
+//       0x01 control / 0x02 events / 0x03 agent-bytes / 0x04 catch-up /
+//       0x05 datagram (tag for unreliable payloads).
+//   - Exposes per-channel API on Session: Control, Events,
+//     OpenAgentBytes, AcceptCatchUp, SendDatagram, RecvDatagram (plus
+//     symmetric counterparts).
+//   - A Go-side Client mirrors the same conventions for tests + future
+//     internal callers.
 //   - Generates a self-signed dev cert when no cert is configured;
 //     production paths supply Cert/Key and skip the dev cert path.
 //
 // What this package does NOT do yet (later slices):
 //
-//   - 5-channel multiplex (control / events / agent-bytes / catch-up /
-//     datagram) per §3.3.3 — slice #2 will layer the full channel set
-//     on top of this skeleton.
 //   - §3.3.1 wire envelope dispatch (encrypted payload, AD-bound kind,
-//     replay/dedup) — slice #3.
-//   - Pairing / device auth (§ pairing / X25519 ECDH handshake from
+//     replay/dedup) — slice #3. Channels currently carry opaque bytes.
+//   - Pairing / device auth (X25519 ECDH handshake from
 //     internal/crypto) — slice #4.
-//   - Wiring as a watchdog-supervised subsystem in
-//     internal/daemon.daemon.Run() — deliberate: the WT block has to
-//     stand alone before it earns a daemon supervisor slot, and the
-//     existing UDS attach socket (internal/agent.attach_socket.go) is
-//     the v0.1 in-process surface for now (D-21 says desktop should
-//     not use UDS, but `tether attach` on the daemon-host shell still
-//     does, so we keep that path untouched).
+//   - Replacing UDS attach for desktop / mobile clients — slice #5.
 //
-// API surface is intentionally minimal:
+// Daemon integration: opt-in via daemon.Config.WTListenAddr (or the
+// `--wt-addr` flag on `cmd/tether daemon`); empty == disabled. The
+// existing UDS attach socket stays the v0.1 local surface for
+// `tether attach` on the daemon-host shell.
 //
-//	srv, err := wt.New(ctx, wt.Config{Addr: ":4444"})
-//	go srv.Serve(ctx)  // blocks until ctx cancels or listener errors
-//	...
-//	srv.Close()        // idempotent shutdown
+// Quick API surface:
+//
+//	srv, err := wt.New(ctx, wt.Config{
+//	    Addr: ":4444",
+//	    SessionHandler: func(s *wt.Session) {
+//	        ctrl, _ := s.Control(ctx)
+//	        // ... dispatch envelopes off ctrl + s.Events / etc.
+//	    },
+//	})
+//	go srv.Serve(ctx)
+//	// client side:
+//	cli, _ := wt.Dial(ctx, wt.ClientConfig{URL: "https://...:4444/wt", ...})
+//	str, _ := cli.OpenControl(ctx)
 package wt
 
 import (
@@ -93,6 +102,17 @@ type Config struct {
 	// origin (dev default). Production should pin to expected client
 	// origins (the desktop / mobile app's bundle origin).
 	CheckOrigin func(*http.Request) bool
+
+	// SessionHandler runs once per accepted WT session. nil → use the
+	// default "log + idle until close" handler suitable for the daemon
+	// wtSubsystem (slice #2 doesn't yet wire envelope dispatch). Tests
+	// inject custom handlers (e.g. per-channel echo) to drive the
+	// channel router.
+	//
+	// The handler runs in its own goroutine; returning from it does
+	// NOT close the session. The session lifecycle is owned by the
+	// Server (closed on Server.Close).
+	SessionHandler func(*Session)
 }
 
 // Server is the WT listener. Exactly one Serve call per Server; reuse
@@ -105,6 +125,8 @@ type Server struct {
 
 	h3 *http3.Server
 	wt *webtransport.Server
+
+	sessionHandler func(*Session)
 
 	// sessions tracked for graceful shutdown.
 	mu       sync.Mutex
@@ -129,9 +151,18 @@ func New(_ context.Context, cfg Config) (*Server, error) {
 	}
 
 	srv := &Server{
-		addr:     addr,
-		logger:   logger,
-		sessions: make(map[*Session]struct{}),
+		addr:           addr,
+		logger:         logger,
+		sessions:       make(map[*Session]struct{}),
+		sessionHandler: cfg.SessionHandler,
+	}
+	if srv.sessionHandler == nil {
+		srv.sessionHandler = func(sess *Session) {
+			// Default: log accept + sit on the session until it closes.
+			// The daemon wtSubsystem uses this — slice #3 will swap in
+			// real envelope dispatch.
+			<-sess.Context().Done()
+		}
 	}
 
 	// Cert: caller-supplied wins; otherwise auto-gen dev cert.
@@ -279,8 +310,8 @@ func (s *Server) Close() error {
 }
 
 // handleUpgrade is the HTTP handler for the /wt endpoint. It performs
-// the WebTransport upgrade and dispatches accepted sessions into the
-// session goroutine.
+// the WebTransport upgrade, wires up the channel-demux Session, and
+// hands it to the configured session handler.
 func (s *Server) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 	wtSess, err := s.wt.Upgrade(w, r)
 	if err != nil {
@@ -289,10 +320,7 @@ func (s *Server) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess := &Session{
-		raw:    wtSess,
-		logger: s.logger,
-	}
+	sess := newSession(wtSess, s.logger)
 
 	s.mu.Lock()
 	if s.sessions == nil {
@@ -311,31 +339,8 @@ func (s *Server) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 			s.mu.Lock()
 			delete(s.sessions, sess)
 			s.mu.Unlock()
+			_ = sess.closeWithError(0, "session done")
 		}()
-		s.runEchoSession(sess)
+		s.sessionHandler(sess)
 	}()
-}
-
-// runEchoSession is the v0.1 smoke handler: open the control stream,
-// JSON-echo whatever envelopes the client sends. Slice #2 will replace
-// this with the real 5-channel dispatch.
-func (s *Server) runEchoSession(sess *Session) {
-	defer func() { _ = sess.closeWithError(0, "session done") }()
-
-	// The CLIENT opens the control stream — we accept it. This matches
-	// the spec direction: clients drive session setup; the server is
-	// passive at the WT layer.
-	ctrl, err := sess.acceptControlStream()
-	if err != nil {
-		s.logger.Printf("wt: accept control stream: %v", err)
-		return
-	}
-	defer ctrl.Close()
-
-	// Echo loop: read until the client half-closes, write back byte-
-	// for-byte. JSON framing is the client's responsibility for v0.1
-	// (newline-delimited JSON is the planned framing in slice #2).
-	if _, err := io.Copy(ctrl, ctrl); err != nil && !errors.Is(err, io.EOF) {
-		s.logger.Printf("wt: control echo: %v", err)
-	}
 }

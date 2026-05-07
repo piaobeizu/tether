@@ -79,6 +79,9 @@ func runDaemon(args []string) int {
 	hookSettingsDir := fs.String("hook-settings-dir", "",
 		"directory for the cc settings.json the daemon generates "+
 			"(default $HOME/.tether/cc-settings; only used when --auth-broker is set)")
+	wtAddr := fs.String("wt-addr", "",
+		"WebTransport listener bind address (e.g. ':4444'); empty disables WT "+
+			"(v0.1 default — slice #2 of WT block, accepts sessions only)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -105,6 +108,7 @@ func runDaemon(args []string) int {
 		DisableLockAudit: *noAudit,
 		EnableAuthBroker: *enableAuth,
 		HookSettingsDir:  *hookSettingsDir,
+		WTListenAddr:     *wtAddr,
 		// Surface the resolved settings.json path on stdout so
 		// downstream tooling (the future `tether resume` integration,
 		// or a session-spawning sidecar) can read it without poking
@@ -207,7 +211,7 @@ func usage(w *os.File) {
 	fmt.Fprintln(w, "usage: tether <subcommand> [flags]")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Subcommands:")
-	fmt.Fprintln(w, "  daemon                         start the supervised daemon (watchdog + daemon + client)")
+	fmt.Fprintln(w, "  daemon                         start the supervised daemon (watchdog + daemon + client; --wt-addr opts in to WebTransport)")
 	fmt.Fprintln(w, "  skill install <name|git-url>   install a skill into the global pool")
 	fmt.Fprintln(w, "  skill list [--json]            list installed skills (--json: machine-readable, consumed by tether-app UI)")
 	fmt.Fprintln(w, "  skill remove <name>            uninstall a skill")

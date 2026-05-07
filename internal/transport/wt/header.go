@@ -37,15 +37,34 @@ import (
 // session id the WT session maps to. JSON-marshaled as a single line
 // terminated by '\n' on the control stream.
 //
-// SLICE #4 — pair.invite supersedes this. The migration path is:
+// SLICE #4 GLUE — DeviceID added as an OPTIONAL field. After a peer
+// completes the pair handshake (see internal/pair) it reconnects and
+// announces "I am device X" via this field; the daemon's
+// SessionHandler then resolves the per-session AEAD key from
+// pair.Registry by deviceId. Peers that haven't paired (legacy / dev /
+// cross-stack tests using DevSharedKey) simply omit the field, and the
+// daemon falls back to wt.DevSharedKey[:].
 //
-//  1. slice #4 lands a richer pair.invite that includes the
-//     attachToSession field (or whatever the real spec names).
-//  2. The daemon's SessionHandler tries pair.invite first; falls back
-//     to the v0.1 SessionIDHeader if the peer is a pre-pair build.
-//  3. After all clients ship pair, this struct is deleted.
+// Migration story (after slice #4 ships):
+//
+//  1. SessionHandler peeks the first JSON line on the control channel.
+//     If it parses as a pair envelope (kind=pair.invite, keyVersion=0)
+//     the handler runs pair.Server.Run to completion and returns —
+//     pair clients reconnect for the actual session post-pairing.
+//  2. Otherwise the line parses as SessionIDHeader; if DeviceID is
+//     non-empty, look up the long-term key; if empty, fall back to
+//     DevSharedKey.
+//  3. After all clients ship pair + announce DeviceID, DevSharedKey
+//     fallback is deleted.
 type SessionIDHeader struct {
 	SessionID string `json:"sessionId"`
+	// DeviceID, when non-empty, identifies the paired device this WT
+	// session belongs to. The daemon resolves the per-device long-term
+	// key from pair.Registry. Empty (legacy / unpaired peers) falls
+	// back to wt.DevSharedKey[:]. Slice #5 (Rust-side cutover) writes
+	// this field after the Tauri pair-completion path persists the
+	// long-term key into its own registry.
+	DeviceID string `json:"deviceId,omitempty"`
 }
 
 // ErrEmptySessionID is returned when the parsed header has no
@@ -56,11 +75,21 @@ var ErrEmptySessionID = errors.New("wt: session id header missing sessionId")
 // WriteSessionIDHeader writes the v0.1 sid header as one JSON line
 // followed by '\n'. Caller is expected to have already opened a
 // control stream (channel-id prefix already written by openBidi).
+//
+// DeviceID is omitted (legacy v0.1 path). Callers that have completed
+// the pair handshake should use WriteSessionHeader(w, hdr) so the
+// daemon can look up the paired long-term key from pair.Registry.
 func WriteSessionIDHeader(w io.Writer, sid string) error {
-	if sid == "" {
+	return WriteSessionHeader(w, SessionIDHeader{SessionID: sid})
+}
+
+// WriteSessionHeader writes the full SessionIDHeader (including
+// optional DeviceID) as a single JSON line.
+func WriteSessionHeader(w io.Writer, hdr SessionIDHeader) error {
+	if hdr.SessionID == "" {
 		return ErrEmptySessionID
 	}
-	body, err := json.Marshal(SessionIDHeader{SessionID: sid})
+	body, err := json.Marshal(hdr)
 	if err != nil {
 		return fmt.Errorf("wt: marshal session id header: %w", err)
 	}
@@ -79,30 +108,52 @@ func WriteSessionIDHeader(w io.Writer, sid string) error {
 //
 // Returns ErrEmptySessionID if the parsed sessionId is empty. Other
 // errors (malformed JSON, EOF mid-line) are returned wrapped.
+//
+// DeviceID is silently dropped — legacy callers don't need it. Use
+// ReadSessionHeader for the full struct.
 func ReadSessionIDHeader(r io.Reader) (string, error) {
+	hdr, err := ReadSessionHeader(r)
+	if err != nil {
+		return "", err
+	}
+	return hdr.SessionID, nil
+}
+
+// ReadSessionHeader is the slice-#4 form: returns the full header
+// struct so callers can resolve a per-device key via DeviceID. Same
+// error contract as ReadSessionIDHeader.
+func ReadSessionHeader(r io.Reader) (SessionIDHeader, error) {
 	br, ok := r.(*bufio.Reader)
 	if !ok {
 		br = bufio.NewReader(r)
 	}
-	return readSessionIDHeader(br)
+	return readSessionHeader(br)
 }
 
-func readSessionIDHeader(br *bufio.Reader) (string, error) {
+// ParseSessionHeaderLine parses a header from a single JSON line
+// already extracted from the stream. Used by the daemon's first-frame
+// router when it has peeked the leading line to disambiguate
+// pair.invite vs SessionIDHeader.
+func ParseSessionHeaderLine(line []byte) (SessionIDHeader, error) {
+	var hdr SessionIDHeader
+	if err := json.Unmarshal(line, &hdr); err != nil {
+		return SessionIDHeader{}, fmt.Errorf("wt: parse session id header: %w", err)
+	}
+	if hdr.SessionID == "" {
+		return SessionIDHeader{}, ErrEmptySessionID
+	}
+	return hdr, nil
+}
+
+func readSessionHeader(br *bufio.Reader) (SessionIDHeader, error) {
 	line, err := br.ReadBytes('\n')
 	if err != nil {
 		// io.EOF without a terminator is a malformed header (the peer
 		// never finished writing). Wrap so callers can branch.
 		if errors.Is(err, io.EOF) && len(line) == 0 {
-			return "", fmt.Errorf("wt: session id header: %w", io.ErrUnexpectedEOF)
+			return SessionIDHeader{}, fmt.Errorf("wt: session id header: %w", io.ErrUnexpectedEOF)
 		}
-		return "", fmt.Errorf("wt: read session id header: %w", err)
+		return SessionIDHeader{}, fmt.Errorf("wt: read session id header: %w", err)
 	}
-	var hdr SessionIDHeader
-	if err := json.Unmarshal(line, &hdr); err != nil {
-		return "", fmt.Errorf("wt: parse session id header: %w", err)
-	}
-	if hdr.SessionID == "" {
-		return "", ErrEmptySessionID
-	}
-	return hdr.SessionID, nil
+	return ParseSessionHeaderLine(line)
 }

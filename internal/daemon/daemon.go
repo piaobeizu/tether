@@ -31,6 +31,7 @@ import (
 	"github.com/piaobeizu/tether/internal/agent"
 	"github.com/piaobeizu/tether/internal/cc"
 	"github.com/piaobeizu/tether/internal/lock"
+	"github.com/piaobeizu/tether/internal/pair"
 	"github.com/piaobeizu/tether/internal/watchdog"
 )
 
@@ -157,23 +158,54 @@ type Config struct {
 	// hermetic). Production callers leave this nil.
 	OnEmitterReady func(*agent.EnvelopeEmitter)
 
-	// WTKeySource resolves the per-session shared key for envelope
-	// sealing. Called once per WT session AFTER the control-stream
-	// header identifies the cc session id (slice #4 pair lookup will
-	// extend this to a real device-id keyed lookup).
+	// WTKeySource is the LEGACY (pre-pair) hook for resolving the per-
+	// session shared key. Slice #4 (pair-glue) now resolves keys via
+	// pair.Registry by deviceId WHEN the peer announces a DeviceID in
+	// SessionIDHeader. WTKeySource is consulted only on the fallback
+	// path — peer omits DeviceID, OR DeviceID is announced but the
+	// registry has no record (with a warnf log line so the operator
+	// notices the spec drift).
 	//
-	// `sid` is the cc session id learned from the v0.1 control header
-	// (see wt.SessionIDHeader). Implementations return the 32-byte
-	// AEAD shared key used to seal envelopes pushed onto the events
-	// stream of this WT session.
+	// If both WTKeySource is nil AND no registry record matches, the
+	// daemon defaults to wt.DevSharedKey[:] — keeps v0.1 cross-stack
+	// smoke tests + dev paths working without any pair plumbing.
 	//
-	// If nil, the daemon defaults to wt.DevSharedKey[:] for every
-	// session — i.e. the same key the cross-stack tests exercise. This
-	// keeps the v0.1 default working without any pair plumbing.
-	//
-	// Slice #4 swaps this for a pair.Registry lookup; the WT subsystem
-	// will continue to call WTKeySource with no behavioral change.
+	// Production paths: pair the device, announce DeviceID in
+	// SessionIDHeader, and the daemon ignores WTKeySource entirely.
 	WTKeySource func(sid string) ([]byte, error)
+
+	// PairRegistryRoot, when non-empty, overrides the default
+	// pair.Registry directory (`$HOME/.tether/users/<user>/devices/`).
+	// Tests inject a temp dir to keep filesystem state hermetic.
+	PairRegistryRoot string
+
+	// PairAuditLogPath, when non-empty, overrides the default pair
+	// audit-log path (`$HOME/.tether/users/<user>/audit.log` per spec
+	// §10.3 + §11.D). Tests inject a temp file. Empty + DisablePairAudit
+	// false → resolve via PairUser/$HOME.
+	PairAuditLogPath string
+
+	// PairUser is the v0.1 single-user bucket name for pair-registry +
+	// pair-audit path resolution (spec §12 / §9.1). Empty → "default".
+	// Distinct from LockUser only for migration safety; in v0.1 the
+	// two are intended to be the same value (both "default").
+	PairUser string
+
+	// DisablePairAudit suppresses creating / writing the pair audit
+	// log. Used by tests that want a hermetic filesystem (no
+	// audit.log writes). Default false.
+	DisablePairAudit bool
+
+	// PairLocalIdentity is the daemon-side device identity baked into
+	// pair.accept frames the daemon emits. Empty fields default per
+	// pair.go (KindDesktop / "tether-daemon").
+	PairLocalIdentity pair.Identity
+
+	// DisablePairServer disables the inbound pair handshake on the
+	// control channel. Default false (pair is on by default whenever
+	// the WT subsystem is). Tests that want to assert "pair.invite is
+	// rejected" set this to true.
+	DisablePairServer bool
 
 	// EnableStubSweeper opts in to the GC stub-session sweeper
 	// (internal/daemon/sweeper.go). Default false for v0.1: ship
@@ -391,23 +423,113 @@ func Run(ctx context.Context, cfg Config) error {
 				Logf:        logf,
 			}))
 		}
-		// WT subsystem — opt-in via WTListenAddr (slice #2 + #3 of WT
-		// block). When opted in, the wtSubsystem also wires real
-		// envelope dispatch: each session reads a v0.1 sid header off
-		// the control stream, subscribes to the emitter, and pushes
-		// envelopes via wt.PushEnvelopeStream onto the events channel.
+		// WT subsystem — opt-in via WTListenAddr (slice #2 + #3 + #4 of
+		// the WT block). When opted in, the wtSubsystem:
+		//   - peeks the first JSON line on the control channel,
+		//   - on pair.invite → runs pair.Server.Run (slice #4),
+		//     persisting the deviceId + long-term key via pair.Registry
+		//     and auditing pair.success/fail to ~/.tether/users/<user>/
+		//     audit.log;
+		//   - on SessionIDHeader → resolves the AEAD key (per-device
+		//     via Registry when DeviceID is announced, else legacy
+		//     WTKeySource → DevSharedKey), subscribes to the emitter,
+		//     and pushes envelopes via wt.PushEnvelopeStream.
 		if cfg.WTListenAddr != "" || cfg.WTListener != nil {
 			addr := cfg.WTListenAddr
 			if addr == "" && cfg.WTListener != nil {
 				addr = cfg.WTListener.LocalAddr().String()
 			}
+
+			// Pair-glue wiring. Errors here degrade to "no pair
+			// support" (legacy peers still work via DevSharedKey
+			// fallback), with a warnf so the operator sees it.
+			pairUser := cfg.PairUser
+			if pairUser == "" {
+				pairUser = pair.DefaultUser
+			}
+			var pairRegistry *pair.Registry
+			var pairAudit *pair.AuditLog
+			if !cfg.DisablePairAudit {
+				auditPath := cfg.PairAuditLogPath
+				if auditPath == "" {
+					home, herr := os.UserHomeDir()
+					if herr != nil {
+						warnf("[daemon] pair audit log: resolve $HOME: %v (continuing without pair audit)", herr)
+					} else {
+						auditPath = filepath.Join(home, ".tether", "users", pairUser, "audit.log")
+					}
+				}
+				if auditPath != "" {
+					a, aerr := pair.NewAuditLog(auditPath)
+					if aerr != nil {
+						warnf("[daemon] pair audit log: open %q: %v (continuing without pair audit)", auditPath, aerr)
+					} else {
+						pairAudit = a
+						logf("[daemon] pair audit log → %s", auditPath)
+					}
+				}
+			}
+			regRoot := cfg.PairRegistryRoot
+			if regRoot == "" {
+				home, herr := os.UserHomeDir()
+				if herr != nil {
+					warnf("[daemon] pair registry: resolve $HOME: %v (continuing without pair registry)", herr)
+				} else {
+					regRoot = pair.DefaultRegistryRoot(home, pairUser)
+				}
+			}
+			if regRoot != "" {
+				r, rerr := pair.NewRegistry(pair.RegistryConfig{Root: regRoot, Audit: pairAudit})
+				if rerr != nil {
+					warnf("[daemon] pair registry: open %q: %v (continuing without pair registry)", regRoot, rerr)
+				} else {
+					pairRegistry = r
+					logf("[daemon] pair registry → %s", regRoot)
+				}
+			}
+
+			var pairFactory func() *pair.Server
+			if !cfg.DisablePairServer && pairRegistry != nil {
+				localIdent := cfg.PairLocalIdentity
+				if localIdent.DeviceID == "" {
+					localIdent.DeviceID = "tether-daemon"
+				}
+				if localIdent.Kind == "" {
+					localIdent.Kind = pair.KindDesktop
+				}
+				if localIdent.DisplayName == "" {
+					localIdent.DisplayName = "tether daemon"
+				}
+				// Capture refs in the closure; pair.NewServer is cheap
+				// (no I/O), so building a fresh one per inbound pair is
+				// fine — keeps per-handshake state isolated.
+				pairFactory = func() *pair.Server {
+					return pair.NewServer(pair.ServerConfig{
+						Identity: localIdent,
+						Registry: pairRegistry,
+						Audit:    pairAudit,
+					})
+				}
+			}
+
+			// Audit log lives for the daemon's lifetime; the deferred
+			// emitter cleanup below also closes it (pair audit is
+			// opened in the same Run() block as the emitter).
+			defer func() {
+				if pairAudit != nil {
+					_ = pairAudit.Close()
+				}
+			}()
+
 			factories = append(factories, wtSubsystemFactory(wtSubsystemConfig{
-				addr:      addr,
-				listener:  cfg.WTListener,
-				emitter:   emitter,
-				keySource: cfg.WTKeySource,
-				logf:      logf,
-				warnf:     warnf,
+				addr:              addr,
+				listener:          cfg.WTListener,
+				emitter:           emitter,
+				legacyKeySource:   cfg.WTKeySource,
+				registry:          pairRegistry,
+				pairServerFactory: pairFactory,
+				logf:              logf,
+				warnf:             warnf,
 			}))
 		}
 		// emitter lives for the daemon's full lifetime; clean up

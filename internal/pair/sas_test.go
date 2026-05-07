@@ -2,6 +2,7 @@ package pair
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"testing"
 )
@@ -43,6 +44,61 @@ func TestSAS_GoldenVector(t *testing.T) {
 		if !bytes.ContainsRune([]byte(sasAlphabet), c) {
 			t.Errorf("SAS char %d (%c) not in alphabet", i, c)
 		}
+	}
+}
+
+// TestSAS_CrossStackGolden pins the SAS for the SAME input vector the
+// Rust client pins (tether-app/src-tauri/src/wt/pair.rs::sas_golden_vector):
+//
+//	shared_secret  = [0x01; 32]
+//	transcript_hash = [0x02; 32]
+//	expected SAS   = "J8LNUS"
+//
+// If this divergence trips on either side, BOTH packages' goldens
+// trip simultaneously and the breaking change is caught at CI time.
+// This is the BLOCKER-3 fix: previously Go and Rust used different
+// inputs so algorithm-level mismatches couldn't be caught by either
+// suite alone.
+func TestSAS_CrossStackGolden(t *testing.T) {
+	shared := bytes.Repeat([]byte{0x01}, 32)
+	thash := bytes.Repeat([]byte{0x02}, 32)
+	sasKey, err := DeriveSASKey(shared, thash)
+	if err != nil {
+		t.Fatalf("DeriveSASKey: %v", err)
+	}
+	sas, err := ComputeSAS(sasKey)
+	if err != nil {
+		t.Fatalf("ComputeSAS: %v", err)
+	}
+	const want = "J8LNUS"
+	if sas != want {
+		t.Errorf("cross-stack SAS golden: got %q want %q — divergence with Rust trips both suites", sas, want)
+	}
+}
+
+// TestConfirmMAC_CrossStackGolden — pin the HMAC against a vector the
+// Rust side mirrors. Inputs match the Rust `confirm_mac_golden` test:
+//
+//	sas_key        = [0xAA; 32]
+//	transcript_hash = [0xBB; 32]
+//
+// Expected hex digests (initiator + responder) are pinned on both
+// sides. Divergence ⇒ cross-stack pair fails MAC verification and
+// BOTH suites' goldens trip.
+func TestConfirmMAC_CrossStackGolden(t *testing.T) {
+	key := bytes.Repeat([]byte{0xAA}, 32)
+	thash := bytes.Repeat([]byte{0xBB}, 32)
+	initMAC := ConfirmMAC(key, RoleInitiator, thash)
+	respMAC := ConfirmMAC(key, RoleResponder, thash)
+	const wantInit = "1392c88c645a6088be25b285b47d52a88215b4f82a927e14844fa24f080033dd"
+	const wantResp = "3e9f0fe0cb6d6b48aa8d43d47786bbaa5a7bc4c8b308c23abc1bab681d550117"
+	gotInit := hex.EncodeToString(initMAC)
+	gotResp := hex.EncodeToString(respMAC)
+	if gotInit != wantInit {
+		t.Errorf("initiator confirm-mac cross-stack golden: got %s want %s", gotInit, wantInit)
+	}
+	if gotResp != wantResp {
+		t.Errorf("responder confirm-mac cross-stack golden: got %s want %s", gotResp, wantResp)
 	}
 }
 

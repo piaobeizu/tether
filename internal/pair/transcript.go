@@ -161,19 +161,40 @@ func b64uDecode(s string) ([]byte, error) {
 
 // canonicalBody implementations: each fills a sorted-key map and runs
 // it through canonicalJSON.
+//
+// CROSS-STACK INVARIANT: these maps MUST byte-match what the Rust side
+// produces via `serde_json::to_value(&frame)` + `canonical_json` in
+// tether-app/src-tauri/src/wt/pair.rs. Spec §3.1/§3.2 lists the full
+// field set; optional fields (model / osVersion / appVersion / push)
+// follow Rust's `Option::None` skip semantics — empty Go string ⇒ key
+// omitted. Any divergence breaks the transcript_hash ⇒ SAS / MAC
+// mismatch ⇒ cross-stack pair becomes impossible.
+//
+// See sas_test.go::TestCanonicalBody_InviteFullFields for the pinned
+// byte sequence.
 
 func (f InviteFrame) canonicalBody() ([]byte, error) {
+	meta := map[string]any{
+		"kind":        string(f.Kind_),
+		"displayName": f.DisplayName,
+	}
+	if f.Model != "" {
+		meta["model"] = f.Model
+	}
+	if f.OSVersion != "" {
+		meta["osVersion"] = f.OSVersion
+	}
+	if f.AppVersion != "" {
+		meta["appVersion"] = f.AppVersion
+	}
 	return canonicalJSON(map[string]any{
 		"type":            string(KindInvite),
 		"v":               f.ProtocolVersion,
 		"deviceId":        string(f.DeviceID),
 		"ephemeralPubkey": b64uEncode(f.InitiatorPubkey),
-		"deviceMetadata": map[string]any{
-			"kind":        string(f.Kind_),
-			"displayName": f.DisplayName,
-		},
-		"ts":    f.TS_,
-		"nonce": b64uEncode(f.Nonce),
+		"deviceMetadata":  meta,
+		"ts":              f.TS_,
+		"nonce":           b64uEncode(f.Nonce),
 	})
 }
 
@@ -181,6 +202,15 @@ func (f AcceptFrame) canonicalBody() ([]byte, error) {
 	meta := map[string]any{
 		"kind":        string(f.Kind_),
 		"displayName": f.DisplayName,
+	}
+	if f.Model != "" {
+		meta["model"] = f.Model
+	}
+	if f.OSVersion != "" {
+		meta["osVersion"] = f.OSVersion
+	}
+	if f.AppVersion != "" {
+		meta["appVersion"] = f.AppVersion
 	}
 	body := map[string]any{
 		"type":            string(KindAccept),
@@ -215,11 +245,27 @@ func (f SASConfirmFrame) canonicalBody() ([]byte, error) {
 }
 
 func (f CompleteFrame) canonicalBody() ([]byte, error) {
-	return canonicalJSON(map[string]any{
+	body := map[string]any{
 		"type": string(KindComplete),
 		"v":    f.ProtocolVersion,
 		"ts":   f.TS_,
-	})
+	}
+	if len(f.Nonce) > 0 {
+		body["nonce"] = b64uEncode(f.Nonce)
+	}
+	if len(f.Tag) > 0 {
+		body["tag"] = b64uEncode(f.Tag)
+	}
+	if f.LongTermKeyID != "" {
+		body["longTermKeyId"] = f.LongTermKeyID
+	}
+	if f.RegisteredInitiatorDeviceID != "" || f.RegisteredResponderDeviceID != "" {
+		body["registeredAs"] = map[string]any{
+			"initiatorDeviceId": f.RegisteredInitiatorDeviceID,
+			"responderDeviceId": f.RegisteredResponderDeviceID,
+		}
+	}
+	return canonicalJSON(body)
 }
 
 func (f AbortFrame) canonicalBody() ([]byte, error) {
@@ -247,6 +293,9 @@ func decodeInviteBody(b []byte) (InviteFrame, error) {
 		DeviceMetadata  struct {
 			Kind        string `json:"kind"`
 			DisplayName string `json:"displayName"`
+			Model       string `json:"model"`
+			OSVersion   string `json:"osVersion"`
+			AppVersion  string `json:"appVersion"`
 		} `json:"deviceMetadata"`
 		TS    int64  `json:"ts"`
 		Nonce string `json:"nonce"`
@@ -268,6 +317,9 @@ func decodeInviteBody(b []byte) (InviteFrame, error) {
 		DeviceID:        DeviceID(raw.DeviceID),
 		Kind_:           DeviceKind(raw.DeviceMetadata.Kind),
 		DisplayName:     raw.DeviceMetadata.DisplayName,
+		Model:           raw.DeviceMetadata.Model,
+		OSVersion:       raw.DeviceMetadata.OSVersion,
+		AppVersion:      raw.DeviceMetadata.AppVersion,
 		TS_:             raw.TS,
 		Nonce:           nonce,
 	}, nil
@@ -281,6 +333,9 @@ func decodeAcceptBody(b []byte) (AcceptFrame, error) {
 		DeviceMetadata  struct {
 			Kind        string `json:"kind"`
 			DisplayName string `json:"displayName"`
+			Model       string `json:"model"`
+			OSVersion   string `json:"osVersion"`
+			AppVersion  string `json:"appVersion"`
 		} `json:"deviceMetadata"`
 		PushSubscription *struct {
 			Type    string `json:"type"`
@@ -308,6 +363,9 @@ func decodeAcceptBody(b []byte) (AcceptFrame, error) {
 		DeviceID:        DeviceID(raw.DeviceID),
 		Kind_:           DeviceKind(raw.DeviceMetadata.Kind),
 		DisplayName:     raw.DeviceMetadata.DisplayName,
+		Model:           raw.DeviceMetadata.Model,
+		OSVersion:       raw.DeviceMetadata.OSVersion,
+		AppVersion:      raw.DeviceMetadata.AppVersion,
 		TS_:             raw.TS,
 		Nonce:           nonce,
 	}
@@ -343,13 +401,39 @@ func decodeSASConfirmBody(b []byte) (SASConfirmFrame, error) {
 
 func decodeCompleteBody(b []byte) (CompleteFrame, error) {
 	var raw struct {
-		V  int   `json:"v"`
-		TS int64 `json:"ts"`
+		V             int    `json:"v"`
+		TS            int64  `json:"ts"`
+		Nonce         string `json:"nonce"`
+		Tag           string `json:"tag"`
+		LongTermKeyID string `json:"longTermKeyId"`
+		RegisteredAs  *struct {
+			InitiatorDeviceID string `json:"initiatorDeviceId"`
+			ResponderDeviceID string `json:"responderDeviceId"`
+		} `json:"registeredAs"`
 	}
 	if err := json.Unmarshal(b, &raw); err != nil {
 		return CompleteFrame{}, fmt.Errorf("pair: decode complete: %w", err)
 	}
-	return CompleteFrame{ProtocolVersion: raw.V, TS_: raw.TS}, nil
+	nonce, err := b64uDecode(raw.Nonce)
+	if err != nil {
+		return CompleteFrame{}, fmt.Errorf("pair: complete nonce: %w", err)
+	}
+	tag, err := b64uDecode(raw.Tag)
+	if err != nil {
+		return CompleteFrame{}, fmt.Errorf("pair: complete tag: %w", err)
+	}
+	out := CompleteFrame{
+		ProtocolVersion: raw.V,
+		TS_:             raw.TS,
+		Nonce:           nonce,
+		Tag:             tag,
+		LongTermKeyID:   raw.LongTermKeyID,
+	}
+	if raw.RegisteredAs != nil {
+		out.RegisteredInitiatorDeviceID = raw.RegisteredAs.InitiatorDeviceID
+		out.RegisteredResponderDeviceID = raw.RegisteredAs.ResponderDeviceID
+	}
+	return out, nil
 }
 
 func decodeAbortBody(b []byte) (AbortFrame, error) {

@@ -125,6 +125,9 @@ func (s *Server) Run(ctx context.Context, stream io.ReadWriter) (Result, error) 
 		DeviceID:        s.identity.DeviceID,
 		Kind_:           s.identity.Kind,
 		DisplayName:     s.identity.DisplayName,
+		Model:           s.identity.Model,
+		OSVersion:       s.identity.OSVersion,
+		AppVersion:      s.identity.AppVersion,
 		PushToken:       s.identity.PushToken,
 		TS_:             s.now().UnixMilli(),
 		Nonce:           mustRandomNonce(s.rand, 16),
@@ -221,22 +224,18 @@ func (s *Server) Run(ctx context.Context, stream io.ReadWriter) (Result, error) 
 		return Result{}, err
 	}
 
-	// 7. Emit pair.complete (server-side ack per spec §2.4 daemon role
-	//    — responder + daemon co-located in v0.1).
-	complete := CompleteFrame{
-		ProtocolVersion: ProtocolVersion,
-		TS_:             s.now().UnixMilli(),
-	}
-	if err := w.writeFrame(complete); err != nil {
-		return Result{}, fmt.Errorf("pair: server send complete: %w", err)
-	}
-	fsm.state = StatePaired
-
-	// 8. Derive long-term keys + persist + audit.
+	// 7. Derive long-term keys + persist + audit BEFORE emitting
+	//    pair.complete — fixes review C3 TOCTOU. A spec-compliant peer
+	//    reconnects on receiving complete and the daemon's
+	//    resolveKeyForSession must find the registry record. If we
+	//    emitted complete first, the peer could race a reconnect before
+	//    Save returned, get ErrNotFound, and silently fall back to the
+	//    dev-shared key.
 	ltk, tbk, err := DeriveLongTermKey(shared, thash)
 	if err != nil {
 		return Result{}, err
 	}
+	ltkID := fmt.Sprintf("ltk-%s", s.now().UTC().Format("20060102-150405"))
 	res := Result{
 		LocalDeviceID:       s.identity.DeviceID,
 		PeerDeviceID:        invite.DeviceID,
@@ -253,22 +252,69 @@ func (s *Server) Run(ctx context.Context, stream io.ReadWriter) (Result, error) 
 			DeviceID:            invite.DeviceID,
 			Kind:                invite.Kind_,
 			DisplayName:         invite.DisplayName,
+			Model:               invite.Model,
 			LongTermKey:         ltk,
 			TransportBindingKey: tbk,
-			LongTermKeyID:       fmt.Sprintf("ltk-%s", s.now().UTC().Format("20060102-150405")),
+			LongTermKeyID:       ltkID,
 			PairedAt:            s.now().UTC(),
 			LastSeen:            s.now().UTC(),
 		}
 		if err := s.registry.Save(rec); err != nil {
 			// Re-pair race: someone else paired this id between our
-			// pre-flight check and now. Surface the error; caller
-			// decides whether to ForceSave.
+			// pre-flight check and now. Surface internal-error to peer
+			// (we can't fulfill the contract) — they'll abort cleanly.
+			ab := abortNow(ReasonProtocolViolation, "internal-error: registry save failed")
+			ab.TS_ = s.now().UnixMilli()
+			_ = w.writeFrame(ab)
 			return res, fmt.Errorf("pair: server persist: %w", err)
 		}
 	}
 	if s.audit != nil {
 		_ = s.audit.AppendSuccess(s.identity.DeviceID, invite.DeviceID, "", thash)
 	}
+
+	// 8. Compose + emit pair.complete with the §3.4 AEAD tag. Receiver
+	//    (initiator) verifies tag with its own derived ltk + same
+	//    transcript_hash; mismatch ⇒ ReasonCertError. This is the
+	//    BLOCKER-4 fix surface — without the tag, a forged complete
+	//    from any in-path actor that survived TLS lets attacker-mediated
+	//    keys be accepted.
+	nonce, tag, err := SealCompleteTag(ltk, thash, s.rand)
+	if err != nil {
+		ab := abortNow(ReasonProtocolViolation, "internal-error: complete seal failed")
+		ab.TS_ = s.now().UnixMilli()
+		_ = w.writeFrame(ab)
+		return res, fmt.Errorf("pair: server seal complete: %w", err)
+	}
+	complete := CompleteFrame{
+		ProtocolVersion:             ProtocolVersion,
+		TS_:                         s.now().UnixMilli(),
+		Nonce:                       nonce,
+		Tag:                         tag,
+		LongTermKeyID:               ltkID,
+		RegisteredInitiatorDeviceID: string(invite.DeviceID),
+		RegisteredResponderDeviceID: string(s.identity.DeviceID),
+	}
+	if err := w.writeFrame(complete); err != nil {
+		return res, fmt.Errorf("pair: server send complete: %w", err)
+	}
+	fsm.state = StatePaired
+
+	// Drain-wait: after emitting the FINAL pair.complete frame, give the
+	// peer a chance to read + verify it before our caller (e.g. the
+	// daemon's wtsubsystem) tears down the underlying stream. Without
+	// this, the transport-level close races our final write and the
+	// client may see "session done" before the buffered pair.complete
+	// bytes arrive.
+	//
+	// We bound the wait via a short context — a healthy peer either
+	// closes the stream (we observe EOF) or in the cert-error path
+	// emits pair.abort{cert-error} (we log and return). 500ms covers
+	// QUIC ACK + FIN at any sane RTT; tests with in-process pipes
+	// typically observe EOF within microseconds.
+	drainCtx, drainCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	_, _ = readFrameWithCtx(drainCtx, r) // intentionally ignore — peer-close → EOF.
+	drainCancel()
 	return res, nil
 }
 

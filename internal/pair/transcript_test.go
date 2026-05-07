@@ -88,6 +88,88 @@ func TestCanonicalJSON_KeyOrderIndependent(t *testing.T) {
 	}
 }
 
+// TestCanonicalBody_InviteFullFields pins the EXACT byte sequence
+// produced by InviteFrame.canonicalBody() when all optional spec
+// §3.1 deviceMetadata fields are populated. This is the BLOCKER-2
+// cross-stack invariant: the Rust side
+// (tether-app/src-tauri/src/wt/pair.rs::canonical_body_invite_full_fields_golden)
+// MUST produce the same bytes for the same inputs. Divergence ⇒
+// transcript_hash diverges ⇒ SAS / MAC mismatch ⇒ pairing fails.
+//
+// Why this exact ordering: canonicalJSON sorts keys lexicographically
+// at every object level. The expected layout reflects:
+//
+//	deviceId, deviceMetadata{appVersion, displayName, kind, model, osVersion},
+//	ephemeralPubkey, nonce, ts, type, v
+//
+// Note that "v" sorts AFTER "type" (lex byte order: 't' < 'v'), and
+// inside deviceMetadata the optional fields all sort before the
+// required ones since their first-letter byte values are smaller.
+func TestCanonicalBody_InviteFullFields(t *testing.T) {
+	// Fixed-byte deterministic inputs — these match the Rust pinning.
+	pubkey := bytes.Repeat([]byte{0xAB}, 32)
+	nonce := bytes.Repeat([]byte{0xCD}, 16)
+	f := InviteFrame{
+		ProtocolVersion: 1,
+		InitiatorPubkey: pubkey,
+		DeviceID:        "device-desktop-aaaa",
+		Kind_:           KindDesktop,
+		DisplayName:     "Kang's MacBook",
+		Model:           "MBP",
+		OSVersion:       "macOS 14.5",
+		AppVersion:      "tether 0.1.0-dev",
+		TS_:             1714000000000,
+		Nonce:           nonce,
+	}
+	got, err := f.canonicalBody()
+	if err != nil {
+		t.Fatalf("canonicalBody: %v", err)
+	}
+	// Pinned: lex-sorted keys, no whitespace, base64url-no-pad for
+	// pubkey + nonce. Construct as a literal so any drift trips here.
+	const want = `{"deviceId":"device-desktop-aaaa","deviceMetadata":{"appVersion":"tether 0.1.0-dev","displayName":"Kang's MacBook","kind":"desktop","model":"MBP","osVersion":"macOS 14.5"},"ephemeralPubkey":"q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s","nonce":"zc3Nzc3Nzc3Nzc3Nzc3NzQ","ts":1714000000000,"type":"pair.invite","v":1}`
+	if string(got) != want {
+		t.Errorf("invite canonical body diverged from cross-stack golden:\n got: %s\nwant: %s", string(got), want)
+	}
+
+	// Round-trip through decode — guarantees all-fields-included survives.
+	parsed, err := decodeInviteBody(got)
+	if err != nil {
+		t.Fatalf("decodeInviteBody: %v", err)
+	}
+	if parsed.Model != "MBP" || parsed.OSVersion != "macOS 14.5" || parsed.AppVersion != "tether 0.1.0-dev" {
+		t.Errorf("optional fields lost on round-trip: %+v", parsed)
+	}
+}
+
+// TestCanonicalBody_InviteOptionalsOmitted — when the optionals are
+// empty strings, they MUST be absent from the canonical body (matching
+// Rust's `Option::None` skip semantics). Otherwise an honest peer that
+// happens to omit them produces a different transcript than one that
+// passes empty strings, breaking interop.
+func TestCanonicalBody_InviteOptionalsOmitted(t *testing.T) {
+	pubkey := bytes.Repeat([]byte{0xAB}, 32)
+	nonce := bytes.Repeat([]byte{0xCD}, 16)
+	f := InviteFrame{
+		ProtocolVersion: 1,
+		InitiatorPubkey: pubkey,
+		DeviceID:        "device-desktop-aaaa",
+		Kind_:           KindDesktop,
+		DisplayName:     "Kang's MacBook",
+		// Model / OSVersion / AppVersion intentionally empty.
+		TS_:   1714000000000,
+		Nonce: nonce,
+	}
+	got, err := f.canonicalBody()
+	if err != nil {
+		t.Fatalf("canonicalBody: %v", err)
+	}
+	const want = `{"deviceId":"device-desktop-aaaa","deviceMetadata":{"displayName":"Kang's MacBook","kind":"desktop"},"ephemeralPubkey":"q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s","nonce":"zc3Nzc3Nzc3Nzc3Nzc3NzQ","ts":1714000000000,"type":"pair.invite","v":1}`
+	if string(got) != want {
+		t.Errorf("omit-optionals canonical body:\n got: %s\nwant: %s", string(got), want)
+	}
+}
+
 // TestEnvelopeRoundtrip — encode + decode an envelope through
 // EnvelopeWrap / EnvelopeUnwrap and verify field equality.
 func TestEnvelopeRoundtrip(t *testing.T) {

@@ -87,12 +87,20 @@ type Frame interface {
 }
 
 // InviteFrame is spec §3.1 pair.invite.
+//
+// Optional deviceMetadata fields (Model / OSVersion / AppVersion) are
+// included in the canonical body when non-empty. These cross-stack
+// optionals are the BLOCKER-2 fix surface — Rust serializes Some(_) and
+// skips None, so the Go side mirrors via empty-string-omit.
 type InviteFrame struct {
 	ProtocolVersion int        `json:"v"`
 	InitiatorPubkey []byte     `json:"ephemeralPubkey"`
 	DeviceID        DeviceID   `json:"deviceId"`
 	Kind_           DeviceKind `json:"-"` // exposed via metadata.kind
 	DisplayName     string     `json:"-"` // exposed via metadata.displayName
+	Model           string     `json:"-"` // exposed via metadata.model (omit if empty)
+	OSVersion       string     `json:"-"` // exposed via metadata.osVersion (omit if empty)
+	AppVersion      string     `json:"-"` // exposed via metadata.appVersion (omit if empty)
 	TS_             int64      `json:"ts"`
 	Nonce           []byte     `json:"nonce"`
 }
@@ -101,12 +109,20 @@ func (f InviteFrame) Kind() FrameKind { return KindInvite }
 func (f InviteFrame) TS() int64       { return f.TS_ }
 
 // AcceptFrame is spec §3.2 pair.accept.
+//
+// Optional deviceMetadata fields (Model / OSVersion / AppVersion)
+// participate in the canonical body via empty-string-omit, matching
+// Rust's Option::None skip behavior. PushToken is the optional spec
+// §3.2 pushSubscription.payload.token.
 type AcceptFrame struct {
 	ProtocolVersion int        `json:"v"`
 	ResponderPubkey []byte     `json:"ephemeralPubkey"`
 	DeviceID        DeviceID   `json:"deviceId"`
 	Kind_           DeviceKind `json:"-"`
 	DisplayName     string     `json:"-"`
+	Model           string     `json:"-"`
+	OSVersion       string     `json:"-"`
+	AppVersion      string     `json:"-"`
 	PushToken       string     `json:"-"`
 	TS_             int64      `json:"ts"`
 	Nonce           []byte     `json:"nonce"`
@@ -129,15 +145,38 @@ func (f SASConfirmFrame) TS() int64       { return f.TS_ }
 
 // CompleteFrame is spec §3.4 pair.complete (daemon-emitted ack).
 //
-// v0.1 simplification: the spec describes an AEAD tag computed under
-// the derived long_term_key; the slice-#4 implementation models this
-// as a frame the daemon emits once both endpoints' SAS-confirm MACs
-// have been observed. The TS field is the only field the bare ack
-// needs to round-trip; richer payload (registeredAs, longTermKeyId,
-// nonce, tag) lives in CompleteFrameExt for the daemon-driven path.
+// Per spec §3.4, the frame carries an AEAD authenticator over the
+// derived long-term key:
+//
+//	tag = XChaCha20-Poly1305.Seal(
+//	    key       = long_term_key,
+//	    nonce     = random 24B,
+//	    plaintext = "" (empty),
+//	    AD        = transcript_hash || "tether-pair-complete-v1",
+//	)
+//
+// `Tag` carries the 16-byte AEAD tag (which is the entire ciphertext
+// since plaintext is empty). Receivers MUST verify the tag with their
+// own derived `long_term_key` + the transcript_hash they observed.
+// Mismatch → emit pair.abort{cert-error} and DO NOT save the registry
+// record. Without this verification, a rogue daemon (or any in-path
+// actor that survived TLS) can forge a pair.complete and trick both
+// endpoints into "succeeding" with an attacker-mediated key.
+//
+// RegisteredAs and LongTermKeyID are §3.4 informational fields the
+// daemon assigns; they are echoed back to the UI for display but do
+// NOT enter the AEAD AD (only `transcript_hash` does).
 type CompleteFrame struct {
-	ProtocolVersion int   `json:"v"`
-	TS_             int64 `json:"ts"`
+	ProtocolVersion int    `json:"v"`
+	TS_             int64  `json:"ts"`
+	Nonce           []byte `json:"-"` // 24B XChaCha20 nonce
+	Tag             []byte `json:"-"` // 16B Poly1305 tag (= AEAD ciphertext over empty plaintext)
+	// Optional informational fields (spec §3.4) — omitted from canonical
+	// body when empty. The daemon assigns these post-pairing; they're
+	// for UI / audit display only and do NOT enter the AEAD AD.
+	RegisteredInitiatorDeviceID string `json:"-"`
+	RegisteredResponderDeviceID string `json:"-"`
+	LongTermKeyID               string `json:"-"`
 }
 
 func (f CompleteFrame) Kind() FrameKind { return KindComplete }

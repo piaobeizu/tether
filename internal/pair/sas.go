@@ -2,10 +2,14 @@ package pair
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
+
+	"golang.org/x/crypto/chacha20poly1305"
 
 	"github.com/piaobeizu/tether/internal/crypto"
 )
@@ -141,4 +145,102 @@ func DeriveLongTermKey(shared, transcriptHash []byte) (longTermKey, transportBin
 		return nil, nil, fmt.Errorf("pair: derive tbk: %w", err)
 	}
 	return ltk, tbk, nil
+}
+
+// completeAEADInfo is the §3.4 AD suffix appended to the transcript_hash
+// when sealing / opening the pair.complete AEAD tag. Wire-stable —
+// changing requires a protocol-version bump.
+const completeAEADInfo = "tether-pair-complete-v1"
+
+// ErrCompleteAEAD is returned when pair.complete tag verification fails.
+// Treated as ReasonCertError per spec §3.4 / §3.5: a rogue daemon (or
+// any in-path actor that survived TLS) cannot forge this tag without
+// also deriving the same long_term_key from the same transcript_hash.
+var ErrCompleteAEAD = errors.New("pair: pair.complete AEAD tag verification failed")
+
+// completeAEADAd builds the AD = transcript_hash || "tether-pair-complete-v1".
+// Both seal and open MUST construct this identically.
+func completeAEADAd(transcriptHash []byte) []byte {
+	out := make([]byte, 0, len(transcriptHash)+len(completeAEADInfo))
+	out = append(out, transcriptHash...)
+	out = append(out, []byte(completeAEADInfo)...)
+	return out
+}
+
+// SealCompleteTag seals an empty plaintext under the long_term_key with
+// AD = transcript_hash || "tether-pair-complete-v1" and a freshly
+// generated 24-byte XChaCha20 nonce. Returns (nonce, tag) where tag is
+// the 16-byte Poly1305 tag (= the entire AEAD ciphertext, since
+// plaintext is empty).
+//
+// Per spec §3.4: this tag is what proves "the daemon emitting
+// pair.complete derived the same long_term_key from the same transcript".
+// Without it, a forged complete frame trips both endpoints into
+// "succeeding" with attacker-mediated keys.
+//
+// The `randSrc` parameter lets tests inject a deterministic source; pass
+// nil for the production crypto/rand.Reader.
+func SealCompleteTag(longTermKey, transcriptHash []byte, randSrc io.Reader) (nonce, tag []byte, err error) {
+	if len(longTermKey) != chacha20poly1305.KeySize {
+		return nil, nil, fmt.Errorf("pair: complete seal: ltk must be %d bytes", chacha20poly1305.KeySize)
+	}
+	if len(transcriptHash) == 0 {
+		return nil, nil, errors.New("pair: complete seal: empty transcript hash")
+	}
+	aead, err := chacha20poly1305.NewX(longTermKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("pair: complete seal: %w", err)
+	}
+	nonce = make([]byte, chacha20poly1305.NonceSizeX)
+	src := randSrc
+	if src == nil {
+		src = rand.Reader
+	}
+	if _, err := io.ReadFull(src, nonce); err != nil {
+		return nil, nil, fmt.Errorf("pair: complete seal nonce: %w", err)
+	}
+	ad := completeAEADAd(transcriptHash)
+	// Empty plaintext + tag-only output is equivalent to AEAD.Seal(nil,
+	// nonce, []byte{}, ad) — golang.org/x/crypto/chacha20poly1305 returns
+	// just the 16-byte tag in this case.
+	tag = aead.Seal(nil, nonce, []byte{}, ad)
+	if len(tag) != chacha20poly1305.Overhead {
+		return nil, nil, fmt.Errorf("pair: complete seal: unexpected tag len %d", len(tag))
+	}
+	return nonce, tag, nil
+}
+
+// OpenCompleteTag verifies a (nonce, tag) pair produced by
+// SealCompleteTag against the same long_term_key + transcript_hash.
+// Returns nil iff the tag authenticates; ErrCompleteAEAD on any
+// mismatch (including malformed sizes — defense-in-depth so callers
+// don't get a different error class for "bad input" vs "auth fail").
+func OpenCompleteTag(longTermKey, transcriptHash, nonce, tag []byte) error {
+	if len(longTermKey) != chacha20poly1305.KeySize {
+		return ErrCompleteAEAD
+	}
+	if len(transcriptHash) == 0 {
+		return ErrCompleteAEAD
+	}
+	if len(nonce) != chacha20poly1305.NonceSizeX {
+		return ErrCompleteAEAD
+	}
+	if len(tag) != chacha20poly1305.Overhead {
+		return ErrCompleteAEAD
+	}
+	aead, err := chacha20poly1305.NewX(longTermKey)
+	if err != nil {
+		return ErrCompleteAEAD
+	}
+	ad := completeAEADAd(transcriptHash)
+	// Open tag-only ciphertext: pass the 16-byte tag as the entire
+	// ciphertext; expected plaintext is empty.
+	pt, err := aead.Open(nil, nonce, tag, ad)
+	if err != nil {
+		return ErrCompleteAEAD
+	}
+	if len(pt) != 0 {
+		return ErrCompleteAEAD
+	}
+	return nil
 }

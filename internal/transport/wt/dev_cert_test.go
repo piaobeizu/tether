@@ -1,6 +1,7 @@
 package wt
 
 import (
+	"crypto/sha256"
 	"crypto/x509"
 	"net"
 	"testing"
@@ -24,8 +25,23 @@ func TestGenerateDevCert_Verifies(t *testing.T) {
 	if len(dc.DER) == 0 {
 		t.Fatal("DER empty")
 	}
-	if dc.SPKISHA256 == ([32]byte{}) {
-		t.Fatal("SPKISHA256 is zero")
+	if dc.DERSHA256 == ([32]byte{}) {
+		t.Fatal("DERSHA256 is zero")
+	}
+
+	// DERSHA256 must equal sha256(leaf DER bytes) — the W3C
+	// `serverCertificateHashes` algorithm. This is the same hash the
+	// Rust client side computes via
+	// web-transport-quinn::ClientBuilder::with_server_certificate_hashes
+	// when the operator pastes the daemon's startup-log fingerprint into
+	// `pinnedCertSha256`. Asserting the algorithm here (not just non-
+	// zero) catches any future regression that flips back to SPKI.
+	wantDER := sha256.Sum256(dc.Leaf.Raw)
+	if dc.DERSHA256 != wantDER {
+		t.Fatalf("DERSHA256 mismatch: got %x want %x (leaf.Raw)", dc.DERSHA256, wantDER)
+	}
+	if len(dc.DER) > 0 && sha256.Sum256(dc.DER) != dc.DERSHA256 {
+		t.Fatalf("DERSHA256 != sha256(dc.DER); fields out of sync")
 	}
 
 	// Self-signed roundtrip: build a pool with the leaf, verify the leaf.

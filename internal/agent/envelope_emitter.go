@@ -39,12 +39,16 @@ import (
 // Unix attach socket. It carries plaintext metadata + (eventually)
 // ciphertext payload but does NOT include the §3.3.1 fields needed for
 // over-network delivery: id, fromDeviceId, toDeviceId, ts, keyVersion,
-// nonce, AD-bound kind, transport-layer ciphertext binding. When
-// QUIC/WT lands, the cross-device wire envelope is a separate type
-// (provisional name: agent.WireEnvelope or transport.OutboundEnvelope)
-// that wraps + signs/encrypts a LocalEnvelope. Code that reads "Local"
-// here must not assume the bytes are wire-ready for the public
-// internet.
+// nonce, AD-bound kind, transport-layer ciphertext binding.
+//
+// The cross-device shape lives at `internal/transport/wt.WireEnvelope`
+// (slice #3). The WT events-channel dispatcher takes a LocalEnvelope,
+// JSON-marshals it as the inner plaintext, and seals it inside a
+// WireEnvelope before pushing onto the events stream — see
+// `transport/wt.PushEnvelopeStream` / `transport/wt.Seal`.
+//
+// Code that reads "Local" here must not assume the bytes are wire-ready
+// for the public internet.
 type LocalEnvelope struct {
 	Kind              string                 `json:"kind"`
 	ProviderType      string                 `json:"providerType"`
@@ -54,6 +58,15 @@ type LocalEnvelope struct {
 	CiphertextPayload []byte                 `json:"ciphertextPayload,omitempty"`
 	SourceUUID        string                 `json:"sourceUuid,omitempty"`
 }
+
+// EnvelopeKind reports the §3.3.2 op kind. Implements the duck-typed
+// interface `transport/wt.LocalEnvelopeShape` so the WT dispatcher can
+// consume LocalEnvelope without an import edge from transport/wt back
+// into agent.
+func (e LocalEnvelope) EnvelopeKind() string { return e.Kind }
+
+// EnvelopeSessionID reports the cc session id (used in WT AD).
+func (e LocalEnvelope) EnvelopeSessionID() string { return e.SessionID }
 
 // fromJSONL converts a jsonl.Envelope to the wire-facing shape.
 func fromJSONL(e jsonl.Envelope) LocalEnvelope {

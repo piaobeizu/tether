@@ -183,7 +183,7 @@ func New(_ context.Context, cfg Config) (*Server, error) {
 		}
 		srv.cert = dc.TLS
 		srv.devCert = &dc
-		logger.Printf("wt: dev cert auto-generated (SPKI sha256=%x)", dc.SPKISHA256)
+		logger.Printf("wt: dev cert auto-generated (DER sha256=%x)", dc.DERSHA256)
 	default:
 		return nil, errors.New("wt: Cert and Key must both be set or both be empty")
 	}
@@ -233,15 +233,28 @@ func New(_ context.Context, cfg Config) (*Server, error) {
 // the post-bind addr; tests use the ServeListener path below.
 func (s *Server) Addr() string { return s.addr }
 
-// DevCertSPKISHA256 returns the SPKI fingerprint of the auto-generated
-// dev cert, or zero value if the server was constructed with operator-
-// supplied certs. Useful for tests + future browser handoff via
-// `serverCertificateHashes`.
-func (s *Server) DevCertSPKISHA256() [32]byte {
+// DevCertDERSHA256 returns the SHA-256 of the auto-generated dev
+// cert's full DER-encoded x509 leaf, or zero value if the server was
+// constructed with operator-supplied certs.
+//
+// This value matches the W3C WebTransport
+// `serverCertificateHashes.value` algorithm (sha256 of the DER cert,
+// NOT the SPKI block), so it is what the Rust client side
+// (web-transport-quinn::ClientBuilder::with_server_certificate_hashes)
+// — and the browser API — actually consume. Pinning by SPKI here would
+// silently fail the TLS handshake on the Rust side; we hash DER so the
+// dev-cert fingerprint the operator copies out of the daemon log can
+// be pasted into the app's `pinnedCertSha256` config and Just Work.
+//
+// Bug-fix history: this method was originally named DevCertSPKISHA256
+// and returned sha256(leaf.RawSubjectPublicKeyInfo) — verifiable
+// against the cert but useless for cross-stack pinning. Slice #3
+// renamed it + switched the algorithm to match the Rust client.
+func (s *Server) DevCertDERSHA256() [32]byte {
 	if s.devCert == nil {
 		return [32]byte{}
 	}
-	return s.devCert.SPKISHA256
+	return s.devCert.DERSHA256
 }
 
 // TLSCertificate returns a copy of the server's TLS certificate.

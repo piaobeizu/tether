@@ -148,8 +148,13 @@ the full 5-channel surface.
 1. **Cert trust on macOS / Android dev devices** — self-signed certs
    require either trust-store install or the `serverCertificateHashes`
    browser API (Chromium / WebView). The dev cert generator exposes
-   `SPKISHA256` so future slices can hand the fingerprint to a Tauri
-   command.
+   `DERSHA256` (sha256 of the DER-encoded leaf cert, matching the W3C
+   `serverCertificateHashes.value` algorithm) so future slices can
+   hand the fingerprint to a Tauri command. The Rust client pins by
+   the same algorithm via
+   `web-transport-quinn::ClientBuilder::with_server_certificate_hashes`.
+   Slice #3 renamed this from `SPKISHA256` after discovering the SPKI
+   form did not interop cross-stack.
 2. **Port-binding under unprivileged users** — UDP `:4444` is fine.
    Anything `< 1024` requires CAP_NET_BIND_SERVICE on Linux or root on
    other Unixes.

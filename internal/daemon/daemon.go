@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/piaobeizu/tether/internal/agent"
+	"github.com/piaobeizu/tether/internal/cc"
 	"github.com/piaobeizu/tether/internal/lock"
 	"github.com/piaobeizu/tether/internal/watchdog"
 )
@@ -64,16 +65,38 @@ type Config struct {
 	// EnableAuthBroker, when true, constructs an AuthBroker bound to
 	// the daemon's envelope emitter and wires it into the attach
 	// socket so auth.tool-decision input frames route through the
-	// broker. Callers that integrate the cc HookServer can fetch
-	// the broker via the OnReady hook to build a BrokerHookHandlers.
+	// broker. The broker is the daemon-side surface that the cc
+	// HookServer's PreToolUse handler routes into via
+	// agent.BrokerHookHandlers. When EnableAuthBroker=true, the
+	// hookSubsystem is also enabled so cc spawns can hit the loopback
+	// hook endpoints and the broker actually fires.
 	EnableAuthBroker bool
 
-	// OnReady, when non-nil, is invoked once after the daemon's
-	// shared components (emitter, broker, lock state) are constructed
-	// and BEFORE the supervisor begins running subsystems. Callers
-	// use it as the wiring seam to plumb cc.NewHookServer with a
-	// BrokerHookHandlers driven by daemon.AuthBroker. Optional.
-	OnReady func(DaemonComponents)
+	// HookSettingsDir is the directory the daemon writes its cc
+	// settings.json into (one file per daemon instance, overwritten on
+	// each Run). The path of the resulting `<dir>/settings.json` is
+	// surfaced via OnHookSettingsReady so cc spawn paths can pass
+	// `--settings <path>` (see internal/backend/claude.SpawnOpts).
+	//
+	// Empty resolves to `$HOME/.tether/cc-settings/`. The directory is
+	// created (0700) at Run() time. Production callers normally leave
+	// this empty; tests inject a temp dir.
+	//
+	// Only consulted when EnableAuthBroker=true (no broker → no
+	// hookserver → no settings.json to write).
+	HookSettingsDir string
+
+	// OnHookSettingsReady, when non-nil, is invoked once after the
+	// hookserver listens and `<HookSettingsDir>/settings.json` has been
+	// written. The argument is the absolute path to settings.json,
+	// suitable for forwarding to cc as `--settings`. Empty / not
+	// invoked when EnableAuthBroker=false.
+	//
+	// The integrating layer (typically cmd/tether's daemon command, or
+	// a test harness) plumbs this path into the cc spawn site. The
+	// daemon itself never spawns cc — that's the session-owner's job
+	// — so this callback is the only seam.
+	OnHookSettingsReady func(settingsPath string)
 
 	// SubsystemFactories lets tests install fake subsystems in place
 	// of the real daemon/client. nil → use defaultSubsystems with
@@ -125,17 +148,6 @@ type Config struct {
 // context, but the same instance — implementations must NOT keep
 // per-run state on the receiver).
 type SubsystemFactory func() watchdog.Subsystem
-
-// DaemonComponents bundles the shared state the daemon constructs
-// before supervising subsystems. Surfaced via Config.OnReady so
-// callers can wire follow-on integrations (e.g. cc.HookServer with
-// BrokerHookHandlers driven by AuthBroker) without forcing those
-// dependencies into this package's import graph.
-type DaemonComponents struct {
-	Emitter    *agent.EnvelopeEmitter
-	Lock       *lock.Lock
-	AuthBroker *agent.AuthBroker // nil when EnableAuthBroker = false
-}
 
 // Run constructs a Watchdog, registers the configured subsystems,
 // and blocks until ctx is canceled. Returns nil on clean shutdown,
@@ -260,15 +272,57 @@ func Run(ctx context.Context, cfg Config) error {
 		// permanently disabled, see clientSubsystem doc).
 		_ = attach.Close()
 
-		if cfg.OnReady != nil {
-			cfg.OnReady(DaemonComponents{
-				Emitter:    emitter,
-				Lock:       lockSM,
-				AuthBroker: broker,
-			})
+		// Hook server — only stood up when we have a broker to drive
+		// PreToolUse decisions. Without a broker the hookserver would
+		// fail-closed on every tool call (noopHandlers default), which
+		// is worse than just not pointing cc at it. The settings.json
+		// file is written eagerly here (before the supervisor starts)
+		// so OnHookSettingsReady fires before any cc spawn could ask
+		// for it — single-shot, watchdog restarts re-bind the listener
+		// but reuse the prior settings file path (the URL inside is
+		// stale until next Run, see hookSubsystem.Run for the
+		// per-restart rewrite).
+		var hookSrv *cc.HookServer
+		var hookSettingsPath string
+		if cfg.EnableAuthBroker {
+			handlers := agent.NewBrokerHookHandlers(broker)
+			hookSrv = cc.NewHookServer(handlers)
+			if err := hookSrv.Start(ctx); err != nil {
+				_ = emitter.Close()
+				return fmt.Errorf("daemon: hook server start: %w", err)
+			}
+			settingsDir := cfg.HookSettingsDir
+			if settingsDir == "" {
+				home, herr := os.UserHomeDir()
+				if herr != nil {
+					_ = hookSrv.Stop(context.Background())
+					_ = emitter.Close()
+					return fmt.Errorf("daemon: resolve $HOME for hook settings dir: %w", herr)
+				}
+				settingsDir = filepath.Join(home, ".tether", "cc-settings")
+			}
+			if err := os.MkdirAll(settingsDir, 0o700); err != nil {
+				_ = hookSrv.Stop(context.Background())
+				_ = emitter.Close()
+				return fmt.Errorf("daemon: mkdir hook settings dir %q: %w", settingsDir, err)
+			}
+			baseURL := "http://" + hookSrv.Addr()
+			hookSettingsPath, err = cc.WriteSettingsFile(settingsDir, baseURL)
+			if err != nil {
+				_ = hookSrv.Stop(context.Background())
+				_ = emitter.Close()
+				return fmt.Errorf("daemon: write cc settings: %w", err)
+			}
+			logf("[daemon] hook server listening at %s; cc settings → %s", baseURL, hookSettingsPath)
+			if cfg.OnHookSettingsReady != nil {
+				cfg.OnHookSettingsReady(hookSettingsPath)
+			}
 		}
 
 		factories = realSubsystems(socketPath, emitter, lockSM, cfg.InputSink, broker, logf)
+		if hookSrv != nil {
+			factories = append(factories, hookSubsystemFactory(hookSrv, logf))
+		}
 		if cfg.EnableStubSweeper {
 			factories = append(factories, gcSubsystemFactory(stubSweeperConfig{
 				ProjectsDir: projectsDir,
@@ -279,10 +333,18 @@ func Run(ctx context.Context, cfg Config) error {
 		// emitter lives for the daemon's full lifetime; clean up
 		// on Run exit. clientSubsystem owns its per-run AttachServer
 		// and closes it inside Run's defer. lockSink (if any) flushes
-		// + releases its file handle here.
+		// + releases its file handle here. hookSrv (if any) is
+		// gracefully shut down — its watchdog subsystem also stops the
+		// server when ctx cancels, but a defensive Stop here covers
+		// the path where Run returns before factories run.
 		defer func() {
 			if broker != nil {
 				broker.Close()
+			}
+			if hookSrv != nil {
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				_ = hookSrv.Stop(shutdownCtx)
+				cancel()
 			}
 			_ = emitter.Close()
 			if lockSink != nil {
@@ -457,6 +519,71 @@ func (c *clientSubsystem) Run(ctx context.Context, hb func()) error {
 		return serveErr
 	}
 	return nil
+}
+
+// hookSubsystem owns the lifetime of the cc.HookServer the daemon
+// spun up before factories ran. The HookServer's listener was bound
+// in Run() (so the address could be baked into settings.json before
+// any cc spawn could need it); this subsystem keeps the goroutine
+// supervised — heartbeats while alive, cleanly stops on ctx cancel.
+//
+// Restart-unsafety note: HookServer is single-use (Stop ⇒
+// ErrServerStopped on the next Start). If Run() returns we tear it
+// down for good. The watchdog therefore should NOT auto-restart this
+// subsystem in v0.1 — but the watchdog has no per-subsystem opt-out
+// today, so a restart would surface ErrServerStopped here and the
+// supervisor would retry forever. A deliberate hardening follow-up
+// is to make HookServer reusable; until then, hookSubsystem.Run
+// returns a non-restartable error path on second-Start.
+type hookSubsystem struct {
+	srv  *cc.HookServer
+	logf func(format string, args ...any)
+}
+
+func (h *hookSubsystem) Name() string { return "hook" }
+
+func (h *hookSubsystem) Run(ctx context.Context, hb func()) error {
+	hb()
+	// Heartbeat side goroutine so the supervisor's deadlock detector
+	// stays happy while we just sit waiting for ctx.
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			// Cleanly shut down. Stop blocks until the Serve goroutine
+			// exits, so when this returns the listener fd is released.
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if err := h.srv.Stop(shutdownCtx); err != nil && h.logf != nil {
+				h.logf("[daemon] hook server stop: %v", err)
+			}
+			// Surface the latest serve error if any (fd exhaustion etc.)
+			// so the watchdog logs reflect the cause; but treat
+			// ctx.Done as a clean exit overall.
+			if se := h.srv.ServeErr(); se != nil && h.logf != nil {
+				h.logf("[daemon] hook server serve error: %v", se)
+			}
+			return nil
+		case <-t.C:
+			hb()
+			// Surface a serve-time error promptly so the watchdog
+			// observes it (keeps "subsystem alive" honest).
+			if se := h.srv.ServeErr(); se != nil {
+				return fmt.Errorf("hook server: %w", se)
+			}
+		}
+	}
+}
+
+// hookSubsystemFactory returns a SubsystemFactory that wraps a
+// pre-bound HookServer. The factory is single-shot — calling it twice
+// would re-Run the same (now-stopped) server, which fails. The
+// watchdog calls each factory exactly once, so this is fine for v0.1.
+func hookSubsystemFactory(srv *cc.HookServer, logf func(format string, args ...any)) SubsystemFactory {
+	return func() watchdog.Subsystem {
+		return &hookSubsystem{srv: srv, logf: logf}
+	}
 }
 
 // placeholderSubsystem is the previous heartbeat-only filler. Kept

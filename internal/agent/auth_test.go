@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -169,6 +170,100 @@ func TestAuthBroker_RememberAlways(t *testing.T) {
 	}
 	if d := <-got; d != agent.AuthDecisionDenyOnce {
 		t.Fatalf("post-forget decision: %v", d)
+	}
+}
+
+// TestAuthBroker_NoSubscribers_FailsFast pins the M1 fix: when the
+// broker tries to inject an auth.tool-request envelope and there are
+// ZERO subscribers for the session, Ask must return deny-once
+// IMMEDIATELY with a clear "no UI subscribed" error. Before the fix,
+// Inject silently dropped on no-subscribers and Ask waited the full
+// Timeout (default 60s) for a reply that could never come — a
+// stub-masked production bug analogous to #47.
+//
+// This test sets a long Timeout deliberately; if the fast-fail path
+// regresses, the test would block until the timeout instead of
+// returning quickly.
+func TestAuthBroker_NoSubscribers_FailsFast(t *testing.T) {
+	t.Parallel()
+	em := newTestEmitter(t)
+	br, err := agent.NewAuthBroker(em)
+	if err != nil {
+		t.Fatalf("broker: %v", err)
+	}
+	// 10s — well above the fast-fail latency (~microseconds), but
+	// SHORT enough that a regression making this hang is visible
+	// before t.Parallel siblings finish.
+	br.Timeout = 10 * time.Second
+	t.Cleanup(br.Close)
+
+	// Deliberately do NOT subscribe — this is the production scenario
+	// where the UI is detached / not yet connected.
+
+	start := time.Now()
+	d, err := br.Ask(t.Context(), "no-listener-sid", "Bash", json.RawMessage(`{}`), "")
+	elapsed := time.Since(start)
+
+	if d != agent.AuthDecisionDenyOnce {
+		t.Errorf("decision = %v, want deny-once", d)
+	}
+	if err == nil {
+		t.Fatal("expected fast-fail error, got nil")
+	}
+	if !strings.Contains(err.Error(), "no UI client") {
+		t.Errorf("error message should mention no-UI cause; got: %v", err)
+	}
+	// The fast-fail must complete WELL under the broker Timeout. 1s is
+	// generous (real path is sub-ms); anything longer means we waited
+	// for the timer.
+	if elapsed > time.Second {
+		t.Errorf("fast-fail took %s; should be sub-ms (regressed back to full Timeout?)", elapsed)
+	}
+}
+
+// TestAuthBroker_AllSubscribersFull_FailsFast covers the related
+// scenario: subscribers exist but every one of them has a full out
+// channel (slow / disconnected consumer). Inject's drop-newest
+// returns delivered=0 even though len(subs)>0; broker must still
+// fast-fail rather than wait the full Timeout.
+func TestAuthBroker_AllSubscribersFull_FailsFast(t *testing.T) {
+	t.Parallel()
+	em := newTestEmitter(t)
+	br, err := agent.NewAuthBroker(em)
+	if err != nil {
+		t.Fatalf("broker: %v", err)
+	}
+	br.Timeout = 10 * time.Second
+	t.Cleanup(br.Close)
+
+	// Subscribe but don't drain — the out channel cap is 64; fill it
+	// up with no-op envelopes so Inject's non-blocking send drops.
+	const sid = "full-sub-sid"
+	out, cancel, err := em.Subscribe(sid)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	defer cancel()
+	// Saturate the per-subscriber buffer (64 envelopes per
+	// envelope_emitter.go::Subscribe). We need to push >64 items
+	// because the relay goroutine drains one at a time; the tightest
+	// way is to flood the underlying watcher's per-sid channel via
+	// repeated Inject. But Inject also drops on full, so the simplest
+	// path is to just stop reading `out` and rely on the next Inject
+	// to find delivered=0. Doing 100 to be safe.
+	_ = out
+	for i := 0; i < 200; i++ {
+		_, _ = em.Inject(agent.LocalEnvelope{Kind: "noise", SessionID: sid})
+	}
+
+	start := time.Now()
+	_, err = br.Ask(t.Context(), sid, "Bash", json.RawMessage(`{}`), "")
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected fast-fail error, got nil")
+	}
+	if elapsed > time.Second {
+		t.Errorf("fast-fail took %s; should be sub-ms", elapsed)
 	}
 }
 

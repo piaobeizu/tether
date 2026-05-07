@@ -247,13 +247,22 @@ func (e *EnvelopeEmitter) Stats() (linesParsed, envelopesEmit, envelopesDrop int
 //
 // Best-effort delivery: if a subscriber's outbound channel is full, the
 // envelope is dropped for that subscriber (the channel buffer of 64 is
-// the same back-pressure model as the watcher relay). Returns
-// ErrEmitterClosed only if the emitter has been Close()'d.
-func (e *EnvelopeEmitter) Inject(env LocalEnvelope) error {
+// the same back-pressure model as the watcher relay). Returns the
+// number of subscribers the envelope was successfully delivered to
+// (post drop-on-full filter), plus an error: ErrEmitterClosed if the
+// emitter has been Close()'d.
+//
+// **A delivered count of zero is NOT an error from Inject's perspective**
+// — it just means nobody is currently listening for this sessionId.
+// Callers that need fail-fast semantics on no-subscribers (e.g.
+// AuthBroker, which would otherwise wait its full Timeout for a
+// reply that can never come) must check the count themselves and
+// short-circuit. See AuthBroker.Ask for the canonical pattern.
+func (e *EnvelopeEmitter) Inject(env LocalEnvelope) (delivered int, err error) {
 	e.mu.Lock()
 	if e.closed {
 		e.mu.Unlock()
-		return ErrEmitterClosed
+		return 0, ErrEmitterClosed
 	}
 	// Snapshot subs to avoid holding the lock while sending. New
 	// subscribers added concurrently won't see this envelope; that's
@@ -268,13 +277,15 @@ func (e *EnvelopeEmitter) Inject(env LocalEnvelope) error {
 	for _, s := range subs {
 		select {
 		case s.out <- env:
+			delivered++
 		default:
 			// Subscriber slow / disconnected; drop. The watcher's
 			// OnDrop reporting only fires on JSONL drops, so we don't
-			// double-count here.
+			// double-count here. The drop is reflected in the returned
+			// delivered count being less than len(subs).
 		}
 	}
-	return nil
+	return delivered, nil
 }
 
 // relay is the per-subscriber goroutine: pulls jsonl.Envelopes from the

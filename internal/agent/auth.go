@@ -115,9 +115,12 @@ type AuthBroker struct {
 	// Timeout overrides DefaultAuthTimeout. Zero = use default.
 	Timeout time.Duration
 
-	// OnDecision is called once per Ask() resolution (allow/deny/timeout)
-	// for daemon-side audit logging. Optional.
-	OnDecision func(sid, toolName string, decision AuthDecision, fromCache bool)
+	// (Removed: an `OnDecision` callback for daemon-side audit logging
+	// was declared but never wired by any caller. If audit-log
+	// integration is wanted later, prefer pushing decisions through
+	// the existing lock.LogSink path or a dedicated
+	// auth-decisions.jsonl sink — that keeps the broker free of
+	// caller-installed callbacks.)
 
 	mu       sync.Mutex
 	pending  map[string]*pendingAuth         // requestId → channel
@@ -172,9 +175,6 @@ func (b *AuthBroker) Ask(ctx context.Context, sid, toolName string, toolInput js
 	// Cache hit — short-circuit before bothering the UI.
 	if cached, ok := b.remember[rememberKey{sid, toolName}]; ok {
 		b.mu.Unlock()
-		if b.OnDecision != nil {
-			b.OnDecision(sid, toolName, cached, true)
-		}
 		return cached, nil
 	}
 	rid := newRequestID()
@@ -199,8 +199,21 @@ func (b *AuthBroker) Ask(ctx context.Context, sid, toolName string, toolInput js
 			"summary":   summary,
 		},
 	}
-	if err := b.Emitter.Inject(env); err != nil {
+	delivered, err := b.Emitter.Inject(env)
+	if err != nil {
 		return AuthDecisionDenyOnce, fmt.Errorf("agent: broker inject: %w", err)
+	}
+	// Fail-fast on no UI listening for this sid. Without this, broker
+	// would block the full Timeout (default 60s) for a decision that
+	// can never come, and cc would see a delayed deny with no
+	// indication that the cause was "no UI attached" vs "user said
+	// no". Keep the deny semantic (fail-closed is the right safety
+	// posture), but return immediately + name the reason.
+	if delivered == 0 {
+		return AuthDecisionDenyOnce, fmt.Errorf(
+			"agent: auth deny — no UI client subscribed to session %q (broker emitted auth.tool-request but reached zero clients)",
+			sid,
+		)
 	}
 
 	timeout := b.Timeout
@@ -217,14 +230,8 @@ func (b *AuthBroker) Ask(ctx context.Context, sid, toolName string, toolInput js
 			b.remember[rememberKey{sid, toolName}] = d
 			b.mu.Unlock()
 		}
-		if b.OnDecision != nil {
-			b.OnDecision(sid, toolName, d, false)
-		}
 		return d, nil
 	case <-timer.C:
-		if b.OnDecision != nil {
-			b.OnDecision(sid, toolName, AuthDecisionDenyOnce, false)
-		}
 		return AuthDecisionDenyOnce, fmt.Errorf("agent: auth decision timeout after %s", timeout)
 	case <-ctx.Done():
 		return AuthDecisionDenyOnce, ctx.Err()

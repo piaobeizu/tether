@@ -158,10 +158,25 @@ func Run(ctx context.Context, cfg Config) error {
 	if stderr == nil {
 		stderr = io.Discard
 	}
+	// logf is the verbose-gated logger — used for routine progress
+	// (heartbeats, frame counts, etc.) where the operator can opt in
+	// via `tether daemon -v`. In production default (-v off), these
+	// are silently dropped.
 	logf := func(format string, args ...any) {
 		if cfg.Verbose {
 			fmt.Fprintf(stderr, format+"\n", args...)
 		}
+	}
+	// warnf is the always-on logger for events the user CANNOT
+	// diagnose without seeing them: audit-log file open failures,
+	// hookserver serve errors, broker emitter Inject errors. Goes to
+	// stderr regardless of the `-v` flag — these are rare enough they
+	// don't constitute log spam, and silencing them in default prod
+	// (which is what -v=false used to do) makes intermittent failures
+	// invisible. cmd/tether sets stderr=os.Stderr unconditionally so
+	// production sees these.
+	warnf := func(format string, args ...any) {
+		fmt.Fprintf(stderr, format+"\n", args...)
 	}
 
 	wd := watchdog.New()
@@ -222,17 +237,17 @@ func Run(ctx context.Context, cfg Config) error {
 		if !cfg.DisableLockAudit {
 			auditPath, perr := resolveLockAuditPath(cfg)
 			if perr != nil {
-				logf("[daemon] lock audit log: resolve path: %v (continuing in-memory only)", perr)
+				warnf("[daemon] lock audit log: resolve path: %v (continuing in-memory only)", perr)
 			} else {
 				sink, serr := lock.NewJSONLLogSink(auditPath)
 				if serr != nil {
-					logf("[daemon] lock audit log: open %q: %v (continuing in-memory only)", auditPath, serr)
+					warnf("[daemon] lock audit log: open %q: %v (continuing in-memory only)", auditPath, serr)
 				} else {
 					lockSink = sink
 					lockOpts = append(lockOpts,
 						lock.WithLogSink(sink),
 						lock.WithSinkErrorHandler(func(err error) {
-							logf("[daemon] lock audit log: append: %v", err)
+							warnf("[daemon] lock audit log: append: %v", err)
 						}),
 					)
 					logf("[daemon] lock audit log → %s", auditPath)

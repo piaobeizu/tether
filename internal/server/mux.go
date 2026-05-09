@@ -21,7 +21,7 @@ import (
 //	/wt/shell       → PTY shell channel stub (s6)
 //	/wt/events      → broadcast events channel (s4)
 //	/wt/_smoke      → WT bidi pure-byte echo (D-22 §6 #2 acceptance gate)
-func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *session.Registry) *http.ServeMux {
+func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *session.Registry, ps *PermState) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	derHex := HashHex(bundle.DER)
@@ -58,10 +58,8 @@ func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *ses
 	mux.HandleFunc("/wt/chat", handleWTChat(reg, wts))
 	mux.HandleFunc("/wt/events", handleWTEvents(reg, wts))
 
-	// s5: permission API (stubs wired in s5).
-	mux.HandleFunc("/api/v1/agent/permission/", func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "not implemented", http.StatusNotImplemented)
-	})
+	// s5: permission API.
+	registerPermAPI(mux, ps, reg)
 
 	// s6: shell WT channel stub.
 	mux.HandleFunc("/wt/shell", func(w http.ResponseWriter, _ *http.Request) {

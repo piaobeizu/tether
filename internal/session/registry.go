@@ -12,9 +12,10 @@ import (
 
 // Registry holds all live sessions and the set of event subscribers per session.
 type Registry struct {
-	mu       sync.RWMutex
-	sessions map[string]*entry // keyed by cc SessionID
-	provider agent.AgentProvider
+	mu           sync.RWMutex
+	sessions     map[string]*entry // keyed by cc SessionID
+	provider     agent.AgentProvider
+	PermEndpoint string // injected into cc subprocess env if non-empty
 }
 
 type entry struct {
@@ -43,7 +44,11 @@ func (r *Registry) GetOrSpawn(ctx context.Context, ccSID string) (agent.Session,
 		}
 	}
 
-	sess, err := r.provider.Spawn(ctx, agent.SpawnConfig{ResumeSessionID: ccSID})
+	var extraEnv []string
+	if r.PermEndpoint != "" {
+		extraEnv = append(extraEnv, "TETHER_DAEMON_PERM_ENDPOINT="+r.PermEndpoint)
+	}
+	sess, err := r.provider.Spawn(ctx, agent.SpawnConfig{ResumeSessionID: ccSID, Env: extraEnv})
 	if err != nil {
 		return nil, fmt.Errorf("spawn: %w", err)
 	}
@@ -62,6 +67,26 @@ func (r *Registry) GetOrSpawn(ctx context.Context, ccSID string) (agent.Session,
 	}()
 
 	return sess, nil
+}
+
+// BroadcastAll sends env to every subscriber across all sessions.
+func (r *Registry) BroadcastAll(env wire.Envelope) {
+	r.mu.RLock()
+	entries := make([]*entry, 0, len(r.sessions))
+	for _, e := range r.sessions {
+		entries = append(entries, e)
+	}
+	r.mu.RUnlock()
+	for _, e := range entries {
+		e.subsMu.RLock()
+		for ch := range e.subs {
+			select {
+			case ch <- env:
+			default:
+			}
+		}
+		e.subsMu.RUnlock()
+	}
 }
 
 // Subscribe registers a channel to receive broadcast envelopes for a session.

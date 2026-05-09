@@ -18,7 +18,7 @@ type Server struct {
 
 // newServer constructs (but does not start) the dual-listener server.
 // Call Start() to bind and serve.
-func newServer(cfg *Config, bundle CertBundle) *Server {
+func newServer(cfg *Config, bundle CertBundle, ps *PermState) *Server {
 	addr := cfg.addr()
 
 	// TCP: HTTP/2 + HTTP/1.1 over TLS.
@@ -50,7 +50,7 @@ func newServer(cfg *Config, bundle CertBundle) *Server {
 		CheckOrigin: func(*http.Request) bool { return true },
 	}
 
-	mux := buildMux(cfg, bundle, wts, cfg.Registry)
+	mux := buildMux(cfg, bundle, wts, cfg.Registry, ps)
 
 	tcpServer := &http.Server{
 		Addr:      addr,

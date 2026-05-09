@@ -1,0 +1,50 @@
+// Package permhook is compiled as a standalone binary that cc invokes as a
+// PreToolUse hook. It posts the tool request to the daemon and exits
+// 0 (allow) or 2 (deny) based on the daemon's response (D-05b §4.1).
+//
+// This file is compiled at daemon startup via EnsureHookBinary() into
+// ~/.tether/bin/tether-permission-hook. It is also embedded as a string
+// constant in embedded.go for the compile-on-startup path.
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"time"
+)
+
+func main() {
+	body, _ := io.ReadAll(os.Stdin)
+
+	endpoint := os.Getenv("TETHER_DAEMON_PERM_ENDPOINT")
+	if endpoint == "" {
+		fmt.Fprintln(os.Stderr, "[hook] TETHER_DAEMON_PERM_ENDPOINT unset")
+		os.Exit(2)
+	}
+
+	client := &http.Client{Timeout: 65 * time.Second}
+	resp, err := client.Post(endpoint, "application/json", bytes.NewReader(body))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[hook] daemon unreachable: %v\n", err)
+		os.Exit(2)
+	}
+	defer resp.Body.Close()
+
+	var dec struct {
+		Allow   bool   `json:"allow"`
+		Message string `json:"message,omitempty"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&dec); err != nil {
+		fmt.Fprintf(os.Stderr, "[hook] decode response: %v\n", err)
+		os.Exit(2)
+	}
+	if dec.Allow {
+		os.Exit(0)
+	}
+	fmt.Fprintf(os.Stderr, "[hook] denied: %s\n", dec.Message)
+	os.Exit(2)
+}

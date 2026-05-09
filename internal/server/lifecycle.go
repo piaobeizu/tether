@@ -7,10 +7,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/piaobeizu/tether/internal/agent"
+	"github.com/piaobeizu/tether/internal/agent/permhook"
 	"github.com/piaobeizu/tether/internal/session"
 )
 
@@ -54,9 +56,24 @@ func Run(cfg *Config) error {
 	if err != nil {
 		return err
 	}
-	_ = binDir
 
-	// Step 3: load or generate cert.
+	// Step 3: permission hook setup (D-05b §4–§5).
+	ps := NewPermState()
+	noHook := os.Getenv("TETHER_NO_PERMISSION_HOOK") == "1"
+	if !noHook {
+		binPath := filepath.Join(binDir, "tether-permission-hook")
+		if err := permhook.EnsureHookBinary(binPath); err != nil {
+			return fmt.Errorf("perm hook compile: %w", err)
+		}
+		permEndpoint := fmt.Sprintf("https://127.0.0.1%s/api/v1/agent/permission/request", cfg.addr())
+		if err := agent.InjectPermHook(binPath, permEndpoint); err != nil {
+			slog.Warn("inject perm hook failed", "err", err)
+		} else {
+			cfg.Registry.PermEndpoint = permEndpoint
+		}
+	}
+
+	// Step 4: load or generate cert.
 	bundle, err := LoadOrGenCert(cfg.CertFile, cfg.KeyFile)
 	if err != nil {
 		return fmt.Errorf("cert: %w", err)
@@ -65,8 +82,8 @@ func Run(cfg *Config) error {
 	// Resolve effective frontend URL for dev mode.
 	cfg.DevFrontendURL = cfg.devFrontend()
 
-	// Step 4: build and start listeners.
-	srv := newServer(cfg, bundle)
+	// Step 5: build and start listeners.
+	srv := newServer(cfg, bundle, ps)
 
 	errCh := make(chan error, 2)
 
@@ -94,7 +111,7 @@ func Run(cfg *Config) error {
 	slog.Info("claude binary", "path", ccPath)
 	slog.Info("cert DER hash", "hash", HashHex(bundle.DER))
 
-	// Step 5: block until signal or listener error.
+	// Step 6: block until signal or listener error.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
@@ -106,6 +123,10 @@ func Run(cfg *Config) error {
 	}
 
 	// Step 6: graceful shutdown (≤5s).
+	if !noHook {
+		_ = agent.RemovePermHook()
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 

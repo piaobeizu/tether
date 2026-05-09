@@ -5,6 +5,8 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+
+	"github.com/piaobeizu/tether/internal/server"
 )
 
 const version = "v0.1.0-dev"
@@ -22,7 +24,7 @@ var rootCmd = &cobra.Command{
 }
 
 func init() {
-	rootCmd.AddCommand(versionCmd, serverCmd, attachCmd, pairCmd, doctorCmd)
+	rootCmd.AddCommand(versionCmd, newServerCmd(), attachCmd, pairCmd, doctorCmd)
 }
 
 var versionCmd = &cobra.Command{
@@ -33,12 +35,21 @@ var versionCmd = &cobra.Command{
 	},
 }
 
-var serverCmd = &cobra.Command{
-	Use:   "server",
-	Short: "Start the tether server (stub — implemented in s2)",
-	RunE: func(_ *cobra.Command, _ []string) error {
-		return fmt.Errorf("server: not yet implemented (s2)")
-	},
+func newServerCmd() *cobra.Command {
+	cfg := &server.Config{}
+	cmd := &cobra.Command{
+		Use:   "server",
+		Short: "Start the tether HTTP/3 + WebTransport server",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return server.Run(cfg)
+		},
+	}
+	cmd.Flags().IntVarP(&cfg.Port, "port", "p", 8898, "listen port (TCP + UDP)")
+	cmd.Flags().StringVar(&cfg.CertFile, "cert-file", "", "TLS cert PEM (bypasses auto-rotation)")
+	cmd.Flags().StringVar(&cfg.KeyFile, "key-file", "", "TLS key PEM (bypasses auto-rotation)")
+	cmd.Flags().BoolVar(&cfg.DevMode, "dev", false, "proxy SPA to Vite dev server")
+	cmd.Flags().StringVar(&cfg.DevFrontendURL, "dev-url", "", "Vite dev server URL (default http://localhost:5173)")
+	return cmd
 }
 
 var attachCmd = &cobra.Command{

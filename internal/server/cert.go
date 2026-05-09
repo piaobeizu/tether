@@ -120,3 +120,18 @@ func HashHex(fp [32]byte) string {
 	}
 	return string(out)
 }
+
+func sha256Sum(b []byte) [32]byte { return sha256.Sum256(b) }
+
+// marshalECKey marshals a crypto.PrivateKey (assumed ECDSA P-256) to PEM.
+func marshalECKey(key any) ([]byte, error) {
+	ecKey, ok := key.(*ecdsa.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("expected *ecdsa.PrivateKey, got %T", key)
+	}
+	der, err := x509.MarshalECPrivateKey(ecKey)
+	if err != nil {
+		return nil, err
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}), nil
+}

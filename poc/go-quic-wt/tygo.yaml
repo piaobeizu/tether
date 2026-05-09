@@ -1,0 +1,9 @@
+packages:
+  - path: github.com/piaobeizu/tether/poc/go-quic-wt/wire
+    output_path: step3_browser/wire-types.gen.ts
+    type_mappings:
+      time.Time: string
+      json.RawMessage: unknown
+    frontmatter: |
+      // ⚠ AUTO-GENERATED FROM wire/types.go BY tygo. DO NOT EDIT.
+      // To change shape: edit Go source then `go generate ./wire`.

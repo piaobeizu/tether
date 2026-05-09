@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>step13 — single-port HTTP/3 mux</title>
+<style>
+  body { font: 14px/1.4 ui-monospace, "SF Mono", Menlo, monospace; padding: 16px; max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  .row { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
+  button { padding: 6px 12px; font: inherit; cursor: pointer; }
+  pre { background: #f6f6f6; padding: 12px; border-radius: 4px; white-space: pre-wrap; word-break: break-all; }
+  .ok { color: #060; }
+  .err { color: #b00; }
+  .muted { color: #888; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>step13 — single-port HTTP/3 mux PoC</h1>
+<p class="muted">
+  This page itself loads via TCP HTTP/2 (TLS on :4433).<br>
+  Browser sees <code>Alt-Svc: h3=":4433"</code> and may upgrade subsequent requests to HTTP/3.<br>
+  WebTransport always goes UDP HTTP/3 with cert pinned via <code>serverCertificateHashes</code>.
+</p>
+
+<div class="row">
+  <button id="btn-cert">GET /cert-hash (TCP)</button>
+  <button id="btn-wt">WT /wt/echo (UDP)</button>
+  <button id="btn-clear">clear</button>
+</div>
+
+<pre id="log">(idle)</pre>
+
+<script>
+const $log = document.getElementById('log');
+function log(line, cls) {
+  const ts = new Date().toISOString().slice(11, 19);
+  const node = document.createElement('div');
+  if (cls) node.className = cls;
+  node.textContent = `[${ts}] ${line}`;
+  $log.appendChild(node);
+}
+
+document.getElementById('btn-clear').onclick = () => { $log.innerHTML = ''; };
+
+document.getElementById('btn-cert').onclick = async () => {
+  try {
+    const r = await fetch('/cert-hash');
+    const txt = (await r.text()).trim();
+    log(`HTTP ${r.status} (proto via Alt-Svc may upgrade) — cert-hash = ${txt}`, 'ok');
+    log(`response Alt-Svc header: ${r.headers.get('Alt-Svc') || '(none, browser may have absorbed it)'}`);
+  } catch (e) {
+    log(`fetch error: ${e}`, 'err');
+  }
+};
+
+document.getElementById('btn-wt').onclick = async () => {
+  if (!('WebTransport' in window)) {
+    log('WebTransport API not available in this browser', 'err');
+    return;
+  }
+  let hashHex;
+  try {
+    const r = await fetch('/cert-hash');
+    hashHex = (await r.text()).trim();
+    if (!/^[0-9a-f]{64}$/.test(hashHex)) {
+      log(`bad cert-hash format: ${hashHex}`, 'err');
+      return;
+    }
+  } catch (e) {
+    log(`fetch /cert-hash failed: ${e}`, 'err');
+    return;
+  }
+
+  const bytes = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) bytes[i] = parseInt(hashHex.substr(i * 2, 2), 16);
+
+  let session;
+  try {
+    session = new WebTransport(`https://${location.host}/wt/echo`, {
+      serverCertificateHashes: [{ algorithm: 'sha-256', value: bytes }],
+    });
+    await session.ready;
+    log(`WT session ready`, 'ok');
+  } catch (e) {
+    log(`WT connect failed: ${e}`, 'err');
+    return;
+  }
+
+  try {
+    const stream = await session.createBidirectionalStream();
+    const writer = stream.writable.getWriter();
+    const msg = `hello-from-browser-${Date.now()}`;
+    const sent = new TextEncoder().encode(msg);
+    await writer.write(sent);
+    await writer.close();
+    const reader = stream.readable.getReader();
+    let received = new Uint8Array(0);
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const merged = new Uint8Array(received.length + value.length);
+      merged.set(received);
+      merged.set(value, received.length);
+      received = merged;
+    }
+    const text = new TextDecoder().decode(received);
+    if (text === msg) {
+      log(`✓ WT echo round-trip: ${msg.length} bytes (pure echo, no prefix)`, 'ok');
+    } else {
+      log(`✗ WT echo mismatch: sent ${msg.length}B, got ${received.length}B (${text})`, 'err');
+    }
+  } catch (e) {
+    log(`WT stream error: ${e}`, 'err');
+  } finally {
+    try { session.close(); } catch {}
+  }
+};
+</script>
+</body>
+</html>

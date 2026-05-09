@@ -3,6 +3,7 @@ module github.com/piaobeizu/tether/poc/go-quic-wt
 go 1.24.6
 
 require (
+	github.com/creack/pty v1.1.24
 	github.com/quic-go/quic-go v0.59.0
 	github.com/quic-go/webtransport-go v0.10.0
 )

@@ -3,10 +3,10 @@
 BINARY := bin/tether
 CMD    := ./cmd/tether
 
-all: codegen build
+all: build
 
 build:
-	go build -o $(BINARY) $(CMD)
+	bash scripts/build.sh
 
 codegen:
 	bash scripts/codegen.sh

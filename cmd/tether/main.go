@@ -1,11 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
 
+	"github.com/piaobeizu/tether/internal/doctor"
 	"github.com/piaobeizu/tether/internal/server"
 )
 
@@ -24,7 +26,7 @@ var rootCmd = &cobra.Command{
 }
 
 func init() {
-	rootCmd.AddCommand(versionCmd, newServerCmd(), attachCmd, pairCmd, doctorCmd)
+	rootCmd.AddCommand(versionCmd, newServerCmd(), attachCmd, pairCmd, newDoctorCmd())
 }
 
 var versionCmd = &cobra.Command{
@@ -68,10 +70,38 @@ var pairCmd = &cobra.Command{
 	},
 }
 
-var doctorCmd = &cobra.Command{
-	Use:   "doctor",
-	Short: "Run preflight checks (stub — implemented in s5.5)",
-	RunE: func(_ *cobra.Command, _ []string) error {
-		return fmt.Errorf("doctor: not yet implemented (s5.5)")
-	},
+func newDoctorCmd() *cobra.Command {
+	var port int
+	var verbose bool
+	var asJSON bool
+	cmd := &cobra.Command{
+		Use:   "doctor",
+		Short: "Run preflight checks",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			report := doctor.Run(port, verbose)
+			if asJSON {
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetIndent("", "  ")
+				return enc.Encode(report)
+			}
+			for _, c := range report.Checks {
+				mark := "✓"
+				if !c.OK {
+					mark = "✗"
+				}
+				fmt.Printf("  %s  %-22s  %s\n", mark, c.Name, c.Message)
+				if verbose && c.Detail != "" {
+					fmt.Printf("       %s\n", c.Detail)
+				}
+			}
+			if !report.OK {
+				return fmt.Errorf("one or more preflight checks failed")
+			}
+			return nil
+		},
+	}
+	cmd.Flags().IntVarP(&port, "port", "p", 8898, "port to check bindability for")
+	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "show extra detail")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "output as JSON")
+	return cmd
 }

@@ -7,7 +7,8 @@ import (
 	"path/filepath"
 )
 
-const tetherManagedKey = "_tether_managed"
+// TetherManagedKey is the sentinel field injected into tether-owned hook entries.
+const TetherManagedKey = "_tether_managed"
 
 // InjectPermHook merges the tether-managed PreToolUse hook entry into
 // ~/.config/claude/settings.json, preserving any existing user hooks.
@@ -28,7 +29,7 @@ func InjectPermHook(hookBinPath, daemonEndpoint string) error {
 
 	hooks := getHookList(settings, "PreToolUse")
 	hooks = append(hooks, map[string]any{
-		tetherManagedKey: true,
+		TetherManagedKey: true,
 		"hooks": []any{map[string]any{
 			"type":    "command",
 			"command": hookBinPath,
@@ -61,7 +62,7 @@ func removeManaged(settings map[string]any) {
 		filtered := hooks[:0]
 		for _, h := range hooks {
 			if hm, ok := h.(map[string]any); ok {
-				if managed, _ := hm[tetherManagedKey].(bool); managed {
+				if managed, _ := hm[TetherManagedKey].(bool); managed {
 					continue
 				}
 			}

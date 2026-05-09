@@ -61,10 +61,9 @@ func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *ses
 	// s5: permission API.
 	registerPermAPI(mux, ps, reg)
 
-	// s6: shell WT channel stub.
-	mux.HandleFunc("/wt/shell", func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "not implemented", http.StatusNotImplemented)
-	})
+	// s6: shell WT channel + session lock API.
+	mux.HandleFunc("/wt/shell", handleWTShell(reg, wts))
+	mux.HandleFunc("/api/v1/session/", handleLockForce(reg))
 
 	mux.HandleFunc("/api/v1/", func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "not implemented", http.StatusNotImplemented)

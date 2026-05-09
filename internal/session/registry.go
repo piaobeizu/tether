@@ -14,6 +14,7 @@ import (
 type Registry struct {
 	mu           sync.RWMutex
 	sessions     map[string]*entry // keyed by cc SessionID
+	locks        map[string]*SessionLock
 	provider     agent.AgentProvider
 	PermEndpoint string // injected into cc subprocess env if non-empty
 }
@@ -27,8 +28,21 @@ type entry struct {
 func NewRegistry(provider agent.AgentProvider) *Registry {
 	return &Registry{
 		sessions: make(map[string]*entry),
+		locks:    make(map[string]*SessionLock),
 		provider: provider,
 	}
+}
+
+// GetLock returns (or lazily creates) the SessionLock for the given ccSID.
+func (r *Registry) GetLock(ccSID string) *SessionLock {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if l, ok := r.locks[ccSID]; ok {
+		return l
+	}
+	l := &SessionLock{}
+	r.locks[ccSID] = l
+	return l
 }
 
 // GetOrSpawn returns the existing session for the given ccSID, or spawns a new

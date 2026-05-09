@@ -78,6 +78,18 @@ export class TetherWT {
   }
 }
 
+// createWT creates a WebTransport to the given URL with cert pinning.
+// For callers that don't need the full TetherWT wrapper (e.g. shell pane).
+export async function createWT(url: string): Promise<WebTransport> {
+  const certHash = await fetchCertHash()
+  const opts: WebTransportOptions = certHash
+    ? { serverCertificateHashes: [{ algorithm: 'sha-256', value: hexToBuffer(certHash) }] }
+    : {}
+  const wt = new WebTransport(url, opts)
+  await wt.ready
+  return wt
+}
+
 // fetchCertHash fetches /cert-hash from the current origin.
 // Returns null if the request fails (e.g. CA-signed cert, no endpoint).
 async function fetchCertHash(): Promise<HashHex64 | null> {

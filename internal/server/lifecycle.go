@@ -14,6 +14,8 @@ import (
 	"github.com/piaobeizu/tether/internal/agent"
 	"github.com/piaobeizu/tether/internal/agent/permhook"
 	"github.com/piaobeizu/tether/internal/session"
+	"github.com/piaobeizu/tether/internal/skill"
+	"github.com/piaobeizu/tether/internal/workspace"
 )
 
 // Config holds all server startup parameters.
@@ -24,6 +26,8 @@ type Config struct {
 	DevMode        bool   // if true, proxy SPA to DevFrontendURL
 	DevFrontendURL string // default http://localhost:5173 when DevMode=true
 	Registry       *session.Registry
+	WsRegistry     *workspace.Registry
+	SkillRegistry  *skill.Registry
 }
 
 func (c *Config) addr() string { return fmt.Sprintf(":%d", c.Port) }
@@ -55,6 +59,24 @@ func Run(cfg *Config) error {
 	binDir, err := tetherBinDir()
 	if err != nil {
 		return err
+	}
+
+	// Step 2b: workspace + skill registries.
+	if cfg.WsRegistry == nil {
+		wsReg, err := workspace.NewRegistry()
+		if err != nil {
+			slog.Warn("workspace registry init failed", "err", err)
+		} else {
+			cfg.WsRegistry = wsReg
+		}
+	}
+	if cfg.SkillRegistry == nil {
+		skReg, err := skill.NewRegistry()
+		if err != nil {
+			slog.Warn("skill registry init failed", "err", err)
+		} else {
+			cfg.SkillRegistry = skReg
+		}
 	}
 
 	// Step 3: permission hook setup (D-05b §4–§5).

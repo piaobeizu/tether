@@ -8,6 +8,8 @@ import (
 	"github.com/quic-go/webtransport-go"
 
 	"github.com/piaobeizu/tether/internal/session"
+	"github.com/piaobeizu/tether/internal/skill"
+	"github.com/piaobeizu/tether/internal/workspace"
 )
 
 // buildMux constructs the shared route table used by both the TCP and UDP
@@ -64,6 +66,14 @@ func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *ses
 	// s6: shell WT channel + session lock API.
 	mux.HandleFunc("/wt/shell", handleWTShell(reg, wts))
 	mux.HandleFunc("/api/v1/session/", handleLockForce(reg))
+
+	// s7: workspace + skill REST APIs.
+	if cfg.WsRegistry != nil {
+		workspace.RegisterAPI(mux, cfg.WsRegistry)
+	}
+	if cfg.SkillRegistry != nil {
+		skill.RegisterAPI(mux, cfg.SkillRegistry)
+	}
 
 	mux.HandleFunc("/api/v1/", func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "not implemented", http.StatusNotImplemented)

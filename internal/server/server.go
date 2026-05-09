@@ -50,7 +50,7 @@ func newServer(cfg *Config, bundle CertBundle) *Server {
 		CheckOrigin: func(*http.Request) bool { return true },
 	}
 
-	mux := buildMux(cfg, bundle, wts)
+	mux := buildMux(cfg, bundle, wts, cfg.Registry)
 
 	tcpServer := &http.Server{
 		Addr:      addr,

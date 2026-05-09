@@ -9,6 +9,9 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/piaobeizu/tether/internal/agent"
+	"github.com/piaobeizu/tether/internal/session"
 )
 
 // Config holds all server startup parameters.
@@ -18,6 +21,7 @@ type Config struct {
 	KeyFile        string
 	DevMode        bool   // if true, proxy SPA to DevFrontendURL
 	DevFrontendURL string // default http://localhost:5173 when DevMode=true
+	Registry       *session.Registry
 }
 
 func (c *Config) addr() string { return fmt.Sprintf(":%d", c.Port) }
@@ -35,8 +39,12 @@ func (c *Config) devFrontend() string {
 // Run executes the §10.A.4 startup sequence, blocks until SIGINT/SIGTERM,
 // then performs graceful shutdown (≤5s per K.1.5).
 func Run(cfg *Config) error {
-	// Step 1: resolve cc binary path.
+	// Step 1: resolve cc binary path + build session registry.
 	ccPath := resolveClaudePath()
+	if cfg.Registry == nil {
+		provider := agent.NewClaudeCodeProvider(ccPath)
+		cfg.Registry = session.NewRegistry(provider)
+	}
 
 	// Step 2: ensure ~/.tether/ data dirs.
 	if _, err := tetherDataDir(); err != nil {

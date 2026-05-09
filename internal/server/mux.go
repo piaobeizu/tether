@@ -6,20 +6,22 @@ import (
 	"net/http"
 
 	"github.com/quic-go/webtransport-go"
+
+	"github.com/piaobeizu/tether/internal/session"
 )
 
 // buildMux constructs the shared route table used by both the TCP and UDP
 // listeners. Routes per §10.B.4:
 //
-//	/             → SPA (embed.FS or dev proxy)
-//	/cert-hash    → 64-char DER hash (wire.HashHex64)
+//	/               → SPA (embed.FS or dev proxy)
+//	/cert-hash      → 64-char DER hash (wire.HashHex64)
 //	/cert-hash-spki → 64-char SPKI hash
-//	/api/v1/*     → 501 stubs (implemented s4+)
-//	/wt/chat      → 501 stub (s4)
-//	/wt/shell     → 501 stub (s6)
-//	/wt/events    → 501 stub (s4)
-//	/wt/_smoke    → WT bidi pure-byte echo (D-22 §6 #2 acceptance gate)
-func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server) *http.ServeMux {
+//	/api/v1/*       → REST API (stubs for s5+)
+//	/wt/chat        → stream-json chat channel (s4)
+//	/wt/shell       → PTY shell channel stub (s6)
+//	/wt/events      → broadcast events channel (s4)
+//	/wt/_smoke      → WT bidi pure-byte echo (D-22 §6 #2 acceptance gate)
+func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *session.Registry) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	derHex := HashHex(bundle.DER)
@@ -52,17 +54,23 @@ func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server) *http.Se
 		}()
 	})
 
-	// §10.B.4 stubs — full implementation in s4/s5/s6.
-	for _, path := range []string{
-		"/api/v1/",
-		"/wt/chat",
-		"/wt/shell",
-		"/wt/events",
-	} {
-		mux.HandleFunc(path, func(w http.ResponseWriter, _ *http.Request) {
-			http.Error(w, "not implemented", http.StatusNotImplemented)
-		})
-	}
+	// s4: chat + events WT channels.
+	mux.HandleFunc("/wt/chat", handleWTChat(reg, wts))
+	mux.HandleFunc("/wt/events", handleWTEvents(reg, wts))
+
+	// s5: permission API (stubs wired in s5).
+	mux.HandleFunc("/api/v1/agent/permission/", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "not implemented", http.StatusNotImplemented)
+	})
+
+	// s6: shell WT channel stub.
+	mux.HandleFunc("/wt/shell", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "not implemented", http.StatusNotImplemented)
+	})
+
+	mux.HandleFunc("/api/v1/", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "not implemented", http.StatusNotImplemented)
+	})
 
 	mux.Handle("/", newStaticHandler(cfg.DevFrontendURL))
 	return mux

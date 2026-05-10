@@ -34,6 +34,7 @@ type Report struct {
 func Run(port int, verbose bool) Report {
 	checks := []CheckResult{
 		checkCCBinary(verbose),
+		checkOpencodeBinary(verbose),
 		checkDataDir(verbose),
 		checkCertState(verbose),
 		checkPortBindable(port, verbose),
@@ -47,6 +48,19 @@ func Run(port int, verbose bool) Report {
 		}
 	}
 	return Report{OK: ok, Checks: checks}
+}
+
+// checkOpencodeBinary verifies the opencode binary is on PATH (optional).
+func checkOpencodeBinary(verbose bool) CheckResult {
+	path, err := exec.LookPath("opencode")
+	if err != nil {
+		return CheckResult{Name: "opencode-binary", OK: true, Message: "opencode not found on PATH (optional)"}
+	}
+	r := CheckResult{Name: "opencode-binary", OK: true, Message: "opencode found"}
+	if verbose {
+		r.Detail = path
+	}
+	return r
 }
 
 // checkCCBinary verifies the claude binary is on PATH and executable.

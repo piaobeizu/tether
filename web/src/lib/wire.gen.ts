@@ -70,3 +70,9 @@ export interface FencedBlock {
   content: string; // skill-defined JSON body (opaque to daemon)
   blockId?: string; // optional, for action callbacks
 }
+/**
+ * ProviderListResponse is the response body for GET /api/v1/providers.
+ */
+export interface ProviderListResponse {
+  providers: string[];
+}

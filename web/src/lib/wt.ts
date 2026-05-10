@@ -90,6 +90,60 @@ export async function createWT(url: string): Promise<WebTransport> {
   return wt
 }
 
+// connectEventsOnly connects to /wt/events?sid=<sid> for read-only fan-out
+// attach (multi-tab). clientId is derived server-side from the JWT cookie —
+// no need to pass it in the URL. Returns the WebTransport; caller must close it.
+export async function connectEventsOnly(
+  sid: string,
+  onEnvelope: (env: Envelope) => void,
+  onClose: () => void,
+): Promise<WebTransport> {
+  const certHash = await fetchCertHash()
+  const wtOpts: WebTransportOptions = certHash
+    ? { serverCertificateHashes: [{ algorithm: 'sha-256', value: hexToBuffer(certHash) }] }
+    : {}
+  const url = `https://${location.host}/wt/events?sid=${encodeURIComponent(sid)}`
+  const wt = new WebTransport(url, wtOpts)
+  await wt.ready
+
+  // Read incoming unidirectional streams — same pattern as TetherWT.readEvents.
+  let closeFired = false
+  const fireClose = () => {
+    if (!closeFired) { closeFired = true; onClose() }
+  }
+  ;(async () => {
+    const reader = wt.incomingUnidirectionalStreams.getReader()
+    try {
+      while (true) {
+        const { value: stream, done } = await reader.read()
+        if (done) break
+        // Read each stream and parse JSONL envelopes.
+        ;(async () => {
+          const sr = stream.getReader()
+          const chunks: Uint8Array[] = []
+          try {
+            while (true) {
+              const { value, done: sd } = await sr.read()
+              if (sd) break
+              chunks.push(value)
+            }
+          } catch { /* closed */ }
+          const text = new TextDecoder().decode(concat(chunks))
+          for (const line of text.split('\n')) {
+            const l = line.trim()
+            if (!l) continue
+            try { onEnvelope(JSON.parse(l) as Envelope) } catch { /* malformed */ }
+          }
+        })()
+      }
+    } catch { /* transport closed */ }
+    fireClose()
+  })()
+
+  wt.closed.then(fireClose).catch(fireClose)
+  return wt
+}
+
 // fetchCertHash fetches /cert-hash from the current origin.
 // Returns null if the request fails (e.g. CA-signed cert, no endpoint).
 async function fetchCertHash(): Promise<HashHex64 | null> {

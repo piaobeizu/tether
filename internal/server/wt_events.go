@@ -7,6 +7,7 @@ import (
 
 	"github.com/quic-go/webtransport-go"
 
+	"github.com/piaobeizu/tether/internal/auth"
 	"github.com/piaobeizu/tether/internal/session"
 	"github.com/piaobeizu/tether/internal/wire"
 )
@@ -14,22 +15,29 @@ import (
 // handleWTEvents handles /wt/events — a unidirectional broadcast channel.
 // Browser connects with ?sid=<sessionID> and receives all envelope events for
 // that session. Supports multi-attach (D-08): multiple clients see same events.
-func handleWTEvents(reg *session.Registry, wts *webtransport.Server) http.HandlerFunc {
+func handleWTEvents(reg *session.Registry, wts *webtransport.Server, authState *auth.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		wtsess, err := wts.Upgrade(w, r)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		go serveEvents(r, wtsess, reg)
+		go serveEvents(r, wtsess, reg, authState)
 	}
 }
 
-func serveEvents(r *http.Request, wtsess *webtransport.Session, reg *session.Registry) {
+func serveEvents(r *http.Request, wtsess *webtransport.Session, reg *session.Registry, authState *auth.State) {
 	defer wtsess.CloseWithError(0, "")
 
 	ccSID := r.URL.Query().Get("sid")
 	if ccSID == "" {
+		return
+	}
+
+	// Derive client identity from verified JWT cookie (not the forgeable ?clientId= param).
+	clientID := authState.ClientIDFromRequest(r)
+	// Owner must use /wt/chat, not /wt/events — silently close.
+	if clientID != "" && reg.IsOwner(ccSID, clientID) {
 		return
 	}
 
@@ -48,10 +56,13 @@ func serveEvents(r *http.Request, wtsess *webtransport.Session, reg *session.Reg
 			env.SessionID = ccSID
 			stream, err := wtsess.OpenUniStreamSync(wtsess.Context())
 			if err != nil {
-				return
+				return // client disconnected
 			}
 			b, _ := json.Marshal(env)
-			fmt.Fprintf(stream, "%s\n", b)
+			if _, err := fmt.Fprintf(stream, "%s\n", b); err != nil {
+				_ = stream.Close()
+				return // write failure = client gone
+			}
 			_ = stream.Close()
 		}
 	}

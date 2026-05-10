@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.2.0 (unreleased)
+
+### Added
+- Auth: static token gate (`--token` flag, auto-generated at `~/.tether/access-token`); JWT cookie (`HttpOnly; Secure; SameSite=Strict; Path=/`; 90-day sliding expiry); `/auth` page in SPA
+- opencode provider: per-prompt subprocess spawn (D-17a §5.1); select per session via provider dropdown in UI
+- `GET /api/v1/providers` — list registered providers (sorted)
+- `tether doctor` now checks for `opencode` binary on PATH (optional, always OK)
+- Multi-tab attach: second browser tab connects to `/wt/events` for read-only event stream; server-side owner enforcement via `OwnerClientID` (CAS, first-wins)
+- Attach/Detach UI in workspace pane
+
 ## v0.1.0 — 2026-05-09
 
 ### What's new

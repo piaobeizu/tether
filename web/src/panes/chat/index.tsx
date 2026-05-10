@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { TetherWT } from '../../lib/wt'
 import { useStore } from '../../lib/store'
-import type { FencedBlock } from '../../lib/wire.gen'
+import type { FencedBlock, ProviderListResponse } from '../../lib/wire.gen'
+import { authedFetch } from '../../lib/auth'
 import { DagBlock } from '../../fenced-blocks/DagBlock'
 import { FormBlock } from '../../fenced-blocks/FormBlock'
 import { CandidatesBlock } from '../../fenced-blocks/CandidatesBlock'
@@ -17,11 +18,23 @@ export default function ChatPane() {
   const [connError, setConnError] = useState<string | null>(null)
   const writerRef = useRef<WritableStreamDefaultWriter<Uint8Array> | null>(null)
   const wtRef = useRef<TetherWT | null>(null)
+  const [providers, setProviders] = useState<string[]>(['claude-code'])
+  const [selectedProvider, setSelectedProvider] = useState('claude-code')
+
+  useEffect(() => {
+    authedFetch('/api/v1/providers')
+      .then(r => r.json() as Promise<ProviderListResponse>)
+      .then(d => {
+        if (d.providers?.length > 0) setProviders(d.providers)
+      })
+      .catch(() => {}) // keep default ['claude'] on error
+  }, [])
 
   const doConnect = () => {
     setConnState('connecting')
     setConnError(null)
-    const url = `https://${location.host}/wt/chat`
+    // clientId is now derived server-side from the JWT cookie (not a URL param).
+    const url = `https://${location.host}/wt/chat?provider=${encodeURIComponent(selectedProvider)}`
     const wt = new TetherWT({
       url,
       onEnvelope: useStore.getState().handleEnvelope,
@@ -78,6 +91,7 @@ export default function ChatPane() {
           <span style={{ width: 8, height: 8, borderRadius: '50%', background: connDot, display: 'inline-block' }} />
           <span style={{ fontSize: 10, color: '#888' }}>{connLabel}</span>
           {sessionId && <span style={{ fontFamily: 'monospace', fontSize: 10, color: '#555' }}>{sessionId.slice(0, 8)}</span>}
+          {sessionId && <span style={{ fontSize: 11, color: '#888', marginLeft: 6 }}>[{selectedProvider}]</span>}
         </span>
       </div>
       <div className="pane-body" style={{ display: 'flex', flexDirection: 'column', gap: 8, paddingBottom: 0 }}>
@@ -112,6 +126,15 @@ export default function ChatPane() {
         {/* fenced-block rendering demo stubs */}
         <DummyFencedBlockDemo />
         <div style={{ display: 'flex', gap: 8, paddingBottom: 12, flexShrink: 0 }}>
+          {providers.length > 1 && (
+            <select
+              value={selectedProvider}
+              onChange={e => setSelectedProvider(e.target.value)}
+              style={{ background: '#222', color: '#e8e8e8', border: '1px solid #333', borderRadius: 4, padding: '4px 8px', fontSize: 12, marginRight: 8 }}
+            >
+              {providers.map(p => <option key={p} value={p}>{p}</option>)}
+            </select>
+          )}
           <input
             disabled={connState !== 'connected'}
             style={{ flex: 1, background: '#1a1a1a', border: '1px solid #333', borderRadius: 4, padding: '6px 10px', color: connState === 'connected' ? '#e8e8e8' : '#555', outline: 'none' }}

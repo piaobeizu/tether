@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 
 	"github.com/piaobeizu/tether/internal/agent"
@@ -16,21 +17,26 @@ type Registry struct {
 	mu           sync.RWMutex
 	sessions     map[string]*entry // keyed by cc SessionID
 	locks        map[string]*SessionLock
-	provider     agent.AgentProvider
+	providers    map[string]agent.AgentProvider
 	PermEndpoint string // injected into cc subprocess env if non-empty
 }
 
 type entry struct {
-	sess   agent.Session
-	subs   map[chan wire.Envelope]struct{}
-	subsMu sync.RWMutex
+	sess          agent.Session
+	subs          map[chan wire.Envelope]struct{}
+	subsMu        sync.RWMutex
+	ownerClientID string
 }
 
-func NewRegistry(provider agent.AgentProvider) *Registry {
+func NewRegistry(providers ...agent.AgentProvider) *Registry {
+	pm := make(map[string]agent.AgentProvider, len(providers))
+	for _, p := range providers {
+		pm[p.Name()] = p
+	}
 	return &Registry{
-		sessions: make(map[string]*entry),
-		locks:    make(map[string]*SessionLock),
-		provider: provider,
+		sessions:  make(map[string]*entry),
+		locks:     make(map[string]*SessionLock),
+		providers: pm,
 	}
 }
 
@@ -47,9 +53,10 @@ func (r *Registry) GetLock(ccSID string) *SessionLock {
 }
 
 // GetOrSpawn returns the existing session for the given ccSID, or spawns a new
-// ClaudeCode process and registers it. If ccSID is empty, a new process is spawned
+// agent process and registers it. If ccSID is empty, a new process is spawned
 // and registered once its system/init provides the real SessionID.
-func (r *Registry) GetOrSpawn(ctx context.Context, ccSID string) (agent.Session, error) {
+// providerName selects the AgentProvider; defaults to "claude-code" if empty.
+func (r *Registry) GetOrSpawn(ctx context.Context, ccSID, providerName string) (agent.Session, error) {
 	if ccSID != "" {
 		r.mu.RLock()
 		e, ok := r.sessions[ccSID]
@@ -59,11 +66,19 @@ func (r *Registry) GetOrSpawn(ctx context.Context, ccSID string) (agent.Session,
 		}
 	}
 
+	if providerName == "" {
+		providerName = "claude-code"
+	}
+	provider, ok := r.providers[providerName]
+	if !ok {
+		return nil, fmt.Errorf("unknown provider: %s", providerName)
+	}
+
 	var extraEnv []string
 	if r.PermEndpoint != "" {
 		extraEnv = append(extraEnv, "TETHER_DAEMON_PERM_ENDPOINT="+r.PermEndpoint)
 	}
-	sess, err := r.provider.Spawn(ctx, agent.SpawnConfig{ResumeSessionID: ccSID, Env: extraEnv})
+	sess, err := provider.Spawn(ctx, agent.SpawnConfig{ResumeSessionID: ccSID, Env: extraEnv})
 	if err != nil {
 		return nil, fmt.Errorf("spawn: %w", err)
 	}
@@ -141,6 +156,46 @@ func (r *Registry) Unsubscribe(ccSID string, ch chan wire.Envelope) {
 	e.subsMu.Lock()
 	delete(e.subs, ch)
 	e.subsMu.Unlock()
+}
+
+// SetOwner records ownerClientID using compare-and-set. Returns true if this call set the owner.
+func (r *Registry) SetOwner(ccSID, clientID string) bool {
+	r.mu.RLock()
+	e, ok := r.sessions[ccSID]
+	r.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	e.subsMu.Lock()
+	defer e.subsMu.Unlock()
+	if e.ownerClientID != "" && e.ownerClientID != clientID {
+		return false
+	}
+	e.ownerClientID = clientID
+	return true
+}
+
+// IsOwner returns true if clientID is the recorded owner of ccSID.
+func (r *Registry) IsOwner(ccSID, clientID string) bool {
+	r.mu.RLock()
+	e, ok := r.sessions[ccSID]
+	r.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	e.subsMu.RLock()
+	defer e.subsMu.RUnlock()
+	return e.ownerClientID == clientID
+}
+
+// Providers returns the names of all registered providers, sorted.
+func (r *Registry) Providers() []string {
+	names := make([]string, 0, len(r.providers))
+	for name := range r.providers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func truncStr(s string, n int) string {

@@ -1,15 +1,19 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 
 	"github.com/quic-go/webtransport-go"
 
+	"github.com/piaobeizu/tether/internal/auth"
 	"github.com/piaobeizu/tether/internal/session"
 	"github.com/piaobeizu/tether/internal/skill"
+	"github.com/piaobeizu/tether/internal/wire"
 	"github.com/piaobeizu/tether/internal/workspace"
 )
 
@@ -24,7 +28,7 @@ import (
 //	/wt/shell       → PTY shell channel stub (s6)
 //	/wt/events      → broadcast events channel (s4)
 //	/wt/_smoke      → WT bidi pure-byte echo (D-22 §6 #2 acceptance gate)
-func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *session.Registry, ps *PermState) http.Handler {
+func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *session.Registry, ps *PermState, authState *auth.State) http.Handler {
 	mux := http.NewServeMux()
 
 	derHex := HashHex(bundle.DER)
@@ -72,8 +76,8 @@ func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *ses
 	})
 
 	// s4: chat + events WT channels.
-	mux.HandleFunc("/wt/chat", handleWTChat(reg, wts))
-	mux.HandleFunc("/wt/events", handleWTEvents(reg, wts))
+	mux.HandleFunc("/wt/chat", handleWTChat(reg, wts, authState))
+	mux.HandleFunc("/wt/events", handleWTEvents(reg, wts, authState))
 
 	// s5: permission API.
 	registerPermAPI(mux, ps, reg)
@@ -90,15 +94,25 @@ func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *ses
 		skill.RegisterAPI(mux, cfg.SkillRegistry)
 	}
 
+	mux.HandleFunc("/api/v1/providers", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(wire.ProviderListResponse{Providers: reg.Providers()}); err != nil {
+			slog.Warn("providers: encode error", "err", err)
+		}
+	})
+
 	mux.HandleFunc("/api/v1/", func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "not implemented", http.StatusNotImplemented)
 	})
 
+	// /api/v1/auth/verify IS wrapped by authState.Middleware below; the
+	// middleware lets it through via isExempt() — not by bypassing the wrapper.
+	mux.HandleFunc("/api/v1/auth/verify", authState.VerifyHandler)
+
 	mux.Handle("/", newStaticHandler(cfg.DevFrontendURL))
 
-	// Wrap all write-method routes with an Origin check to prevent CSRF + DNS
-	// rebinding attacks against the local-loopback API (H-3).
-	return withOriginGuard(cfg.Port, mux)
+	// Wrap all routes: origin guard first, then auth middleware outermost.
+	return authState.Middleware(withOriginGuard(cfg.Port, mux))
 }
 
 // withOriginGuard rejects non-safe-method requests (POST/PUT/PATCH/DELETE) whose

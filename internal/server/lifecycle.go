@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -23,11 +24,14 @@ type Config struct {
 	Port           int
 	CertFile       string // empty = use managed cert at ~/.tether/cert.pem
 	KeyFile        string
+	AcmeDomain     string // if set, obtain cert via ACME/Let's Encrypt (port 80 required)
+	AcmeEmail      string // contact email for ACME registration
 	DevMode        bool   // if true, proxy SPA to DevFrontendURL
 	DevFrontendURL string // default http://localhost:5173 when DevMode=true
 	Registry       *session.Registry
 	WsRegistry     *workspace.Registry
 	SkillRegistry  *skill.Registry
+	acmeTLSBase    *tls.Config // populated by Run() when AcmeDomain is active
 }
 
 func (c *Config) addr() string { return fmt.Sprintf(":%d", c.Port) }
@@ -101,6 +105,19 @@ func Run(cfg *Config) error {
 		return fmt.Errorf("cert: %w", err)
 	}
 
+	// Step 4b: ACME override — when --acme-domain is set, certmagic obtains and
+	// auto-renews a Let's Encrypt cert (HTTP-01; port 80 must be reachable).
+	if cfg.AcmeDomain != "" {
+		slog.Info("obtaining ACME cert", "domain", cfg.AcmeDomain)
+		acmeTLS, acmeBundle, err := SetupACME(context.Background(), cfg.AcmeDomain, cfg.AcmeEmail)
+		if err != nil {
+			return fmt.Errorf("ACME setup: %w", err)
+		}
+		bundle = acmeBundle
+		cfg.acmeTLSBase = acmeTLS
+		slog.Info("ACME cert ready", "domain", cfg.AcmeDomain)
+	}
+
 	// Resolve effective frontend URL for dev mode.
 	cfg.DevFrontendURL = cfg.devFrontend()
 
@@ -131,7 +148,11 @@ func Run(cfg *Config) error {
 	}
 	slog.Info("✓ tether server up", "url", fmt.Sprintf("https://%s%s/", host, cfg.addr()))
 	slog.Info("claude binary", "path", ccPath)
-	slog.Info("cert DER hash", "hash", HashHex(bundle.DER))
+	if !bundle.External {
+		slog.Info("cert DER hash", "hash", HashHex(bundle.DER))
+	} else if cfg.AcmeDomain != "" {
+		slog.Info("cert mode", "acme", cfg.AcmeDomain)
+	}
 
 	// Step 6: block until signal or listener error.
 	sigCh := make(chan os.Signal, 1)

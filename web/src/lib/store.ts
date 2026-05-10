@@ -40,7 +40,12 @@ export const useStore = create<AppState>((set) => ({
 
   handleEnvelope: (env) => {
     switch (env.kind) {
-      case 'message':
+      case 'message': {
+        const p = env.payload as Record<string, unknown> | string
+        if (p && typeof p === 'object' && p['type'] === 'session_ready') {
+          set({ sessionId: p['sessionId'] as string })
+          break
+        }
         set((s) => ({
           messages: [...s.messages, {
             id: crypto.randomUUID(),
@@ -50,6 +55,7 @@ export const useStore = create<AppState>((set) => ({
           }],
         }))
         break
+      }
       case 'permission':
         set({ pendingPermission: env.payload as PermissionRequest })
         break

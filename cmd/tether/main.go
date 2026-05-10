@@ -51,6 +51,7 @@ func newServerCmd() *cobra.Command {
 	cmd.Flags().StringVar(&cfg.KeyFile, "key-file", "", "TLS key PEM (bypasses auto-rotation)")
 	cmd.Flags().BoolVar(&cfg.DevMode, "dev", false, "proxy SPA to Vite dev server")
 	cmd.Flags().StringVar(&cfg.DevFrontendURL, "dev-url", "", "Vite dev server URL (default http://localhost:5173)")
+	cmd.Flags().StringVar(&cfg.Token, "token", "", "static access token (runtime only, not persisted)")
 	return cmd
 }
 

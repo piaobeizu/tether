@@ -8,6 +8,8 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/webtransport-go"
+
+	"github.com/piaobeizu/tether/internal/auth"
 )
 
 // Server holds the TCP and UDP listeners plus the WebTransport server.
@@ -19,7 +21,7 @@ type Server struct {
 
 // newServer constructs (but does not start) the dual-listener server.
 // Call Start() to bind and serve.
-func newServer(cfg *Config, bundle CertBundle, ps *PermState) *Server {
+func newServer(cfg *Config, bundle CertBundle, ps *PermState, authState *auth.State) *Server {
 	addr := cfg.addr()
 
 	// TCP: HTTP/2 + HTTP/1.1 over TLS.
@@ -56,7 +58,7 @@ func newServer(cfg *Config, bundle CertBundle, ps *PermState) *Server {
 		CheckOrigin: func(r *http.Request) bool { return originAllowed(r.Header.Get("Origin"), cfg.Port) },
 	}
 
-	mux := buildMux(cfg, bundle, wts, cfg.Registry, ps)
+	mux := buildMux(cfg, bundle, wts, cfg.Registry, ps, authState)
 
 	tcpServer := &http.Server{
 		Addr:      addr,

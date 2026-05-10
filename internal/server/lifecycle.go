@@ -13,6 +13,7 @@ import (
 
 	"github.com/piaobeizu/tether/internal/agent"
 	"github.com/piaobeizu/tether/internal/agent/permhook"
+	"github.com/piaobeizu/tether/internal/auth"
 	"github.com/piaobeizu/tether/internal/session"
 	"github.com/piaobeizu/tether/internal/skill"
 	"github.com/piaobeizu/tether/internal/workspace"
@@ -25,6 +26,7 @@ type Config struct {
 	KeyFile        string
 	DevMode        bool   // if true, proxy SPA to DevFrontendURL
 	DevFrontendURL string // default http://localhost:5173 when DevMode=true
+	Token          string // static access token; empty = auto-generate from ~/.tether/access-token
 	Registry       *session.Registry
 	WsRegistry     *workspace.Registry
 	SkillRegistry  *skill.Registry
@@ -48,8 +50,9 @@ func Run(cfg *Config) error {
 	// Step 1: resolve cc binary path + build session registry.
 	ccPath := resolveClaudePath()
 	if cfg.Registry == nil {
-		provider := agent.NewClaudeCodeProvider(ccPath)
-		cfg.Registry = session.NewRegistry(provider)
+		ccProvider := agent.NewClaudeCodeProvider(ccPath)
+		ocProvider := agent.NewOpenCodeProvider()
+		cfg.Registry = session.NewRegistry(ccProvider, ocProvider)
 	}
 
 	// Step 2: ensure ~/.tether/ data dirs.
@@ -104,8 +107,19 @@ func Run(cfg *Config) error {
 	// Resolve effective frontend URL for dev mode.
 	cfg.DevFrontendURL = cfg.devFrontend()
 
+	// Step 4c: auth state.
+	accessToken, err := auth.LoadOrGenToken(cfg.Token)
+	if err != nil {
+		return fmt.Errorf("auth token: %w", err)
+	}
+	jwtSecret, err := auth.LoadOrGenSecret()
+	if err != nil {
+		return fmt.Errorf("auth secret: %w", err)
+	}
+	authState := auth.NewState(accessToken, jwtSecret)
+
 	// Step 5: build and start listeners.
-	srv := newServer(cfg, bundle, ps)
+	srv := newServer(cfg, bundle, ps, authState)
 
 	errCh := make(chan error, 2)
 

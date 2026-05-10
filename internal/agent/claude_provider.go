@@ -208,14 +208,6 @@ func (s *ccSession) parseLine(line []byte) *Event {
 
 // Stub providers for future providers (D-17a §5).
 
-// OpenCodeProvider — stub; see D-17a §5.1 for implementation gotchas.
-type OpenCodeProvider struct{}
-
-func (OpenCodeProvider) Name() string                              { return "opencode" }
-func (OpenCodeProvider) Spawn(_ context.Context, _ SpawnConfig) (Session, error) {
-	return nil, fmt.Errorf("opencode provider: not yet implemented")
-}
-
 // CursorProvider — stub; see D-17a §5.2.
 type CursorProvider struct{}
 

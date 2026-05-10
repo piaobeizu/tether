@@ -10,6 +10,7 @@ import (
 
 	"github.com/quic-go/webtransport-go"
 
+	"github.com/piaobeizu/tether/internal/auth"
 	"github.com/piaobeizu/tether/internal/session"
 	"github.com/piaobeizu/tether/internal/wire"
 )
@@ -18,7 +19,7 @@ import (
 // Each connection spawns (or attaches to) a cc stream-json session.
 // Bidi stream: browser → daemon = user prompt JSON lines,
 //              daemon → browser = wire.Envelope JSON lines.
-func handleWTChat(reg *session.Registry, wts *webtransport.Server) http.HandlerFunc {
+func handleWTChat(reg *session.Registry, wts *webtransport.Server, authState *auth.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		slog.Info("WT chat upgrade attempt", "origin", r.Header.Get("Origin"), "remote", r.RemoteAddr)
 		wtsess, err := wts.Upgrade(w, r)
@@ -28,16 +29,27 @@ func handleWTChat(reg *session.Registry, wts *webtransport.Server) http.HandlerF
 			return
 		}
 		slog.Info("WT chat upgrade OK")
-		go serveChat(r, wtsess, reg)
+		go serveChat(r, wtsess, reg, authState)
 	}
 }
 
-func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Registry) {
+func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Registry, authState *auth.State) {
 	defer wtsess.CloseWithError(0, "")
 	ctx := wtsess.Context()
 
 	ccSID := r.URL.Query().Get("sid")
-	agentSess, err := reg.GetOrSpawn(ctx, ccSID)
+	// Derive client identity from verified JWT cookie (not the forgeable ?clientId= param).
+	clientID := authState.ClientIDFromRequest(r)
+	providerName := r.URL.Query().Get("provider")
+
+	// If resuming an existing session, verify ownership before spawning.
+	// Note: ccSID == realSID for resumed sessions (registry is keyed by the same ID).
+	if ccSID != "" && clientID != "" && !reg.IsOwner(ccSID, clientID) {
+		sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindError, Payload: "session owned by another client; use /wt/events to attach read-only"})
+		return
+	}
+
+	agentSess, err := reg.GetOrSpawn(ctx, ccSID, providerName)
 	if err != nil {
 		sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindError, Payload: err.Error()})
 		return
@@ -78,6 +90,15 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 	// is delivered on cc stdin by the goroutine above).
 	realSID := agentSess.SessionID()
 	slog.Info("serveChat: SessionID resolved", "sid", realSID)
+
+	// Claim ownership (CAS — first caller wins).
+	if clientID != "" {
+		if !reg.SetOwner(realSID, clientID) {
+			sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindError, Payload: "session ownership race; retry"})
+			return
+		}
+	}
+
 	sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindMessage, SessionID: realSID, Payload: map[string]any{
 		"type":      "session_ready",
 		"sessionId": realSID,

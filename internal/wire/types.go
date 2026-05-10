@@ -48,3 +48,8 @@ type FencedBlock struct {
 	Content string          `json:"content"`           // skill-defined JSON body (opaque to daemon)
 	BlockID string          `json:"blockId,omitempty"` // optional, for action callbacks
 }
+
+// ProviderListResponse is the response body for GET /api/v1/providers.
+type ProviderListResponse struct {
+	Providers []string `json:"providers"`
+}

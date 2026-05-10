@@ -10,6 +10,7 @@ import (
 	"github.com/quic-go/webtransport-go"
 
 	"github.com/piaobeizu/tether/internal/auth"
+	"github.com/piaobeizu/tether/internal/permission"
 )
 
 // Server holds the TCP and UDP listeners plus the WebTransport server.
@@ -21,7 +22,7 @@ type Server struct {
 
 // newServer constructs (but does not start) the dual-listener server.
 // Call Start() to bind and serve.
-func newServer(cfg *Config, bundle CertBundle, ps *PermState, authState *auth.State) *Server {
+func newServer(cfg *Config, bundle CertBundle, ps *permission.PermState, authState *auth.State) *Server {
 	addr := cfg.addr()
 
 	// When ACME is active, certmagic provides a tls.Config with GetCertificate

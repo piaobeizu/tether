@@ -1,4 +1,4 @@
-package permhook
+package cchook
 
 import (
 	"crypto/sha256"

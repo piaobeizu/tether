@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3.0 (unreleased)
+
+### Changed
+- Permission API: canonical paths are now `/api/v1/permission/request` and `/api/v1/permission/{id}/decide`. Old paths `/api/v1/agent/permission/*` are kept as aliases through v0.3.x and will be removed in v0.4.
+- Permission request envelope gains a `source` field (`"claude_hook"` for existing hook flow; `"mcp:<server>"` for future MCP gateway). Clients omitting `source` default to `"claude_hook"`.
+- `internal/agent/permhook/` renamed to `internal/permission/cchook/` (import path change; binary behavior unchanged).
+- `/mcp` and `/api/v1/mcp/*` reserved — return 501 until MCP host is implemented later in v0.3.
+
 ## v0.2.0 (unreleased)
 
 ### Added

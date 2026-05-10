@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -38,6 +39,7 @@ func registerPermAPI(mux *http.ServeMux, ps *PermState, reg *session.Registry) {
 			Input:    body.Input,
 		}
 		decideCh := ps.Add(req)
+		slog.Info("permission request", "id", req.ID, "tool", body.ToolName, "sid", body.SessionID)
 
 		// Broadcast to browser subscribers so the UI can render the Allow/Deny prompt.
 		reg.BroadcastAll(wire.Envelope{
@@ -52,6 +54,7 @@ func registerPermAPI(mux *http.ServeMux, ps *PermState, reg *session.Registry) {
 
 		// Block until decided or timeout (hook has 65s client timeout; we use 60s).
 		allow := <-decideCh
+		slog.Info("permission decided", "id", req.ID, "allow", allow)
 
 		w.Header().Set("Content-Type", "application/json")
 		if allow {

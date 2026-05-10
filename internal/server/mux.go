@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 
 	"github.com/quic-go/webtransport-go"
 
@@ -23,17 +24,31 @@ import (
 //	/wt/shell       → PTY shell channel stub (s6)
 //	/wt/events      → broadcast events channel (s4)
 //	/wt/_smoke      → WT bidi pure-byte echo (D-22 §6 #2 acceptance gate)
-func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *session.Registry, ps *PermState) *http.ServeMux {
+func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *session.Registry, ps *PermState) http.Handler {
 	mux := http.NewServeMux()
 
 	derHex := HashHex(bundle.DER)
 	spkiHex := HashHex(bundle.SPKI)
 
-	mux.HandleFunc("/cert-hash", func(w http.ResponseWriter, _ *http.Request) {
+	// When using a CA-signed cert (--cert-file), do NOT serve the hash —
+	// W3C serverCertificateHashes requires ≤14d validity + ECDSA P-256 +
+	// self-signed. Letting the browser pin a hash for a CA cert that
+	// violates these constraints causes Chrome to reject the WT connection
+	// silently with QUIC_NETWORK_IDLE_TIMEOUT. With 404, wt.ts falls back
+	// to standard CA validation (which works for any browser-trusted cert).
+	mux.HandleFunc("/cert-hash", func(w http.ResponseWriter, r *http.Request) {
+		if bundle.External {
+			http.NotFound(w, r)
+			return
+		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		fmt.Fprintln(w, derHex)
 	})
-	mux.HandleFunc("/cert-hash-spki", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/cert-hash-spki", func(w http.ResponseWriter, r *http.Request) {
+		if bundle.External {
+			http.NotFound(w, r)
+			return
+		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		fmt.Fprintln(w, spkiHex)
 	})
@@ -80,5 +95,42 @@ func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *ses
 	})
 
 	mux.Handle("/", newStaticHandler(cfg.DevFrontendURL))
-	return mux
+
+	// Wrap all write-method routes with an Origin check to prevent CSRF + DNS
+	// rebinding attacks against the local-loopback API (H-3).
+	return withOriginGuard(cfg.Port, mux)
+}
+
+// withOriginGuard rejects non-safe-method requests (POST/PUT/PATCH/DELETE) whose
+// Origin header is present but not in the daemon's allowlist. Requests without an
+// Origin header (curl, other trusted clients) pass through unchanged.
+func withOriginGuard(port int, h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			// safe methods: pass through unrestricted
+		default:
+			if origin := r.Header.Get("Origin"); origin != "" && !originAllowed(origin, port) {
+				http.Error(w, "forbidden: origin not allowed", http.StatusForbidden)
+				return
+			}
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// originAllowed returns true when origin matches one of the daemon's own HTTPS
+// origins (127.0.0.1, localhost, or TETHER_HOST at the given port).
+func originAllowed(origin string, port int) bool {
+	portSuffix := fmt.Sprintf(":%d", port)
+	hosts := []string{"127.0.0.1", "localhost"}
+	if h := os.Getenv("TETHER_HOST"); h != "" {
+		hosts = append(hosts, h)
+	}
+	for _, h := range hosts {
+		if origin == "https://"+h+portSuffix {
+			return true
+		}
+	}
+	return false
 }

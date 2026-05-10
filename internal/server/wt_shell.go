@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 
 	"github.com/creack/pty"
 	"github.com/quic-go/webtransport-go"
@@ -65,7 +66,7 @@ func handleWTShell(reg *session.Registry, wts *webtransport.Server) http.Handler
 			args = append(args, "--resume", ccSID)
 		}
 		cmd := exec.CommandContext(ctx, ccPath, args...)
-		cmd.Env = buildPTYEnv()
+		cmd.Env = buildPTYEnv(reg.PermEndpoint)
 
 		ptmx, err := pty.Start(cmd)
 		if err != nil {
@@ -76,6 +77,8 @@ func handleWTShell(reg *session.Registry, wts *webtransport.Server) http.Handler
 		}
 
 		done := make(chan struct{})
+		var closeOnce sync.Once
+		closePTY := func() { closeOnce.Do(func() { ptmx.Close() }) }
 
 		// PTY → WT: forward raw output bytes.
 		go func() {
@@ -86,7 +89,7 @@ func handleWTShell(reg *session.Registry, wts *webtransport.Server) http.Handler
 		// WT → PTY: forward keyboard input.
 		go func() {
 			_, _ = io.Copy(ptmx, stream)
-			ptmx.Close()
+			closePTY()
 		}()
 
 		select {
@@ -95,10 +98,10 @@ func handleWTShell(reg *session.Registry, wts *webtransport.Server) http.Handler
 		case <-preempted:
 			// Force-taken by another client.
 			_, _ = stream.Write([]byte("\r\n[tether] session taken over\r\n"))
-			ptmx.Close()
+			closePTY()
 		case <-ctx.Done():
 			// WebTransport session disconnected.
-			ptmx.Close()
+			closePTY()
 		}
 
 		_ = stream.Close()
@@ -149,11 +152,15 @@ func handleLockForce(reg *session.Registry) http.HandlerFunc {
 
 // buildPTYEnv constructs the env for the PTY shell subprocess.
 // IS_SANDBOX=1 injected for root (D-05a §2 fact 5). TERM set for full TUI.
-func buildPTYEnv() []string {
+// permEndpoint is injected when non-empty so the PreToolUse hook can reach the daemon.
+func buildPTYEnv(permEndpoint string) []string {
 	env := os.Environ()
 	env = append(env, "TERM=xterm-256color")
 	if os.Geteuid() == 0 {
 		env = append(env, "IS_SANDBOX=1")
+	}
+	if permEndpoint != "" {
+		env = append(env, "TETHER_DAEMON_PERM_ENDPOINT="+permEndpoint)
 	}
 	return env
 }

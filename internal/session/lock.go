@@ -78,8 +78,12 @@ func (l *SessionLock) resetTimerLocked() {
 	l.timer = time.AfterFunc(lockTimeout, func() {
 		l.mu.Lock()
 		defer l.mu.Unlock()
-		// Only auto-release if the preempted channel hasn't changed.
+		// Only auto-release if the preempted channel hasn't changed (i.e. no
+		// ForceAcquire raced us). Close the channel so the PTY handler unblocks
+		// its <-preempted select and terminates — mirrors ForceAcquire behaviour.
 		if l.preempted == preempted {
+			close(l.preempted)
+			l.preempted = nil
 			l.holder = ""
 			l.timer = nil
 		}

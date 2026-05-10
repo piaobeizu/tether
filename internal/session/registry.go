@@ -4,6 +4,7 @@ package session
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 
 	"github.com/piaobeizu/tether/internal/agent"
@@ -69,13 +70,25 @@ func (r *Registry) GetOrSpawn(ctx context.Context, ccSID string) (agent.Session,
 
 	e := &entry{sess: sess, subs: make(map[chan wire.Envelope]struct{})}
 
+	// Register entry under a synthetic placeholder key BEFORE waiting for
+	// SessionID. This breaks the deadlock: cc's stream-json `--input-format`
+	// mode does NOT emit system/init until the first user prompt arrives,
+	// but serveChat needs the entry registered to call Subscribe and start
+	// reading user prompts. Solution: register under a temp key now, re-key
+	// once cc emits system/init asynchronously.
+	tempKey := fmt.Sprintf("pending-%p", e)
+	r.mu.Lock()
+	r.sessions[tempKey] = e
+	r.mu.Unlock()
+
 	// background goroutine: fan out events to subscribers
 	go r.fanOut(e)
 
-	// Wait for SessionID, then register.
+	// Re-key once cc emits system/init asynchronously.
 	go func() {
 		sid := sess.SessionID()
 		r.mu.Lock()
+		delete(r.sessions, tempKey)
 		r.sessions[sid] = e
 		r.mu.Unlock()
 	}()
@@ -130,18 +143,31 @@ func (r *Registry) Unsubscribe(ccSID string, ch chan wire.Envelope) {
 	e.subsMu.Unlock()
 }
 
+func truncStr(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
+
 // fanOut translates agent.Events into wire.Envelopes and broadcasts to all subscribers.
 func (r *Registry) fanOut(e *entry) {
 	for ev := range e.sess.Events() {
+		slog.Info("fanOut: agent event", "kind", ev.Kind, "text_preview", truncStr(ev.Text, 60))
 		env := translateEvent(ev)
 		if env == nil {
 			continue
 		}
 		e.subsMu.RLock()
+		nsub := len(e.subs)
+		e.subsMu.RUnlock()
+		slog.Info("fanOut: broadcasting", "wire_kind", env.Kind, "nsub", nsub)
+		e.subsMu.RLock()
 		for ch := range e.subs {
 			select {
 			case ch <- *env:
-			default: // slow consumer; drop rather than block
+			default:
+				slog.Warn("fanOut: slow subscriber, envelope dropped", "kind", env.Kind)
 			}
 		}
 		e.subsMu.RUnlock()

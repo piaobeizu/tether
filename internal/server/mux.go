@@ -11,6 +11,7 @@ import (
 	"github.com/quic-go/webtransport-go"
 
 	"github.com/piaobeizu/tether/internal/auth"
+	"github.com/piaobeizu/tether/internal/permission"
 	"github.com/piaobeizu/tether/internal/session"
 	"github.com/piaobeizu/tether/internal/skill"
 	"github.com/piaobeizu/tether/internal/wire"
@@ -28,7 +29,7 @@ import (
 //	/wt/shell       → PTY shell channel stub (s6)
 //	/wt/events      → broadcast events channel (s4)
 //	/wt/_smoke      → WT bidi pure-byte echo (D-22 §6 #2 acceptance gate)
-func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *session.Registry, ps *PermState, authState *auth.State) http.Handler {
+func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *session.Registry, ps *permission.PermState, authState *auth.State) http.Handler {
 	mux := http.NewServeMux()
 
 	derHex := HashHex(bundle.DER)
@@ -80,7 +81,7 @@ func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *ses
 	mux.HandleFunc("/wt/events", handleWTEvents(reg, wts, authState))
 
 	// s5: permission API.
-	registerPermAPI(mux, ps, reg)
+	permission.RegisterPermAPI(mux, ps, reg)
 
 	// s6: shell WT channel + session lock API.
 	mux.HandleFunc("/wt/shell", handleWTShell(reg, wts))
@@ -100,6 +101,8 @@ func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *ses
 			slog.Warn("providers: encode error", "err", err)
 		}
 	})
+
+	registerMCPStubs(mux)
 
 	mux.HandleFunc("/api/v1/", func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "not implemented", http.StatusNotImplemented)
@@ -131,6 +134,16 @@ func withOriginGuard(port int, h http.Handler) http.Handler {
 		}
 		h.ServeHTTP(w, r)
 	})
+}
+
+// registerMCPStubs reserves MCP URL paths returning 501 until the v0.3 MCP host is implemented.
+// Do not use /mcp or /api/v1/mcp/* for any other purpose before then.
+func registerMCPStubs(mux *http.ServeMux) {
+	stub := func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not implemented: MCP host not yet active", http.StatusNotImplemented)
+	}
+	mux.HandleFunc("/mcp", stub)
+	mux.HandleFunc("/api/v1/mcp/", stub)
 }
 
 // originAllowed returns true when origin matches one of the daemon's own HTTPS

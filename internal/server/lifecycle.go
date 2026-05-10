@@ -13,8 +13,9 @@ import (
 	"time"
 
 	"github.com/piaobeizu/tether/internal/agent"
-	"github.com/piaobeizu/tether/internal/agent/permhook"
 	"github.com/piaobeizu/tether/internal/auth"
+	"github.com/piaobeizu/tether/internal/permission"
+	"github.com/piaobeizu/tether/internal/permission/cchook"
 	"github.com/piaobeizu/tether/internal/session"
 	"github.com/piaobeizu/tether/internal/skill"
 	"github.com/piaobeizu/tether/internal/workspace"
@@ -87,11 +88,11 @@ func Run(cfg *Config) error {
 	}
 
 	// Step 3: permission hook setup (D-05b §4–§5).
-	ps := NewPermState()
+	ps := permission.NewPermState()
 	noHook := os.Getenv("TETHER_NO_PERMISSION_HOOK") == "1"
 	if !noHook {
 		binPath := filepath.Join(binDir, "tether-permission-hook")
-		if err := permhook.EnsureHookBinary(binPath); err != nil {
+		if err := cchook.EnsureHookBinary(binPath); err != nil {
 			return fmt.Errorf("perm hook compile: %w", err)
 		}
 		permEndpoint := fmt.Sprintf("https://127.0.0.1%s/api/v1/agent/permission/request", cfg.addr())

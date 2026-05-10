@@ -70,11 +70,17 @@ func (ps *PermState) Decide(id string, allow bool) bool {
 	return true
 }
 
-// GetPending returns the pending request (may be nil).
-func (ps *PermState) GetPending(id string) *PermRequest {
+// GetPending returns a snapshot of the pending request for the given ID.
+// Returns zero value if the ID is not found. Callers receive a copy — mutating
+// it does not affect the in-flight request.
+func (ps *PermState) GetPending(id string) (PermRequest, bool) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
-	return ps.pending[id]
+	req, ok := ps.pending[id]
+	if !ok {
+		return PermRequest{}, false
+	}
+	return *req, true
 }
 
 // NewID returns a random 8-byte hex ID. Panics on crypto/rand failure (unrecoverable).

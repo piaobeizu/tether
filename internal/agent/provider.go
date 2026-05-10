@@ -4,6 +4,10 @@ package agent
 
 import "context"
 
+// MCP host integration (internal/mcp/) is orthogonal to AgentProvider.
+// The provider abstraction selects which LLM drives the conversation;
+// MCP server lifecycle is managed independently of which provider is active.
+
 // AgentProvider manages the lifecycle of AI agent sessions.
 type AgentProvider interface {
 	Name() string

@@ -1,6 +1,8 @@
 package server
 
 import (
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -37,7 +39,7 @@ func handleWTShell(reg *session.Registry, wts *webtransport.Server) http.Handler
 			return
 		}
 
-		clientID := newID()
+		clientID := newShellID()
 		lock := reg.GetLock(ccSID)
 		acquired, preempted := lock.Acquire(clientID)
 		if !acquired {
@@ -130,7 +132,7 @@ func handleLockForce(reg *session.Registry) http.HandlerFunc {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		clientID := body.ClientID
 		if clientID == "" {
-			clientID = newID()
+			clientID = newShellID()
 		}
 
 		lock := reg.GetLock(ccSID)
@@ -148,6 +150,17 @@ func handleLockForce(reg *session.Registry) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"clientId": clientID})
 	}
+}
+
+// newShellID returns a random hex ID for shell session client tracking.
+// Defined here rather than in internal/permission to avoid coupling
+// unrelated identity domains to the permission package.
+func newShellID() string {
+	b := make([]byte, 8)
+	if _, err := cryptorand.Read(b); err != nil {
+		panic("server: crypto/rand unavailable: " + err.Error())
+	}
+	return hex.EncodeToString(b)
 }
 
 // buildPTYEnv constructs the env for the PTY shell subprocess.

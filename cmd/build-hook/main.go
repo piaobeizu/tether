@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/piaobeizu/tether/internal/agent/permhook"
+	"github.com/piaobeizu/tether/internal/permission/cchook"
 )
 
 func main() {
@@ -16,7 +16,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: build-hook <output-path>")
 		os.Exit(1)
 	}
-	if err := permhook.EnsureHookBinary(os.Args[1]); err != nil {
+	if err := cchook.EnsureHookBinary(os.Args[1]); err != nil {
 		fmt.Fprintf(os.Stderr, "build-hook: %v\n", err)
 		os.Exit(1)
 	}

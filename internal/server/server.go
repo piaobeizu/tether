@@ -22,21 +22,30 @@ type Server struct {
 func newServer(cfg *Config, bundle CertBundle, ps *PermState) *Server {
 	addr := cfg.addr()
 
+	// When ACME is active, certmagic provides a tls.Config with GetCertificate
+	// already wired for auto-renewal. Clone it and override ALPN per listener.
+	// Otherwise fall back to the static cert from CertBundle.
+	makeTLS := func(protos []string) *tls.Config {
+		if cfg.acmeTLSBase != nil {
+			c := cfg.acmeTLSBase.Clone()
+			c.NextProtos = protos
+			return c
+		}
+		return &tls.Config{
+			Certificates: []tls.Certificate{bundle.TLS},
+			NextProtos:   protos,
+		}
+	}
+
 	// TCP: HTTP/2 + HTTP/1.1 over TLS.
 	// ALPN must be ["h2","http/1.1"] — separate from the UDP h3 TLS config.
-	tcpTLS := &tls.Config{
-		Certificates: []tls.Certificate{bundle.TLS},
-		NextProtos:   []string{"h2", "http/1.1"},
-	}
+	tcpTLS := makeTLS([]string{"h2", "http/1.1"})
 
 	// UDP: HTTP/3 + WebTransport.
 	// Both EnableDatagrams flags are required (§10.B.2 #3).
 	h3 := &http3.Server{
-		Addr: addr,
-		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{bundle.TLS},
-			NextProtos:   []string{"h3"},
-		},
+		Addr:      addr,
+		TLSConfig: makeTLS([]string{"h3"}),
 		EnableDatagrams: true,
 		QUICConfig: &quic.Config{
 			EnableDatagrams:                  true,

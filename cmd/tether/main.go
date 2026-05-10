@@ -49,6 +49,8 @@ func newServerCmd() *cobra.Command {
 	cmd.Flags().IntVarP(&cfg.Port, "port", "p", 8898, "listen port (TCP + UDP)")
 	cmd.Flags().StringVar(&cfg.CertFile, "cert-file", "", "TLS cert PEM (bypasses auto-rotation)")
 	cmd.Flags().StringVar(&cfg.KeyFile, "key-file", "", "TLS key PEM (bypasses auto-rotation)")
+	cmd.Flags().StringVar(&cfg.AcmeDomain, "acme-domain", "", "domain for ACME/Let's Encrypt cert (requires port 80)")
+	cmd.Flags().StringVar(&cfg.AcmeEmail, "acme-email", "", "email for ACME registration (required with --acme-domain)")
 	cmd.Flags().BoolVar(&cfg.DevMode, "dev", false, "proxy SPA to Vite dev server")
 	cmd.Flags().StringVar(&cfg.DevFrontendURL, "dev-url", "", "Vite dev server URL (default http://localhost:5173)")
 	return cmd

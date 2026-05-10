@@ -55,11 +55,14 @@ jobs:
 
       - name: Build permission hook binary (D-05b §4.2)
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
         run: |
-          go run ./cmd/build-hook dist/tether-permission-hook${{ matrix.ext }}
+          # Build the build-hook wrapper for the host first (no cross-compile env),
+          # then invoke it with the target GOOS/GOARCH so the inner go-build produces
+          # a cross-compiled hook binary — go run would exec a cross-compiled binary.
+          go build -o /tmp/build-hook ./cmd/build-hook
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            /tmp/build-hook dist/tether-permission-hook${{ matrix.ext }}
 
       - name: Create release tarball
         run: |
@@ -67,7 +70,7 @@ jobs:
           NAME="tether-${{ github.ref_name }}-${PLATFORM}"
           mkdir -p "release/${NAME}"
           cp dist/tether${{ matrix.ext }} "release/${NAME}/"
-          cp dist/tether-permission-hook${{ matrix.ext }} "release/${NAME}/" || true
+          cp dist/tether-permission-hook${{ matrix.ext }} "release/${NAME}/"
           cp README.md "release/${NAME}/"
           cd release && tar czf "${NAME}.tar.gz" "${NAME}"
 

@@ -18,7 +18,12 @@ const certRotateThreshold = 24 * time.Hour
 // generated and persisted (§10.B.2 #5 rotation contract).
 func LoadOrGenCert(certFile, keyFile string) (CertBundle, error) {
 	if certFile != "" && keyFile != "" {
-		return loadPEMFiles(certFile, keyFile)
+		bundle, err := loadPEMFiles(certFile, keyFile)
+		if err != nil {
+			return bundle, err
+		}
+		bundle.External = true
+		return bundle, nil
 	}
 	return loadOrRotateManaged()
 }

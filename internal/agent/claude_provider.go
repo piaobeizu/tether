@@ -28,6 +28,11 @@ func (p *ClaudeCodeProvider) Spawn(ctx context.Context, cfg SpawnConfig) (Sessio
 		"--output-format", "stream-json",
 		"--input-format", "stream-json",
 		"--verbose",
+		// Force "default" permission mode so PreToolUse hooks ALWAYS fire,
+		// regardless of user's ~/.claude/settings.json `defaultMode` setting.
+		// Without this, users with `defaultMode: "auto"` or `bypassPermissions`
+		// silently skip tether's permission UI.
+		"--permission-mode", "default",
 	}
 	if cfg.ResumeSessionID != "" {
 		args = append(args, "--resume", cfg.ResumeSessionID)

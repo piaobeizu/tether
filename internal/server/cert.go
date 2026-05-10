@@ -26,6 +26,13 @@ type CertBundle struct {
 	TLS  tls.Certificate
 	DER  [32]byte // SHA-256 of full DER cert (W3C spec wording)
 	SPKI [32]byte // SHA-256 of SubjectPublicKeyInfo (Chrome impl)
+	// External is true when the cert was loaded from --cert-file/--key-file
+	// (typically a CA-signed cert with >14d validity). When External is true,
+	// /cert-hash MUST return 404 — passing serverCertificateHashes for a CA
+	// cert that violates the W3C constraints (max 14d validity, ECDSA P-256,
+	// self-signed) causes Chrome to reject the connection silently with
+	// QUIC_NETWORK_IDLE_TIMEOUT. Browser then uses normal TLS validation.
+	External bool
 }
 
 // GenerateCert generates a fresh self-signed ECDSA P-256 certificate

@@ -77,12 +77,15 @@ func removeManaged(settings map[string]any) {
 }
 
 func ccSettingsPath() (string, error) {
-	// cc reads ~/.config/claude/settings.json on Linux/Mac.
+	// Claude Code reads ~/.claude/settings.json (user-level), NOT
+	// ~/.config/claude/settings.json. The latter is unread; writing there
+	// makes the PreToolUse hook silently no-op. Verified against running
+	// `claude --setting-sources=project,user,local` invocation.
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	dir := filepath.Join(home, ".config", "claude")
+	dir := filepath.Join(home, ".claude")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}

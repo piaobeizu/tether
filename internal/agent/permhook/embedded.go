@@ -27,8 +27,11 @@ func main() {
 	body, _ := io.ReadAll(os.Stdin)
 	endpoint := os.Getenv("TETHER_DAEMON_PERM_ENDPOINT")
 	if endpoint == "" {
-		fmt.Fprintln(os.Stderr, "[hook] TETHER_DAEMON_PERM_ENDPOINT unset")
-		os.Exit(2)
+		// When env var is unset, this is NOT a tether-spawned cc (it's the
+		// user's IDE / standalone cc). Exit 0 so we don't break unrelated
+		// cc invocations. The hook only enforces tether's permission UI for
+		// cc subprocesses launched by the tether daemon.
+		os.Exit(0)
 	}
 	// InsecureSkipVerify is safe: endpoint is always loopback (127.0.0.1).
 	client := &http.Client{

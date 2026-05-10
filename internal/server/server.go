@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/tls"
 	"net/http"
+	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -40,6 +41,11 @@ func newServer(cfg *Config, bundle CertBundle, ps *PermState) *Server {
 		QUICConfig: &quic.Config{
 			EnableDatagrams:                  true,
 			EnableStreamResetPartialDelivery: true,
+			// Keep NAT entry alive across user typing pauses. Without this,
+			// home-router/carrier NAT (typical UDP timeout 30s) silently drops
+			// the binding and the next stream write fails with "Connection lost".
+			KeepAlivePeriod: 15 * time.Second,
+			MaxIdleTimeout:  90 * time.Second,
 		},
 	}
 	// MANDATORY: without this the browser WT handshake fails (§10.B.2 #1).
@@ -47,7 +53,7 @@ func newServer(cfg *Config, bundle CertBundle, ps *PermState) *Server {
 
 	wts := &webtransport.Server{
 		H3:          h3,
-		CheckOrigin: func(*http.Request) bool { return true },
+		CheckOrigin: func(r *http.Request) bool { return originAllowed(r.Header.Get("Origin"), cfg.Port) },
 	}
 
 	mux := buildMux(cfg, bundle, wts, cfg.Registry, ps)

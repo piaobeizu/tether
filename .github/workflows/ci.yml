@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "pf2.*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node + pnpm
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install pnpm
+        run: npm install -g pnpm@10
+
+      - name: Install tygo
+        run: go install github.com/gzuidhof/tygo@v0.2.21
+
+      # ── codegen drift gate (D-22 §2.6, K.7.1) ──────────────────────────────
+      - name: Run codegen
+        run: bash scripts/codegen.sh
+
+      - name: Check codegen drift
+        run: git diff --exit-code web/src/lib/wire.gen.ts
+
+      # ── web build ───────────────────────────────────────────────────────────
+      - name: Install web dependencies
+        run: cd web && pnpm install --frozen-lockfile
+
+      - name: Build web
+        run: cd web && pnpm build
+
+      # ── Go build ────────────────────────────────────────────────────────────
+      - name: Build Go binary
+        run: go build -o bin/tether ./cmd/tether
+
+      # ── wire-contract tests (D-22 §6) ───────────────────────────────────────
+      - name: Run wire-contract tests
+        run: cd web && pnpm test
+
+      # ── Go tests ────────────────────────────────────────────────────────────
+      - name: Run Go tests
+        run: go test ./...

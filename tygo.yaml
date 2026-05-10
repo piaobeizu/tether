@@ -1,0 +1,9 @@
+packages:
+  - path: github.com/piaobeizu/tether/internal/wire
+    output_path: web/src/lib/wire.gen.ts
+    type_mappings:
+      time.Time: string
+      json.RawMessage: unknown
+    frontmatter: |
+      // ⚠ AUTO-GENERATED FROM internal/wire/types.go BY tygo. DO NOT EDIT.
+      // To change shape: edit Go source then `make codegen`.

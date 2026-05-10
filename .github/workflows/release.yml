@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+            ext: ".exe"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node + pnpm
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install pnpm
+        run: npm install -g pnpm@10
+
+      - name: Build web assets
+        run: |
+          cd web && pnpm install --frozen-lockfile && pnpm build
+
+      - name: Build tether binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          go build -ldflags="-s -w -X main.version=${{ github.ref_name }}" \
+            -o dist/tether${{ matrix.ext }} ./cmd/tether
+
+      - name: Build permission hook binary (D-05b §4.2)
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          # Build the build-hook wrapper for the host first (no cross-compile env),
+          # then invoke it with the target GOOS/GOARCH so the inner go-build produces
+          # a cross-compiled hook binary — go run would exec a cross-compiled binary.
+          go build -o /tmp/build-hook ./cmd/build-hook
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            /tmp/build-hook dist/tether-permission-hook${{ matrix.ext }}
+
+      - name: Create release tarball
+        run: |
+          PLATFORM="${{ matrix.goos }}-${{ matrix.goarch }}"
+          NAME="tether-${{ github.ref_name }}-${PLATFORM}"
+          mkdir -p "release/${NAME}"
+          cp dist/tether${{ matrix.ext }} "release/${NAME}/"
+          cp dist/tether-permission-hook${{ matrix.ext }} "release/${NAME}/"
+          cp README.md "release/${NAME}/"
+          cd release && tar czf "${NAME}.tar.gz" "${NAME}"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tether-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: release/*.tar.gz
+
+  publish:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tether-*
+          merge-multiple: true
+          path: tarballs/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: tarballs/*.tar.gz
+          generate_release_notes: true

@@ -137,3 +137,64 @@ func deleteHookList(settings map[string]any, kind string) {
 		delete(hooks, kind)
 	}
 }
+
+// InjectMCPServer adds mcpServers.tether to ~/.claude/settings.json.
+// It removes any existing _tether_managed entry first (idempotent).
+// token is the per-daemon bearer token injected into the Authorization header.
+func InjectMCPServer(port int, token string) error {
+	path, err := ccSettingsPath()
+	if err != nil {
+		return err
+	}
+	settings, err := loadSettings(path)
+	if err != nil {
+		settings = map[string]any{}
+	}
+	removeManagedMCPServer(settings)
+
+	mcpServers, _ := settings["mcpServers"].(map[string]any)
+	if mcpServers == nil {
+		mcpServers = map[string]any{}
+		settings["mcpServers"] = mcpServers
+	}
+	mcpServers["tether"] = map[string]any{
+		TetherManagedKey: true,
+		"type":           "http",
+		"url":            fmt.Sprintf("http://127.0.0.1:%d/mcp", port),
+		"headers": map[string]any{
+			"Authorization": "Bearer " + token,
+		},
+	}
+	return saveSettings(path, settings)
+}
+
+// RemoveMCPServer removes the tether-managed mcpServers.tether entry from settings.json.
+func RemoveMCPServer() error {
+	path, err := ccSettingsPath()
+	if err != nil {
+		return err
+	}
+	settings, err := loadSettings(path)
+	if err != nil {
+		return nil // absent = nothing to clean up
+	}
+	removeManagedMCPServer(settings)
+	return saveSettings(path, settings)
+}
+
+func removeManagedMCPServer(settings map[string]any) {
+	mcpServers, _ := settings["mcpServers"].(map[string]any)
+	if mcpServers == nil {
+		return
+	}
+	for k, v := range mcpServers {
+		if m, ok := v.(map[string]any); ok {
+			if managed, _ := m[TetherManagedKey].(bool); managed {
+				delete(mcpServers, k)
+			}
+		}
+	}
+	if len(mcpServers) == 0 {
+		delete(settings, "mcpServers")
+	}
+}

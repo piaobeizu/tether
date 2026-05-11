@@ -1,3 +1,4 @@
+// internal/permission/http.go
 package permission
 
 import (
@@ -5,138 +6,107 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-
-	"github.com/piaobeizu/tether/internal/wire"
 )
 
-// Broadcaster is satisfied by *session.Registry. Defined here to avoid
-// a direct import of internal/session (which would create a cycle when
-// internal/mcp/gateway imports internal/permission).
-type Broadcaster interface {
-	BroadcastAll(env wire.Envelope)
-}
+// BroadcastFn is called when a new permission request is registered,
+// allowing the server layer to push it to connected browser clients.
+// May be nil (no broadcast).
+type BroadcastFn func(req *Request)
 
-// RegisterPermAPI wires permission HTTP API routes into mux.
+// RegisterAPI mounts permission endpoints on mux.
 //
-// Canonical routes (v0.3+):
+// Canonical paths:
 //
-//	POST /api/v1/permission/request       — hook/MCP → daemon
-//	POST /api/v1/permission/{id}/decide   — UI → daemon
+//	POST /api/v1/permission/request
+//	POST /api/v1/permission/{id}/decide
 //
-// Alias routes (kept for v0.3.x backward compat; deprecated, remove in v0.4):
+// Alias paths (kept for v0.3.x compat):
 //
 //	POST /api/v1/agent/permission/request
 //	POST /api/v1/agent/permission/{id}/decide
-func RegisterPermAPI(mux *http.ServeMux, ps *PermState, reg Broadcaster) {
-	handleRequest := func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var body struct {
-			SessionID  string          `json:"session_id"`
-			ToolName   string          `json:"tool_name"`
-			Input      json.RawMessage `json:"tool_input"`
-			Source     string          `json:"source"`
-			SourceMeta json.RawMessage `json:"source_meta,omitempty"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
-			return
-		}
-		if body.ToolName == "" {
-			http.Error(w, "tool_name required", http.StatusBadRequest)
-			return
-		}
-		if body.Source == "" {
-			body.Source = "claude_hook"
-		}
-
-		req := &PermRequest{
-			ID:       NewID(),
-			ToolName: body.ToolName,
-			Input:    body.Input,
-			Source:   body.Source,
-		}
-		decideCh, err := ps.Add(req)
-		if err != nil {
-			slog.Error("permission: duplicate ID", "id", req.ID, "err", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
-		slog.Info("permission request", "id", req.ID, "tool", body.ToolName,
-			"sid", body.SessionID, "source", body.Source)
-
-		reg.BroadcastAll(wire.Envelope{
-			Kind:      wire.KindPermission,
-			SessionID: wire.SessionID(body.SessionID),
-			Payload: map[string]any{
-				"id":          req.ID,
-				"toolName":    req.ToolName,
-				"input":       req.Input,
-				"source":      body.Source,
-				"source_meta": body.SourceMeta,
-			},
-		})
-
-		var allow bool
-		var reason string
-		select {
-		case allow = <-decideCh:
-			if allow {
-				reason = "allowed"
-			} else {
-				reason = "denied or timeout"
+func RegisterAPI(mux *http.ServeMux, m *Manager, broadcast BroadcastFn) {
+	requestHandler := func(defaultSource string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
 			}
-		case <-r.Context().Done():
-			ps.Decide(req.ID, false)
-			slog.Info("permission request cancelled by client", "id", req.ID)
-			return
-		}
-		slog.Info("permission decided", "id", req.ID, "allow", allow, "reason", reason)
-
-		w.Header().Set("Content-Type", "application/json")
-		if allow {
-			_ = json.NewEncoder(w).Encode(map[string]any{"allow": true})
-		} else {
-			_ = json.NewEncoder(w).Encode(map[string]any{"allow": false, "message": reason})
+			var body struct {
+				Source    string          `json:"source"`
+				SessionID string          `json:"session_id"`
+				ToolName  string          `json:"tool_name"`
+				Input     json.RawMessage `json:"tool_input"`
+				TaskID    string          `json:"task_id,omitempty"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			src := body.Source
+			if src == "" {
+				src = defaultSource
+			}
+			req := &Request{
+				Source:    src,
+				SessionID: body.SessionID,
+				ToolName:  body.ToolName,
+				Args:      body.Input,
+				TaskID:    body.TaskID,
+			}
+			decideCh := m.Add(req)
+			slog.Info("permission request", "id", req.ID, "tool", req.ToolName, "source", req.Source)
+			if broadcast != nil {
+				broadcast(req)
+			}
+			var dec Decision
+			select {
+			case dec = <-decideCh:
+			case <-r.Context().Done():
+				m.Decide(req.ID, false, "client disconnected")
+				return
+			}
+			slog.Info("permission decided", "id", req.ID, "allow", dec.Allow)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"allow":   dec.Allow,
+				"message": dec.Reason,
+			})
 		}
 	}
 
-	handleDecide := func(w http.ResponseWriter, r *http.Request, prefix string) {
-		parts := strings.Split(strings.TrimPrefix(r.URL.Path, prefix), "/")
-		if len(parts) != 2 || parts[1] != "decide" {
-			http.NotFound(w, r)
-			return
+	decideHandler := func(pathPrefix string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			parts := strings.Split(strings.TrimPrefix(r.URL.Path, pathPrefix), "/")
+			if len(parts) != 2 || parts[1] != "decide" {
+				http.NotFound(w, r)
+				return
+			}
+			id := parts[0]
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			var body struct {
+				Allow  bool   `json:"allow"`
+				Reason string `json:"message,omitempty"` // "message" matches wire format used by existing UI; maps to Decision.Reason
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			if !m.Decide(id, body.Allow, body.Reason) {
+				http.Error(w, "unknown request id", http.StatusNotFound)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
 		}
-		id := parts[0]
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var body struct {
-			Allow bool `json:"allow"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
-			return
-		}
-		if !ps.Decide(id, body.Allow) {
-			http.Error(w, "unknown request id", http.StatusNotFound)
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
 	}
 
-	// Canonical paths (v0.3+)
-	mux.HandleFunc("/api/v1/permission/request", handleRequest)
-	mux.HandleFunc("/api/v1/permission/", func(w http.ResponseWriter, r *http.Request) {
-		handleDecide(w, r, "/api/v1/permission/")
-	})
+	// Canonical
+	mux.HandleFunc("/api/v1/permission/request", requestHandler("unknown"))
+	mux.HandleFunc("/api/v1/permission/", decideHandler("/api/v1/permission/"))
 
-	// Alias paths (deprecated; remove in v0.4)
-	mux.HandleFunc("/api/v1/agent/permission/request", handleRequest)
-	mux.HandleFunc("/api/v1/agent/permission/", func(w http.ResponseWriter, r *http.Request) {
-		handleDecide(w, r, "/api/v1/agent/permission/")
-	})
+	// Alias (v0.3.x compat)
+	mux.HandleFunc("/api/v1/agent/permission/request", requestHandler("claude_hook"))
+	mux.HandleFunc("/api/v1/agent/permission/", decideHandler("/api/v1/agent/permission/"))
 }

@@ -29,7 +29,7 @@ import (
 //	/wt/shell       → PTY shell channel stub (s6)
 //	/wt/events      → broadcast events channel (s4)
 //	/wt/_smoke      → WT bidi pure-byte echo (D-22 §6 #2 acceptance gate)
-func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *session.Registry, ps *permission.PermState, authState *auth.State) http.Handler {
+func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *session.Registry, pm *permission.Manager, authState *auth.State) http.Handler {
 	mux := http.NewServeMux()
 
 	derHex := HashHex(bundle.DER)
@@ -80,8 +80,19 @@ func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *ses
 	mux.HandleFunc("/wt/chat", handleWTChat(reg, wts, authState))
 	mux.HandleFunc("/wt/events", handleWTEvents(reg, wts, authState))
 
-	// s5: permission API.
-	permission.RegisterPermAPI(mux, ps, reg)
+	// s5: permission API (canonical + alias).
+	broadcastFn := func(req *permission.Request) {
+		reg.BroadcastAll(wire.Envelope{
+			Kind:      wire.KindPermission,
+			SessionID: wire.SessionID(req.SessionID),
+			Payload: map[string]any{
+				"id":       req.ID,
+				"toolName": req.ToolName,
+				"input":    req.Args,
+			},
+		})
+	}
+	permission.RegisterAPI(mux, pm, broadcastFn)
 
 	// s6: shell WT channel + session lock API.
 	mux.HandleFunc("/wt/shell", handleWTShell(reg, wts))
@@ -94,6 +105,11 @@ func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *ses
 	if cfg.SkillRegistry != nil {
 		skill.RegisterAPI(mux, cfg.SkillRegistry)
 	}
+
+	// /mcp — reserved for MCP Streamable HTTP endpoint (v0.4+).
+	mux.HandleFunc("/mcp", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "MCP endpoint not yet available", http.StatusNotImplemented)
+	})
 
 	mux.HandleFunc("/api/v1/providers", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

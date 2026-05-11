@@ -1,93 +1,112 @@
+// internal/permission/manager.go
 package permission
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"sync"
 	"time"
 )
 
-const PermTimeout = 60 * time.Second
+// Timeout is the deadline for a pending permission request.
+// Package-level var so tests can override it. Tests override this; not parallel-safe.
+var Timeout = 60 * time.Second
 
-// PermRequest represents a pending PreToolUse (or MCP tool-call) permission request.
-type PermRequest struct {
-	ID       string          `json:"id"`
-	ToolName string          `json:"tool_name"`
-	Input    json.RawMessage `json:"tool_input"`
-	// Source identifies the caller: "claude_hook" for cc PreToolUse, "mcp:<server>" for MCP gateway.
-	Source   string          `json:"source,omitempty"`
-	decideCh chan bool
+// Request is the generalized permission check request.
+type Request struct {
+	ID        string          // populated by Manager.Add
+	Source    string          `json:"source"`              // "claude_hook" | "mcp:<servername>"
+	SessionID string          `json:"session_id,omitempty"`
+	ToolName  string          `json:"tool_name"`
+	Args      json.RawMessage `json:"tool_input"`
+	TaskID    string          `json:"task_id,omitempty"`
+}
+
+// Decision is the outcome of a permission check.
+type Decision struct {
+	Allow  bool
+	Reason string
+}
+
+type entry struct {
+	req      *Request
+	decideCh chan Decision
 	timer    *time.Timer
 }
 
-// PermState manages in-flight permission requests.
-type PermState struct {
+// Manager manages in-flight permission requests.
+type Manager struct {
 	mu      sync.Mutex
-	pending map[string]*PermRequest
+	pending map[string]*entry
 }
 
-func NewPermState() *PermState {
-	return &PermState{pending: make(map[string]*PermRequest)}
+// New returns a ready Manager.
+func New() *Manager {
+	return &Manager{pending: make(map[string]*entry)}
 }
 
-// Add registers a new pending request and returns a channel that receives
-// the allow/deny decision. Returns error if ID is already in-flight.
-func (ps *PermState) Add(req *PermRequest) (<-chan bool, error) {
-	ps.mu.Lock()
-	if _, dup := ps.pending[req.ID]; dup {
-		ps.mu.Unlock()
-		return nil, fmt.Errorf("permission: duplicate request ID %q", req.ID)
-	}
-	req.decideCh = make(chan bool, 1)
-	req.timer = time.AfterFunc(PermTimeout, func() {
-		ps.mu.Lock()
-		if _, ok := ps.pending[req.ID]; ok {
-			delete(ps.pending, req.ID)
-			req.decideCh <- false
+// Add registers req, sets req.ID, and returns a channel that yields the decision.
+func (m *Manager) Add(req *Request) <-chan Decision {
+	req.ID = newID()
+	ch := make(chan Decision, 1)
+	e := &entry{req: req, decideCh: ch}
+	e.timer = time.AfterFunc(Timeout, func() {
+		m.mu.Lock()
+		if _, ok := m.pending[req.ID]; ok {
+			delete(m.pending, req.ID)
+			ch <- Decision{Reason: "timeout"}
 		}
-		ps.mu.Unlock()
+		m.mu.Unlock()
 	})
-	ps.pending[req.ID] = req
-	ps.mu.Unlock()
-	return req.decideCh, nil
+	m.mu.Lock()
+	m.pending[req.ID] = e
+	m.mu.Unlock()
+	return ch
 }
 
-// Decide resolves a pending request. Returns false if the request ID is unknown.
-func (ps *PermState) Decide(id string, allow bool) bool {
-	ps.mu.Lock()
-	req, ok := ps.pending[id]
+// Decide resolves a pending request. Returns false if id is unknown.
+func (m *Manager) Decide(id string, allow bool, reason string) bool {
+	m.mu.Lock()
+	e, ok := m.pending[id]
 	if ok {
-		delete(ps.pending, id)
+		delete(m.pending, id)
 	}
-	ps.mu.Unlock()
+	m.mu.Unlock()
 	if !ok {
 		return false
 	}
-	req.timer.Stop()
-	req.decideCh <- allow
+	e.timer.Stop()
+	e.decideCh <- Decision{Allow: allow, Reason: reason}
 	return true
 }
 
-// GetPending returns a snapshot of the pending request for the given ID.
-// Returns zero value if the ID is not found. Callers receive a copy — mutating
-// it does not affect the in-flight request.
-func (ps *PermState) GetPending(id string) (PermRequest, bool) {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
-	req, ok := ps.pending[id]
-	if !ok {
-		return PermRequest{}, false
+// GetPending returns the pending request, or nil if id is unknown / already decided.
+func (m *Manager) GetPending(id string) *Request {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if e, ok := m.pending[id]; ok {
+		return e.req
 	}
-	return *req, true
+	return nil
 }
 
-// NewID returns a random 8-byte hex ID. Panics on crypto/rand failure (unrecoverable).
-func NewID() string {
+func newID() string {
 	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
-		panic("permission: crypto/rand unavailable: " + err.Error())
-	}
+	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// Check implements a blocking permission check for use by the gateway.
+// It adds the request and blocks until decided or ctx cancelled.
+func (m *Manager) Check(ctx context.Context, req *Request) (*Decision, error) {
+	ch := m.Add(req)
+	select {
+	case d := <-ch:
+		return &d, nil
+	case <-ctx.Done():
+		m.Decide(req.ID, false, "context cancelled")
+		return nil, ctx.Err()
+	}
 }

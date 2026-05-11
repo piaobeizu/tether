@@ -12,6 +12,7 @@ import (
 
 	"github.com/piaobeizu/tether/internal/auth"
 	"github.com/piaobeizu/tether/internal/auth/apitoken"
+	"github.com/piaobeizu/tether/internal/auth/oauth"
 	"github.com/piaobeizu/tether/internal/permission"
 )
 
@@ -24,7 +25,7 @@ type Server struct {
 
 // newServer constructs (but does not start) the dual-listener server.
 // Call Start() to bind and serve.
-func newServer(cfg *Config, bundle CertBundle, pm *permission.Manager, authState *auth.State, mcpSrv *mcp.Server, mcpTokens *apitoken.Store) *Server {
+func newServer(cfg *Config, bundle CertBundle, pm *permission.Manager, authState *auth.State, mcpSrv *mcp.Server, mcpTokens *apitoken.Store, oauthH *oauth.Handlers) *Server {
 	addr := cfg.addr()
 
 	// When ACME is active, certmagic provides a tls.Config with GetCertificate
@@ -70,7 +71,7 @@ func newServer(cfg *Config, bundle CertBundle, pm *permission.Manager, authState
 		CheckOrigin: func(r *http.Request) bool { return originAllowed(r.Header.Get("Origin"), cfg.Port) },
 	}
 
-	mux := buildMux(cfg, bundle, wts, cfg.Registry, pm, authState, mcpSrv, mcpTokens)
+	mux := buildMux(cfg, bundle, wts, cfg.Registry, pm, authState, mcpSrv, mcpTokens, oauthH)
 
 	tcpServer := &http.Server{
 		Addr:      addr,

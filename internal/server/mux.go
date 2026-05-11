@@ -106,10 +106,8 @@ func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *ses
 		skill.RegisterAPI(mux, cfg.SkillRegistry)
 	}
 
-	// /mcp — reserved for MCP Streamable HTTP endpoint (v0.4+).
-	mux.HandleFunc("/mcp", func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "MCP endpoint not yet available", http.StatusNotImplemented)
-	})
+	// /mcp on the HTTPS main port returns 501 until OAuth 2.1 lands in v0.4.
+	// The real /mcp endpoint is served by MCPLoopback on the loopback HTTP port.
 
 	mux.HandleFunc("/api/v1/providers", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

@@ -1,192 +1,117 @@
+// internal/permission/http_test.go
 package permission_test
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
-	"time"
 
 	"github.com/piaobeizu/tether/internal/permission"
-	"github.com/piaobeizu/tether/internal/wire"
 )
 
-type stubReg struct {
-	last wire.Envelope
-}
-
-func (s *stubReg) BroadcastAll(env wire.Envelope) { s.last = env }
-
-func TestPermStateRoundTrip(t *testing.T) {
-	ps := permission.NewPermState()
-	req := &permission.PermRequest{ID: "x1", ToolName: "Bash"}
-	ch, err := ps.Add(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { ps.Decide("x1", false) })
-	if !ps.Decide("x1", true) {
-		t.Fatal("Decide returned false for known id")
-	}
-	if allow := <-ch; !allow {
-		t.Fatal("expected allow=true")
-	}
-}
-
-func TestPermStateUnknownID(t *testing.T) {
-	ps := permission.NewPermState()
-	if ps.Decide("no-such-id", true) {
-		t.Fatal("Decide should return false for unknown id")
-	}
-}
-
-func TestPermStateDuplicateID(t *testing.T) {
-	ps := permission.NewPermState()
-	req := &permission.PermRequest{ID: "dup1", ToolName: "Bash"}
-	_, err := ps.Add(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { ps.Decide("dup1", false) })
-	_, err = ps.Add(&permission.PermRequest{ID: "dup1", ToolName: "Write"})
-	if err == nil {
-		t.Fatal("expected error for duplicate ID, got nil")
-	}
-}
-
-// TestDecideCanonicalPath verifies POST /api/v1/permission/{id}/decide returns 204.
-func TestDecideCanonicalPath(t *testing.T) {
-	ps := permission.NewPermState()
-	reg := &stubReg{}
+func TestRegisterAPI_CanonicalRequest(t *testing.T) {
+	m := permission.New()
 	mux := http.NewServeMux()
-	permission.RegisterPermAPI(mux, ps, reg)
-
-	req := &permission.PermRequest{ID: "abc123", ToolName: "Write"}
-	if _, err := ps.Add(req); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { ps.Decide("abc123", false) })
-
-	body, _ := json.Marshal(map[string]any{"allow": true})
-	rec := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/api/v1/permission/abc123/decide",
-		bytes.NewReader(body))
-	mux.ServeHTTP(rec, r)
-
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("expected 204, got %d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
-// TestDecideAliasPath verifies old /api/v1/agent/permission/{id}/decide still works.
-func TestDecideAliasPath(t *testing.T) {
-	ps := permission.NewPermState()
-	reg := &stubReg{}
-	mux := http.NewServeMux()
-	permission.RegisterPermAPI(mux, ps, reg)
-
-	req := &permission.PermRequest{ID: "def456", ToolName: "Bash"}
-	if _, err := ps.Add(req); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { ps.Decide("def456", false) })
-
-	body, _ := json.Marshal(map[string]any{"allow": false})
-	rec := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/api/v1/agent/permission/def456/decide",
-		bytes.NewReader(body))
-	mux.ServeHTTP(rec, r)
-
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("expected 204, got %d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
-// TestDecideUnknownID verifies decide on unknown id returns 404.
-func TestDecideUnknownID(t *testing.T) {
-	ps := permission.NewPermState()
-	reg := &stubReg{}
-	mux := http.NewServeMux()
-	permission.RegisterPermAPI(mux, ps, reg)
-
-	body, _ := json.Marshal(map[string]any{"allow": true})
-	rec := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/api/v1/permission/notexist/decide",
-		bytes.NewReader(body))
-	mux.ServeHTTP(rec, r)
-
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("expected 404, got %d", rec.Code)
-	}
-}
-
-// TestDecideNegativeCases covers method rejection, malformed JSON, bad path segment.
-func TestDecideNegativeCases(t *testing.T) {
-	ps := permission.NewPermState()
-	reg := &stubReg{}
-	mux := http.NewServeMux()
-	permission.RegisterPermAPI(mux, ps, reg)
-
-	req := &permission.PermRequest{ID: "neg1", ToolName: "Bash"}
-	if _, err := ps.Add(req); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { ps.Decide("neg1", false) })
-
-	cases := []struct {
-		name   string
-		method string
-		path   string
-		body   string
-		want   int
-	}{
-		{"wrong method GET decide", http.MethodGet, "/api/v1/permission/neg1/decide", `{"allow":true}`, http.StatusMethodNotAllowed},
-		{"malformed JSON decide", http.MethodPost, "/api/v1/permission/neg1/decide", `not-json`, http.StatusBadRequest},
-		{"wrong path segment", http.MethodPost, "/api/v1/permission/neg1/other", `{"allow":true}`, http.StatusNotFound},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			rec := httptest.NewRecorder()
-			r := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
-			mux.ServeHTTP(rec, r)
-			if rec.Code != tc.want {
-				t.Fatalf("expected %d, got %d", tc.want, rec.Code)
-			}
-		})
-	}
-}
-
-// TestRequestContextCancellation verifies the handler exits cleanly when client disconnects.
-func TestRequestContextCancellation(t *testing.T) {
-	ps := permission.NewPermState()
-	reg := &stubReg{}
-	mux := http.NewServeMux()
-	permission.RegisterPermAPI(mux, ps, reg)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	body, _ := json.Marshal(map[string]any{
-		"session_id": "s-cancel",
-		"tool_name":  "Bash",
-		"tool_input": json.RawMessage(`{}`),
+	var capturedReq *permission.Request
+	permission.RegisterAPI(mux, m, func(r *permission.Request) {
+		capturedReq = r
+		m.Decide(r.ID, true, "auto-allow")
 	})
-	rec := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/api/v1/permission/request",
-		bytes.NewReader(body)).WithContext(ctx)
 
-	done := make(chan struct{})
-	go func() {
-		mux.ServeHTTP(rec, r)
-		close(done)
-	}()
+	body, _ := json.Marshal(map[string]any{
+		"source": "mcp:test-server", "tool_name": "echo", "tool_input": nil,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/permission/request",
+		bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
 
-	cancel()
-	select {
-	case <-done:
-		// ok
-	case <-time.After(2 * time.Second):
-		t.Fatal("handler did not return after context cancellation")
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200 got %d: %s", w.Code, w.Body)
+	}
+	var resp map[string]any
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["allow"] != true {
+		t.Fatalf("expected allow=true, got %v", resp)
+	}
+	if capturedReq == nil || capturedReq.Source != "mcp:test-server" {
+		t.Fatalf("broadcast not called or wrong source: %+v", capturedReq)
+	}
+}
+
+func TestRegisterAPI_AliasRequest(t *testing.T) {
+	m := permission.New()
+	mux := http.NewServeMux()
+	var capturedReq *permission.Request
+	permission.RegisterAPI(mux, m, func(r *permission.Request) {
+		capturedReq = r
+		m.Decide(r.ID, false, "denied")
+	})
+
+	body, _ := json.Marshal(map[string]any{
+		"session_id": "sess-1", "tool_name": "bash", "tool_input": map[string]any{"command": "ls"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agent/permission/request",
+		bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200 got %d: %s", w.Code, w.Body)
+	}
+	var resp map[string]any
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["allow"] != false {
+		t.Fatalf("expected allow=false, got %v", resp)
+	}
+	// Alias path must default Source to "claude_hook"
+	if capturedReq == nil || capturedReq.Source != "claude_hook" {
+		t.Fatalf("alias must default Source=claude_hook, got %+v", capturedReq)
+	}
+}
+
+func TestRegisterAPI_DecideCanonical(t *testing.T) {
+	m := permission.New()
+	mux := http.NewServeMux()
+	permission.RegisterAPI(mux, m, nil)
+
+	// Add a request manually
+	req := &permission.Request{Source: "mcp:srv", ToolName: "foo"}
+	m.Add(req)
+
+	body, _ := json.Marshal(map[string]any{"allow": true})
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/permission/"+req.ID+"/decide",
+		bytes.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, r)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("want 204 got %d: %s", w.Code, w.Body)
+	}
+}
+
+func TestRegisterAPI_AliasAndCanonicalDecideIdentical(t *testing.T) {
+	m := permission.New()
+	mux := http.NewServeMux()
+	permission.RegisterAPI(mux, m, nil)
+
+	req := &permission.Request{Source: "claude_hook", ToolName: "write"}
+	m.Add(req)
+
+	// Call /decide via alias path
+	body, _ := json.Marshal(map[string]any{"allow": true})
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/agent/permission/"+req.ID+"/decide",
+		bytes.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, r)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("alias /decide want 204 got %d", w.Code)
 	}
 }

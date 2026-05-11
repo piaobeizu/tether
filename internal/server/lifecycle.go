@@ -88,14 +88,14 @@ func Run(cfg *Config) error {
 	}
 
 	// Step 3: permission hook setup (D-05b §4–§5).
-	ps := permission.NewPermState()
+	pm := permission.New()
 	noHook := os.Getenv("TETHER_NO_PERMISSION_HOOK") == "1"
 	if !noHook {
 		binPath := filepath.Join(binDir, "tether-permission-hook")
 		if err := cchook.EnsureHookBinary(binPath); err != nil {
 			return fmt.Errorf("perm hook compile: %w", err)
 		}
-		permEndpoint := fmt.Sprintf("https://127.0.0.1%s/api/v1/agent/permission/request", cfg.addr())
+		permEndpoint := fmt.Sprintf("https://127.0.0.1%s/api/v1/permission/request", cfg.addr())
 		if err := agent.InjectPermHook(binPath, permEndpoint); err != nil {
 			slog.Warn("inject perm hook failed", "err", err)
 		} else {
@@ -137,7 +137,7 @@ func Run(cfg *Config) error {
 	authState := auth.NewState(accessToken, jwtSecret)
 
 	// Step 5: build and start listeners.
-	srv := newServer(cfg, bundle, ps, authState)
+	srv := newServer(cfg, bundle, pm, authState)
 
 	errCh := make(chan error, 2)
 

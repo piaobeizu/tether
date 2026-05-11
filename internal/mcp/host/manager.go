@@ -139,6 +139,7 @@ func (m *Manager) Stop(name string) error {
 }
 
 // StopAll shuts down all running servers.
+// Assumes no concurrent Start calls are in flight (safe for shutdown-only use).
 func (m *Manager) StopAll() {
 	m.mu.Lock()
 	names := make([]string, 0, len(m.conns))

@@ -36,7 +36,7 @@ func TestMCPLoopback_ToolsListAndCall(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := loop.Start(ctx); err != nil {
+	if err := loop.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	defer func() {

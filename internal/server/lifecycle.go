@@ -148,15 +148,23 @@ func Run(cfg *Config) error {
 		return fmt.Errorf("bearer token: %w", err)
 	}
 	// Persist token to ~/.tether/mcp-token (0600) for debugging/scripting.
-	mcpTokenPath := filepath.Join(func() string { h, _ := os.UserHomeDir(); return h }(), ".tether", "mcp-token")
-	_ = os.WriteFile(mcpTokenPath, []byte(bearerToken), 0o600)
+	tetherDir, err := tetherDataDir() // already called in Step 2; safe to call again (idempotent)
+	if err != nil {
+		return fmt.Errorf("tether data dir: %w", err)
+	}
+	mcpTokenPath := filepath.Join(tetherDir, "mcp-token")
+	if err := os.WriteFile(mcpTokenPath, []byte(bearerToken), 0o600); err != nil {
+		slog.Warn("mcp: could not write token file", "path", mcpTokenPath, "err", err)
+	}
 
 	loopback := NewMCPLoopback(mcpPort, mcpSrv, bearerToken)
-	if err := loopback.Start(context.Background()); err != nil {
+	if err := loopback.Start(); err != nil {
 		return fmt.Errorf("mcp loopback: %w", err)
 	}
 	if !cfg.SkipMCPInject {
 		if err := agent.InjectMCPServer(mcpPort, bearerToken); err != nil {
+			mcpMgr.StopAll()
+			_ = loopback.Stop(context.Background())
 			return fmt.Errorf("mcp settings inject: %w", err)
 		}
 	}

@@ -3,6 +3,7 @@ package host
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"time"
 
@@ -110,7 +111,7 @@ func (s *Supervisor) Run(ctx context.Context) {
 type deadConn struct{ err error }
 
 func (d *deadConn) ListTools(context.Context) ([]mcp.Tool, error) { return nil, d.err }
-func (d *deadConn) CallTool(context.Context, string, map[string]any) (*mcp.CallToolResult, error) {
+func (d *deadConn) CallTool(context.Context, string, json.RawMessage) (*mcp.CallToolResult, error) {
 	return nil, d.err
 }
 func (d *deadConn) Wait() error  { return d.err }

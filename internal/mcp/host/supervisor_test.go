@@ -3,6 +3,7 @@ package host_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -26,7 +27,7 @@ func newFakeConn(crashErr error, listResp ...mcp.Tool) *fakeConn {
 }
 
 func (f *fakeConn) ListTools(_ context.Context) ([]mcp.Tool, error) { return f.listResp, nil }
-func (f *fakeConn) CallTool(_ context.Context, _ string, _ map[string]any) (*mcp.CallToolResult, error) {
+func (f *fakeConn) CallTool(_ context.Context, _ string, _ json.RawMessage) (*mcp.CallToolResult, error) {
 	return nil, errors.New("not implemented in fake")
 }
 func (f *fakeConn) Wait() error {

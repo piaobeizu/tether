@@ -3,6 +3,7 @@ package host
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 
@@ -14,7 +15,7 @@ import (
 // Tests use fake implementations.
 type ServerConn interface {
 	ListTools(ctx context.Context) ([]mcp.Tool, error)
-	CallTool(ctx context.Context, name string, args map[string]any) (*mcp.CallToolResult, error)
+	CallTool(ctx context.Context, name string, args json.RawMessage) (*mcp.CallToolResult, error)
 	Wait() error  // blocks until session closes
 	Close() error
 }
@@ -43,7 +44,7 @@ func (c *liveConn) ListTools(ctx context.Context) ([]mcp.Tool, error) {
 	return out, nil
 }
 
-func (c *liveConn) CallTool(ctx context.Context, name string, args map[string]any) (*mcp.CallToolResult, error) {
+func (c *liveConn) CallTool(ctx context.Context, name string, args json.RawMessage) (*mcp.CallToolResult, error) {
 	result, err := c.session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
 	if err != nil {
 		return nil, fmt.Errorf("mcp/host: CallTool %s: %w", name, err)

@@ -11,7 +11,7 @@ import (
 )
 
 // Timeout is the deadline for a pending permission request.
-// Package-level var so tests can override it.
+// Package-level var so tests can override it. Tests override this; not parallel-safe.
 var Timeout = 60 * time.Second
 
 // Request is the generalized permission check request.
@@ -106,6 +106,7 @@ func (m *Manager) Check(ctx context.Context, req *Request) (*Decision, error) {
 	case d := <-ch:
 		return &d, nil
 	case <-ctx.Done():
+		m.Decide(req.ID, false, "context cancelled")
 		return nil, ctx.Err()
 	}
 }

@@ -82,7 +82,7 @@ func RegisterAPI(mux *http.ServeMux, m *Manager, broadcast BroadcastFn) {
 			}
 			var body struct {
 				Allow  bool   `json:"allow"`
-				Reason string `json:"message,omitempty"`
+				Reason string `json:"message,omitempty"` // "message" matches wire format used by existing UI; maps to Decision.Reason
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				http.Error(w, "bad request", http.StatusBadRequest)

@@ -4,6 +4,7 @@ package host
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -19,7 +20,9 @@ type ServerConn interface {
 }
 
 type liveConn struct {
-	session *mcp.ClientSession
+	session   *mcp.ClientSession
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // NewLiveConn wraps a *mcp.ClientSession as a ServerConn.
@@ -48,5 +51,8 @@ func (c *liveConn) CallTool(ctx context.Context, name string, args map[string]an
 	return result, nil
 }
 
-func (c *liveConn) Wait() error  { return c.session.Wait() }
-func (c *liveConn) Close() error { return c.session.Close() }
+func (c *liveConn) Wait() error { return c.session.Wait() }
+func (c *liveConn) Close() error {
+	c.closeOnce.Do(func() { c.closeErr = c.session.Close() })
+	return c.closeErr
+}

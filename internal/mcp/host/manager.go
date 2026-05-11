@@ -43,22 +43,24 @@ func (m *Manager) Start(ctx context.Context, cfg *Config) error {
 
 func (m *Manager) startOne(ctx context.Context, cfg ServerConfig) error {
 	supCtx, cancel := context.WithCancel(ctx)
-	m.mu.Lock()
-	m.cancels[cfg.Name] = cancel
-	m.mu.Unlock()
 
 	client := mcp.NewClient(&mcp.Implementation{Name: "tether", Version: "v0.3"}, nil)
 
-	connectFn := func() (ServerConn, []mcp.Tool, error) {
+	spawnConn := func() (ServerConn, []mcp.Tool, error) {
 		if len(cfg.Command) == 0 {
 			return nil, nil, fmt.Errorf("command is empty")
 		}
 		cmd := exec.CommandContext(supCtx, cfg.Command[0], cfg.Command[1:]...)
-		extra := make([]string, 0, len(cfg.Env))
-		for k, v := range cfg.Env {
-			extra = append(extra, k+"="+v)
+		// I4: curated env — inherit only safe keys; use cfg.InheritEnv for additional opt-ins.
+		safeKeys := []string{"PATH", "HOME", "USER", "TMPDIR", "TZ", "LANG", "LC_ALL"}
+		for _, k := range append(safeKeys, cfg.InheritEnv...) {
+			if v := os.Getenv(k); v != "" {
+				cmd.Env = append(cmd.Env, k+"="+v)
+			}
 		}
-		cmd.Env = append(os.Environ(), extra...)
+		for k, v := range cfg.Env {
+			cmd.Env = append(cmd.Env, k+"="+v)
+		}
 		transport := &mcp.CommandTransport{Command: cmd}
 		session, err := client.Connect(supCtx, transport, nil)
 		if err != nil {
@@ -70,14 +72,50 @@ func (m *Manager) startOne(ctx context.Context, cfg ServerConfig) error {
 			_ = c.Close()
 			return nil, nil, fmt.Errorf("list tools: %w", err)
 		}
-		m.mu.Lock()
-		m.conns[cfg.Name] = c
-		m.mu.Unlock()
 		return c, tools, nil
 	}
 
-	sup := NewSupervisor(cfg, m.reg, m.logger, connectFn)
-	go sup.Run(supCtx)
+	// C1: synchronous initial connect — caller gets the error.
+	conn, tools, err := spawnConn()
+	if err != nil {
+		cancel()
+		return fmt.Errorf("mcp/manager: start %s: %w", cfg.Name, err)
+	}
+	if len(tools) > 0 {
+		if regErr := m.reg.Register(cfg, tools); regErr != nil {
+			_ = conn.Close()
+			cancel()
+			return fmt.Errorf("mcp/manager: register %s: %w", cfg.Name, regErr)
+		}
+	}
+
+	m.mu.Lock()
+	m.conns[cfg.Name] = conn
+	m.cancels[cfg.Name] = cancel
+	m.mu.Unlock()
+
+	// connectFn for supervisor retries: creates a new connection and updates m.conns.
+	connectFn := func() (ServerConn, []mcp.Tool, error) {
+		c, t, err := spawnConn()
+		if err != nil {
+			return nil, nil, err
+		}
+		m.mu.Lock()
+		m.conns[cfg.Name] = c
+		m.mu.Unlock()
+		return c, t, nil
+	}
+
+	sup := NewSupervisor(cfg, m.reg, m.logger, conn, connectFn)
+	go func() {
+		sup.Run(supCtx)
+		// C2: clear stale conn when supervisor exits (retries exhausted or ctx cancelled).
+		m.mu.Lock()
+		delete(m.conns, cfg.Name)
+		m.mu.Unlock()
+		m.reg.Deregister(cfg.Name)
+	}()
+
 	return nil
 }
 

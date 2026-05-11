@@ -29,7 +29,12 @@ func TestGatewayIntegration_InProcessServer(t *testing.T) {
 	)
 
 	clientTransport, serverTransport := mcp.NewInMemoryTransports()
-	go func() { srv.Connect(ctx, serverTransport, nil) }()
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		srv.Connect(ctx, serverTransport, nil)
+	}()
+	t.Cleanup(func() { <-serverDone })
 
 	client := mcp.NewClient(&mcp.Implementation{Name: "tether-test", Version: "v0.0.1"}, nil)
 	session, err := client.Connect(ctx, clientTransport, nil)

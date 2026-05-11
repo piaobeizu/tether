@@ -58,7 +58,13 @@ func RegisterAPI(mux *http.ServeMux, m *Manager, broadcast BroadcastFn) {
 			if broadcast != nil {
 				broadcast(req)
 			}
-			dec := <-decideCh
+			var dec Decision
+			select {
+			case dec = <-decideCh:
+			case <-r.Context().Done():
+				m.Decide(req.ID, false, "client disconnected")
+				return
+			}
 			slog.Info("permission decided", "id", req.ID, "allow", dec.Allow)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{

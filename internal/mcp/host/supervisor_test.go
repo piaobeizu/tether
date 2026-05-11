@@ -63,20 +63,24 @@ func TestSupervisorExhaustsRetries(t *testing.T) {
 	connectFn := func() (host.ServerConn, []mcp.Tool, error) {
 		connectCalls.Add(1)
 		conn := newFakeConn(errors.New("crash"))
-		go conn.Close() // immediately trigger crash
+		go conn.Close()
 		return conn, nil, nil
 	}
 
+	// Initial conn crashes immediately (separate from connectFn).
+	initialConn := newFakeConn(errors.New("initial crash"))
+	go initialConn.Close()
+
 	cfg := host.ServerConfig{Name: "test-srv"}
-	sup := host.NewSupervisor(cfg, reg, logger, connectFn)
+	sup := host.NewSupervisor(cfg, reg, logger, initialConn, connectFn)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	sup.Run(ctx)
 
-	// 1 initial + 3 retries = 4 total connects
-	if n := connectCalls.Load(); n != 4 {
-		t.Fatalf("expected 4 connect calls, got %d", n)
+	// 3 retry connects (initial conn is separate, not counted in connectFn).
+	if n := connectCalls.Load(); n != 3 {
+		t.Fatalf("expected 3 connect calls, got %d", n)
 	}
 	if len(logger.events) == 0 || logger.events[len(logger.events)-1] != "mcp_server_crashed" {
 		t.Fatalf("expected mcp_server_crashed event, got %v", logger.events)
@@ -97,8 +101,11 @@ func TestSupervisorCleanShutdown(t *testing.T) {
 		return c, nil, nil
 	}
 
+	// Initial conn: clean close (nil crash error).
+	initialConn := newFakeConn(nil)
+
 	cfg := host.ServerConfig{Name: "srv2"}
-	sup := host.NewSupervisor(cfg, reg, logger, connectFn)
+	sup := host.NewSupervisor(cfg, reg, logger, initialConn, connectFn)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -106,6 +113,7 @@ func TestSupervisorCleanShutdown(t *testing.T) {
 
 	time.Sleep(20 * time.Millisecond)
 	cancel()
+	initialConn.Close() // unblock initialConn.Wait()
 	mu.Lock()
 	c := conn
 	mu.Unlock()
@@ -132,19 +140,20 @@ func TestSupervisorDeregistersBeforeRetry(t *testing.T) {
 	logger := &crashLogger{}
 
 	var calls atomic.Int32
+	tools := []mcp.Tool{{Name: "foo"}}
 	connectFn := func() (host.ServerConn, []mcp.Tool, error) {
-		n := calls.Add(1)
-		tools := []mcp.Tool{{Name: "foo"}}
-		if n == 1 {
-			conn := newFakeConn(errors.New("crash"), tools...)
-			go conn.Close()
-			return conn, tools, nil
-		}
+		calls.Add(1)
 		return nil, nil, errors.New("connect fail")
 	}
 
+	// Initial conn has tools registered by Manager (simulated here).
+	initialConn := newFakeConn(errors.New("crash"), tools...)
 	cfg := host.ServerConfig{Name: "srv3"}
-	sup := host.NewSupervisor(cfg, reg, logger, connectFn)
+	// Pre-register tools as Manager.startOne would.
+	reg.Register(cfg, tools)
+	go initialConn.Close()
+
+	sup := host.NewSupervisor(cfg, reg, logger, initialConn, connectFn)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

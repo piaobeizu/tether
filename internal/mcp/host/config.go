@@ -10,11 +10,12 @@ type Config struct {
 
 // ServerConfig describes a single MCP server connection (stdio, v0.3).
 type ServerConfig struct {
-	Name    string            // set from the map key by Manager; do not set manually
-	Command []string          // argv: Command[0] is the binary, rest are args
-	Env     map[string]string // literal env vars (no ${TASK_*} expansion in v0.3)
-	Prefix  string            // namespace prefix override (without trailing _)
-	                          // if empty: strings.ReplaceAll(Name, "-", "_")
+	Name       string            // set from the map key by Manager; do not set manually
+	Command    []string          // argv: Command[0] is the binary, rest are args
+	Env        map[string]string // literal env vars (no ${TASK_*} expansion in v0.3)
+	Prefix     string            // namespace prefix override (without trailing _)
+	                             // if empty: strings.ReplaceAll(Name, "-", "_")
+	InheritEnv []string          // extra os env var names to pass to the subprocess (e.g. "GOPATH", "NODE_ENV")
 }
 
 // HistoryLogger is a minimal interface for writing task-history events.

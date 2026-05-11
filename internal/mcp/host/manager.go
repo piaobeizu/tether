@@ -138,6 +138,19 @@ func (m *Manager) Stop(name string) error {
 	return nil
 }
 
+// StopAll shuts down all running servers.
+func (m *Manager) StopAll() {
+	m.mu.Lock()
+	names := make([]string, 0, len(m.conns))
+	for name := range m.conns {
+		names = append(names, name)
+	}
+	m.mu.Unlock()
+	for _, name := range names {
+		_ = m.Stop(name)
+	}
+}
+
 // GetConn returns the live connection for a server name.
 func (m *Manager) GetConn(name string) (ServerConn, bool) {
 	m.mu.RLock()

@@ -147,6 +147,10 @@ func Run(cfg *Config) error {
 	if err != nil {
 		return fmt.Errorf("bearer token: %w", err)
 	}
+	// Persist token to ~/.tether/mcp-token (0600) for debugging/scripting.
+	mcpTokenPath := filepath.Join(func() string { h, _ := os.UserHomeDir(); return h }(), ".tether", "mcp-token")
+	_ = os.WriteFile(mcpTokenPath, []byte(bearerToken), 0o600)
+
 	loopback := NewMCPLoopback(mcpPort, mcpSrv, bearerToken)
 	if err := loopback.Start(context.Background()); err != nil {
 		return fmt.Errorf("mcp loopback: %w", err)
@@ -247,6 +251,7 @@ func Run(cfg *Config) error {
 	if !cfg.SkipMCPInject {
 		_ = agent.RemoveMCPServer()
 	}
+	_ = os.Remove(mcpTokenPath)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

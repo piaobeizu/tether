@@ -3,6 +3,7 @@ package gateway_test
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -71,7 +72,7 @@ func TestGatewayIntegration_InProcessServer(t *testing.T) {
 	result, err := gw.CallTool(ctx, gateway.CallRequest{
 		SessionID: "sess",
 		ToolName:  "tsrv_echo",
-		Arguments: map[string]any{"text": "hello mcp"},
+		Arguments: json.RawMessage(`{"text":"hello mcp"}`),
 	})
 	if err != nil {
 		t.Fatalf("CallTool: %v", err)

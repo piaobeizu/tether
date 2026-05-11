@@ -3,6 +3,7 @@ package gateway_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 
@@ -37,7 +38,7 @@ func (denyAll) Check(_ context.Context, _ *permission.Request) (*permission.Deci
 type fakeConn struct{}
 
 func (f *fakeConn) ListTools(_ context.Context) ([]mcp.Tool, error) { return nil, nil }
-func (f *fakeConn) CallTool(_ context.Context, _ string, _ map[string]any) (*mcp.CallToolResult, error) {
+func (f *fakeConn) CallTool(_ context.Context, _ string, _ json.RawMessage) (*mcp.CallToolResult, error) {
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: "result"}},
 	}, nil
@@ -80,7 +81,7 @@ func TestGatewayCallToolPermissionDenied(t *testing.T) {
 	result, err := gw.CallTool(context.Background(), gateway.CallRequest{
 		SessionID: "sess-1",
 		ToolName:  "svc_echo",
-		Arguments: map[string]any{"text": "hello"},
+		Arguments: json.RawMessage(`{"text":"hello"}`),
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -103,7 +104,7 @@ func TestGatewayCallToolSuccess(t *testing.T) {
 	result, err := gw.CallTool(context.Background(), gateway.CallRequest{
 		SessionID: "sess-1",
 		ToolName:  "svc_echo",
-		Arguments: map[string]any{"text": "hello"},
+		Arguments: json.RawMessage(`{"text":"hello"}`),
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

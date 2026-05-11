@@ -54,6 +54,10 @@ func newServerCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&cfg.DevMode, "dev", false, "proxy SPA to Vite dev server")
 	cmd.Flags().StringVar(&cfg.DevFrontendURL, "dev-url", "", "Vite dev server URL (default http://localhost:5173)")
 	cmd.Flags().StringVar(&cfg.Token, "token", "", "static access token (runtime only, not persisted)")
+	cmd.Flags().IntVar(&cfg.MCPPort, "mcp-port", 8899, "loopback port for /mcp endpoint")
+	cmd.Flags().StringVar(&cfg.MCPConfigPath, "mcp-config", "", "path to config file with [mcp.servers] (default ~/.tether/config.json)")
+	cmd.Flags().StringVar(&cfg.WorkspaceRoot, "workspace-root", "", "workspace root for builtin tools (default ~/.tether/workspace)")
+	cmd.Flags().BoolVar(&cfg.SkipMCPInject, "skip-mcp-inject", false, "skip ~/.claude/settings.json injection (CI/test)")
 	return cmd
 }
 

@@ -58,7 +58,7 @@ func (l *ipLimiter) record(ip string) bool {
 		e.windowStart = time.Now()
 	}
 	e.failures++
-	if e.failures > 5 {
+	if e.failures >= 5 {
 		e.blockedUntil = time.Now().Add(5 * time.Minute)
 		return true
 	}

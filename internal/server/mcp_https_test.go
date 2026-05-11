@@ -234,7 +234,7 @@ func sha256Hex(raw string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func TestIPLimiter_BlocksAfterFiveFailures(t *testing.T) {
+func TestIPLimiter_BlocksOnFifthFailure(t *testing.T) {
 	store, _ := apitoken.Open(filepath.Join(t.TempDir(), "t.json"))
 	h := server.MCPHTTPSHandler(nil, store, slog.Default())
 
@@ -246,7 +246,8 @@ func TestIPLimiter_BlocksAfterFiveFailures(t *testing.T) {
 		return w.Code
 	}
 
-	for i := 0; i < 5; i++ {
+	// First 4 failures return 401; 5th triggers the block (429).
+	for i := 0; i < 4; i++ {
 		code := makeReq()
 		if code != http.StatusUnauthorized {
 			t.Fatalf("failure %d: want 401, got %d", i+1, code)

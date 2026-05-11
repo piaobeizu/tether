@@ -216,7 +216,7 @@ func isLoopback(rawURL string) bool {
 		return false
 	}
 	h := u.Hostname()
-	return h == "localhost" || h == "127.0.0.1"
+	return h == "localhost" || h == "127.0.0.1" || h == "::1"
 }
 
 func oauthRedirectError(w http.ResponseWriter, r *http.Request, redirectURI, errCode, desc, state string) {
@@ -243,9 +243,6 @@ func oauthTokenError(w http.ResponseWriter, errCode, desc string) {
 }
 
 func remoteIP(r *http.Request) string {
-	if h := r.Header.Get("X-Real-IP"); h != "" {
-		return h
-	}
 	addr := r.RemoteAddr
 	// IPv6: [::1]:port
 	if strings.HasPrefix(addr, "[") {

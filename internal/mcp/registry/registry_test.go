@@ -2,6 +2,8 @@
 package registry_test
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -85,4 +87,106 @@ func TestRegistryListAllEmptyAfterDeregister(t *testing.T) {
 	if len(entries) != 1 || entries[0].ServerName != "beta" {
 		t.Fatalf("expected only beta after deregister alpha: %+v", entries)
 	}
+}
+
+func TestRegistryAddObserverFiresOnRegisterAndDeregister(t *testing.T) {
+	r := registry.New()
+	var events []registry.RegistryEvent
+	var mu sync.Mutex
+	r.AddObserver(func(e registry.RegistryEvent) {
+		mu.Lock()
+		events = append(events, e)
+		mu.Unlock()
+	})
+
+	r.Register(host.ServerConfig{Name: "svc"}, tools("a", "b"))
+	r.Deregister("svc")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+	if events[0].Server != "svc" || len(events[0].Added) != 2 || len(events[0].Removed) != 0 {
+		t.Fatalf("event[0]: %+v", events[0])
+	}
+	if events[1].Server != "svc" || len(events[1].Added) != 0 || len(events[1].Removed) != 2 {
+		t.Fatalf("event[1]: %+v", events[1])
+	}
+}
+
+func TestRegistryReconnectPattern_FiresAddsAndRemoves(t *testing.T) {
+	r := registry.New()
+	var events []registry.RegistryEvent
+	r.AddObserver(func(e registry.RegistryEvent) { events = append(events, e) })
+
+	if err := r.Register(host.ServerConfig{Name: "svc"}, tools("a", "b")); err != nil {
+		t.Fatal(err)
+	}
+	r.Deregister("svc")
+	if err := r.Register(host.ServerConfig{Name: "svc"}, tools("b", "c")); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events, got %d: %+v", len(events), events)
+	}
+	if events[0].Server != "svc" || len(events[0].Added) != 2 || len(events[0].Removed) != 0 {
+		t.Fatalf("event[0] (initial register): %+v", events[0])
+	}
+	if events[1].Server != "svc" || len(events[1].Added) != 0 || len(events[1].Removed) != 2 {
+		t.Fatalf("event[1] (deregister): %+v", events[1])
+	}
+	if events[2].Server != "svc" || len(events[2].Added) != 2 || len(events[2].Removed) != 0 {
+		t.Fatalf("event[2] (re-register): %+v", events[2])
+	}
+	addedNames := map[string]bool{}
+	for _, e := range events[2].Added {
+		addedNames[e.PrefixedName] = true
+	}
+	if !addedNames["svc_b"] || !addedNames["svc_c"] {
+		t.Fatalf("event[2] Added must include svc_b + svc_c, got %v", addedNames)
+	}
+}
+
+func TestRegistryRegister_CollisionOnExistingServerErrors(t *testing.T) {
+	r := registry.New()
+	if err := r.Register(host.ServerConfig{Name: "svc"}, tools("a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Register(host.ServerConfig{Name: "svc"}, tools("a")); err == nil {
+		t.Fatal("expected collision error on second Register of same server")
+	}
+}
+
+func TestRegistryObserverFanOut(t *testing.T) {
+	r := registry.New()
+	var c1, c2 atomic.Int32
+	r.AddObserver(func(e registry.RegistryEvent) { c1.Add(1) })
+	r.AddObserver(func(e registry.RegistryEvent) { c2.Add(1) })
+	r.Register(host.ServerConfig{Name: "svc"}, tools("a"))
+	if c1.Load() != 1 || c2.Load() != 1 {
+		t.Fatalf("both observers must fire: c1=%d c2=%d", c1.Load(), c2.Load())
+	}
+}
+
+func TestRegistryObserverPanicIsIsolated(t *testing.T) {
+	r := registry.New()
+	var goodFired atomic.Int32
+	r.AddObserver(func(e registry.RegistryEvent) { panic("boom") })
+	r.AddObserver(func(e registry.RegistryEvent) { goodFired.Add(1) })
+	r.Register(host.ServerConfig{Name: "svc"}, tools("a"))
+	if goodFired.Load() != 1 {
+		t.Fatalf("good observer must fire even when prior observer panics: %d", goodFired.Load())
+	}
+}
+
+func TestRegistryObserverFiresAfterLockRelease(t *testing.T) {
+	r := registry.New()
+	r.AddObserver(func(e registry.RegistryEvent) {
+		// If the write lock were still held, ListAll (which RLocks) would deadlock.
+		_ = r.ListAll()
+	})
+	r.Register(host.ServerConfig{Name: "svc"}, tools("a"))
+	// Reaching here without timeout proves observers run outside the write lock.
 }

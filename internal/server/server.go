@@ -5,11 +5,13 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/webtransport-go"
 
 	"github.com/piaobeizu/tether/internal/auth"
+	"github.com/piaobeizu/tether/internal/auth/apitoken"
 	"github.com/piaobeizu/tether/internal/permission"
 )
 
@@ -22,7 +24,7 @@ type Server struct {
 
 // newServer constructs (but does not start) the dual-listener server.
 // Call Start() to bind and serve.
-func newServer(cfg *Config, bundle CertBundle, pm *permission.Manager, authState *auth.State) *Server {
+func newServer(cfg *Config, bundle CertBundle, pm *permission.Manager, authState *auth.State, mcpSrv *mcp.Server, mcpTokens *apitoken.Store) *Server {
 	addr := cfg.addr()
 
 	// When ACME is active, certmagic provides a tls.Config with GetCertificate
@@ -68,7 +70,7 @@ func newServer(cfg *Config, bundle CertBundle, pm *permission.Manager, authState
 		CheckOrigin: func(r *http.Request) bool { return originAllowed(r.Header.Get("Origin"), cfg.Port) },
 	}
 
-	mux := buildMux(cfg, bundle, wts, cfg.Registry, pm, authState)
+	mux := buildMux(cfg, bundle, wts, cfg.Registry, pm, authState, mcpSrv, mcpTokens)
 
 	tcpServer := &http.Server{
 		Addr:      addr,

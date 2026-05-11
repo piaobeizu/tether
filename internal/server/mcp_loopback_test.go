@@ -2,6 +2,7 @@ package server_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"testing"
@@ -30,7 +31,7 @@ func TestMCPLoopback_ToolsListAndCall(t *testing.T) {
 	const port = 19899
 	const token = "loopbacktesttoken"
 
-	mcpSrv := server.BuildMCPServer(gw, bi)
+	mcpSrv := server.BuildMCPServer(gw, bi, reg)
 	loop := server.NewMCPLoopback(port, mcpSrv, token)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -100,4 +101,88 @@ func (bt *bearerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	r = r.Clone(r.Context())
 	r.Header.Set("Authorization", "Bearer "+bt.token)
 	return bt.base.RoundTrip(r)
+}
+
+func TestBuildMCPServer_ObservesRegistryChanges(t *testing.T) {
+	reg := registry.New()
+	gw := gateway.New(stubMgr{}, reg, alwaysAllow{}, host.NoopLogger())
+
+	noInput := json.RawMessage(`{"type":"object"}`)
+	makeTool := func(name string) mcp.Tool {
+		return mcp.Tool{Name: name, InputSchema: noInput}
+	}
+
+	cfg := host.ServerConfig{Name: "svc"}
+	if err := reg.Register(cfg, []mcp.Tool{makeTool("alpha"), makeTool("beta")}); err != nil {
+		t.Fatal(err)
+	}
+
+	bi, err := builtin.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := server.BuildMCPServer(gw, bi, reg)
+
+	clientT, serverT := mcp.NewInMemoryTransports()
+	go func() { _ = srv.Run(t.Context(), serverT) }()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test"}, nil)
+	session, err := client.Connect(t.Context(), clientT, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	got, err := session.ListTools(t.Context(), &mcp.ListToolsParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsTool(got.Tools, "svc_alpha") || !containsTool(got.Tools, "svc_beta") {
+		t.Fatalf("expected svc_alpha + svc_beta initially, got %v", toolNames(got.Tools))
+	}
+
+	reg.Deregister("svc")
+	if err := reg.Register(cfg, []mcp.Tool{makeTool("gamma"), makeTool("delta")}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err = session.ListTools(t.Context(), &mcp.ListToolsParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsTool(got.Tools, "svc_alpha") || containsTool(got.Tools, "svc_beta") {
+		t.Fatalf("alpha/beta must be removed after reconnect, got %v", toolNames(got.Tools))
+	}
+	if !containsTool(got.Tools, "svc_gamma") || !containsTool(got.Tools, "svc_delta") {
+		t.Fatalf("expected svc_gamma + svc_delta after reconnect, got %v", toolNames(got.Tools))
+	}
+}
+
+func TestBuildMCPServer_ObserverLatencyBudget(t *testing.T) {
+	reg := registry.New()
+	gw := gateway.New(stubMgr{}, reg, alwaysAllow{}, host.NoopLogger())
+	bi, err := builtin.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = server.BuildMCPServer(gw, bi, reg)
+
+	noInput := json.RawMessage(`{"type":"object"}`)
+	cfg := host.ServerConfig{Name: "bulk"}
+	toolList := make([]mcp.Tool, 100)
+	for i := range toolList {
+		toolList[i] = mcp.Tool{Name: fmt.Sprintf("t%03d", i), InputSchema: noInput}
+	}
+
+	start := time.Now()
+	if err := reg.Register(cfg, toolList); err != nil {
+		t.Fatal(err)
+	}
+	reg.Deregister("bulk")
+	dur := time.Since(start)
+
+	if dur > 100*time.Millisecond {
+		t.Fatalf("observer batch (100 add + 100 remove) took %v, budget 100ms", dur)
+	}
 }

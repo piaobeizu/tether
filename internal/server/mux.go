@@ -8,9 +8,11 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/quic-go/webtransport-go"
 
 	"github.com/piaobeizu/tether/internal/auth"
+	"github.com/piaobeizu/tether/internal/auth/apitoken"
 	"github.com/piaobeizu/tether/internal/permission"
 	"github.com/piaobeizu/tether/internal/session"
 	"github.com/piaobeizu/tether/internal/skill"
@@ -29,7 +31,7 @@ import (
 //	/wt/shell       → PTY shell channel stub (s6)
 //	/wt/events      → broadcast events channel (s4)
 //	/wt/_smoke      → WT bidi pure-byte echo (D-22 §6 #2 acceptance gate)
-func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *session.Registry, pm *permission.Manager, authState *auth.State) http.Handler {
+func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *session.Registry, pm *permission.Manager, authState *auth.State, mcpSrv *mcp.Server, mcpTokens *apitoken.Store) http.Handler {
 	mux := http.NewServeMux()
 
 	derHex := HashHex(bundle.DER)
@@ -116,7 +118,15 @@ func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *ses
 		}
 	})
 
-	registerMCPStubs(mux)
+	// /mcp on HTTPS: served by MCPHTTPSHandler when store is configured (v0.3.2+).
+	// One handler instance is shared for both patterns so the SDK's session map
+	// is not split between /mcp and /mcp/ registrations.
+	if mcpSrv != nil && mcpTokens != nil {
+		mcpH := MCPHTTPSHandler(mcpSrv, mcpTokens, nil)
+		mux.Handle("/mcp", mcpH)
+		mux.Handle("/mcp/", mcpH)
+		RegisterMCPTokensAPI(mux, mcpTokens, nil)
+	}
 
 	mux.HandleFunc("/api/v1/", func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "not implemented", http.StatusNotImplemented)
@@ -129,13 +139,13 @@ func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *ses
 	mux.Handle("/", newStaticHandler(cfg.DevFrontendURL))
 
 	// Wrap all routes: origin guard first, then auth middleware outermost.
-	return authState.Middleware(withOriginGuard(cfg.Port, mux))
+	return authState.Middleware(WithOriginGuard(cfg.Port, mux))
 }
 
-// withOriginGuard rejects non-safe-method requests (POST/PUT/PATCH/DELETE) whose
+// WithOriginGuard rejects non-safe-method requests (POST/PUT/PATCH/DELETE) whose
 // Origin header is present but not in the daemon's allowlist. Requests without an
 // Origin header (curl, other trusted clients) pass through unchanged.
-func withOriginGuard(port int, h http.Handler) http.Handler {
+func WithOriginGuard(port int, h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet, http.MethodHead, http.MethodOptions:
@@ -150,15 +160,6 @@ func withOriginGuard(port int, h http.Handler) http.Handler {
 	})
 }
 
-// registerMCPStubs reserves MCP URL paths returning 501 until the v0.3 MCP host is implemented.
-// Do not use /mcp or /api/v1/mcp/* for any other purpose before then.
-func registerMCPStubs(mux *http.ServeMux) {
-	stub := func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "not implemented: MCP host not yet active", http.StatusNotImplemented)
-	}
-	mux.HandleFunc("/mcp", stub)
-	mux.HandleFunc("/api/v1/mcp/", stub)
-}
 
 // originAllowed returns true when origin matches one of the daemon's own HTTPS
 // origins (127.0.0.1, localhost, or TETHER_HOST at the given port).

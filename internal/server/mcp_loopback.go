@@ -12,6 +12,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/piaobeizu/tether/internal/mcp/builtin"
 	"github.com/piaobeizu/tether/internal/mcp/gateway"
+	mcpreg "github.com/piaobeizu/tether/internal/mcp/registry"
 )
 
 // MCPLoopback serves the MCP Streamable HTTP endpoint on a plain HTTP loopback
@@ -23,25 +24,47 @@ type MCPLoopback struct {
 }
 
 // BuildMCPServer constructs the singleton *mcp.Server from gateway proxies and
-// builtins. Call once at daemon startup; all CC sessions share the same server
-// instance.
+// builtins. The server subscribes to registry changes so that supervisor
+// reconnects keep the tool list in sync without requiring clients to reconnect.
 //
-// NOTE: the tool list is snapshotted at construction time. Tools added by
-// supervisor reconnects after a child-server crash will not appear in
-// tools/list until the CC session reconnects. TODO(v0.4): wire srv.AddTool /
-// srv.RemoveTools to registry-change callbacks.
-func BuildMCPServer(gw *gateway.Gateway, bi *builtin.Registry) *mcp.Server {
-	srv := mcp.NewServer(&mcp.Implementation{Name: "tether", Version: "v0.3.1"}, nil)
-	for _, e := range gw.ListToolsSnapshot() {
-		entry := e // capture for closure
-		srv.AddTool(&entry.Tool, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+// Thread-safety: go-sdk Server.AddTool and Server.RemoveTools both route
+// through changeAndNotify which acquires the Server's internal mutex before
+// mutating tool state. The SDK automatically dispatches
+// notifications/tools/list_changed to every connected session.
+func BuildMCPServer(gw *gateway.Gateway, bi *builtin.Registry, reg *mcpreg.Registry) *mcp.Server {
+	srv := mcp.NewServer(&mcp.Implementation{Name: "tether", Version: "v0.3.2"}, nil)
+
+	addOne := func(entry mcpreg.ToolEntry) {
+		// Use a copy with the prefixed name so the tool appears with its
+		// namespaced name in tools/list (e.g. "svc_alpha" not "alpha").
+		t := entry.Tool
+		t.Name = entry.PrefixedName
+		srv.AddTool(&t, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			return gw.CallTool(ctx, gateway.CallRequest{
 				ToolName:  entry.PrefixedName,
 				Arguments: req.Params.Arguments,
 			})
 		})
 	}
+
+	for _, e := range gw.ListToolsSnapshot() {
+		addOne(e)
+	}
 	bi.RegisterInto(srv)
+
+	reg.AddObserver(func(e mcpreg.RegistryEvent) {
+		if len(e.Removed) > 0 {
+			names := make([]string, len(e.Removed))
+			for i, t := range e.Removed {
+				names[i] = t.PrefixedName
+			}
+			srv.RemoveTools(names...)
+		}
+		for _, entry := range e.Added {
+			addOne(entry)
+		}
+	})
+
 	return srv
 }
 

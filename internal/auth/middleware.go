@@ -114,6 +114,8 @@ func (s *State) isExempt(r *http.Request) bool {
 	case p == "/auth",
 		p == "/api/v1/auth/verify",
 		p == "/",
+		p == "/mcp",
+		strings.HasPrefix(p, "/mcp/"),
 		hasSuffix(p, ".js", ".css", ".ico", ".png", ".svg", ".woff2", ".woff", ".ttf", ".webmanifest"):
 		return true
 	}

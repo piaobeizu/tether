@@ -3,6 +3,7 @@ package registry
 
 import (
 	"fmt"
+	"log/slog"
 	"sync"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -17,11 +18,23 @@ type ToolEntry struct {
 	Tool         mcp.Tool
 }
 
+// RegistryEvent describes a tool-set change for a single server.
+type RegistryEvent struct {
+	Server  string
+	Added   []ToolEntry
+	Removed []ToolEntry
+}
+
+// Observer is a callback invoked after Register or Deregister mutates the
+// registry. Observers must be non-blocking. Panics are recovered and logged;
+// one bad observer must not prevent siblings from firing.
+type Observer func(RegistryEvent)
+
 // Registry maps prefixed tool names to their server and original name.
-// Register applies NamespacePrefix; callers pass raw tool lists.
 type Registry struct {
-	mu    sync.RWMutex
-	tools map[string]*ToolEntry // prefixed name → entry
+	mu        sync.RWMutex
+	tools     map[string]*ToolEntry
+	observers []Observer
 }
 
 // New returns an empty Registry.
@@ -29,28 +42,45 @@ func New() *Registry {
 	return &Registry{tools: make(map[string]*ToolEntry)}
 }
 
+// AddObserver registers fn to be invoked on every Register / Deregister,
+// after the write lock has been released.
+func (r *Registry) AddObserver(fn Observer) {
+	r.mu.Lock()
+	r.observers = append(r.observers, fn)
+	r.mu.Unlock()
+}
+
 // Register adds tools from serverCfg, applying namespace prefix.
 // Returns an error if any prefixed name already exists (no silent override).
 func (r *Registry) Register(serverCfg host.ServerConfig, tools []mcp.Tool) error {
 	prefix := host.NamespacePrefix(serverCfg)
+
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	// Collision check first (all-or-nothing).
 	for _, t := range tools {
 		prefixed := prefix + t.Name
 		if existing, ok := r.tools[prefixed]; ok {
+			r.mu.Unlock()
 			return fmt.Errorf("mcp/registry: tool %q already registered by server %q",
 				prefixed, existing.ServerName)
 		}
 	}
+	added := make([]ToolEntry, 0, len(tools))
 	for _, t := range tools {
 		prefixed := prefix + t.Name
-		r.tools[prefixed] = &ToolEntry{
+		entry := &ToolEntry{
 			PrefixedName: prefixed,
 			OriginalName: t.Name,
 			ServerName:   serverCfg.Name,
 			Tool:         t,
 		}
+		r.tools[prefixed] = entry
+		added = append(added, *entry)
+	}
+	obsSnapshot := append([]Observer(nil), r.observers...)
+	r.mu.Unlock()
+
+	if len(added) > 0 {
+		notify(obsSnapshot, RegistryEvent{Server: serverCfg.Name, Added: added})
 	}
 	return nil
 }
@@ -58,11 +88,18 @@ func (r *Registry) Register(serverCfg host.ServerConfig, tools []mcp.Tool) error
 // Deregister removes all tools registered under serverName.
 func (r *Registry) Deregister(serverName string) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	var removed []ToolEntry
 	for k, e := range r.tools {
 		if e.ServerName == serverName {
+			removed = append(removed, *e)
 			delete(r.tools, k)
 		}
+	}
+	obsSnapshot := append([]Observer(nil), r.observers...)
+	r.mu.Unlock()
+
+	if len(removed) > 0 {
+		notify(obsSnapshot, RegistryEvent{Server: serverName, Removed: removed})
 	}
 }
 
@@ -95,4 +132,17 @@ func (r *Registry) ListAll() []ToolEntry {
 		out = append(out, *e)
 	}
 	return out
+}
+
+func notify(observers []Observer, e RegistryEvent) {
+	for _, fn := range observers {
+		func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					slog.Error("mcp/registry: observer panicked", "panic", rec)
+				}
+			}()
+			fn(e)
+		}()
+	}
 }

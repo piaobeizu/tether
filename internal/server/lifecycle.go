@@ -18,6 +18,7 @@ import (
 
 	"github.com/piaobeizu/tether/internal/agent"
 	"github.com/piaobeizu/tether/internal/auth"
+	"github.com/piaobeizu/tether/internal/auth/apitoken"
 	"github.com/piaobeizu/tether/internal/mcp/builtin"
 	mcpgw "github.com/piaobeizu/tether/internal/mcp/gateway"
 	mcphost "github.com/piaobeizu/tether/internal/mcp/host"
@@ -49,6 +50,9 @@ type Config struct {
 	MCPConfigPath string // path to [mcp.servers] config; "" = ~/.tether/config.json
 	WorkspaceRoot string // builtin tools workspace root; "" = ~/.tether/workspace
 	SkipMCPInject bool   // skip ~/.claude/settings.json injection (CI/test)
+
+	// v0.3.2: external client API token store
+	APITokensPath string // path to api-tokens.json; "" = ~/.tether/api-tokens.json
 }
 
 func (c *Config) addr() string { return fmt.Sprintf(":%d", c.Port) }
@@ -142,7 +146,7 @@ func Run(cfg *Config) error {
 		return fmt.Errorf("mcp builtin init: %w", err)
 	}
 	mcpGW := mcpgw.New(mcpMgr, mcpReg, pm, mcphost.NoopLogger())
-	mcpSrv := BuildMCPServer(mcpGW, builtins)
+	mcpSrv := BuildMCPServer(mcpGW, builtins, mcpReg)
 	bearerToken, err := generateBearerToken()
 	if err != nil {
 		return fmt.Errorf("bearer token: %w", err)
@@ -202,8 +206,18 @@ func Run(cfg *Config) error {
 	}
 	authState := auth.NewState(accessToken, jwtSecret)
 
+	// Step 4d: open API token store for external MCP clients (v0.3.2).
+	apiTokensPath := cfg.APITokensPath
+	if apiTokensPath == "" {
+		apiTokensPath = filepath.Join(tetherDir, "api-tokens.json")
+	}
+	apiTokens, err := apitoken.Open(apiTokensPath)
+	if err != nil {
+		return fmt.Errorf("api-tokens store: %w", err)
+	}
+
 	// Step 5: build and start listeners.
-	srv := newServer(cfg, bundle, pm, authState)
+	srv := newServer(cfg, bundle, pm, authState, mcpSrv, apiTokens)
 
 	errCh := make(chan error, 2)
 

@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.3.2 (unreleased)
+
+### Added
+- HTTPS `/mcp` endpoint on the main port for external MCP clients (Cursor, Goose).
+  Protected by manually-issued Bearer tokens.
+- REST API `POST/GET/DELETE /api/v1/mcp/tokens` for managing external client tokens.
+  Tokens stored hashed (SHA-256) in `~/.tether/api-tokens.json` (mode 0600).
+- Audit log events `mcp.apitoken.{created,revoked,auth_ok,auth_failed}` (slog).
+- Dynamic tool list refresh: external clients and CC immediately see tools
+  added or removed by supervisor reconnects without needing to reconnect.
+
+### Changed
+- `/mcp` HTTPS endpoint no longer returns 501.
+- `BuildMCPServer` now takes a `*registry.Registry` to subscribe live tool updates.
+
+### Deferred to v0.3.3
+- Full OAuth 2.1 PKCE flow (`/oauth/authorize`, `/oauth/token`).
+- OAuth discovery endpoint (`/.well-known/oauth-authorization-server` — currently 404).
+- Token TTL, scope, dynamic client registration, web UI for token management.
+- Rate limiting on `/mcp` Bearer-validation failures.
+
+### Migration
+- Existing v0.3.1 deployments: no migration needed. CC loopback at
+  `127.0.0.1:8899/mcp` continues to work unchanged.
+- New file `~/.tether/api-tokens.json` is created lazily on first
+  `POST /api/v1/mcp/tokens`; include in backups if external clients are expected.
+
+### Security
+- Manual tokens are long-lived and all-scope. Use one token per external client;
+  revoke and recreate on suspected leak. See spec
+  `tether-doc/wiki/specs/2026-05-11-mcp-v032-design.md` §9 for the rotation
+  workflow.
+- Token-CRUD endpoints `/api/v1/mcp/tokens` are protected by the existing JWT
+  cookie middleware and `WithOriginGuard` CSRF posture (rejects POST/DELETE with
+  mismatched `Origin` header).
+
+## v0.3.1 (merged 2026-05-11)
+
+### Added
+- MCP loopback endpoint at `127.0.0.1:8899/mcp` for CC subprocess integration.
+- Builtin workspace tools (`workspace_read_file`, `workspace_list_files`, etc.).
+- CC settings injection into `~/.claude/settings.json` on daemon startup.
+
 ## v0.3.0 (unreleased)
 
 ### Changed

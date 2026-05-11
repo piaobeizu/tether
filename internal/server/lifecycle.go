@@ -2,8 +2,12 @@ package server
 
 import (
 	"context"
+	crand "crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -14,6 +18,10 @@ import (
 
 	"github.com/piaobeizu/tether/internal/agent"
 	"github.com/piaobeizu/tether/internal/auth"
+	"github.com/piaobeizu/tether/internal/mcp/builtin"
+	mcpgw "github.com/piaobeizu/tether/internal/mcp/gateway"
+	mcphost "github.com/piaobeizu/tether/internal/mcp/host"
+	mcpreg "github.com/piaobeizu/tether/internal/mcp/registry"
 	"github.com/piaobeizu/tether/internal/permission"
 	"github.com/piaobeizu/tether/internal/permission/cchook"
 	"github.com/piaobeizu/tether/internal/session"
@@ -35,6 +43,12 @@ type Config struct {
 	WsRegistry     *workspace.Registry
 	SkillRegistry  *skill.Registry
 	acmeTLSBase    *tls.Config // populated by Run() when AcmeDomain is active
+
+	// MCP fields (v0.3.1)
+	MCPPort       int    // loopback port; 0 = default 8899
+	MCPConfigPath string // path to [mcp.servers] config; "" = ~/.tether/config.json
+	WorkspaceRoot string // builtin tools workspace root; "" = ~/.tether/workspace
+	SkipMCPInject bool   // skip ~/.claude/settings.json injection (CI/test)
 }
 
 func (c *Config) addr() string { return fmt.Sprintf(":%d", c.Port) }
@@ -100,6 +114,46 @@ func Run(cfg *Config) error {
 			slog.Warn("inject perm hook failed", "err", err)
 		} else {
 			cfg.Registry.PermEndpoint = permEndpoint
+		}
+	}
+
+	// Step 3b: MCP host + loopback (v0.3.1).
+	mcpPort := cfg.MCPPort
+	if mcpPort == 0 {
+		mcpPort = 8899
+	}
+	wsRoot := cfg.WorkspaceRoot
+	if wsRoot == "" {
+		home, _ := os.UserHomeDir()
+		wsRoot = filepath.Join(home, ".tether", "workspace")
+		_ = os.MkdirAll(wsRoot, 0o700)
+	}
+	mcpCfg, err := loadMCPConfig(cfg.MCPConfigPath)
+	if err != nil {
+		return fmt.Errorf("mcp config: %w", err)
+	}
+	mcpReg := mcpreg.New()
+	mcpMgr := mcphost.NewManager(mcpReg, mcphost.NoopLogger())
+	if err := mcpMgr.Start(context.Background(), mcpCfg); err != nil {
+		return fmt.Errorf("mcp manager: %w", err)
+	}
+	builtins, err := builtin.New(wsRoot)
+	if err != nil {
+		return fmt.Errorf("mcp builtin init: %w", err)
+	}
+	mcpGW := mcpgw.New(mcpMgr, mcpReg, pm, mcphost.NoopLogger())
+	mcpSrv := BuildMCPServer(mcpGW, builtins)
+	bearerToken, err := generateBearerToken()
+	if err != nil {
+		return fmt.Errorf("bearer token: %w", err)
+	}
+	loopback := NewMCPLoopback(mcpPort, mcpSrv, bearerToken)
+	if err := loopback.Start(context.Background()); err != nil {
+		return fmt.Errorf("mcp loopback: %w", err)
+	}
+	if !cfg.SkipMCPInject {
+		if err := agent.InjectMCPServer(mcpPort, bearerToken); err != nil {
+			return fmt.Errorf("mcp settings inject: %w", err)
 		}
 	}
 
@@ -185,6 +239,15 @@ func Run(cfg *Config) error {
 		_ = agent.RemovePermHook()
 	}
 
+	// MCP shutdown: drain → stop children → housekeeping.
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer drainCancel()
+	_ = loopback.Stop(drainCtx)
+	mcpMgr.StopAll()
+	if !cfg.SkipMCPInject {
+		_ = agent.RemoveMCPServer()
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -203,4 +266,44 @@ func tetherBinDir() (string, error) {
 		return "", fmt.Errorf("mkdir ~/.tether/bin: %w", err)
 	}
 	return binDir, nil
+}
+
+// loadMCPConfig reads the [mcp] section from a tether config file.
+// flagPath overrides the default ~/.tether/config.json.
+// Returns empty config (no servers) if the file is absent.
+func loadMCPConfig(flagPath string) (*mcphost.Config, error) {
+	path := flagPath
+	if path == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, err
+		}
+		path = filepath.Join(home, ".tether", "config.json")
+	}
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return &mcphost.Config{Servers: map[string]mcphost.ServerConfig{}}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("loadMCPConfig: %w", err)
+	}
+	var wrapper struct {
+		MCP *mcphost.Config `json:"mcp"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return nil, fmt.Errorf("loadMCPConfig parse: %w", err)
+	}
+	if wrapper.MCP == nil {
+		return &mcphost.Config{Servers: map[string]mcphost.ServerConfig{}}, nil
+	}
+	return wrapper.MCP, nil
+}
+
+// generateBearerToken returns a cryptographically random 32-byte hex token.
+func generateBearerToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := io.ReadFull(crand.Reader, b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }

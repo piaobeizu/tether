@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -28,8 +29,8 @@ type ManagerReader interface {
 // CallRequest is the input to Gateway.CallTool.
 type CallRequest struct {
 	SessionID string
-	ToolName  string         // prefixed name as seen by caller
-	Arguments map[string]any
+	ToolName  string              // prefixed name as seen by caller
+	Arguments json.RawMessage
 }
 
 // Gateway is the single entry point for MCP tool calls.
@@ -60,6 +61,12 @@ func (g *Gateway) ListTools(_ context.Context, _ string) ([]mcp.Tool, error) {
 		tools[i] = t
 	}
 	return tools, nil
+}
+
+// ListToolsSnapshot returns all registered tools for mcp.Server construction.
+// Safe to call concurrently; delegates to the registry's RLock-protected ListAll.
+func (g *Gateway) ListToolsSnapshot() []registry.ToolEntry {
+	return g.reg.ListAll()
 }
 
 // CallTool runs the permission check and dispatches to the correct server.

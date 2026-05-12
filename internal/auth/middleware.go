@@ -114,6 +114,8 @@ func (s *State) isExempt(r *http.Request) bool {
 	case p == "/auth",
 		p == "/api/v1/auth/verify",
 		p == "/",
+		p == "/cert-hash",
+		p == "/cert-hash-spki",
 		p == "/mcp",
 		strings.HasPrefix(p, "/mcp/"),
 		p == "/oauth/authorize",

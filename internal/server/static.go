@@ -51,7 +51,12 @@ func newStaticHandler(devFrontendURL string) http.Handler {
 		spy := &spy404{ResponseWriter: w}
 		fileServer.ServeHTTP(spy, r)
 		if spy.code == http.StatusNotFound {
-			// Unknown path — serve index.html so the SPA router handles it client-side.
+			// Clear headers poisoned by the 404 probe (e.g. Content-Type: text/plain).
+			// http.FileServer only sets Content-Type when it's absent, so we must
+			// clear it before serving index.html or it will stay as text/plain.
+			for k := range w.Header() {
+				delete(w.Header(), k)
+			}
 			r2 := r.Clone(r.Context())
 			r2.URL.Path = "/"
 			fileServer.ServeHTTP(w, r2)

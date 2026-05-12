@@ -113,7 +113,11 @@ func (s *State) isExempt(r *http.Request) bool {
 	switch {
 	case p == "/auth",
 		p == "/api/v1/auth/verify",
-		p == "/",
+		p == "/cert-hash",
+		// WebTransport CONNECT uses a new QUIC connection that may not carry
+		// SameSite=Strict cookies. Auth is checked inside the handler instead.
+		strings.HasPrefix(p, "/wt/"),
+		p == "/cert-hash-spki",
 		p == "/mcp",
 		strings.HasPrefix(p, "/mcp/"),
 		p == "/oauth/authorize",

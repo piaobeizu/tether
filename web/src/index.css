@@ -1,14 +1,102 @@
 @import "@xterm/xterm/css/xterm.css";
 
+/* ============================================================
+   tether — design tokens (ported from tether-app)
+   Source: Claude Design handoff bundle 2026-05-06
+   Light-first: warm rice canvas + warm-clay accent.
+   ============================================================ */
+
+:root {
+  --bg-app:        #F6F4EE;
+  --bg-surface:    #FBF9F4;
+  --bg-elevated:   #FFFFFF;
+  --bg-sunken:     #EFEBE1;
+  --bg-tint:       #E8E2D2;
+  --bg-code:       #F1ECDF;
+
+  --ink-primary:   #1B1A18;
+  --ink-secondary: #4A4742;
+  --ink-tertiary:  #837E73;
+  --ink-quat:      #B4AC9B;
+  --ink-disabled:  #CFC8B7;
+
+  --line-strong:   #2A2824;
+  --line:          #D9D2C0;
+  --line-soft:     #E5DFCE;
+  --line-hairline: #ECE7D8;
+
+  --accent:        #C2410C;
+  --accent-hover:  #9A330A;
+  --accent-tint:   #FBE6D7;
+  --accent-deep:   #6B2407;
+
+  --success:       #2F7D5B;
+  --success-tint:  #DFEBE0;
+  --warn:          #B7791F;
+  --warn-tint:     #F6E9C8;
+  --danger:        #B42318;
+  --danger-tint:   #FBE2DD;
+  --info:          #2A5FB7;
+  --info-tint:     #DDE6F7;
+
+  --font-sans:  "Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono:  "Geist Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  --r-1:    3px;
+  --r-2:    5px;
+  --r-3:    8px;
+  --r-4:    12px;
+  --r-5:    16px;
+  --r-pill: 999px;
+
+  --sh-1:   0 1px 0 rgba(27,26,24,.04), 0 1px 2px rgba(27,26,24,.04);
+  --sh-2:   0 1px 0 rgba(27,26,24,.04), 0 2px 6px rgba(27,26,24,.06);
+  --sh-3:   0 1px 0 rgba(27,26,24,.04), 0 8px 24px rgba(27,26,24,.08);
+}
+
+[data-theme="dark"] body { background: #0F0E0C; }
+
+[data-theme="dark"] {
+  --bg-app:        #1A1815;
+  --bg-surface:    #211E1A;
+  --bg-elevated:   #2A2620;
+  --bg-sunken:     #141210;
+  --bg-tint:       #322D26;
+  --bg-code:       #2A2620;
+
+  --ink-primary:   #F5F1E6;
+  --ink-secondary: #C7BEA9;
+  --ink-tertiary:  #8E8576;
+  --ink-quat:      #5C5448;
+  --ink-disabled:  #3F3A32;
+
+  --line-strong:   #C7BEA9;
+  --line:          #3F3A32;
+  --line-soft:     #322D26;
+  --line-hairline: #2A2620;
+
+  --accent:        #F0834F;
+  --accent-hover:  #E26B36;
+  --accent-tint:   #3A2418;
+  --accent-deep:   #FFB287;
+
+  --success-tint:  #1F2D24;
+  --warn-tint:     #2F2918;
+  --danger-tint:   #2F1F1C;
+  --info-tint:     #1B2436;
+}
+
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 html, body, #root {
   height: 100%;
-  background: #0f0f0f;
-  color: #e8e8e8;
-  font-family: system-ui, -apple-system, sans-serif;
+  background: var(--bg-app);
+  color: var(--ink-primary);
+  font-family: var(--font-sans);
   font-size: 14px;
   line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 /* three-pane layout ≥768px (D-19) */
@@ -35,7 +123,7 @@ html, body, #root {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  border-right: 1px solid #222;
+  border-right: 1px solid var(--line);
 }
 .pane:last-child { border-right: none; }
 .pane-header {
@@ -43,8 +131,8 @@ html, body, #root {
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.08em;
-  color: #666;
-  border-bottom: 1px solid #222;
+  color: var(--ink-tertiary);
+  border-bottom: 1px solid var(--line);
   flex-shrink: 0;
 }
 .pane-body { flex: 1; overflow: auto; padding: 12px; }

@@ -9,10 +9,32 @@ import (
 	"github.com/piaobeizu/tether/web"
 )
 
+// spy404 wraps a ResponseWriter and intercepts 404 responses so the caller
+// can detect them and serve a fallback without opening the file twice.
+type spy404 struct {
+	http.ResponseWriter
+	code int
+}
+
+func (s *spy404) WriteHeader(code int) {
+	s.code = code
+	if code != http.StatusNotFound {
+		s.ResponseWriter.WriteHeader(code)
+	}
+}
+
+func (s *spy404) Write(b []byte) (int, error) {
+	if s.code == http.StatusNotFound {
+		return len(b), nil // discard 404 body
+	}
+	return s.ResponseWriter.Write(b)
+}
+
 // newStaticHandler returns an http.Handler that:
 //   - In dev mode (devFrontendURL != ""): reverse-proxies to the Vite dev server
 //     for all requests not matched by other routes (§10.C.2).
-//   - Otherwise: serves the embedded web/dist/ SPA via embed.FS.
+//   - Otherwise: serves the embedded web/dist/ SPA via embed.FS with index.html
+//     fallback for unknown paths (SPA client-side routing).
 func newStaticHandler(devFrontendURL string) http.Handler {
 	if devFrontendURL != "" {
 		target, err := url.Parse(devFrontendURL)
@@ -24,5 +46,20 @@ func newStaticHandler(devFrontendURL string) http.Handler {
 	if err != nil {
 		panic("embed.FS sub failed: " + err.Error())
 	}
-	return http.FileServer(http.FS(sub))
+	fileServer := http.FileServer(http.FS(sub))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		spy := &spy404{ResponseWriter: w}
+		fileServer.ServeHTTP(spy, r)
+		if spy.code == http.StatusNotFound {
+			// Clear headers poisoned by the 404 probe (e.g. Content-Type: text/plain).
+			// http.FileServer only sets Content-Type when it's absent, so we must
+			// clear it before serving index.html or it will stay as text/plain.
+			for k := range w.Header() {
+				delete(w.Header(), k)
+			}
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = "/"
+			fileServer.ServeHTTP(w, r2)
+		}
+	})
 }

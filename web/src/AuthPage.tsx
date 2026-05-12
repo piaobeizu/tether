@@ -36,23 +36,23 @@ export default function AuthPage() {
   }
 
   return (
-    <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh', background: '#111' }}>
-      <form onSubmit={submit} style={{ background: '#1a1a1a', padding: 32, borderRadius: 8, minWidth: 320 }}>
-        <h2 style={{ color: '#e8e8e8', marginTop: 0 }}>tether</h2>
-        <p style={{ color: '#888', fontSize: 13, marginBottom: 16 }}>Enter the access token from the server.</p>
+    <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh', background: 'var(--bg-sunken)' }}>
+      <form onSubmit={submit} style={{ background: 'var(--bg-surface)', padding: 32, borderRadius: 8, minWidth: 320, border: '1px solid var(--line)', boxShadow: 'var(--sh-3)' }}>
+        <h2 style={{ color: 'var(--ink-primary)', marginTop: 0 }}>tether</h2>
+        <p style={{ color: 'var(--ink-tertiary)', fontSize: 13, marginBottom: 16 }}>Enter the access token from the server.</p>
         <input
           type="password"
           value={token}
           onChange={e => setToken(e.target.value)}
           placeholder="Access token"
           autoFocus
-          style={{ width: '100%', padding: '8px 10px', background: '#222', border: '1px solid #333', color: '#e8e8e8', borderRadius: 4, boxSizing: 'border-box', fontSize: 14 }}
+          style={{ width: '100%', padding: '8px 10px', background: 'var(--bg-elevated)', border: '1px solid var(--line)', color: 'var(--ink-primary)', borderRadius: 4, boxSizing: 'border-box', fontSize: 14 }}
         />
-        {error && <p style={{ color: '#f87171', fontSize: 12, marginTop: 8 }}>{error}</p>}
+        {error && <p style={{ color: 'var(--danger)', fontSize: 12, marginTop: 8 }}>{error}</p>}
         <button
           type="submit"
           disabled={loading || !token}
-          style={{ marginTop: 16, width: '100%', padding: '8px', background: loading ? '#333' : '#2563eb', color: '#fff', border: 'none', borderRadius: 4, cursor: loading ? 'default' : 'pointer', fontSize: 14 }}
+          style={{ marginTop: 16, width: '100%', padding: '8px', background: loading ? 'var(--bg-tint)' : 'var(--accent)', color: '#fff', border: 'none', borderRadius: 4, cursor: loading ? 'default' : 'pointer', fontSize: 14 }}
         >
           {loading ? 'Verifying…' : 'Connect'}
         </button>

@@ -10,9 +10,9 @@ export default function App() {
   const [rightTab, setRightTab] = useState<'skill' | 'shell'>('skill')
 
   const tabBtnStyle = (active: boolean): React.CSSProperties => ({
-    background: active ? '#2a2a2a' : 'transparent',
+    background: active ? 'var(--bg-tint)' : 'transparent',
     border: 'none',
-    color: active ? '#e8e8e8' : '#888',
+    color: active ? 'var(--ink-primary)' : 'var(--ink-tertiary)',
     padding: '4px 12px',
     cursor: active ? 'default' : 'pointer',
     fontSize: 12,
@@ -28,7 +28,7 @@ export default function App() {
         <ChatPane />
       </div>
       <div className="pane pane-skill" style={{ display: 'flex', flexDirection: 'column' }}>
-        <div style={{ display: 'flex', gap: 4, padding: '4px 8px', borderBottom: '1px solid #222', flexShrink: 0 }}>
+        <div style={{ display: 'flex', gap: 4, padding: '4px 8px', borderBottom: '1px solid var(--line)', flexShrink: 0 }}>
           <button onClick={() => setRightTab('skill')} style={tabBtnStyle(rightTab === 'skill')}>Skill</button>
           <button onClick={() => setRightTab('shell')} style={tabBtnStyle(rightTab === 'shell')}>Shell</button>
         </div>

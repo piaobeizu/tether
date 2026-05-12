@@ -79,7 +79,7 @@ func GenerateCert() (CertBundle, error) {
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: "tether"},
 		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(maxValidity),
+		NotAfter:     time.Now().Add(maxValidity - time.Hour), // total validity = exactly 14d (Chrome ≤14d limit)
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		IPAddresses:  ips,

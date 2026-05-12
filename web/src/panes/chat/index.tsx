@@ -89,20 +89,20 @@ export default function ChatPane() {
         <span>Chat</span>
         <span style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
           <span style={{ width: 8, height: 8, borderRadius: '50%', background: connDot, display: 'inline-block' }} />
-          <span style={{ fontSize: 10, color: '#888' }}>{connLabel}</span>
-          {sessionId && <span style={{ fontFamily: 'monospace', fontSize: 10, color: '#555' }}>{sessionId.slice(0, 8)}</span>}
-          {sessionId && <span style={{ fontSize: 11, color: '#888', marginLeft: 6 }}>[{selectedProvider}]</span>}
+          <span style={{ fontSize: 10, color: 'var(--ink-tertiary)' }}>{connLabel}</span>
+          {sessionId && <span style={{ fontFamily: 'monospace', fontSize: 10, color: 'var(--ink-secondary)' }}>{sessionId.slice(0, 8)}</span>}
+          {sessionId && <span style={{ fontSize: 11, color: 'var(--ink-tertiary)', marginLeft: 6 }}>[{selectedProvider}]</span>}
         </span>
       </div>
       <div className="pane-body" style={{ display: 'flex', flexDirection: 'column', gap: 8, paddingBottom: 0 }}>
         {connState === 'failed' && (
-          <div style={{ background: '#2a1010', border: '1px solid #5a2020', borderRadius: 4, padding: '8px 10px', fontSize: 12 }}>
-            <div style={{ color: '#f44336', marginBottom: 4 }}>WebTransport connection failed</div>
-            {connError && <div style={{ color: '#888', fontSize: 11, marginBottom: 6, wordBreak: 'break-all' }}>{connError}</div>}
-            <div style={{ color: '#888', fontSize: 11, marginBottom: 6 }}>UDP/QUIC may be blocked on this network. Check K.8.1 in README.</div>
+          <div style={{ background: 'var(--danger-tint)', border: '1px solid var(--danger)', borderRadius: 4, padding: '8px 10px', fontSize: 12 }}>
+            <div style={{ color: 'var(--danger)', marginBottom: 4 }}>WebTransport connection failed</div>
+            {connError && <div style={{ color: 'var(--ink-tertiary)', fontSize: 11, marginBottom: 6, wordBreak: 'break-all' }}>{connError}</div>}
+            <div style={{ color: 'var(--ink-tertiary)', fontSize: 11, marginBottom: 6 }}>UDP/QUIC may be blocked on this network. Check K.8.1 in README.</div>
             <button
               onClick={doConnect}
-              style={{ background: '#333', border: '1px solid #555', borderRadius: 3, padding: '3px 10px', color: '#e8e8e8', cursor: 'pointer', fontSize: 12 }}
+              style={{ background: 'var(--bg-tint)', border: '1px solid var(--line)', borderRadius: 3, padding: '3px 10px', color: 'var(--ink-primary)', cursor: 'pointer', fontSize: 12 }}
             >
               Retry
             </button>
@@ -111,7 +111,7 @@ export default function ChatPane() {
         <div style={{ flex: 1, overflowY: 'auto' }}>
           {messages.map((m) => (
             <div key={m.id} style={{ marginBottom: 8, opacity: m.role === 'user' ? 1 : 0.85 }}>
-              <span style={{ color: '#555', fontSize: 11 }}>{m.role}: </span>
+              <span style={{ color: 'var(--ink-secondary)', fontSize: 11 }}>{m.role}: </span>
               <span>{m.text}</span>
             </div>
           ))}
@@ -130,14 +130,14 @@ export default function ChatPane() {
             <select
               value={selectedProvider}
               onChange={e => setSelectedProvider(e.target.value)}
-              style={{ background: '#222', color: '#e8e8e8', border: '1px solid #333', borderRadius: 4, padding: '4px 8px', fontSize: 12, marginRight: 8 }}
+              style={{ background: 'var(--bg-elevated)', color: 'var(--ink-primary)', border: '1px solid var(--line)', borderRadius: 4, padding: '4px 8px', fontSize: 12, marginRight: 8 }}
             >
               {providers.map(p => <option key={p} value={p}>{p}</option>)}
             </select>
           )}
           <input
             disabled={connState !== 'connected'}
-            style={{ flex: 1, background: '#1a1a1a', border: '1px solid #333', borderRadius: 4, padding: '6px 10px', color: connState === 'connected' ? '#e8e8e8' : '#555', outline: 'none' }}
+            style={{ flex: 1, background: 'var(--bg-surface)', border: '1px solid var(--line)', borderRadius: 4, padding: '6px 10px', color: connState === 'connected' ? 'var(--ink-primary)' : 'var(--ink-disabled)', outline: 'none' }}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && void sendMessage()}
@@ -146,7 +146,7 @@ export default function ChatPane() {
           <button
             disabled={connState !== 'connected'}
             onClick={() => void sendMessage()}
-            style={{ background: connState === 'connected' ? '#2a2a2a' : '#1a1a1a', border: '1px solid #444', borderRadius: 4, padding: '6px 14px', color: connState === 'connected' ? '#e8e8e8' : '#555', cursor: connState === 'connected' ? 'pointer' : 'not-allowed' }}
+            style={{ background: connState === 'connected' ? 'var(--bg-tint)' : 'var(--bg-surface)', border: '1px solid var(--line)', borderRadius: 4, padding: '6px 14px', color: connState === 'connected' ? 'var(--ink-primary)' : 'var(--ink-disabled)', cursor: connState === 'connected' ? 'pointer' : 'not-allowed' }}
           >
             Send
           </button>

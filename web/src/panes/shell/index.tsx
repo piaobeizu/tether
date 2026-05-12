@@ -81,7 +81,7 @@ export default function ShellPane() {
       <div
         ref={containerRef}
         className="pane-body"
-        style={{ background: '#0a0a0a', padding: 0, overflow: 'hidden' }}
+        style={{ background: 'var(--bg-sunken)', padding: 0, overflow: 'hidden' }}
       />
     </>
   )

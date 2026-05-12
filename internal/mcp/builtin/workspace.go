@@ -13,12 +13,17 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const shellTimeout = 30 * time.Second
+const (
+	shellDefaultTimeout = 30 * time.Second
+	shellMaxTimeout     = 300 * time.Second
+	maxOutputBytes      = 4 << 20 // 4 MiB per stream
+)
 
 // Registry holds builtin MCP tool registrations scoped to a workspace root.
 type Registry struct {
@@ -71,8 +76,8 @@ func (r *Registry) RegisterInto(srv *mcp.Server) {
 
 	srv.AddTool(&mcp.Tool{
 		Name:        "workspace_run_shell",
-		Description: "Run a shell command inside the workspace. Returns stdout, stderr, and exit code as JSON.",
-		InputSchema: json.RawMessage(`{"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute via sh -c"},"cwd":{"type":"string","description":"Working directory relative to workspace root (default: workspace root)"}},"required":["command"]}`),
+		Description: "Run a shell command inside the workspace (30s default timeout, max 300s). Returns stdout, stderr, exit_code, and truncated as JSON. Each output stream is capped at 4 MiB.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute via sh -c"},"cwd":{"type":"string","description":"Working directory relative to workspace root (default: workspace root)"},"timeout_secs":{"type":"integer","description":"Timeout in seconds (1–300, default 30)"}},"required":["command"]}`),
 	}, r.handleRunShell)
 }
 
@@ -124,17 +129,22 @@ func (r *Registry) handleListFiles(_ context.Context, req *mcp.CallToolRequest) 
 }
 
 type shellResult struct {
-	Stdout   string `json:"stdout"`
-	Stderr   string `json:"stderr"`
-	ExitCode int    `json:"exit_code"`
+	Stdout    string `json:"stdout"`
+	Stderr    string `json:"stderr"`
+	ExitCode  int    `json:"exit_code"`
+	Truncated bool   `json:"truncated,omitempty"`
 }
 
 func (r *Registry) handleRunShell(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	var params struct {
-		Command string `json:"command"`
-		Cwd     string `json:"cwd"`
+		Command     string `json:"command"`
+		Cwd         string `json:"cwd"`
+		TimeoutSecs int    `json:"timeout_secs"`
 	}
-	if err := json.Unmarshal(req.Params.Arguments, &params); err != nil || params.Command == "" {
+	if err := json.Unmarshal(req.Params.Arguments, &params); err != nil {
+		return errResult(fmt.Sprintf("workspace_run_shell: invalid arguments: %v", err)), nil
+	}
+	if params.Command == "" {
 		return errResult("workspace_run_shell: missing required field 'command'"), nil
 	}
 
@@ -147,32 +157,91 @@ func (r *Registry) handleRunShell(ctx context.Context, req *mcp.CallToolRequest)
 		cwd = resolved
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, shellTimeout)
+	timeout := shellDefaultTimeout
+	if params.TimeoutSecs > 0 {
+		t := time.Duration(params.TimeoutSecs) * time.Second
+		if t > shellMaxTimeout {
+			t = shellMaxTimeout
+		}
+		timeout = t
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "sh", "-c", params.Command)
+	cmd := exec.Command("sh", "-c", params.Command)
 	cmd.Dir = cwd
+	// Setpgid puts the child in its own process group so we can kill the
+	// entire group (child + any spawned subprocesses) on timeout.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	var stdoutBuf, stderrBuf bytes.Buffer
+	stdoutLW := &limitWriter{w: &stdoutBuf, remaining: maxOutputBytes}
+	stderrLW := &limitWriter{w: &stderrBuf, remaining: maxOutputBytes}
+	cmd.Stdout = stdoutLW
+	cmd.Stderr = stderrLW
+
+	if err := cmd.Start(); err != nil {
+		return errResult(fmt.Sprintf("workspace_run_shell: %v", err)), nil
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	var runErr error
+	select {
+	case runErr = <-done:
+		// normal completion
+	case <-ctx.Done():
+		// Kill the entire process group to avoid orphaned children.
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		<-done
+		return errResult("workspace_run_shell: timed out"), nil
+	}
 
 	exitCode := 0
-	if err := cmd.Run(); err != nil {
+	if runErr != nil {
 		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
+		if errors.As(runErr, &exitErr) {
 			exitCode = exitErr.ExitCode()
 		} else {
-			return errResult(fmt.Sprintf("workspace_run_shell: %v", err)), nil
+			return errResult(fmt.Sprintf("workspace_run_shell: %v", runErr)), nil
 		}
 	}
 
 	b, _ := json.Marshal(shellResult{
-		Stdout:   stdout.String(),
-		Stderr:   stderr.String(),
-		ExitCode: exitCode,
+		Stdout:    stdoutBuf.String(),
+		Stderr:    stderrBuf.String(),
+		ExitCode:  exitCode,
+		Truncated: stdoutLW.truncated || stderrLW.truncated,
 	})
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: string(b)}}}, nil
+}
+
+// limitWriter caps writes at remaining bytes; excess bytes are silently
+// discarded (truncated=true). Always reports the full len(p) to callers so
+// exec's pipe machinery doesn't stall.
+type limitWriter struct {
+	w         *bytes.Buffer
+	remaining int64
+	truncated bool
+}
+
+func (lw *limitWriter) Write(p []byte) (int, error) {
+	orig := len(p)
+	if lw.remaining <= 0 {
+		lw.truncated = true
+		return orig, nil
+	}
+	if int64(len(p)) > lw.remaining {
+		p = p[:lw.remaining]
+		lw.truncated = true
+	}
+	n, err := lw.w.Write(p)
+	lw.remaining -= int64(n)
+	return orig, err
 }
 
 func errResult(msg string) *mcp.CallToolResult {

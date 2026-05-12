@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json" // for startInstanceReq body marshaling
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -117,8 +118,8 @@ func TestTaskMCPLifecycle_ToolCallEndToEnd(t *testing.T) {
 	port := int(out["port"].(float64))
 	token := out["token"].(string)
 
-	// Small delay for the loopback goroutine to be ready.
-	time.Sleep(20 * time.Millisecond)
+	// Wait for loopback to be ready via retry-dial instead of a fixed sleep.
+	waitForPort(t, port, 200*time.Millisecond)
 
 	// Connect MCP client to the per-task loopback.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -190,4 +191,20 @@ func TestTaskMCPLifecycle_MissingSlugRejected(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected 400 for missing slug, got %d", resp.StatusCode)
 	}
+}
+
+// waitForPort retries a TCP dial until the port accepts connections or deadline.
+func waitForPort(t *testing.T, port int, deadline time.Duration) {
+	t.Helper()
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	end := time.Now().Add(deadline)
+	for time.Now().Before(end) {
+		conn, err := net.DialTimeout("tcp", addr, 5*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("port %d not ready after %v", port, deadline)
 }

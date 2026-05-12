@@ -212,3 +212,55 @@ func invokeBuiltin(t *testing.T, srv *mcp.Server, toolName string, args json.Raw
 	}
 	return result
 }
+
+func TestRunShell_TruncatesLargeOutput(t *testing.T) {
+	root := t.TempDir()
+	srv := mcp.NewServer(&mcp.Implementation{Name: "test"}, nil)
+	reg, err := builtin.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg.RegisterInto(srv)
+
+	// Generate output larger than maxOutputBytes (4 MiB); dd writes 5 MiB zeros.
+	args, _ := json.Marshal(map[string]string{"command": "dd if=/dev/zero bs=1M count=5 2>/dev/null | cat"})
+	result := invokeBuiltin(t, srv, "workspace_run_shell", args)
+	if result.IsError {
+		t.Fatalf("unexpected tool error: %v", result.Content)
+	}
+	var out struct {
+		Stdout    string `json:"stdout"`
+		Truncated bool   `json:"truncated"`
+	}
+	if err := json.Unmarshal([]byte(result.Content[0].(*mcp.TextContent).Text), &out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.Truncated {
+		t.Fatal("expected truncated=true for 5 MiB output")
+	}
+	if len(out.Stdout) > 4<<20+1 {
+		t.Fatalf("stdout exceeds 4 MiB cap: %d bytes", len(out.Stdout))
+	}
+}
+
+
+func TestRunShell_CustomTimeout(t *testing.T) {
+	root := t.TempDir()
+	srv := mcp.NewServer(&mcp.Implementation{Name: "test"}, nil)
+	reg, err := builtin.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg.RegisterInto(srv)
+
+	// 1s timeout, command sleeps 10s — should time out.
+	args, _ := json.Marshal(map[string]any{"command": "sleep 10", "timeout_secs": 1})
+	result := invokeBuiltin(t, srv, "workspace_run_shell", args)
+	if !result.IsError {
+		t.Fatal("expected IsError=true for timed-out command")
+	}
+	text := result.Content[0].(*mcp.TextContent).Text
+	if !strings.Contains(text, "timed out") {
+		t.Fatalf("expected 'timed out' in error, got %q", text)
+	}
+}

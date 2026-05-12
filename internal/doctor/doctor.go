@@ -7,9 +7,11 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/piaobeizu/tether/internal/agent"
@@ -39,6 +41,9 @@ func Run(port int, verbose bool) Report {
 		checkCertState(verbose),
 		checkPortBindable(port, verbose),
 		checkCCSettingsHooks(verbose),
+		checkMCPSettingsInject(verbose),
+		checkMCPAPITokens(verbose),
+		checkMCPLoopback(verbose),
 	}
 
 	ok := true
@@ -143,6 +148,117 @@ func checkPortBindable(port int, verbose bool) CheckResult {
 	return r
 }
 
+// checkMCPSettingsInject verifies that ~/.claude/settings.json contains the
+// tether-managed mcpServers.tether entry injected by `tether server`.
+func checkMCPSettingsInject(verbose bool) CheckResult {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return CheckResult{Name: "mcp-settings-inject", OK: false, Message: "cannot determine home dir: " + err.Error()}
+	}
+	path := filepath.Join(home, ".claude", "settings.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return CheckResult{Name: "mcp-settings-inject", OK: false, Message: "~/.claude/settings.json not found — run `tether server` to inject"}
+	}
+	var settings map[string]any
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return CheckResult{Name: "mcp-settings-inject", OK: false, Message: "~/.claude/settings.json: parse error: " + err.Error()}
+	}
+	mcpServers, _ := settings["mcpServers"].(map[string]any)
+	if entry, ok := mcpServers["tether"].(map[string]any); ok {
+		if managed, _ := entry[agent.TetherManagedKey].(bool); managed {
+			mcpURL, _ := entry["url"].(string)
+			r := CheckResult{Name: "mcp-settings-inject", OK: true, Message: "tether MCP server injected in settings.json"}
+			if verbose {
+				r.Detail = "url=" + mcpURL
+			}
+			return r
+		}
+	}
+	return CheckResult{Name: "mcp-settings-inject", OK: false, Message: "tether MCP server not in settings.json — run `tether server` to inject"}
+}
+
+// checkMCPAPITokens reports how many external API tokens are configured in
+// ~/.tether/api-tokens.json. A missing or empty file is not an error — it
+// just means no external MCP clients (Cursor, Goose) have been authorised yet.
+func checkMCPAPITokens(verbose bool) CheckResult {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return CheckResult{Name: "mcp-api-tokens", OK: true, Message: "cannot determine home dir: " + err.Error()}
+	}
+	path := filepath.Join(home, ".tether", "api-tokens.json")
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return CheckResult{Name: "mcp-api-tokens", OK: true, Message: "no external API tokens yet (create via POST /api/v1/mcp/tokens or OAuth flow)"}
+	}
+	if err != nil {
+		return CheckResult{Name: "mcp-api-tokens", OK: true, Message: "api-tokens.json unreadable: " + err.Error()}
+	}
+	var file struct {
+		Tokens []struct{ ID string } `json:"tokens"`
+	}
+	if err := json.Unmarshal(data, &file); err != nil {
+		return CheckResult{Name: "mcp-api-tokens", OK: false, Message: "api-tokens.json: parse error (file may be corrupt): " + err.Error()}
+	}
+	n := len(file.Tokens)
+	if n == 0 {
+		return CheckResult{Name: "mcp-api-tokens", OK: true, Message: "api-tokens.json exists, no external tokens yet"}
+	}
+	r := CheckResult{Name: "mcp-api-tokens", OK: true, Message: fmt.Sprintf("%d external API token(s) configured", n)}
+	if verbose {
+		r.Detail = path
+	}
+	return r
+}
+
+// checkMCPLoopback attempts a TCP connection to the tether MCP loopback
+// endpoint. The port is read from mcpServers.tether.url in
+// ~/.claude/settings.json; falls back to :8899 if absent.
+// A failed connection is reported as a warning (OK=true) because doctor may
+// be run when the server is not started.
+func checkMCPLoopback(verbose bool) CheckResult {
+	port := 8899
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		if data, err := os.ReadFile(filepath.Join(home, ".claude", "settings.json")); err == nil {
+			var settings map[string]any
+			if json.Unmarshal(data, &settings) == nil {
+				if mcpServers, _ := settings["mcpServers"].(map[string]any); mcpServers != nil {
+					for _, v := range mcpServers {
+						if m, ok := v.(map[string]any); ok {
+							if managed, _ := m[agent.TetherManagedKey].(bool); managed {
+								if rawURL, _ := m["url"].(string); rawURL != "" {
+									if u, err := url.Parse(rawURL); err == nil {
+										if p, err := strconv.Atoi(u.Port()); err == nil && p > 0 {
+											port = p
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		return CheckResult{
+			Name:    "mcp-loopback",
+			OK:      true,
+			Message: fmt.Sprintf("MCP loopback not reachable at %s (is `tether server` running?)", addr),
+		}
+	}
+	_ = conn.Close()
+	r := CheckResult{Name: "mcp-loopback", OK: true, Message: fmt.Sprintf("MCP loopback reachable at %s", addr)}
+	if verbose {
+		r.Detail = addr
+	}
+	return r
+}
+
 // checkCCSettingsHooks verifies that ~/.config/claude/settings.json contains
 // the tether-managed PreToolUse hook entry.
 func checkCCSettingsHooks(verbose bool) CheckResult {
@@ -150,10 +266,11 @@ func checkCCSettingsHooks(verbose bool) CheckResult {
 	if err != nil {
 		return CheckResult{Name: "cc-settings-hooks", OK: false, Message: "cannot determine home dir: " + err.Error()}
 	}
-	path := filepath.Join(home, ".config", "claude", "settings.json")
+	// Claude Code reads ~/.claude/settings.json (user-level), not ~/.config/claude/settings.json.
+	path := filepath.Join(home, ".claude", "settings.json")
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return CheckResult{Name: "cc-settings-hooks", OK: false, Message: "settings.json not found — run `tether server` to inject hook"}
+		return CheckResult{Name: "cc-settings-hooks", OK: false, Message: "~/.claude/settings.json not found — run `tether server` to inject hook"}
 	}
 	var settings map[string]any
 	if err := json.Unmarshal(data, &settings); err != nil {

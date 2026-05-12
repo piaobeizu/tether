@@ -59,17 +59,34 @@ tether version
 ### K.8.1 — VPN / corporate firewall breaks the shell and chat channels
 
 tether uses HTTP/3 (QUIC over UDP) for WebTransport. Many VPNs and corporate firewalls
-proxy or drop UDP traffic, causing the WT handshake to fail even though the TCP HTTPS page
-loads fine.
+proxy or drop UDP traffic, causing the WT handshake to fail silently even though the TCP
+HTTPS page loads fine.
 
-**Symptoms**: The page loads, but the chat/shell panes show "connect failed" or hang silently.
+**Common offenders**:
+- **Clash Verge (TUN mode)** on macOS — TUN intercepts all traffic including UDP; the
+  QUIC handshake packet is proxied through TCP and dropped on the remote side.
+- **Tailscale exit node** — routing all traffic through an exit node often blocks UDP/443.
+- **Corporate VPN** — most enterprise VPNs proxy UDP or apply egress firewall rules that
+  drop non-TCP traffic.
 
-**Fix**: Disconnect the VPN. tether has no TCP fallback in v0.1 (see [upgrade path](docs/upgrade-path.md)).
+**Symptoms**: The SPA loads, but the chat/shell panes immediately show "Opening handshake
+failed", "connect failed", or hang silently with no progress indicator.
 
-**Verify**: `udp:<host>:<port>` must be reachable from the browser. On Linux:
+**Fix**: Disconnect the VPN (or disable TUN mode / exit node). tether has no WebSocket/TCP
+fallback in the current version (see [upgrade path](docs/upgrade-path.md)).
+
+**Verify UDP reachability** before blaming other causes:
+
 ```bash
-nc -u <host> <port>    # should not hang immediately
+# Linux / macOS — should NOT return immediately with ICMP unreachable:
+nc -u -z -w 3 <host> <port>
+
+# macOS alternative via curl (QUIC):
+curl -v --http3-only https://<host>:<port>/healthz 2>&1 | grep -E "Connected|failed"
 ```
+
+If `nc -u` times out cleanly (no "Connection refused") but tether still fails, the UDP
+packet is being dropped mid-path — that's a VPN/firewall, not a tether config issue.
 
 ### K.8.2 — Browser version requirements
 
@@ -110,8 +127,9 @@ chrome://flags/#unsafely-treat-insecure-origin-as-secure
 ```
 Add `https://<host>:<port>` to the list and relaunch.
 
-> Note: WebTransport `serverCertificateHashes` still works for the WT channels regardless
-> of TCP cert trust; the above is only needed to load the initial HTML page over TCP HTTPS.
+> **Important**: `serverCertificateHashes` and CA-signed certs are mutually exclusive — see
+> K.8.6 below. If you switch from a self-signed to a Let's Encrypt cert, you must also
+> remove the hash from the frontend config.
 
 ### K.8.4 — Permission hook not firing
 
@@ -131,3 +149,36 @@ lsof -i :8898
 # Run tether on a different port:
 tether server --port 9000
 ```
+
+### K.8.6 — `serverCertificateHashes` must not be passed with a CA-signed cert
+
+The WebTransport JS API accepts `serverCertificateHashes` to pin a specific certificate
+by hash, bypassing normal CA chain validation. This is designed for self-signed / dev certs.
+
+**Chrome silently refuses** the WebTransport connection if you pass `serverCertificateHashes`
+when the server presents a CA-signed cert (e.g. Let's Encrypt). The connection attempt
+produces no JS error — it just never resolves, which looks identical to a UDP block.
+
+| Cert type | `serverCertificateHashes` |
+|---|---|
+| Self-signed (default `~/.tether/cert.pem`) | **Required** — pass the SPKI hash |
+| CA-signed (Let's Encrypt / custom CA) | **Must be omitted** — pass an empty array or omit the field |
+
+**How to tell which cert tether is using**:
+```bash
+tether doctor --verbose   # cert-state check shows "self-signed" or "CA-signed (ACME)"
+```
+
+**Frontend config** (in `web/src/lib/transport.ts` — the relevant field):
+```ts
+// self-signed: include the hash
+new WebTransport(url, { serverCertificateHashes: [{ algorithm: 'sha-256', value: hash }] });
+
+// CA-signed: omit the field entirely
+new WebTransport(url);
+```
+
+**Diagnosis**: if switching from self-signed to Let's Encrypt fixes TCP HTTPS but WT still
+hangs, `serverCertificateHashes` is still being passed. Check the browser DevTools →
+Network → the WebTransport entry; if it shows state "failed" immediately after "connecting",
+this is the cause.

@@ -71,7 +71,7 @@ func newServer(cfg *Config, bundle CertBundle, pm *permission.Manager, authState
 		CheckOrigin: func(r *http.Request) bool { return originAllowed(r.Header.Get("Origin"), cfg.Port) },
 	}
 
-	mux := buildMux(cfg, bundle, wts, cfg.Registry, pm, authState, mcpSrv, mcpTokens, oauthH)
+	mux := buildMux(cfg, bundle, wts, cfg.Registry, pm, authState, mcpSrv, mcpTokens, oauthH, cfg.MCPLifecycle)
 
 	tcpServer := &http.Server{
 		Addr:      addr,

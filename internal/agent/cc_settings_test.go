@@ -18,7 +18,7 @@ func TestInjectAndRemoveMCPServer(t *testing.T) {
 	const port = 8899
 	const token = "testtoken123"
 
-	if err := InjectMCPServer(port, token); err != nil {
+	if err := InjectMCPServer(port, token, "tether"); err != nil {
 		t.Fatalf("InjectMCPServer: %v", err)
 	}
 
@@ -48,7 +48,7 @@ func TestInjectAndRemoveMCPServer(t *testing.T) {
 	}
 
 	// Idempotent re-inject — must not duplicate.
-	if err := InjectMCPServer(port, token); err != nil {
+	if err := InjectMCPServer(port, token, "tether"); err != nil {
 		t.Fatalf("second InjectMCPServer: %v", err)
 	}
 	data2, _ := os.ReadFile(filepath.Join(dir, ".claude", "settings.json"))
@@ -60,7 +60,7 @@ func TestInjectAndRemoveMCPServer(t *testing.T) {
 	}
 
 	// Remove.
-	if err := RemoveMCPServer(); err != nil {
+	if err := RemoveMCPServer("tether"); err != nil {
 		t.Fatalf("RemoveMCPServer: %v", err)
 	}
 	data3, _ := os.ReadFile(filepath.Join(dir, ".claude", "settings.json"))

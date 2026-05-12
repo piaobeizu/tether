@@ -23,6 +23,7 @@ import (
 	"github.com/piaobeizu/tether/internal/mcp/builtin"
 	mcpgw "github.com/piaobeizu/tether/internal/mcp/gateway"
 	mcphost "github.com/piaobeizu/tether/internal/mcp/host"
+	mcplifecycle "github.com/piaobeizu/tether/internal/mcp/lifecycle"
 	mcpreg "github.com/piaobeizu/tether/internal/mcp/registry"
 	"github.com/piaobeizu/tether/internal/permission"
 	"github.com/piaobeizu/tether/internal/permission/cchook"
@@ -54,6 +55,10 @@ type Config struct {
 
 	// v0.3.2: external client API token store
 	APITokensPath string // path to api-tokens.json; "" = ~/.tether/api-tokens.json
+
+	// v0.4: per-task MCP lifecycle manager.
+	// If nil, Run() initialises one and stores it here.
+	MCPLifecycle *mcplifecycle.LifecycleManager
 }
 
 func (c *Config) addr() string { return fmt.Sprintf(":%d", c.Port) }
@@ -170,11 +175,16 @@ func Run(cfg *Config) error {
 		return fmt.Errorf("mcp loopback: %w", err)
 	}
 	if !cfg.SkipMCPInject {
-		if err := agent.InjectMCPServer(mcpPort, bearerToken); err != nil {
+		if err := agent.InjectMCPServer(mcpPort, bearerToken, "tether"); err != nil {
 			mcpMgr.StopAll()
 			_ = loopback.Stop(context.Background())
 			return fmt.Errorf("mcp settings inject: %w", err)
 		}
+	}
+
+	// Step 3c: per-task MCP lifecycle manager (v0.4).
+	if cfg.MCPLifecycle == nil {
+		cfg.MCPLifecycle = mcplifecycle.New()
 	}
 
 	// Step 4: load or generate cert.
@@ -287,10 +297,14 @@ func Run(cfg *Config) error {
 	// MCP shutdown: drain → stop children → housekeeping.
 	drainCtx, drainCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer drainCancel()
+
+	// v0.4: stop per-task instances before global stack.
+	cfg.MCPLifecycle.StopAll(drainCtx)
+
 	_ = loopback.Stop(drainCtx)
 	mcpMgr.StopAll()
 	if !cfg.SkipMCPInject {
-		_ = agent.RemoveMCPServer()
+		_ = agent.RemoveMCPServer("tether")
 	}
 	_ = os.Remove(mcpTokenPath)
 

@@ -2,10 +2,12 @@ package apitoken_test
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/piaobeizu/tether/internal/auth/apitoken"
 )
@@ -163,5 +165,95 @@ func TestStore_OpenCreatesParentDirWith0700(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o700 {
 		t.Fatalf("parent dir mode: %o, want 0700", info.Mode().Perm())
+	}
+}
+
+func TestCreateWithTTL_IssuedTokenIsValid(t *testing.T) {
+	dir := t.TempDir()
+	s, err := apitoken.Open(filepath.Join(dir, "tokens.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, tok, err := s.CreateWithTTL("cursor", apitoken.TokenSourceOAuth, time.Hour)
+	if err != nil {
+		t.Fatalf("CreateWithTTL: %v", err)
+	}
+	if tok.Source != apitoken.TokenSourceOAuth {
+		t.Errorf("source = %q, want %q", tok.Source, apitoken.TokenSourceOAuth)
+	}
+	if tok.ExpiresAt == nil {
+		t.Fatal("ExpiresAt should not be nil")
+	}
+	if !s.Validate(raw) {
+		t.Error("fresh token should validate")
+	}
+}
+
+func TestCreateWithTTL_ExpiredTokenSkipped(t *testing.T) {
+	dir := t.TempDir()
+	s, err := apitoken.Open(filepath.Join(dir, "tokens.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _, err := s.CreateWithTTL("goose", apitoken.TokenSourceOAuth, -time.Second)
+	if err != nil {
+		t.Fatalf("CreateWithTTL: %v", err)
+	}
+	if s.Validate(raw) {
+		t.Error("expired token should not validate")
+	}
+	_, _, ok := s.LookupByRaw(raw)
+	if ok {
+		t.Error("LookupByRaw should return false for expired token")
+	}
+}
+
+func TestCreateWithTTL_ManualTokenNeverExpires(t *testing.T) {
+	dir := t.TempDir()
+	s, err := apitoken.Open(filepath.Join(dir, "tokens.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, tok, err := s.Create("manual")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if tok.ExpiresAt != nil {
+		t.Errorf("manual token should have nil ExpiresAt, got %v", tok.ExpiresAt)
+	}
+	if !s.Validate(raw) {
+		t.Error("manual token should always validate")
+	}
+}
+
+func TestCreateWithTTL_EvictsExpiredAtCap(t *testing.T) {
+	dir := t.TempDir()
+	s, err := apitoken.Open(filepath.Join(dir, "tokens.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < apitoken.MaxOAuthTokens; i++ {
+		if _, _, err := s.CreateWithTTL(fmt.Sprintf("c%d", i), apitoken.TokenSourceOAuth, -time.Second); err != nil {
+			t.Fatalf("fill: %v", err)
+		}
+	}
+	if _, _, err := s.CreateWithTTL("new", apitoken.TokenSourceOAuth, time.Hour); err != nil {
+		t.Fatalf("post-eviction create: %v", err)
+	}
+}
+
+func TestCreateWithTTL_ErrStoreFullWhenNoneExpired(t *testing.T) {
+	dir := t.TempDir()
+	s, err := apitoken.Open(filepath.Join(dir, "tokens.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < apitoken.MaxOAuthTokens; i++ {
+		if _, _, err := s.CreateWithTTL(fmt.Sprintf("c%d", i), apitoken.TokenSourceOAuth, time.Hour); err != nil {
+			t.Fatalf("fill: %v", err)
+		}
+	}
+	if _, _, err := s.CreateWithTTL("overflow", apitoken.TokenSourceOAuth, time.Hour); !errors.Is(err, apitoken.ErrStoreFull) {
+		t.Errorf("want ErrStoreFull, got %v", err)
 	}
 }

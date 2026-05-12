@@ -233,3 +233,47 @@ func sha256Hex(raw string) string {
 	sum := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(sum[:])
 }
+
+func TestIPLimiter_BlocksOnFifthFailure(t *testing.T) {
+	store, _ := apitoken.Open(filepath.Join(t.TempDir(), "t.json"))
+	h := server.MCPHTTPSHandler(nil, store, slog.Default())
+
+	makeReq := func() int {
+		req := httptest.NewRequest("POST", "/mcp", nil)
+		req.RemoteAddr = "10.0.0.1:9999"
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	// First 4 failures return 401; 5th triggers the block (429).
+	for i := 0; i < 4; i++ {
+		code := makeReq()
+		if code != http.StatusUnauthorized {
+			t.Fatalf("failure %d: want 401, got %d", i+1, code)
+		}
+	}
+	if code := makeReq(); code != http.StatusTooManyRequests {
+		t.Errorf("6th request: want 429, got %d", code)
+	}
+}
+
+func TestIPLimiter_DifferentIPsAreIndependent(t *testing.T) {
+	store, _ := apitoken.Open(filepath.Join(t.TempDir(), "t.json"))
+	h := server.MCPHTTPSHandler(nil, store, slog.Default())
+
+	makeReqFrom := func(ip string) int {
+		req := httptest.NewRequest("POST", "/mcp", nil)
+		req.RemoteAddr = ip + ":9999"
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	for i := 0; i < 5; i++ {
+		makeReqFrom("10.0.0.1")
+	}
+	if code := makeReqFrom("10.0.0.2"); code == http.StatusTooManyRequests {
+		t.Error("10.0.0.2 should not be rate-limited")
+	}
+}

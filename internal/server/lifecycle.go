@@ -19,6 +19,7 @@ import (
 	"github.com/piaobeizu/tether/internal/agent"
 	"github.com/piaobeizu/tether/internal/auth"
 	"github.com/piaobeizu/tether/internal/auth/apitoken"
+	"github.com/piaobeizu/tether/internal/auth/oauth"
 	"github.com/piaobeizu/tether/internal/mcp/builtin"
 	mcpgw "github.com/piaobeizu/tether/internal/mcp/gateway"
 	mcphost "github.com/piaobeizu/tether/internal/mcp/host"
@@ -70,6 +71,9 @@ func (c *Config) devFrontend() string {
 // Run executes the §10.A.4 startup sequence, blocks until SIGINT/SIGTERM,
 // then performs graceful shutdown (≤5s per K.1.5).
 func Run(cfg *Config) error {
+	runCtx, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
+
 	// Step 1: resolve cc binary path + build session registry.
 	ccPath := resolveClaudePath()
 	if cfg.Registry == nil {
@@ -215,9 +219,24 @@ func Run(cfg *Config) error {
 	if err != nil {
 		return fmt.Errorf("api-tokens store: %w", err)
 	}
+	apiTokens.StartEviction(runCtx)
+
+	// Step 4e: OAuth 2.1 PKCE handlers (v0.3.3).
+	oauthHost := "127.0.0.1"
+	if h := os.Getenv("TETHER_HOST"); h != "" {
+		oauthHost = h
+	}
+	var oauthIssuer string
+	if cfg.Port == 443 {
+		oauthIssuer = "https://" + oauthHost
+	} else {
+		oauthIssuer = fmt.Sprintf("https://%s:%d", oauthHost, cfg.Port)
+	}
+	oauthCS := oauth.NewCodeStore()
+	oauthH := oauth.NewHandlers(oauthCS, apiTokens, oauthIssuer)
 
 	// Step 5: build and start listeners.
-	srv := newServer(cfg, bundle, pm, authState, mcpSrv, apiTokens)
+	srv := newServer(cfg, bundle, pm, authState, mcpSrv, apiTokens, oauthH)
 
 	errCh := make(chan error, 2)
 

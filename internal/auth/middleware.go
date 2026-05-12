@@ -116,10 +116,18 @@ func (s *State) isExempt(r *http.Request) bool {
 		p == "/",
 		p == "/mcp",
 		strings.HasPrefix(p, "/mcp/"),
+		p == "/oauth/authorize",
+		p == "/oauth/token",
+		p == "/.well-known/oauth-authorization-server",
 		hasSuffix(p, ".js", ".css", ".ico", ".png", ".svg", ".woff2", ".woff", ".ttf", ".webmanifest"):
 		return true
 	}
 	return false
+}
+
+// IsExemptForTest exposes isExempt for whitebox testing.
+func (s *State) IsExemptForTest(r *http.Request) bool {
+	return s.isExempt(r)
 }
 
 func isAPIorWT(r *http.Request) bool {

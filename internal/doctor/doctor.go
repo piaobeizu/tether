@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/piaobeizu/tether/internal/agent"
@@ -164,16 +165,14 @@ func checkMCPSettingsInject(verbose bool) CheckResult {
 		return CheckResult{Name: "mcp-settings-inject", OK: false, Message: "~/.claude/settings.json: parse error: " + err.Error()}
 	}
 	mcpServers, _ := settings["mcpServers"].(map[string]any)
-	for _, v := range mcpServers {
-		if m, ok := v.(map[string]any); ok {
-			if managed, _ := m[agent.TetherManagedKey].(bool); managed {
-				mcpURL, _ := m["url"].(string)
-				r := CheckResult{Name: "mcp-settings-inject", OK: true, Message: "tether MCP server injected in settings.json"}
-				if verbose {
-					r.Detail = "url=" + mcpURL
-				}
-				return r
+	if entry, ok := mcpServers["tether"].(map[string]any); ok {
+		if managed, _ := entry[agent.TetherManagedKey].(bool); managed {
+			mcpURL, _ := entry["url"].(string)
+			r := CheckResult{Name: "mcp-settings-inject", OK: true, Message: "tether MCP server injected in settings.json"}
+			if verbose {
+				r.Detail = "url=" + mcpURL
 			}
+			return r
 		}
 	}
 	return CheckResult{Name: "mcp-settings-inject", OK: false, Message: "tether MCP server not in settings.json — run `tether server` to inject"}
@@ -199,7 +198,7 @@ func checkMCPAPITokens(verbose bool) CheckResult {
 		Tokens []struct{ ID string } `json:"tokens"`
 	}
 	if err := json.Unmarshal(data, &file); err != nil {
-		return CheckResult{Name: "mcp-api-tokens", OK: true, Message: "api-tokens.json: parse error (file may be corrupt)"}
+		return CheckResult{Name: "mcp-api-tokens", OK: false, Message: "api-tokens.json: parse error (file may be corrupt): " + err.Error()}
 	}
 	n := len(file.Tokens)
 	if n == 0 {
@@ -230,7 +229,7 @@ func checkMCPLoopback(verbose bool) CheckResult {
 							if managed, _ := m[agent.TetherManagedKey].(bool); managed {
 								if rawURL, _ := m["url"].(string); rawURL != "" {
 									if u, err := url.Parse(rawURL); err == nil {
-										if p, err := net.LookupPort("tcp", u.Port()); err == nil && p > 0 {
+										if p, err := strconv.Atoi(u.Port()); err == nil && p > 0 {
 											port = p
 										}
 									}
@@ -267,10 +266,11 @@ func checkCCSettingsHooks(verbose bool) CheckResult {
 	if err != nil {
 		return CheckResult{Name: "cc-settings-hooks", OK: false, Message: "cannot determine home dir: " + err.Error()}
 	}
-	path := filepath.Join(home, ".config", "claude", "settings.json")
+	// Claude Code reads ~/.claude/settings.json (user-level), not ~/.config/claude/settings.json.
+	path := filepath.Join(home, ".claude", "settings.json")
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return CheckResult{Name: "cc-settings-hooks", OK: false, Message: "settings.json not found — run `tether server` to inject hook"}
+		return CheckResult{Name: "cc-settings-hooks", OK: false, Message: "~/.claude/settings.json not found — run `tether server` to inject hook"}
 	}
 	var settings map[string]any
 	if err := json.Unmarshal(data, &settings); err != nil {

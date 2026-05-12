@@ -4,15 +4,21 @@
 package builtin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+const shellTimeout = 30 * time.Second
 
 // Registry holds builtin MCP tool registrations scoped to a workspace root.
 type Registry struct {
@@ -48,7 +54,8 @@ func (r *Registry) SafeJoin(input string) (string, error) {
 	return resolved, nil
 }
 
-// RegisterInto adds workspace_read_file and workspace_list_files to srv.
+// RegisterInto adds workspace_read_file, workspace_list_files, and
+// workspace_run_shell to srv.
 func (r *Registry) RegisterInto(srv *mcp.Server) {
 	srv.AddTool(&mcp.Tool{
 		Name:        "workspace_read_file",
@@ -61,6 +68,12 @@ func (r *Registry) RegisterInto(srv *mcp.Server) {
 		Description: "List files and directories one level deep within the workspace.",
 		InputSchema: json.RawMessage(`{"type":"object","properties":{"dir":{"type":"string","description":"Relative directory path (default: workspace root)"}}}`),
 	}, r.handleListFiles)
+
+	srv.AddTool(&mcp.Tool{
+		Name:        "workspace_run_shell",
+		Description: "Run a shell command inside the workspace. Returns stdout, stderr, and exit code as JSON.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute via sh -c"},"cwd":{"type":"string","description":"Working directory relative to workspace root (default: workspace root)"}},"required":["command"]}`),
+	}, r.handleRunShell)
 }
 
 func (r *Registry) handleReadFile(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -107,6 +120,58 @@ func (r *Registry) handleListFiles(_ context.Context, req *mcp.CallToolRequest) 
 		files[i] = fileEntry{Name: e.Name(), IsDir: e.IsDir()}
 	}
 	b, _ := json.Marshal(files)
+	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: string(b)}}}, nil
+}
+
+type shellResult struct {
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+	ExitCode int    `json:"exit_code"`
+}
+
+func (r *Registry) handleRunShell(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	var params struct {
+		Command string `json:"command"`
+		Cwd     string `json:"cwd"`
+	}
+	if err := json.Unmarshal(req.Params.Arguments, &params); err != nil || params.Command == "" {
+		return errResult("workspace_run_shell: missing required field 'command'"), nil
+	}
+
+	cwd := r.root
+	if params.Cwd != "" {
+		resolved, err := r.SafeJoin(params.Cwd)
+		if err != nil {
+			return errResult(fmt.Sprintf("workspace_run_shell: invalid cwd: %v", err)), nil
+		}
+		cwd = resolved
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, shellTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sh", "-c", params.Command)
+	cmd.Dir = cwd
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	exitCode := 0
+	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		} else {
+			return errResult(fmt.Sprintf("workspace_run_shell: %v", err)), nil
+		}
+	}
+
+	b, _ := json.Marshal(shellResult{
+		Stdout:   stdout.String(),
+		Stderr:   stderr.String(),
+		ExitCode: exitCode,
+	})
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: string(b)}}}, nil
 }
 

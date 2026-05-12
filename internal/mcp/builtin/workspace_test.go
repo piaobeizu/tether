@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -94,6 +95,92 @@ func TestListFiles_ReturnsDirEntries(t *testing.T) {
 	result := invokeBuiltin(t, srv, "workspace_list_files", args)
 	if result.IsError {
 		t.Fatalf("unexpected error: %v", result.Content)
+	}
+}
+
+func TestRunShell_Success(t *testing.T) {
+	root := t.TempDir()
+	srv := mcp.NewServer(&mcp.Implementation{Name: "test"}, nil)
+	reg, err := builtin.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg.RegisterInto(srv)
+
+	args, _ := json.Marshal(map[string]string{"command": "echo hello"})
+	result := invokeBuiltin(t, srv, "workspace_run_shell", args)
+	if result.IsError {
+		t.Fatalf("unexpected error: %v", result.Content)
+	}
+	var out struct {
+		Stdout   string `json:"stdout"`
+		ExitCode int    `json:"exit_code"`
+	}
+	if err := json.Unmarshal([]byte(result.Content[0].(*mcp.TextContent).Text), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.ExitCode != 0 {
+		t.Fatalf("expected exit_code 0, got %d", out.ExitCode)
+	}
+	if !strings.Contains(out.Stdout, "hello") {
+		t.Fatalf("expected stdout to contain 'hello', got %q", out.Stdout)
+	}
+}
+
+func TestRunShell_NonZeroExit(t *testing.T) {
+	root := t.TempDir()
+	srv := mcp.NewServer(&mcp.Implementation{Name: "test"}, nil)
+	reg, err := builtin.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg.RegisterInto(srv)
+
+	args, _ := json.Marshal(map[string]string{"command": "exit 42"})
+	result := invokeBuiltin(t, srv, "workspace_run_shell", args)
+	if result.IsError {
+		t.Fatalf("unexpected tool-level error: %v", result.Content)
+	}
+	var out struct {
+		ExitCode int `json:"exit_code"`
+	}
+	if err := json.Unmarshal([]byte(result.Content[0].(*mcp.TextContent).Text), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.ExitCode != 42 {
+		t.Fatalf("expected exit_code 42, got %d", out.ExitCode)
+	}
+}
+
+func TestRunShell_MissingCommand(t *testing.T) {
+	root := t.TempDir()
+	srv := mcp.NewServer(&mcp.Implementation{Name: "test"}, nil)
+	reg, err := builtin.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg.RegisterInto(srv)
+
+	args, _ := json.Marshal(map[string]string{})
+	result := invokeBuiltin(t, srv, "workspace_run_shell", args)
+	if !result.IsError {
+		t.Fatal("expected IsError=true for missing command")
+	}
+}
+
+func TestRunShell_CwdEscapeRejected(t *testing.T) {
+	root := t.TempDir()
+	srv := mcp.NewServer(&mcp.Implementation{Name: "test"}, nil)
+	reg, err := builtin.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg.RegisterInto(srv)
+
+	args, _ := json.Marshal(map[string]string{"command": "pwd", "cwd": "../../"})
+	result := invokeBuiltin(t, srv, "workspace_run_shell", args)
+	if !result.IsError {
+		t.Fatal("expected IsError=true for cwd traversal")
 	}
 }
 

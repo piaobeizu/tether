@@ -32,22 +32,18 @@ echo "  URL:    $TETHER_URL"
 echo "  repeat: $REPEAT"
 echo ""
 
-auth_header=""
-if [[ -n "$TETHER_TOKEN" ]]; then
-    auth_header="-H 'Authorization: Bearer $TETHER_TOKEN'"
-fi
-
 # ─────────────────────────────────────────────────────────────────────────────
-# K.9.1 helper: TCP HTTPS round-trip latency (healthz endpoint)
+# K.9.1 helper: TCP HTTPS round-trip latency (/api/v1/providers endpoint)
 # Not the full K.9.1 criterion (which requires cc subprocess), but establishes
 # the network baseline from which to reason about cc startup overhead.
+# Using /api/v1/providers — lightweight JSON endpoint that requires no auth.
 # ─────────────────────────────────────────────────────────────────────────────
-bold "--- TCP/HTTPS latency baseline (GET /healthz) ---"
+bold "--- TCP/HTTPS latency baseline (GET /api/v1/providers) ---"
 total=0
 for i in $(seq 1 "$REPEAT"); do
     ms=$(curl -sk -o /dev/null -w '%{time_total}' \
         ${TETHER_TOKEN:+-H "Authorization: Bearer $TETHER_TOKEN"} \
-        "$TETHER_URL/healthz" | awk '{printf "%.1f", $1*1000}')
+        "$TETHER_URL/api/v1/providers" | awk '{printf "%.1f", $1*1000}')
     echo "  run $i: ${ms} ms"
     total=$(echo "$total + $ms" | bc)
 done
@@ -82,12 +78,11 @@ echo ""
 bold "--- K.9.3: HTTP/3 / QUIC reachability ---"
 HOST=$(echo "$TETHER_URL" | sed 's|https://||' | cut -d: -f1)
 PORT=$(echo "$TETHER_URL" | sed 's|https://||' | cut -d: -f2)
-if nc -u -z -w 3 "$HOST" "$PORT" 2>/dev/null; then
-    green "  UDP $HOST:$PORT reachable"
-else
-    red "  UDP $HOST:$PORT NOT reachable — VPN/firewall likely blocking QUIC"
-    echo "  Fix: disconnect VPN (see README K.8.1)"
-fi
+# nc -u cannot detect silent VPN drops (no ICMP unreachable returned).
+# Instead: compare HTTP/3 vs TCP latency — if HTTP/3 hangs but TCP is fast,
+# UDP is being blocked. We measure both and let the operator compare.
+echo "  (UDP reachability via nc is unreliable for silent VPN drops;"
+echo "   compare the HTTP/3 vs TCP latency below instead)"
 
 h3_result=$(curl -sk --http3-only -o /dev/null -w '%{http_code} %{time_total}' \
     ${TETHER_TOKEN:+-H "Authorization: Bearer $TETHER_TOKEN"} \

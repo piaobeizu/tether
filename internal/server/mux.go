@@ -13,6 +13,8 @@ import (
 
 	"github.com/piaobeizu/tether/internal/auth"
 	"github.com/piaobeizu/tether/internal/auth/apitoken"
+	"github.com/piaobeizu/tether/internal/auth/oauth"
+	mcplifecycle "github.com/piaobeizu/tether/internal/mcp/lifecycle"
 	"github.com/piaobeizu/tether/internal/permission"
 	"github.com/piaobeizu/tether/internal/session"
 	"github.com/piaobeizu/tether/internal/skill"
@@ -31,7 +33,7 @@ import (
 //	/wt/shell       → PTY shell channel stub (s6)
 //	/wt/events      → broadcast events channel (s4)
 //	/wt/_smoke      → WT bidi pure-byte echo (D-22 §6 #2 acceptance gate)
-func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *session.Registry, pm *permission.Manager, authState *auth.State, mcpSrv *mcp.Server, mcpTokens *apitoken.Store) http.Handler {
+func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *session.Registry, pm *permission.Manager, authState *auth.State, mcpSrv *mcp.Server, mcpTokens *apitoken.Store, oauthH *oauth.Handlers, lm *mcplifecycle.LifecycleManager) http.Handler {
 	mux := http.NewServeMux()
 
 	derHex := HashHex(bundle.DER)
@@ -126,6 +128,18 @@ func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *ses
 		mux.Handle("/mcp", mcpH)
 		mux.Handle("/mcp/", mcpH)
 		RegisterMCPTokensAPI(mux, mcpTokens, nil)
+	}
+
+	// OAuth 2.1 PKCE endpoints (v0.3.3). Auth middleware exempts these paths.
+	if oauthH != nil {
+		mux.Handle("/.well-known/oauth-authorization-server", oauthH.Metadata())
+		mux.Handle("/oauth/authorize", oauthH.Authorize())
+		mux.Handle("/oauth/token", oauthH.Token())
+	}
+
+	// v0.4: per-task MCP lifecycle endpoints.
+	if lm != nil {
+		registerTaskMCPAPI(mux, lm, pm)
 	}
 
 	mux.HandleFunc("/api/v1/", func(w http.ResponseWriter, _ *http.Request) {

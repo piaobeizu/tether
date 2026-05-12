@@ -138,10 +138,13 @@ func deleteHookList(settings map[string]any, kind string) {
 	}
 }
 
-// InjectMCPServer adds mcpServers.tether to ~/.claude/settings.json.
-// It removes any existing _tether_managed entry first (idempotent).
-// token is the per-daemon bearer token injected into the Authorization header.
-func InjectMCPServer(port int, token string) error {
+// InjectMCPServer adds an MCP server entry under the given name key to
+// ~/.claude/settings.json.  name is typically "tether" for the global
+// singleton or "tether-<slug>" for a per-task instance.
+//
+// The function removes any existing entry with the same name first so the
+// operation is idempotent.  token is the per-daemon bearer token.
+func InjectMCPServer(port int, token, name string) error {
 	path, err := ccSettingsPath()
 	if err != nil {
 		return err
@@ -150,14 +153,14 @@ func InjectMCPServer(port int, token string) error {
 	if err != nil {
 		settings = map[string]any{}
 	}
-	removeManagedMCPServer(settings)
+	removeMCPServerByName(settings, name)
 
 	mcpServers, _ := settings["mcpServers"].(map[string]any)
 	if mcpServers == nil {
 		mcpServers = map[string]any{}
 		settings["mcpServers"] = mcpServers
 	}
-	mcpServers["tether"] = map[string]any{
+	mcpServers[name] = map[string]any{
 		TetherManagedKey: true,
 		"type":           "http",
 		"url":            fmt.Sprintf("http://127.0.0.1:%d/mcp", port),
@@ -168,8 +171,9 @@ func InjectMCPServer(port int, token string) error {
 	return saveSettings(path, settings)
 }
 
-// RemoveMCPServer removes the tether-managed mcpServers.tether entry from settings.json.
-func RemoveMCPServer() error {
+// RemoveMCPServer removes the named tether-managed mcpServers entry from
+// settings.json.  name should match what was passed to InjectMCPServer.
+func RemoveMCPServer(name string) error {
 	path, err := ccSettingsPath()
 	if err != nil {
 		return err
@@ -178,10 +182,12 @@ func RemoveMCPServer() error {
 	if err != nil {
 		return nil // absent = nothing to clean up
 	}
-	removeManagedMCPServer(settings)
+	removeMCPServerByName(settings, name)
 	return saveSettings(path, settings)
 }
 
+// removeManagedMCPServer removes ALL tether-managed mcpServers entries
+// (used only by the legacy path; prefer removeMCPServerByName for targeted removal).
 func removeManagedMCPServer(settings map[string]any) {
 	mcpServers, _ := settings["mcpServers"].(map[string]any)
 	if mcpServers == nil {
@@ -192,6 +198,23 @@ func removeManagedMCPServer(settings map[string]any) {
 			if managed, _ := m[TetherManagedKey].(bool); managed {
 				delete(mcpServers, k)
 			}
+		}
+	}
+	if len(mcpServers) == 0 {
+		delete(settings, "mcpServers")
+	}
+}
+
+// removeMCPServerByName removes the single named entry if it carries
+// TetherManagedKey=true.  Does nothing if absent or not managed.
+func removeMCPServerByName(settings map[string]any, name string) {
+	mcpServers, _ := settings["mcpServers"].(map[string]any)
+	if mcpServers == nil {
+		return
+	}
+	if m, ok := mcpServers[name].(map[string]any); ok {
+		if managed, _ := m[TetherManagedKey].(bool); managed {
+			delete(mcpServers, name)
 		}
 	}
 	if len(mcpServers) == 0 {

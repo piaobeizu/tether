@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.3.4 — tether doctor MCP health (unreleased)
+
+### Added
+- Three new `tether doctor` checks for MCP subsystem health:
+  - `mcp-settings-inject` — verifies `~/.claude/settings.json` contains the
+    tether-managed `mcpServers.tether` entry; fails with actionable message if
+    absent (run `tether server` to inject)
+  - `mcp-api-tokens` — reports count of external API tokens in
+    `~/.tether/api-tokens.json`; informational (OK) when file is absent or empty
+  - `mcp-loopback` — TCP-connects to the MCP loopback port (default 8899,
+    read from settings); informational (OK) when server is not running
+
+### Fixed
+- `checkCCSettingsHooks` was reading `~/.config/claude/settings.json` instead of
+  `~/.claude/settings.json`; hooks check now reads the correct file so it no
+  longer always reports "hook not found" on a correctly configured system
+
+## v0.3.3 — OAuth 2.1 PKCE (unreleased)
+
+### Added
+- `internal/auth/oauth/` — OAuth 2.1 Authorization Code + PKCE (S256) flow
+  - `GET /.well-known/oauth-authorization-server` — RFC 8414 discovery metadata
+  - `GET /oauth/authorize` — PKCE validation + `html/template` approval page (XSS-safe)
+  - `POST /oauth/authorize` — allow/deny form handler
+  - `POST /oauth/token` — auth code exchange; issues 24h Bearer token via `apitoken.Store`
+- `apitoken.TokenSource` typed constant (`TokenSourceManual` / `TokenSourceOAuth`), `ExpiresAt` field, `CreateWithTTL`, `StartEviction` background eviction goroutine
+- `MCPHTTPSHandler` — IP rate limiter (5 failures/60s → 429 for 5 min, bounded map)
+- Structured audit log events: `oauth.authorize.{allowed,denied,invalid_req_id}`, `oauth.token.{issued,invalid_grant}`, `mcp.bearer.{auth_ok,auth_failed,rate_limited}`
+
+### Security
+- `redirect_uri` restricted to loopback (localhost / 127.0.0.1) — prevents exfiltration
+- Approval page uses `html/template` (XSS-safe `client_id` rendering)
+- PKCE `plain` method rejected per OAuth 2.1 §7.5.1
+- Auth codes: single-use, 256-bit entropy, deleted on mismatch or expiry
+
+### Changed
+- `auth.State.isExempt` — exact-path exemptions for `/oauth/authorize`, `/oauth/token`, `/.well-known/oauth-authorization-server`
+
 ## v0.3.2 (unreleased)
 
 ### Added

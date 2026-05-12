@@ -19,9 +19,11 @@ import (
 	"github.com/piaobeizu/tether/internal/agent"
 	"github.com/piaobeizu/tether/internal/auth"
 	"github.com/piaobeizu/tether/internal/auth/apitoken"
+	"github.com/piaobeizu/tether/internal/auth/oauth"
 	"github.com/piaobeizu/tether/internal/mcp/builtin"
 	mcpgw "github.com/piaobeizu/tether/internal/mcp/gateway"
 	mcphost "github.com/piaobeizu/tether/internal/mcp/host"
+	mcplifecycle "github.com/piaobeizu/tether/internal/mcp/lifecycle"
 	mcpreg "github.com/piaobeizu/tether/internal/mcp/registry"
 	"github.com/piaobeizu/tether/internal/permission"
 	"github.com/piaobeizu/tether/internal/permission/cchook"
@@ -53,6 +55,10 @@ type Config struct {
 
 	// v0.3.2: external client API token store
 	APITokensPath string // path to api-tokens.json; "" = ~/.tether/api-tokens.json
+
+	// v0.4: per-task MCP lifecycle manager.
+	// If nil, Run() initialises one and stores it here.
+	MCPLifecycle *mcplifecycle.LifecycleManager
 }
 
 func (c *Config) addr() string { return fmt.Sprintf(":%d", c.Port) }
@@ -70,6 +76,9 @@ func (c *Config) devFrontend() string {
 // Run executes the §10.A.4 startup sequence, blocks until SIGINT/SIGTERM,
 // then performs graceful shutdown (≤5s per K.1.5).
 func Run(cfg *Config) error {
+	runCtx, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
+
 	// Step 1: resolve cc binary path + build session registry.
 	ccPath := resolveClaudePath()
 	if cfg.Registry == nil {
@@ -166,11 +175,16 @@ func Run(cfg *Config) error {
 		return fmt.Errorf("mcp loopback: %w", err)
 	}
 	if !cfg.SkipMCPInject {
-		if err := agent.InjectMCPServer(mcpPort, bearerToken); err != nil {
+		if err := agent.InjectMCPServer(mcpPort, bearerToken, "tether"); err != nil {
 			mcpMgr.StopAll()
 			_ = loopback.Stop(context.Background())
 			return fmt.Errorf("mcp settings inject: %w", err)
 		}
+	}
+
+	// Step 3c: per-task MCP lifecycle manager (v0.4).
+	if cfg.MCPLifecycle == nil {
+		cfg.MCPLifecycle = mcplifecycle.New()
 	}
 
 	// Step 4: load or generate cert.
@@ -215,9 +229,24 @@ func Run(cfg *Config) error {
 	if err != nil {
 		return fmt.Errorf("api-tokens store: %w", err)
 	}
+	apiTokens.StartEviction(runCtx)
+
+	// Step 4e: OAuth 2.1 PKCE handlers (v0.3.3).
+	oauthHost := "127.0.0.1"
+	if h := os.Getenv("TETHER_HOST"); h != "" {
+		oauthHost = h
+	}
+	var oauthIssuer string
+	if cfg.Port == 443 {
+		oauthIssuer = "https://" + oauthHost
+	} else {
+		oauthIssuer = fmt.Sprintf("https://%s:%d", oauthHost, cfg.Port)
+	}
+	oauthCS := oauth.NewCodeStore()
+	oauthH := oauth.NewHandlers(oauthCS, apiTokens, oauthIssuer)
 
 	// Step 5: build and start listeners.
-	srv := newServer(cfg, bundle, pm, authState, mcpSrv, apiTokens)
+	srv := newServer(cfg, bundle, pm, authState, mcpSrv, apiTokens, oauthH)
 
 	errCh := make(chan error, 2)
 
@@ -268,10 +297,14 @@ func Run(cfg *Config) error {
 	// MCP shutdown: drain → stop children → housekeeping.
 	drainCtx, drainCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer drainCancel()
+
+	// v0.4: stop per-task instances before global stack.
+	cfg.MCPLifecycle.StopAll(drainCtx)
+
 	_ = loopback.Stop(drainCtx)
 	mcpMgr.StopAll()
 	if !cfg.SkipMCPInject {
-		_ = agent.RemoveMCPServer()
+		_ = agent.RemoveMCPServer("tether")
 	}
 	_ = os.Remove(mcpTokenPath)
 

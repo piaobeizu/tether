@@ -58,3 +58,32 @@ func TestMiddleware_MCPLookAlikeNotExempt(t *testing.T) {
 		t.Fatalf("'/mcpadmin' must NOT be exempt (got code=%d, innerCalled=%v)", rr.Code, innerCalled)
 	}
 }
+
+func TestIsExempt_OAuthAndWellKnownExact(t *testing.T) {
+	s := auth.NewState("tok", []byte("secret01secret02secret03secret04"))
+
+	exempt := []string{
+		"/oauth/authorize",
+		"/oauth/token",
+		"/.well-known/oauth-authorization-server",
+	}
+	notExempt := []string{
+		"/.well-known/other",
+		"/.well-known/",
+		"/oauth/",
+		"/api/v1/mcp/tokens",
+	}
+
+	for _, p := range exempt {
+		req := httptest.NewRequest("GET", p, nil)
+		if !s.IsExemptForTest(req) {
+			t.Errorf("path %q should be exempt", p)
+		}
+	}
+	for _, p := range notExempt {
+		req := httptest.NewRequest("GET", p, nil)
+		if s.IsExemptForTest(req) {
+			t.Errorf("path %q should NOT be exempt", p)
+		}
+	}
+}

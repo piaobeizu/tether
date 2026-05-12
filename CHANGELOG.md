@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.3.4 — tether doctor MCP health (unreleased)
+
+### Added
+- Three new `tether doctor` checks for MCP subsystem health:
+  - `mcp-settings-inject` — verifies `~/.claude/settings.json` contains the
+    tether-managed `mcpServers.tether` entry; fails with actionable message if
+    absent (run `tether server` to inject)
+  - `mcp-api-tokens` — reports count of external API tokens in
+    `~/.tether/api-tokens.json`; informational (OK) when file is absent or empty
+  - `mcp-loopback` — TCP-connects to the MCP loopback port (default 8899,
+    read from settings); informational (OK) when server is not running
+
+### Fixed
+- `checkCCSettingsHooks` was reading `~/.config/claude/settings.json` instead of
+  `~/.claude/settings.json`; hooks check now reads the correct file so it no
+  longer always reports "hook not found" on a correctly configured system
+
 ## v0.3.3 — OAuth 2.1 PKCE (unreleased)
 
 ### Added

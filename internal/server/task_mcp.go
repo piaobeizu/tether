@@ -13,12 +13,12 @@ import (
 	"github.com/piaobeizu/tether/internal/permission"
 )
 
-// registerTaskMCPAPI mounts the per-task MCP lifecycle REST endpoints.
+// RegisterTaskMCPAPI mounts the per-task MCP lifecycle REST endpoints.
 //
 //	POST   /api/v1/tasks/{id}/mcp   → start a per-task MCPInstance
 //	DELETE /api/v1/tasks/{id}/mcp   → stop the instance for task {id}
 //	GET    /api/v1/tasks/{id}/mcp   → inspect the running instance (port, token)
-func registerTaskMCPAPI(mux *http.ServeMux, lm *mcplifecycle.LifecycleManager, pm *permission.Manager) {
+func RegisterTaskMCPAPI(mux *http.ServeMux, lm *mcplifecycle.LifecycleManager, pm *permission.Manager) {
 	mux.HandleFunc("/api/v1/tasks/", func(w http.ResponseWriter, r *http.Request) {
 		// ServeMux routes all /api/v1/tasks/{...} paths here.
 		// We only handle paths of the form /api/v1/tasks/{id}/mcp.

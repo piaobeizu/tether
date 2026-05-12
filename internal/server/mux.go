@@ -139,7 +139,7 @@ func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *ses
 
 	// v0.4: per-task MCP lifecycle endpoints.
 	if lm != nil {
-		registerTaskMCPAPI(mux, lm, pm)
+		RegisterTaskMCPAPI(mux, lm, pm)
 	}
 
 	mux.HandleFunc("/api/v1/", func(w http.ResponseWriter, _ *http.Request) {

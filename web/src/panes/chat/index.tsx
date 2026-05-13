@@ -12,7 +12,7 @@ import { PermissionBlock } from '../../fenced-blocks/PermissionBlock'
 type ConnState = 'connecting' | 'connected' | 'failed'
 
 export default function ChatPane() {
-  const { messages, sessionId, pendingPermission } = useStore()
+  const { messages, sessionId, pendingPermission, streaming } = useStore()
   const [input, setInput] = useState('')
   const [connState, setConnState] = useState<ConnState>('connecting')
   const [connError, setConnError] = useState<string | null>(null)
@@ -115,6 +115,12 @@ export default function ChatPane() {
               <span>{m.text}</span>
             </div>
           ))}
+          {streaming && (
+            <div style={{ color: '#555', fontSize: 13, padding: '2px 0' }}>
+              <span>assistant: </span>
+              <span style={{ letterSpacing: 2 }}>…</span>
+            </div>
+          )}
         </div>
         {pendingPermission && (
           <PermissionBlock

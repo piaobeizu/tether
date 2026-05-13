@@ -244,6 +244,8 @@ func translateEvent(ev agent.Event) *wire.Envelope {
 				"input": ev.ToolUse.Input,
 			}}
 		}
+	case agent.EventResult:
+		return &wire.Envelope{Kind: wire.KindResult, Payload: ev.Text}
 	case agent.EventError:
 		return &wire.Envelope{Kind: wire.KindError, Payload: ev.Err.Error()}
 	}

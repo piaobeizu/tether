@@ -1,6 +1,27 @@
 # Changelog
 
-## v0.3.4 — tether doctor MCP health (unreleased)
+## v0.4.0 — 2026-05-12 (PR #68, #69, #70)
+
+### Added
+- **Per-task MCP lifecycle**: `MCPInstance` + `LifecycleManager` — spawn/stop external MCP
+  servers on task start/pause; REST API `POST/DELETE /api/v1/mcp/lifecycle/{task_id}`.
+- **`workspace_run_shell` builtin tool**: exec + pipe (no PTY), 4 MiB output cap,
+  `Setpgid` process-group kill, `timeout_secs` parameter.
+- **End-to-end smoke test**: REST POST → MCPInstance → HTTP MCP → tool call
+  (`waitForPort` replaces flaky `sleep`).
+- **Polyforge lifecycle hooks**: `.claude/settings.json` PostToolUse intercepts
+  `pf2_task_start/pause/wrap` → curl tether REST, bridging workspace events into
+  tether's MCP lifecycle.
+- **Design token system**: CSS custom properties in `tokens.css`; dark-mode body
+  background override (`[data-theme="dark"] body { background: #0F0E0C }`).
+- **WebTransport + SPA routing fixes**: Alt-Svc rewrite, `/wt/*` path conflicts resolved.
+
+### Notes
+- `workspace_run_shell` is exec+pipe only; PTY is `/wt/shell` (interactive terminal).
+- `CallToolParams.Arguments` in go-sdk is `any`; pass `map[string]any`, not
+  `json.RawMessage`, to avoid base64-encoding in tests.
+
+## v0.3.4 — 2026-05-12 (PR #69)
 
 ### Added
 - Three new `tether doctor` checks for MCP subsystem health:
@@ -17,7 +38,7 @@
   `~/.claude/settings.json`; hooks check now reads the correct file so it no
   longer always reports "hook not found" on a correctly configured system
 
-## v0.3.3 — OAuth 2.1 PKCE (unreleased)
+## v0.3.3 — 2026-05-11/12 (PR #68)
 
 ### Added
 - `internal/auth/oauth/` — OAuth 2.1 Authorization Code + PKCE (S256) flow
@@ -38,7 +59,7 @@
 ### Changed
 - `auth.State.isExempt` — exact-path exemptions for `/oauth/authorize`, `/oauth/token`, `/.well-known/oauth-authorization-server`
 
-## v0.3.2 (unreleased)
+## v0.3.2 — 2026-05-11 (PR #67)
 
 ### Added
 - HTTPS `/mcp` endpoint on the main port for external MCP clients (Cursor, Goose).
@@ -74,14 +95,14 @@
   cookie middleware and `WithOriginGuard` CSRF posture (rejects POST/DELETE with
   mismatched `Origin` header).
 
-## v0.3.1 (merged 2026-05-11)
+## v0.3.1 — 2026-05-11 (PR #66)
 
 ### Added
 - MCP loopback endpoint at `127.0.0.1:8899/mcp` for CC subprocess integration.
 - Builtin workspace tools (`workspace_read_file`, `workspace_list_files`, etc.).
 - CC settings injection into `~/.claude/settings.json` on daemon startup.
 
-## v0.3.0 (unreleased)
+## v0.3.0 — 2026-05-10 (PR #64/#65)
 
 ### Changed
 - Permission API: canonical paths are now `/api/v1/permission/request` and `/api/v1/permission/{id}/decide`. Old paths `/api/v1/agent/permission/*` are kept as aliases through v0.3.x and will be removed in v0.4.
@@ -89,7 +110,7 @@
 - `internal/agent/permhook/` renamed to `internal/permission/cchook/` (import path change; binary behavior unchanged).
 - `/mcp` and `/api/v1/mcp/*` reserved — return 501 until MCP host is implemented later in v0.3.
 
-## v0.2.0 (unreleased)
+## v0.2.0 — 2026-05-10 (PR #63)
 
 ### Added
 - Auth: static token gate (`--token` flag, auto-generated at `~/.tether/access-token`); JWT cookie (`HttpOnly; Secure; SameSite=Strict; Path=/`; 90-day sliding expiry); `/auth` page in SPA

@@ -186,7 +186,7 @@ export default function ChatPane({ onMenuClick }: Props) {
           <span style={{ fontSize: 10, color: 'var(--ink-tertiary)', fontFamily: 'var(--font-mono)' }}>
             {connState === 'connected' ? 'live' :
              connState === 'connecting' ? 'connecting…' :
-             connState === 'reconnecting' ? `retry ${attemptRef.current}` : 'dropped'}
+             connState === 'reconnecting' ? `reconnecting` : 'dropped'}
           </span>
         </span>
         {sessionId && (
@@ -326,7 +326,7 @@ export default function ChatPane({ onMenuClick }: Props) {
             </button>
           </div>
           <div className="composer-foot">
-            <span className="mono" style={{ fontSize: 10.5, color: 'var(--ink-tertiary)' }}>⌘↵ send · ⇧↵ newline</span>
+            <span className="mono" style={{ fontSize: 10.5, color: 'var(--ink-tertiary)' }}>⌘↵ send · shift+↵ newline</span>
             {sessionId && (
               <span className="mono" style={{ fontSize: 10.5, color: 'var(--ink-tertiary)', marginLeft: 'auto' }}>
                 {selectedProvider}

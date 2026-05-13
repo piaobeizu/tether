@@ -21,11 +21,11 @@ export class TetherWT {
   }
 
   async connect(): Promise<void> {
-    const certHash = await fetchCertHash()
+    const [certHash, ticket] = await Promise.all([fetchCertHash(), fetchWtTicket()])
     const wtOpts: WebTransportOptions = certHash
       ? { serverCertificateHashes: [{ algorithm: 'sha-256', value: hexToBuffer(certHash) }] }
       : {}
-    this.wt = new WebTransport(this.opts.url, wtOpts)
+    this.wt = new WebTransport(appendTicket(this.opts.url, ticket), wtOpts)
     await this.wt.ready
     this.readEvents()
     this.wt.closed.then((info) => {
@@ -98,11 +98,14 @@ export async function connectEventsOnly(
   onEnvelope: (env: Envelope) => void,
   onClose: () => void,
 ): Promise<WebTransport> {
-  const certHash = await fetchCertHash()
+  const [certHash, ticket] = await Promise.all([fetchCertHash(), fetchWtTicket()])
   const wtOpts: WebTransportOptions = certHash
     ? { serverCertificateHashes: [{ algorithm: 'sha-256', value: hexToBuffer(certHash) }] }
     : {}
-  const url = `https://${location.host}/wt/events?sid=${encodeURIComponent(sid)}`
+  const url = appendTicket(
+    `https://${location.host}/wt/events?sid=${encodeURIComponent(sid)}`,
+    ticket,
+  )
   const wt = new WebTransport(url, wtOpts)
   await wt.ready
 
@@ -142,6 +145,28 @@ export async function connectEventsOnly(
 
   wt.closed.then(fireClose).catch(fireClose)
   return wt
+}
+
+// fetchWtTicket fetches a short-lived WT auth ticket from the daemon.
+// The browser has the session cookie; the Ticket bridges it to the WT
+// CONNECT request which Chrome does not attach cookies to.
+async function fetchWtTicket(): Promise<string | null> {
+  try {
+    const resp = await fetch('/api/v1/auth/wt-ticket', { method: 'POST' })
+    if (!resp.ok) return null
+    const body = await resp.json() as { ticket?: string }
+    return typeof body.ticket === 'string' ? body.ticket : null
+  } catch {
+    return null
+  }
+}
+
+// appendTicket appends ?ticket=<t> (or &ticket=<t>) to url.
+// Returns url unchanged when ticket is null.
+function appendTicket(url: string, ticket: string | null): string {
+  if (!ticket) return url
+  const sep = url.includes('?') ? '&' : '?'
+  return `${url}${sep}ticket=${encodeURIComponent(ticket)}`
 }
 
 // fetchCertHash fetches /cert-hash from the current origin.

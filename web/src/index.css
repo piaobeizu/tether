@@ -136,3 +136,18 @@ html, body, #root {
   flex-shrink: 0;
 }
 .pane-body { flex: 1; overflow: auto; padding: 12px; }
+
+/* ── Streaming cursor ─────────────────────────────────── */
+@keyframes tether-blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0; }
+}
+.tether-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  background: currentColor;
+  vertical-align: text-bottom;
+  margin-left: 1px;
+  animation: tether-blink 1s step-start infinite;
+}

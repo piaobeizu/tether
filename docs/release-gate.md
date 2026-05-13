@@ -21,7 +21,7 @@
 
 ---
 
-## What ships at v0.4 ("v1.0 baseline")
+## What's in v0.4.0 (current ship-gate)
 
 - Single-port HTTP/3 + TCP server with ECDSA P-256 cert (self-signed or ACME).
 - Chat + Shell + Events WebTransport channels.

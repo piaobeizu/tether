@@ -189,11 +189,6 @@ export default function ChatPane({ onMenuClick }: Props) {
              connState === 'reconnecting' ? `reconnecting` : 'dropped'}
           </span>
         </span>
-        {sessionId && (
-          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--ink-quat)' }}>
-            {sessionId.slice(0, 8)}
-          </span>
-        )}
       </div>
 
       {/* ── Message list ──────────────────────────────────── */}

@@ -77,7 +77,6 @@ export default function ShellPane() {
 
   return (
     <>
-      <div className="pane-header">Shell</div>
       <div
         ref={containerRef}
         className="pane-body"

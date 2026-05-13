@@ -49,14 +49,8 @@ export default function SkillPane() {
 
   return (
     <>
-      <div className="pane-header" style={{ display: 'flex', justifyContent: 'space-between' }}>
-        <span>Skills</span>
-        <button
-          onClick={install}
-          style={{ background: 'none', border: '1px solid var(--line)', borderRadius: 4, padding: '2px 8px', color: 'var(--ink-tertiary)', cursor: 'pointer', fontSize: 11 }}
-        >
-          + Install
-        </button>
+      <div style={{ padding: '8px 12px', display: 'flex', justifyContent: 'flex-end', borderBottom: '1px solid var(--line-soft)', flexShrink: 0 }}>
+        <button onClick={install} className="btn-ghost-sm">+ Install</button>
       </div>
       <div className="pane-body">
         {error && <div style={{ color: 'var(--danger)', fontSize: 11, marginBottom: 8 }}>{error}</div>}

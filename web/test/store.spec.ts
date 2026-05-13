@@ -34,10 +34,21 @@ describe('useStore.handleEnvelope', () => {
     expect(useStore.getState().messages).toHaveLength(0)
   })
 
-  it('tool_use object payload is NOT added to chat messages', () => {
+  it('tool_use object payload sets streaming=true but adds no chat message', () => {
     const env: Envelope = {
       kind: 'message',
       payload: { type: 'tool_use', id: 'toolu_01abc', name: 'Read', input: { file_path: '/tmp/x' } },
+    }
+    useStore.getState().handleEnvelope(env)
+    expect(useStore.getState().messages).toHaveLength(0)
+    // streaming stays on: Claude is mid-turn executing a tool.
+    expect(useStore.getState().streaming).toBe(true)
+  })
+
+  it('unknown structured payload is ignored without changing state', () => {
+    const env: Envelope = {
+      kind: 'message',
+      payload: { type: 'future_kind', data: 42 },
     }
     useStore.getState().handleEnvelope(env)
     expect(useStore.getState().messages).toHaveLength(0)

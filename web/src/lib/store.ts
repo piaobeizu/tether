@@ -46,13 +46,21 @@ export const useStore = create<AppState>((set) => ({
     switch (env.kind) {
       case 'message': {
         const p = env.payload
-        if (p && typeof p === 'object' && (p as Record<string, unknown>)['type'] === 'session_ready') {
-          set({ sessionId: (p as Record<string, unknown>)['sessionId'] as string })
+        if (p && typeof p === 'object') {
+          const pObj = p as Record<string, unknown>
+          if (pObj['type'] === 'session_ready') {
+            set({ sessionId: pObj['sessionId'] as string })
+            break
+          }
+          if (pObj['type'] === 'tool_use') {
+            // Claude is executing a tool — no chat bubble, but keep the
+            // streaming indicator on so the user sees activity.
+            set({ streaming: true })
+            break
+          }
+          // Unknown structured payload (future kinds) — ignore.
           break
         }
-        // Only stream text chunks to chat. Structured payloads (tool_use, tool_result)
-        // will be surfaced in the DAG/fenced-block pane (F.1). Coercing them to JSON
-        // strings here produces unreadable noise in the chat bubble.
         if (typeof p !== 'string') break
         set((s) => ({
           streaming: true,

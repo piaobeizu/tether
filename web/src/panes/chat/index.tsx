@@ -190,9 +190,9 @@ export default function ChatPane() {
             </div>
           ))}
           {streaming && (
-            <div style={{ color: '#555', fontSize: 13, padding: '2px 0' }}>
-              <span>assistant: </span>
-              <span style={{ letterSpacing: 2 }}>…</span>
+            <div style={{ color: 'var(--ink-tertiary)', fontSize: 13, padding: '2px 0' }}>
+              <span style={{ color: 'var(--ink-secondary)' }}>assistant: </span>
+              <span className="tether-cursor" aria-label="Claude is responding" />
             </div>
           )}
         </div>
@@ -216,12 +216,12 @@ export default function ChatPane() {
             </select>
           )}
           <input
-            disabled={connState !== 'connected'}
-            style={{ flex: 1, background: 'var(--bg-surface)', border: '1px solid var(--line)', borderRadius: 4, padding: '6px 10px', color: connState === 'connected' ? 'var(--ink-primary)' : 'var(--ink-disabled)', outline: 'none' }}
+            disabled={connState !== 'connected' || streaming}
+            style={{ flex: 1, background: 'var(--bg-surface)', border: '1px solid var(--line)', borderRadius: 4, padding: '6px 10px', color: (connState === 'connected' && !streaming) ? 'var(--ink-primary)' : 'var(--ink-disabled)', outline: 'none' }}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && void sendMessage()}
-            placeholder={connState === 'connected' ? 'Message…' : connState === 'connecting' ? 'Connecting…' : 'Not connected'}
+            placeholder={connState !== 'connected' ? (connState === 'connecting' ? 'Connecting…' : 'Not connected') : streaming ? 'Claude is thinking…' : 'Message…'}
           />
           <button
             disabled={connState !== 'connected'}

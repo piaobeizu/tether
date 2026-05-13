@@ -21,6 +21,7 @@ const (
 	CookieName   = cookieName
 	CookieMaxAge = cookieMaxAge
 	jwtTTL       = 90 * 24 * time.Hour
+	WtTicketTTL  = 60 * time.Second
 )
 
 // LoadOrGenSecret returns the HMAC signing secret from ~/.tether/jwt-secret,
@@ -105,6 +106,59 @@ func FormatSetCookie(token string) string {
 		"%s=%s; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=%d",
 		cookieName, token, cookieMaxAge,
 	)
+}
+
+// IssueWTTicket issues a short-lived JWT (60s) for a single WebTransport
+// connection. The ticket carries the same clientID as the session JWT but is
+// safe to pass in a URL query param because it expires quickly.
+func IssueWTTicket(secret []byte, clientID string) (string, error) {
+	now := time.Now()
+	header := base64url([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	payload, err := json.Marshal(map[string]any{
+		"sub": "wt-ticket",
+		"iat": now.Unix(),
+		"exp": now.Add(WtTicketTTL).Unix(),
+		"jti": clientID,
+	})
+	if err != nil {
+		return "", fmt.Errorf("wt-ticket payload: %w", err)
+	}
+	body := header + "." + base64url(payload)
+	sig := hmacSHA256(secret, body)
+	return body + "." + sig, nil
+}
+
+// VerifyWTTicket validates a WT ticket token, returning (clientID, true) on success.
+// It rejects tokens whose sub is not "wt-ticket" so session JWTs cannot be reused.
+func VerifyWTTicket(secret []byte, token string) (clientID string, ok bool) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return "", false
+	}
+	body := parts[0] + "." + parts[1]
+	expected := hmacSHA256(secret, body)
+	if !hmac.Equal([]byte(expected), []byte(parts[2])) {
+		return "", false
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return "", false
+	}
+	var claims struct {
+		Sub string `json:"sub"`
+		Exp int64  `json:"exp"`
+		Jti string `json:"jti"`
+	}
+	if err := json.Unmarshal(raw, &claims); err != nil {
+		return "", false
+	}
+	if claims.Sub != "wt-ticket" {
+		return "", false
+	}
+	if time.Now().Unix() > claims.Exp {
+		return "", false
+	}
+	return claims.Jti, true
 }
 
 func hmacSHA256(secret []byte, data string) string {

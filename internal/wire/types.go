@@ -10,6 +10,7 @@ const (
 	KindPermission EnvelopeKind = "permission"  // PreToolUse callback (s5)
 	KindFenced     EnvelopeKind = "fenced"      // D-19 fenced-block structured output (s4)
 	KindError      EnvelopeKind = "error"       // daemon-side error surfaced to UI
+	KindResult     EnvelopeKind = "result"      // turn complete; payload is stop reason string
 )
 
 // Envelope is the top-level wrapper for all events sent over /wt/events

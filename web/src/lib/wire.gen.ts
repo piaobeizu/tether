@@ -35,6 +35,7 @@ export const KindMessage: EnvelopeKind = "message"; // assistant text / tool out
 export const KindPermission: EnvelopeKind = "permission"; // PreToolUse callback (s5)
 export const KindFenced: EnvelopeKind = "fenced"; // D-19 fenced-block structured output (s4)
 export const KindError: EnvelopeKind = "error"; // daemon-side error surfaced to UI
+export const KindResult: EnvelopeKind = "result"; // turn complete; payload is stop reason string
 /**
  * Envelope is the top-level wrapper for all events sent over /wt/events
  * and /wt/chat. The Payload field carries kind-specific JSON (D-05a §3,

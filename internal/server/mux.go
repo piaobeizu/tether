@@ -99,7 +99,7 @@ func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *ses
 	permission.RegisterAPI(mux, pm, broadcastFn)
 
 	// s6: shell WT channel + session lock API.
-	mux.HandleFunc("/wt/shell", handleWTShell(reg, wts))
+	mux.HandleFunc("/wt/shell", handleWTShell(reg, wts, authState))
 	mux.HandleFunc("/api/v1/session/", handleLockForce(reg))
 
 	// s7: workspace + skill REST APIs.
@@ -149,6 +149,9 @@ func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *ses
 	// /api/v1/auth/verify IS wrapped by authState.Middleware below; the
 	// middleware lets it through via isExempt() — not by bypassing the wrapper.
 	mux.HandleFunc("/api/v1/auth/verify", authState.VerifyHandler)
+	// /api/v1/auth/wt-ticket requires a valid session cookie (middleware enforces)
+	// and issues a short-lived JWT for WebTransport connections.
+	mux.HandleFunc("/api/v1/auth/wt-ticket", authState.WtTicketHandler)
 
 	mux.Handle("/", newStaticHandler(cfg.DevFrontendURL))
 

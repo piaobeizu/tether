@@ -9,15 +9,24 @@ import { CandidatesBlock } from '../../fenced-blocks/CandidatesBlock'
 import { MediaBlock } from '../../fenced-blocks/MediaBlock'
 import { PermissionBlock } from '../../fenced-blocks/PermissionBlock'
 
-type ConnState = 'connecting' | 'connected' | 'failed'
+type ConnState = 'connecting' | 'connected' | 'reconnecting' | 'failed'
+
+const RECONNECT_BASE_MS = 1_000
+const RECONNECT_MAX_MS = 16_000
+const RECONNECT_MAX_ATTEMPTS = 5
 
 export default function ChatPane() {
-  const { messages, sessionId, pendingPermission } = useStore()
+  const { messages, sessionId, pendingPermission, streaming } = useStore()
   const [input, setInput] = useState('')
   const [connState, setConnState] = useState<ConnState>('connecting')
   const [connError, setConnError] = useState<string | null>(null)
+  const [reconnectIn, setReconnectIn] = useState(0)
   const writerRef = useRef<WritableStreamDefaultWriter<Uint8Array> | null>(null)
   const wtRef = useRef<TetherWT | null>(null)
+  const attemptRef = useRef(0)
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const unmountedRef = useRef(false)
   const [providers, setProviders] = useState<string[]>(['claude-code'])
   const [selectedProvider, setSelectedProvider] = useState('claude-code')
 
@@ -30,19 +39,65 @@ export default function ChatPane() {
       .catch(() => {}) // keep default ['claude'] on error
   }, [])
 
+  const cancelPendingReconnect = () => {
+    if (reconnectTimerRef.current !== null) {
+      clearTimeout(reconnectTimerRef.current)
+      reconnectTimerRef.current = null
+    }
+    if (countdownRef.current !== null) {
+      clearInterval(countdownRef.current)
+      countdownRef.current = null
+    }
+  }
+
+  const scheduleReconnect = () => {
+    if (unmountedRef.current) return
+    attemptRef.current += 1
+    if (attemptRef.current > RECONNECT_MAX_ATTEMPTS) {
+      setConnState('failed')
+      return
+    }
+    const delayMs = Math.min(RECONNECT_BASE_MS * 2 ** (attemptRef.current - 1), RECONNECT_MAX_MS)
+    setConnState('reconnecting')
+    setReconnectIn(Math.ceil(delayMs / 1000))
+
+    countdownRef.current = setInterval(() => {
+      setReconnectIn(prev => Math.max(0, prev - 1))
+    }, 1000)
+
+    reconnectTimerRef.current = setTimeout(() => {
+      cancelPendingReconnect()
+      if (!unmountedRef.current) doConnect()
+    }, delayMs)
+  }
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const doConnect = () => {
+    cancelPendingReconnect()
     setConnState('connecting')
     setConnError(null)
+
+    // Tear down the old client before opening a new one.
+    const old = wtRef.current
+    wtRef.current = null
+    writerRef.current?.releaseLock()
+    writerRef.current = null
+    old?.close()
+
     // clientId is now derived server-side from the JWT cookie (not a URL param).
     const url = `https://${location.host}/wt/chat?provider=${encodeURIComponent(selectedProvider)}`
     const wt = new TetherWT({
       url,
       onEnvelope: useStore.getState().handleEnvelope,
-      onClose: () => { useStore.getState().setConnected(false); setConnState('failed') },
+      onClose: () => {
+        useStore.getState().setConnected(false)
+        if (!unmountedRef.current) scheduleReconnect()
+      },
     })
     wtRef.current = wt
 
     wt.connect().then(async () => {
+      attemptRef.current = 0 // reset backoff on success
       useStore.getState().setConnected(true)
       setConnState('connected')
       const stream = await wt.openBidiStream()
@@ -50,14 +105,22 @@ export default function ChatPane() {
     }).catch((err: unknown) => {
       const msg = err instanceof Error ? err.message : String(err)
       console.error('[tether] chat connect failed:', msg)
-      setConnState('failed')
       setConnError(msg)
+      if (!unmountedRef.current) scheduleReconnect()
     })
   }
 
+  const manualRetry = () => {
+    attemptRef.current = 0
+    doConnect()
+  }
+
   useEffect(() => {
+    unmountedRef.current = false
     doConnect()
     return () => {
+      unmountedRef.current = true
+      cancelPendingReconnect()
       writerRef.current?.releaseLock()
       wtRef.current?.close()
     }
@@ -80,8 +143,8 @@ export default function ChatPane() {
     setInput('')
   }
 
-  const connDot = connState === 'connected' ? '#4caf50' : connState === 'connecting' ? '#ff9800' : '#f44336'
-  const connLabel = connState === 'connected' ? 'connected' : connState === 'connecting' ? 'connecting…' : 'disconnected'
+  const connDot = connState === 'connected' ? '#4caf50' : connState === 'connecting' || connState === 'reconnecting' ? '#ff9800' : '#f44336'
+  const connLabel = connState === 'connected' ? 'connected' : connState === 'connecting' ? 'connecting…' : connState === 'reconnecting' ? `reconnecting…` : 'disconnected'
 
   return (
     <>
@@ -95,14 +158,25 @@ export default function ChatPane() {
         </span>
       </div>
       <div className="pane-body" style={{ display: 'flex', flexDirection: 'column', gap: 8, paddingBottom: 0 }}>
+        {connState === 'reconnecting' && (
+          <div style={{ background: '#1a1a10', border: '1px solid #4a4020', borderRadius: 4, padding: '6px 10px', fontSize: 12, color: '#aaa' }}>
+            Connection lost — reconnecting in {reconnectIn}s…
+            <span
+              onClick={manualRetry}
+              style={{ marginLeft: 10, color: '#888', cursor: 'pointer', textDecoration: 'underline', fontSize: 11 }}
+            >
+              retry now
+            </span>
+          </div>
+        )}
         {connState === 'failed' && (
           <div style={{ background: 'var(--danger-tint)', border: '1px solid var(--danger)', borderRadius: 4, padding: '8px 10px', fontSize: 12 }}>
             <div style={{ color: 'var(--danger)', marginBottom: 4 }}>WebTransport connection failed</div>
             {connError && <div style={{ color: 'var(--ink-tertiary)', fontSize: 11, marginBottom: 6, wordBreak: 'break-all' }}>{connError}</div>}
             <div style={{ color: 'var(--ink-tertiary)', fontSize: 11, marginBottom: 6 }}>UDP/QUIC may be blocked on this network. Check K.8.1 in README.</div>
             <button
-              onClick={doConnect}
-              style={{ background: 'var(--bg-tint)', border: '1px solid var(--line)', borderRadius: 3, padding: '3px 10px', color: 'var(--ink-primary)', cursor: 'pointer', fontSize: 12 }}
+              onClick={manualRetry}
+              style={{ background: '#333', border: '1px solid #555', borderRadius: 3, padding: '3px 10px', color: '#e8e8e8', cursor: 'pointer', fontSize: 12 }}
             >
               Retry
             </button>
@@ -115,6 +189,12 @@ export default function ChatPane() {
               <span>{m.text}</span>
             </div>
           ))}
+          {streaming && (
+            <div style={{ color: '#555', fontSize: 13, padding: '2px 0' }}>
+              <span>assistant: </span>
+              <span style={{ letterSpacing: 2 }}>…</span>
+            </div>
+          )}
         </div>
         {pendingPermission && (
           <PermissionBlock

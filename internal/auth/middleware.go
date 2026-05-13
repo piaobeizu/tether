@@ -108,6 +108,47 @@ func (s *State) ClientIDFromRequest(r *http.Request) string {
 	return clientID
 }
 
+// WtTicketHandler handles POST /api/v1/auth/wt-ticket.
+// Requires a valid tether_session cookie (enforced by auth middleware).
+// Issues a short-lived (60s) JWT for one WebTransport connection; the
+// ticket is passed as ?ticket= in the WT URL because Chrome's WT CONNECT
+// does not carry cookies.
+func (s *State) WtTicketHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	clientID := s.ClientIDFromRequest(r)
+	if clientID == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+		return
+	}
+	ticket, err := IssueWTTicket(s.secret, clientID)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"ticket": ticket})
+}
+
+// ClientIDFromTicket extracts client identity from a ?ticket= WT ticket.
+// Returns "" if the ticket is absent, invalid, or expired.
+// Used by WebTransport handlers where cookies are unavailable.
+func (s *State) ClientIDFromTicket(r *http.Request) string {
+	ticket := r.URL.Query().Get("ticket")
+	if ticket == "" {
+		return ""
+	}
+	clientID, ok := VerifyWTTicket(s.secret, ticket)
+	if !ok {
+		return ""
+	}
+	return clientID
+}
+
 func (s *State) isExempt(r *http.Request) bool {
 	p := r.URL.Path
 	switch {
@@ -120,6 +161,7 @@ func (s *State) isExempt(r *http.Request) bool {
 		p == "/cert-hash-spki",
 		p == "/mcp",
 		strings.HasPrefix(p, "/mcp/"),
+		strings.HasPrefix(p, "/wt/"),
 		p == "/oauth/authorize",
 		p == "/oauth/token",
 		p == "/.well-known/oauth-authorization-server",

@@ -150,9 +150,15 @@ export async function connectEventsOnly(
 // fetchWtTicket fetches a short-lived WT auth ticket from the daemon.
 // The browser has the session cookie; the Ticket bridges it to the WT
 // CONNECT request which Chrome does not attach cookies to.
+// Returns null on network error; redirects to /auth on 401/403.
 async function fetchWtTicket(): Promise<string | null> {
   try {
     const resp = await fetch('/api/v1/auth/wt-ticket', { method: 'POST' })
+    if (resp.status === 401 || resp.status === 403) {
+      // Session cookie missing or expired — send user to the login page.
+      window.location.href = '/auth'
+      return null
+    }
     if (!resp.ok) return null
     const body = await resp.json() as { ticket?: string }
     return typeof body.ticket === 'string' ? body.ticket : null

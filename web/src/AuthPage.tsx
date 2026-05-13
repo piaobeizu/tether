@@ -17,7 +17,7 @@ export default function AuthPage() {
       const res = await fetch('/api/v1/auth/verify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token, clientId }),
+        body: JSON.stringify({ token: token.trim(), clientId }),
       })
       if (res.ok) {
         const params = new URLSearchParams(window.location.search)

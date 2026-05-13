@@ -17,16 +17,23 @@ import (
 // that session. Supports multi-attach (D-08): multiple clients see same events.
 func handleWTEvents(reg *session.Registry, wts *webtransport.Server, authState *auth.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		clientID := authState.ClientIDFromTicket(r)
+		if clientID == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+			return
+		}
 		wtsess, err := wts.Upgrade(w, r)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		go serveEvents(r, wtsess, reg, authState)
+		go serveEvents(r, wtsess, reg, clientID)
 	}
 }
 
-func serveEvents(r *http.Request, wtsess *webtransport.Session, reg *session.Registry, authState *auth.State) {
+func serveEvents(r *http.Request, wtsess *webtransport.Session, reg *session.Registry, clientID string) {
 	defer wtsess.CloseWithError(0, "")
 
 	ccSID := r.URL.Query().Get("sid")
@@ -34,10 +41,8 @@ func serveEvents(r *http.Request, wtsess *webtransport.Session, reg *session.Reg
 		return
 	}
 
-	// Derive client identity from verified JWT cookie (not the forgeable ?clientId= param).
-	clientID := authState.ClientIDFromRequest(r)
 	// Owner must use /wt/chat, not /wt/events — silently close.
-	if clientID != "" && reg.IsOwner(ccSID, clientID) {
+	if reg.IsOwner(ccSID, clientID) {
 		return
 	}
 

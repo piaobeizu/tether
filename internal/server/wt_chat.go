@@ -15,12 +15,22 @@ import (
 	"github.com/piaobeizu/tether/internal/wire"
 )
 
+
 // handleWTChat handles /wt/chat WebTransport upgrade.
 // Each connection spawns (or attaches to) a cc stream-json session.
 // Bidi stream: browser → daemon = user prompt JSON lines,
 //              daemon → browser = wire.Envelope JSON lines.
 func handleWTChat(reg *session.Registry, wts *webtransport.Server, authState *auth.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Validate WT ticket before upgrading — Chrome WT CONNECT does not
+		// carry cookies, so auth passes a short-lived ?ticket= instead.
+		clientID := authState.ClientIDFromTicket(r)
+		if clientID == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+			return
+		}
 		slog.Info("WT chat upgrade attempt", "origin", r.Header.Get("Origin"), "remote", r.RemoteAddr)
 		wtsess, err := wts.Upgrade(w, r)
 		if err != nil {
@@ -29,17 +39,15 @@ func handleWTChat(reg *session.Registry, wts *webtransport.Server, authState *au
 			return
 		}
 		slog.Info("WT chat upgrade OK")
-		go serveChat(r, wtsess, reg, authState)
+		go serveChat(r, wtsess, reg, clientID)
 	}
 }
 
-func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Registry, authState *auth.State) {
+func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Registry, clientID string) {
 	defer wtsess.CloseWithError(0, "")
 	ctx := wtsess.Context()
 
 	ccSID := r.URL.Query().Get("sid")
-	// Derive client identity from verified JWT cookie (not the forgeable ?clientId= param).
-	clientID := authState.ClientIDFromRequest(r)
 	providerName := r.URL.Query().Get("provider")
 
 	// If resuming an existing session, verify ownership before spawning.

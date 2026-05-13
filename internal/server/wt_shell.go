@@ -14,6 +14,7 @@ import (
 	"github.com/creack/pty"
 	"github.com/quic-go/webtransport-go"
 
+	"github.com/piaobeizu/tether/internal/auth"
 	"github.com/piaobeizu/tether/internal/session"
 	"github.com/piaobeizu/tether/internal/wire"
 )
@@ -21,8 +22,14 @@ import (
 // handleWTShell handles /wt/shell WebTransport upgrades (s6 / D-05a §2 fact 4).
 // The connection carries raw PTY bytes — no JSON framing, no envelope wrapping.
 // xterm.js on the browser side consumes the raw stream directly.
-func handleWTShell(reg *session.Registry, wts *webtransport.Server) http.HandlerFunc {
+func handleWTShell(reg *session.Registry, wts *webtransport.Server, authState *auth.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if authState.ClientIDFromTicket(r) == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+			return
+		}
 		ccSID := r.URL.Query().Get("sid")
 
 		wtSess, err := wts.Upgrade(w, r)

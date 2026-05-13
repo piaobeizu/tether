@@ -14,19 +14,27 @@ export interface PermissionRequest {
   input: unknown
 }
 
+export type ConnState = 'connecting' | 'live' | 'reconnecting' | 'dropped'
+
+export interface Connection {
+  state: ConnState
+  latency: number
+  attempt: number
+}
+
 interface AppState {
   sessionId: string | null
   messages: Message[]
   pendingPermission: PermissionRequest | null
   connected: boolean
-  /** True while the daemon is mid-turn (text arrived but result not yet received).
-   *  Drives the "…" typing indicator in the chat pane. */
   streaming: boolean
+  connection: Connection
 
   setSessionId: (id: string) => void
   addMessage: (msg: Message) => void
   setPendingPermission: (req: PermissionRequest | null) => void
   setConnected: (v: boolean) => void
+  setConnection: (patch: Partial<Connection>) => void
   handleEnvelope: (env: Envelope) => void
 }
 
@@ -36,11 +44,15 @@ export const useStore = create<AppState>((set) => ({
   pendingPermission: null,
   connected: false,
   streaming: false,
+  connection: { state: 'connecting', latency: 0, attempt: 0 },
 
   setSessionId: (id) => set({ sessionId: id }),
   addMessage: (msg) => set((s) => ({ messages: [...s.messages, msg] })),
   setPendingPermission: (req) => set({ pendingPermission: req }),
-  setConnected: (v) => v ? set({ connected: true }) : set({ connected: false, streaming: false }),
+  setConnected: (v) => v
+    ? set({ connected: true, connection: { state: 'live', latency: 0, attempt: 0 } })
+    : set({ connected: false, streaming: false, connection: { state: 'dropped', latency: 0, attempt: 0 } }),
+  setConnection: (patch) => set((s) => ({ connection: { ...s.connection, ...patch } })),
 
   handleEnvelope: (env) => {
     switch (env.kind) {
@@ -53,12 +65,9 @@ export const useStore = create<AppState>((set) => ({
             break
           }
           if (pObj['type'] === 'tool_use') {
-            // Claude is executing a tool — no chat bubble, but keep the
-            // streaming indicator on so the user sees activity.
             set({ streaming: true })
             break
           }
-          // Unknown structured payload (future kinds) — ignore.
           break
         }
         if (typeof p !== 'string') break
@@ -74,7 +83,6 @@ export const useStore = create<AppState>((set) => ({
         break
       }
       case 'result':
-        // Turn complete — clear the streaming indicator.
         set({ streaming: false })
         break
       case 'permission':

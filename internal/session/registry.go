@@ -18,7 +18,8 @@ type Registry struct {
 	sessions     map[string]*entry // keyed by cc SessionID
 	locks        map[string]*SessionLock
 	providers    map[string]agent.AgentProvider
-	PermEndpoint string // injected into cc subprocess env if non-empty
+	PermEndpoint string        // injected into cc subprocess env if non-empty
+	History      *HistoryStore // nil = history disabled
 }
 
 type entry struct {
@@ -109,6 +110,13 @@ func (r *Registry) GetOrSpawn(ctx context.Context, ccSID, providerName string) (
 	}()
 
 	return sess, nil
+}
+
+// RecordUserMessage persists a user-sent message to session history.
+func (r *Registry) RecordUserMessage(ccSID, text string) {
+	if r.History != nil && ccSID != "" {
+		r.History.RecordUser(ccSID, text)
+	}
 }
 
 // BroadcastAll sends env to every subscriber across all sessions.
@@ -206,9 +214,27 @@ func truncStr(s string, n int) string {
 }
 
 // fanOut translates agent.Events into wire.Envelopes and broadcasts to all subscribers.
+// It also writes messages to HistoryStore when available.
 func (r *Registry) fanOut(e *entry) {
+	// Resolve session ID for history (available after SessionID() unblocks).
+	var sid string
+	go func() {
+		sid = e.sess.SessionID()
+	}()
+
 	for ev := range e.sess.Events() {
 		slog.Info("fanOut: agent event", "kind", ev.Kind, "text_preview", truncStr(ev.Text, 60))
+
+		// Persist to history.
+		if r.History != nil && sid != "" {
+			switch ev.Kind {
+			case agent.EventText:
+				r.History.AccumulateAssistant(sid, ev.Text)
+			case agent.EventResult:
+				r.History.FinalizeAssistant(sid)
+			}
+		}
+
 		env := translateEvent(ev)
 		if env == nil {
 			continue

@@ -154,6 +154,13 @@ func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *ses
 	// and issues a short-lived JWT for WebTransport connections.
 	mux.HandleFunc("/api/v1/auth/wt-ticket", authState.WtTicketHandler)
 
+	// Session history API.
+	if reg.History != nil {
+		listSessions, getMessages := sessionAPIHandlers(reg.History)
+		mux.HandleFunc("/api/v1/sessions", listSessions)
+		mux.HandleFunc("/api/v1/sessions/", getMessages)
+	}
+
 	mux.Handle("/", newStaticHandler(cfg.DevFrontendURL))
 
 	// Wrap all routes: origin guard first, then auth middleware outermost.

@@ -47,6 +47,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   const [sessionStart, setSessionStart] = useState<number | null>(null)
   const [_elapsed, setElapsed] = useState('')
   const [slashOpen, setSlashOpen] = useState(false)
+  const [isComposing, setIsComposing] = useState(false)
   const writerRef = useRef<WritableStreamDefaultWriter<Uint8Array> | null>(null)
   const wtRef = useRef<TetherWT | null>(null)
   const attemptRef = useRef(0)
@@ -75,6 +76,24 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
     window.addEventListener('tether:provider-changed', onProviderChange)
     return () => window.removeEventListener('tether:provider-changed', onProviderChange)
   }, [])
+
+  // Load chat history when session ID is first established.
+  useEffect(() => {
+    if (!sessionId) return
+    fetch(`/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`)
+      .then(r => r.ok ? r.json() : [])
+      .then((msgs: Array<{ role: string; text: string; ts: number }>) => {
+        if (msgs.length > 0) {
+          useStore.getState().loadHistory(msgs.map(m => ({
+            id: crypto.randomUUID(),
+            role: m.role as 'user' | 'assistant',
+            text: m.text,
+            ts: m.ts,
+          })))
+        }
+      })
+      .catch(() => {})
+  }, [sessionId])
 
   useEffect(() => {
     if (sessionId) setSessionStart(Date.now())
@@ -134,7 +153,9 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
     writerRef.current = null
     old?.close()
 
-    const url = `https://${location.host}/wt/chat?provider=${encodeURIComponent(selectedProvider)}`
+    // Resume last session if available — keeps history consistent across refreshes.
+    const lastSid = localStorage.getItem('tether_last_sid') ?? ''
+    const url = `https://${location.host}/wt/chat?provider=${encodeURIComponent(selectedProvider)}${lastSid ? `&sid=${encodeURIComponent(lastSid)}` : ''}`
     const wt = new TetherWT({
       url,
       onEnvelope: useStore.getState().handleEnvelope,
@@ -242,7 +263,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
           )
         })}
 
-        {/* Only show thinking bubble when streaming but no text has arrived yet */}
+        {/* Thinking indicator: animated dots (not a cursor) while waiting for first token */}
         {streaming && !streamingMsgId && (
           <div className="msg-ai">
             <div className="msg-ai-header">
@@ -252,7 +273,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
               <span className="msg-ai-name">tether</span>
             </div>
             <div className="msg-ai-body">
-              <span className="tether-cursor" aria-label="Claude is responding" />
+              <span className="thinking-dots" aria-label="Claude is thinking" />
             </div>
           </div>
         )}
@@ -308,8 +329,10 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
               disabled={connState !== 'connected'}
               value={input}
               onChange={e => handleInputChange(e.target.value)}
+              onCompositionStart={() => setIsComposing(true)}
+              onCompositionEnd={() => setIsComposing(false)}
               onKeyDown={e => {
-                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void sendMessage() }
+                if (e.key === 'Enter' && !e.shiftKey && !isComposing) { e.preventDefault(); void sendMessage() }
                 if (e.key === 'Escape') setSlashOpen(false)
               }}
               placeholder={

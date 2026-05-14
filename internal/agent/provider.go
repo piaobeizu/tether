@@ -20,6 +20,9 @@ type SpawnConfig struct {
 	ResumeSessionID string
 	// Env holds additional environment variables passed to the subprocess.
 	Env []string
+	// Workdir sets the working directory for the agent subprocess.
+	// Defaults to the process cwd if empty.
+	Workdir string
 }
 
 // Session is a live connection to an agent subprocess.

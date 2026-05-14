@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Icon } from '../../lib/icons'
+import { useStore } from '../../lib/store'
 
 interface Workspace {
   id: string
@@ -13,7 +14,17 @@ export default function WorkspacePane() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([])
   const [error, setError] = useState<string | null>(null)
   const [activeId, setActiveId] = useState<string | null>(null)
+  const [sessions, setSessions] = useState<string[]>([])
+  const [sessionsOpen, setSessionsOpen] = useState(false)
+  const currentSid = useStore(s => s.sessionId)
   const [filter, setFilter] = useState('')
+
+  const loadSessions = async () => {
+    try {
+      const res = await fetch('/api/v1/sessions')
+      if (res.ok) setSessions(await res.json() as string[])
+    } catch { /* ignore */ }
+  }
 
   const load = async () => {
     try {
@@ -28,7 +39,7 @@ export default function WorkspacePane() {
     }
   }
 
-  useEffect(() => { void load() }, [])
+  useEffect(() => { void load(); void loadSessions() }, [])
 
   const addWorkspace = async () => {
     const path = prompt('Workspace path:')
@@ -126,6 +137,54 @@ export default function WorkspacePane() {
           </div>
         ))}
       </div>
+
+      {/* Session history list */}
+      {sessions.length > 0 && (
+        <div style={{ borderTop: '1px solid var(--line-soft)', flexShrink: 0 }}>
+          <div
+            className="dt-left-head"
+            style={{ cursor: 'pointer', paddingTop: 8, paddingBottom: 8 }}
+            onClick={() => setSessionsOpen(o => !o)}
+          >
+            <span className="section-label">Sessions</span>
+            <span style={{ fontSize: 10, color: 'var(--ink-quat)', fontFamily: 'var(--font-mono)' }}>
+              {sessions.length}
+            </span>
+          </div>
+          {sessionsOpen && (
+            <div style={{ maxHeight: 180, overflow: 'auto' }} className="scroll-thin">
+              {[...sessions].reverse().map(sid => (
+                <div
+                  key={sid}
+                  className={`tree-row${sid === currentSid ? ' active' : ''}`}
+                  style={{ paddingLeft: 12, fontSize: 11 }}
+                  onClick={() => {
+                    fetch(`/api/v1/sessions/${encodeURIComponent(sid)}/messages`)
+                      .then(r => r.ok ? r.json() : [])
+                      .then((msgs: Array<{ role: string; text: string; ts: number }>) => {
+                        if (msgs.length > 0) {
+                          useStore.getState().loadHistory(msgs.map(m => ({
+                            id: crypto.randomUUID(),
+                            role: m.role as 'user' | 'assistant',
+                            text: m.text,
+                            ts: m.ts,
+                          })))
+                          useStore.getState().setSessionId(sid)
+                        }
+                      })
+                      .catch(() => {})
+                  }}
+                >
+                  <span className="ws-dot" style={{ background: sid === currentSid ? 'var(--success)' : undefined }} />
+                  <span className="tree-label" style={{ fontFamily: 'var(--font-mono)', fontSize: 10 }}>
+                    {sid.slice(0, 16)}…
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="dt-left-foot">
         {workspaces.length} workspace{workspaces.length !== 1 ? 's' : ''}

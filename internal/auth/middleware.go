@@ -92,6 +92,17 @@ func (s *State) VerifyHandler(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
+// LogoutHandler handles GET /api/v1/auth/logout — clears the session cookie
+// and redirects to /auth. Clearing an HttpOnly cookie requires server-side
+// Set-Cookie with Max-Age=0; JS cannot do this.
+func (s *State) LogoutHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Add("Set-Cookie", fmt.Sprintf(
+		"%s=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0",
+		CookieName,
+	))
+	http.Redirect(w, r, "/auth", http.StatusFound)
+}
+
 // ClientIDFromRequest extracts the client identity (JWT jti) from the
 // tether_session cookie. Returns "" if the cookie is absent or invalid.
 // Use this instead of trusting a ?clientId= URL param — the cookie has
@@ -154,6 +165,7 @@ func (s *State) isExempt(r *http.Request) bool {
 	switch {
 	case p == "/auth",
 		p == "/api/v1/auth/verify",
+		p == "/api/v1/auth/logout",
 		p == "/cert-hash",
 		// WebTransport CONNECT uses a new QUIC connection that may not carry
 		// SameSite=Strict cookies. Auth is checked inside the handler instead.

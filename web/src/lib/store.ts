@@ -29,6 +29,7 @@ interface AppState {
   connected: boolean
   streaming: boolean
   connection: Connection
+  streamingMsgId: string | null   // id of the in-progress assistant bubble
 
   setSessionId: (id: string) => void
   addMessage: (msg: Message) => void
@@ -44,6 +45,7 @@ export const useStore = create<AppState>((set) => ({
   pendingPermission: null,
   connected: false,
   streaming: false,
+  streamingMsgId: null,
   connection: { state: 'connecting', latency: 0, attempt: 0 },
 
   setSessionId: (id) => set({ sessionId: id }),
@@ -51,7 +53,7 @@ export const useStore = create<AppState>((set) => ({
   setPendingPermission: (req) => set({ pendingPermission: req }),
   setConnected: (v) => v
     ? set({ connected: true, connection: { state: 'live', latency: 0, attempt: 0 } })
-    : set({ connected: false, streaming: false, connection: { state: 'dropped', latency: 0, attempt: 0 } }),
+    : set({ connected: false, streaming: false, streamingMsgId: null, connection: { state: 'dropped', latency: 0, attempt: 0 } }),
   setConnection: (patch) => set((s) => ({ connection: { ...s.connection, ...patch } })),
 
   handleEnvelope: (env) => {
@@ -71,19 +73,35 @@ export const useStore = create<AppState>((set) => ({
           break
         }
         if (typeof p !== 'string') break
-        set((s) => ({
-          streaming: true,
-          messages: [...s.messages, {
-            id: crypto.randomUUID(),
-            role: 'assistant',
-            text: p,
-            ts: Date.now(),
-          }],
-        }))
+        set((s) => {
+          if (s.streamingMsgId) {
+            // Append chunk to the current streaming bubble
+            return {
+              streaming: true,
+              messages: s.messages.map(m =>
+                m.id === s.streamingMsgId
+                  ? { ...m, text: m.text + p }
+                  : m
+              ),
+            }
+          }
+          // First chunk — create new bubble
+          const id = crypto.randomUUID()
+          return {
+            streaming: true,
+            streamingMsgId: id,
+            messages: [...s.messages, {
+              id,
+              role: 'assistant',
+              text: p,
+              ts: Date.now(),
+            }],
+          }
+        })
         break
       }
       case 'result':
-        set({ streaming: false })
+        set({ streaming: false, streamingMsgId: null })
         break
       case 'permission':
         set({ pendingPermission: env.payload as PermissionRequest })

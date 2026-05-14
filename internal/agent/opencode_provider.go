@@ -125,6 +125,11 @@ func (s *opencodeSession) SendPrompt(ctx context.Context, text string) error {
 	if err := cmd.Wait(); err != nil {
 		s.emitError(fmt.Sprintf("opencode exit: %v", err))
 	}
+	// Signal turn complete so the browser clears the streaming indicator.
+	select {
+	case s.events <- Event{Kind: EventResult, Text: "stop"}:
+	default:
+	}
 	return nil
 }
 

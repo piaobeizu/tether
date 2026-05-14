@@ -38,14 +38,14 @@ interface Props {
   onMenuClick?: () => void
 }
 
-export default function ChatPane({ onMenuClick }: Props) {
-  const { messages, sessionId, pendingPermission, streaming } = useStore()
+export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
+  const { messages, sessionId, pendingPermission, streaming, streamingMsgId } = useStore()
   const [input, setInput] = useState('')
   const [connState, setConnState] = useState<ConnState>('connecting')
   const [connError, setConnError] = useState<string | null>(null)
   const [reconnectIn, setReconnectIn] = useState(0)
   const [sessionStart, setSessionStart] = useState<number | null>(null)
-  const [elapsed, setElapsed] = useState('')
+  const [_elapsed, setElapsed] = useState('')
   const [slashOpen, setSlashOpen] = useState(false)
   const writerRef = useRef<WritableStreamDefaultWriter<Uint8Array> | null>(null)
   const wtRef = useRef<TetherWT | null>(null)
@@ -55,13 +55,25 @@ export default function ChatPane({ onMenuClick }: Props) {
   const unmountedRef = useRef(false)
   const chatRef = useRef<HTMLDivElement>(null)
   const [providers, setProviders] = useState<string[]>(['claude-code'])
-  const [selectedProvider, setSelectedProvider] = useState('claude-code')
+  const [selectedProvider, setSelectedProvider] = useState(
+    () => localStorage.getItem('tether_default_provider') ?? 'claude-code'
+  )
 
   useEffect(() => {
     authedFetch('/api/v1/providers')
       .then(r => r.json() as Promise<ProviderListResponse>)
       .then(d => { if (d.providers?.length > 0) setProviders(d.providers) })
       .catch(() => {})
+  }, [])
+
+  // Sync default provider when changed from Settings panel (same-window custom event)
+  useEffect(() => {
+    const onProviderChange = (e: Event) => {
+      const p = (e as CustomEvent<string>).detail
+      if (p) setSelectedProvider(p)
+    }
+    window.addEventListener('tether:provider-changed', onProviderChange)
+    return () => window.removeEventListener('tether:provider-changed', onProviderChange)
   }, [])
 
   useEffect(() => {
@@ -76,9 +88,17 @@ export default function ChatPane({ onMenuClick }: Props) {
     return () => clearInterval(id)
   }, [sessionStart])
 
+  // Scroll to bottom on new messages AND when streaming text accumulates
+  const lastMsgText = messages.length > 0 ? messages[messages.length - 1].text : ''
   useEffect(() => {
-    if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight
-  }, [messages.length, streaming])
+    const el = chatRef.current
+    if (!el) return
+    // Always scroll during streaming; otherwise only if already near bottom
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120
+    if (streaming || nearBottom) {
+      el.scrollTop = el.scrollHeight
+    }
+  }, [messages.length, lastMsgText, streaming])
 
   const cancelPendingReconnect = () => {
     if (reconnectTimerRef.current !== null) { clearTimeout(reconnectTimerRef.current); reconnectTimerRef.current = null }
@@ -171,26 +191,6 @@ export default function ChatPane({ onMenuClick }: Props) {
 
   return (
     <>
-      {/* ── Right-pane header ─────────────────────────────── */}
-      <div className="dt-right-head">
-        {onMenuClick && (
-          <button className="icon-btn m-only" onClick={onMenuClick}>
-            <Icon name="menu" size={16} />
-          </button>
-        )}
-        <span className="section-label">CHAT</span>
-        <span style={{ flex: 1 }} />
-        {elapsed && <span className="pill">session · {elapsed}</span>}
-        <span style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-          <span className={`dot${connState === 'connected' ? ' live' : ''}`} />
-          <span style={{ fontSize: 10, color: 'var(--ink-tertiary)', fontFamily: 'var(--font-mono)' }}>
-            {connState === 'connected' ? 'live' :
-             connState === 'connecting' ? 'connecting…' :
-             connState === 'reconnecting' ? `reconnecting` : 'dropped'}
-          </span>
-        </span>
-      </div>
-
       {/* ── Message list ──────────────────────────────────── */}
       <div className="dt-chat scroll-thin" ref={chatRef}>
 
@@ -232,12 +232,18 @@ export default function ChatPane({ onMenuClick }: Props) {
                 <span className="msg-ai-name">tether</span>
                 <span className="msg-ai-time">{fmtTime(m.ts)}</span>
               </div>
-              <div className="msg-ai-body">{m.text}</div>
+              <div className="msg-ai-body">
+                {m.text}
+                {streaming && m.id === streamingMsgId && (
+                  <span className="tether-cursor" aria-label="Claude is responding" />
+                )}
+              </div>
             </div>
           )
         })}
 
-        {streaming && (
+        {/* Only show thinking bubble when streaming but no text has arrived yet */}
+        {streaming && !streamingMsgId && (
           <div className="msg-ai">
             <div className="msg-ai-header">
               <span className="msg-ai-avatar">
@@ -299,7 +305,7 @@ export default function ChatPane({ onMenuClick }: Props) {
             <span className="composer-prefix">/</span>
             <input
               className="composer-input"
-              disabled={connState !== 'connected' || streaming}
+              disabled={connState !== 'connected'}
               value={input}
               onChange={e => handleInputChange(e.target.value)}
               onKeyDown={e => {
@@ -314,7 +320,7 @@ export default function ChatPane({ onMenuClick }: Props) {
             />
             <button
               className="send-btn"
-              disabled={connState !== 'connected' || streaming}
+              disabled={connState !== 'connected'}
               onClick={() => void sendMessage()}
             >
               <Icon name="arrow-up" size={13} />

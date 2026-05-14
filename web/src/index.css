@@ -83,8 +83,23 @@
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-html, body, #root {
+html {
   height: 100%;
+}
+
+body {
+  height: 100%;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+#root {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
   background: var(--bg-app);
   color: var(--ink-primary);
   font-family: var(--font-sans);
@@ -161,10 +176,14 @@ html, body, #root {
 
 /* ── Root layout ────────────────────────────────────────────── */
 .dt-root {
-  width: 100%; height: 100%;
+  /* flex: 1 on #root doesn't give children a definite height for height:100%.
+     Use flex instead: #root is a flex column, dt-root grows to fill it. */
+  flex: 1 1 0;
+  min-height: 0;
+  width: 100%;
   background: var(--bg-app); overflow: hidden;
   display: grid;
-  grid-template-rows: 38px auto 1fr 22px;
+  grid-template-rows: 38px auto minmax(0, 1fr) 22px;
 }
 
 /* ── Titlebar ───────────────────────────────────────────────── */
@@ -197,16 +216,31 @@ html, body, #root {
 }
 @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .3 } }
 
-/* ── Main three-column grid ─────────────────────────────────── */
+/* ── Main columns (flex, widths driven by JS state) ─────────── */
 .dt-grid {
-  display: grid;
-  grid-template-columns: 240px 1fr 380px;
+  display: flex;
   min-height: 0; overflow: hidden;
 }
 
+/* Drag handle between columns */
+.col-resizer {
+  width: 1px; flex-shrink: 0;
+  background: var(--line);
+  cursor: col-resize;
+  position: relative;
+  transition: background .15s;
+}
+.col-resizer::after {
+  content: '';
+  position: absolute;
+  top: 0; bottom: 0; left: -4px; right: -4px;
+}
+.col-resizer:hover { background: var(--accent); }
+
 /* ── Left pane ──────────────────────────────────────────────── */
 .dt-left {
-  background: var(--bg-sunken); border-right: 1px solid var(--line);
+  background: var(--bg-sunken);
+  flex-shrink: 0;
   display: grid; grid-template-rows: auto auto 1fr auto;
   min-height: 0; overflow: hidden;
 }
@@ -247,6 +281,7 @@ html, body, #root {
 /* ── Middle pane ────────────────────────────────────────────── */
 .dt-mid {
   background: var(--bg-app);
+  flex: 1; min-width: 0;
   display: grid; grid-template-rows: auto 1fr;
   min-height: 0; overflow: hidden;
 }
@@ -261,17 +296,40 @@ html, body, #root {
 .dt-mid-actions { display: flex; gap: 6px; }
 .dt-mid-body { padding: 16px; overflow: auto; min-height: 0; }
 
-/* ── Right pane ─────────────────────────────────────────────── */
+/* ── Right pane (tabbed: Chat / Skills / Shell) ─────────────── */
 .dt-right {
-  background: var(--bg-surface); border-left: 1px solid var(--line);
-  display: grid; grid-template-rows: auto 1fr auto;
+  background: var(--bg-surface);
+  flex-shrink: 0;
+  display: grid; grid-template-rows: auto 1fr;
   min-height: 0; overflow: hidden;
 }
+.dt-right-tabs {
+  display: flex; align-items: center;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--bg-sunken);
+  flex-shrink: 0; gap: 2px;
+}
+.dt-right-tab {
+  padding: 8px 14px; font-size: 12px; font-weight: 500;
+  background: transparent; border: 0;
+  color: var(--ink-tertiary); cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+.dt-right-tab:hover { color: var(--ink-primary); }
+.dt-right-tab.on { color: var(--ink-primary); border-bottom-color: var(--accent); }
+.dt-right-body {
+  display: flex; flex-direction: column;
+  min-height: 0; overflow: hidden;
+}
+/* Legacy: dt-right-head still used by ChatPane for its inner header */
 .dt-right-head {
   display: flex; align-items: center; gap: 8px;
-  padding: 10px 14px; border-bottom: 1px solid var(--line-soft); flex-shrink: 0;
+  padding: 8px 14px; border-bottom: 1px solid var(--line-soft); flex-shrink: 0;
 }
 .dt-chat {
+  flex: 1 1 0;
   padding: 18px 16px 12px; overflow: auto;
   display: flex; flex-direction: column; gap: 20px; min-height: 0;
 }
@@ -297,6 +355,7 @@ html, body, #root {
 
 /* ── Composer ───────────────────────────────────────────────── */
 .dt-composer {
+  flex-shrink: 0;
   padding: 10px 14px 14px; border-top: 1px solid var(--line-soft);
   background: var(--bg-surface); position: relative;
 }
@@ -356,6 +415,7 @@ html, body, #root {
 /* ── Statusbar ──────────────────────────────────────────────── */
 .dt-statusbar {
   display: flex; align-items: center;
+  height: 22px; min-height: 22px; max-height: 22px; overflow: hidden;
   background: var(--ink-primary); color: var(--bg-sunken);
   font-family: var(--font-mono); font-size: 10.5px; padding: 0 10px;
 }
@@ -386,13 +446,93 @@ html, body, #root {
 
 .m-only { display: none !important; }
 
-/* ── Responsive: ≤768px ─────────────────────────────────────── */
+/* ── Responsive: ≤768px — only right pane ───────────────────── */
 @media (max-width: 768px) {
-  .dt-grid { grid-template-columns: 1fr; }
-  .dt-left, .dt-mid { display: none; }
-  .dt-right { border-left: none; }
+  .dt-left, .dt-mid, .col-resizer { display: none; }
+  .dt-right { width: 100% !important; }
   .m-only { display: flex !important; }
 }
 
 /* ── Legacy: pane-body used by skill/shell content ──────────── */
 .pane-body { flex: 1; overflow: auto; padding: 12px; }
+
+/* ── Settings panel ─────────────────────────────────────────── */
+.settings-overlay {
+  position: fixed; inset: 0; z-index: 200;
+  background: rgba(0,0,0,.25);
+  animation: fade .15s;
+}
+.settings-panel {
+  position: absolute; top: 0; right: 0; bottom: 0;
+  width: 340px;
+  background: var(--bg-surface);
+  border-left: 1px solid var(--line);
+  display: flex; flex-direction: column;
+  box-shadow: var(--sh-3);
+  animation: slide-right-in .18s ease-out;
+}
+@keyframes slide-right-in { from { transform: translateX(100%) } to { transform: translateX(0) } }
+
+.settings-header {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line-soft);
+  flex-shrink: 0;
+}
+.settings-tabs {
+  display: flex; gap: 0;
+  border-bottom: 1px solid var(--line-soft);
+  flex-shrink: 0;
+  padding: 0 8px;
+}
+.settings-tab {
+  padding: 8px 14px; font-size: 12px; font-weight: 500;
+  background: transparent; border: 0;
+  color: var(--ink-tertiary); cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+.settings-tab:hover { color: var(--ink-primary); }
+.settings-tab.on { color: var(--ink-primary); border-bottom-color: var(--accent); }
+.settings-body {
+  flex: 1; overflow: auto;
+  padding: 16px;
+}
+
+/* Settings rows */
+.set-section {
+  font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase;
+  font-family: var(--font-mono);
+  color: var(--ink-tertiary);
+  margin-bottom: 8px;
+}
+.set-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line-hairline);
+  gap: 12px;
+}
+.set-label { font-size: 13px; color: var(--ink-secondary); flex-shrink: 0; }
+.set-value { font-size: 12px; color: var(--ink-primary); text-align: right; }
+.set-value.mono { font-family: var(--font-mono); }
+.set-value.success { color: var(--success); }
+.set-value.warn { color: var(--warn); }
+.set-hint { font-size: 11px; color: var(--ink-quat); margin-top: 6px; }
+
+/* Toggle switch */
+.set-toggle {
+  width: 36px; height: 20px; border-radius: 999px;
+  background: var(--line); border: 0;
+  cursor: pointer; position: relative;
+  flex-shrink: 0;
+  transition: background .15s;
+}
+.set-toggle.on { background: var(--accent); }
+.set-toggle-knob {
+  position: absolute; top: 2px; left: 2px;
+  width: 16px; height: 16px; border-radius: 999px;
+  background: white;
+  transition: transform .15s;
+  display: block;
+}
+.set-toggle.on .set-toggle-knob { transform: translateX(16px); }

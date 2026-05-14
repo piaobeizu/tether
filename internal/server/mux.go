@@ -149,6 +149,7 @@ func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *ses
 	// /api/v1/auth/verify IS wrapped by authState.Middleware below; the
 	// middleware lets it through via isExempt() — not by bypassing the wrapper.
 	mux.HandleFunc("/api/v1/auth/verify", authState.VerifyHandler)
+	mux.HandleFunc("/api/v1/auth/logout", authState.LogoutHandler)
 	// /api/v1/auth/wt-ticket requires a valid session cookie (middleware enforces)
 	// and issues a short-lived JWT for WebTransport connections.
 	mux.HandleFunc("/api/v1/auth/wt-ticket", authState.WtTicketHandler)

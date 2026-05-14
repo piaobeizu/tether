@@ -47,19 +47,19 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 	defer wtsess.CloseWithError(0, "")
 	ctx := wtsess.Context()
 
-	ccSID := r.URL.Query().Get("sid")
+	sid := r.URL.Query().Get("sid")
 	providerName := r.URL.Query().Get("provider")
 
 	// If resuming an existing session, verify ownership before spawning.
-	// Only reject if the session EXISTS and is owned by a different client.
-	// If the session doesn't exist (e.g. server restart), silently ignore the
-	// stale sid and fall through to spawn a fresh session below.
-	if ccSID != "" && clientID != "" && reg.IsLive(ccSID) && !reg.IsOwner(ccSID, clientID) {
+	// Only reject if the session EXISTS and is owned by a different client
+	// (#83). If the session doesn't exist (e.g. server restart), silently
+	// ignore the stale sid and fall through to spawn a fresh session below.
+	if sid != "" && clientID != "" && reg.IsLive(sid) && !reg.IsOwner(sid, clientID) {
 		sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindError, Payload: "session owned by another client; use /wt/events to attach read-only"})
 		return
 	}
 
-	entry, err := reg.GetOrSpawnEntry(ctx, ccSID, providerName)
+	entry, err := reg.GetOrSpawnEntry(ctx, sid, providerName)
 	if err != nil {
 		sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindError, Payload: err.Error()})
 		return

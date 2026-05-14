@@ -30,7 +30,7 @@ func handleWTShell(reg *session.Registry, wts *webtransport.Server, authState *a
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
 			return
 		}
-		ccSID := r.URL.Query().Get("sid")
+		sid := r.URL.Query().Get("sid")
 
 		wtSess, err := wts.Upgrade(w, r)
 		if err != nil {
@@ -47,7 +47,7 @@ func handleWTShell(reg *session.Registry, wts *webtransport.Server, authState *a
 		}
 
 		clientID := newShellID()
-		lock := reg.GetLock(ccSID)
+		lock := reg.GetLock(sid)
 		acquired, preempted := lock.Acquire(clientID)
 		if !acquired {
 			holder := lock.Holder()
@@ -58,7 +58,7 @@ func handleWTShell(reg *session.Registry, wts *webtransport.Server, authState *a
 				Payload: map[string]any{
 					"code":      "lock_held",
 					"holder":    holder,
-					"sessionId": ccSID,
+					"sessionId": sid,
 				},
 			})
 			_ = stream.Close()
@@ -71,8 +71,8 @@ func handleWTShell(reg *session.Registry, wts *webtransport.Server, authState *a
 		// concurrent chat subprocess (D-05a §2 fact 3).
 		ccPath := resolveClaudePath()
 		var args []string
-		if ccSID != "" {
-			args = append(args, "--resume", ccSID)
+		if sid != "" {
+			args = append(args, "--resume", sid)
 		}
 		cmd := exec.CommandContext(ctx, ccPath, args...)
 		cmd.Env = buildPTYEnv(reg.PermEndpoint)
@@ -131,7 +131,7 @@ func handleLockForce(reg *session.Registry) http.HandlerFunc {
 			http.NotFound(w, r)
 			return
 		}
-		ccSID := parts[0]
+		sid := parts[0]
 
 		var body struct {
 			ClientID string `json:"clientId"`
@@ -142,12 +142,12 @@ func handleLockForce(reg *session.Registry) http.HandlerFunc {
 			clientID = newShellID()
 		}
 
-		lock := reg.GetLock(ccSID)
+		lock := reg.GetLock(sid)
 		lock.ForceAcquire(clientID)
 
 		reg.BroadcastAll(wire.Envelope{
 			Kind:      wire.KindMessage,
-			SessionID: wire.SessionID(ccSID),
+			SessionID: wire.SessionID(sid),
 			Payload: map[string]any{
 				"type":     "lock_taken",
 				"clientId": clientID,

@@ -64,20 +64,20 @@ func NewRegistry(providers ...agent.AgentProvider) *Registry {
 	}
 }
 
-// GetLock returns (or lazily creates) the SessionLock for the given ccSID.
-func (r *Registry) GetLock(ccSID string) *SessionLock {
+// GetLock returns (or lazily creates) the SessionLock for the given sid.
+func (r *Registry) GetLock(sid string) *SessionLock {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if l, ok := r.locks[ccSID]; ok {
+	if l, ok := r.locks[sid]; ok {
 		return l
 	}
 	l := &SessionLock{}
-	r.locks[ccSID] = l
+	r.locks[sid] = l
 	return l
 }
 
-// GetOrSpawnEntry returns the *Entry for the given ccSID, or spawns a new
-// agent process and registers a fresh Entry. If ccSID is empty, a new
+// GetOrSpawnEntry returns the *Entry for the given sid, or spawns a new
+// agent process and registers a fresh Entry. If sid is empty, a new
 // process is spawned and re-keyed once its system/init provides the real
 // SessionID. providerName selects the AgentProvider; defaults to
 // "claude-code" if empty.
@@ -87,10 +87,10 @@ func (r *Registry) GetLock(ccSID string) *SessionLock {
 // session ID is only published AFTER cc consumes a prompt, and any text
 // events produced in between would otherwise be fanned out to zero
 // subscribers.
-func (r *Registry) GetOrSpawnEntry(ctx context.Context, ccSID, providerName string) (*Entry, error) {
-	if ccSID != "" {
+func (r *Registry) GetOrSpawnEntry(ctx context.Context, sid, providerName string) (*Entry, error) {
+	if sid != "" {
 		r.mu.RLock()
-		e, ok := r.sessions[ccSID]
+		e, ok := r.sessions[sid]
 		r.mu.RUnlock()
 		if ok {
 			return e, nil
@@ -109,7 +109,7 @@ func (r *Registry) GetOrSpawnEntry(ctx context.Context, ccSID, providerName stri
 	if r.PermEndpoint != "" {
 		extraEnv = append(extraEnv, "TETHER_DAEMON_PERM_ENDPOINT="+r.PermEndpoint)
 	}
-	sess, err := provider.Spawn(ctx, agent.SpawnConfig{ResumeSessionID: ccSID, Env: extraEnv})
+	sess, err := provider.Spawn(ctx, agent.SpawnConfig{ResumeSessionID: sid, Env: extraEnv})
 	if err != nil {
 		return nil, fmt.Errorf("spawn: %w", err)
 	}
@@ -147,8 +147,8 @@ func (r *Registry) GetOrSpawnEntry(ctx context.Context, ccSID, providerName stri
 // GetOrSpawn is a thin wrapper that hides the Entry behind the Session;
 // retained for /wt/events and any callers that don't need pre-init
 // subscription.
-func (r *Registry) GetOrSpawn(ctx context.Context, ccSID, providerName string) (agent.Session, error) {
-	e, err := r.GetOrSpawnEntry(ctx, ccSID, providerName)
+func (r *Registry) GetOrSpawn(ctx context.Context, sid, providerName string) (agent.Session, error) {
+	e, err := r.GetOrSpawnEntry(ctx, sid, providerName)
 	if err != nil {
 		return nil, err
 	}
@@ -156,9 +156,9 @@ func (r *Registry) GetOrSpawn(ctx context.Context, ccSID, providerName string) (
 }
 
 // RecordUserMessage persists a user-sent message to session history.
-func (r *Registry) RecordUserMessage(ccSID, text string) {
-	if r.History != nil && ccSID != "" {
-		r.History.RecordUser(ccSID, text)
+func (r *Registry) RecordUserMessage(sid, text string) {
+	if r.History != nil && sid != "" {
+		r.History.RecordUser(sid, text)
 	}
 }
 
@@ -184,9 +184,9 @@ func (r *Registry) BroadcastAll(env wire.Envelope) {
 
 // Subscribe registers a channel to receive broadcast envelopes for a session.
 // Call Unsubscribe when done.
-func (r *Registry) Subscribe(ccSID string, ch chan wire.Envelope) {
+func (r *Registry) Subscribe(sid string, ch chan wire.Envelope) {
 	r.mu.RLock()
-	e, ok := r.sessions[ccSID]
+	e, ok := r.sessions[sid]
 	r.mu.RUnlock()
 	if !ok {
 		return
@@ -197,9 +197,9 @@ func (r *Registry) Subscribe(ccSID string, ch chan wire.Envelope) {
 }
 
 // Unsubscribe removes the channel from broadcast.
-func (r *Registry) Unsubscribe(ccSID string, ch chan wire.Envelope) {
+func (r *Registry) Unsubscribe(sid string, ch chan wire.Envelope) {
 	r.mu.RLock()
-	e, ok := r.sessions[ccSID]
+	e, ok := r.sessions[sid]
 	r.mu.RUnlock()
 	if !ok {
 		return
@@ -210,9 +210,9 @@ func (r *Registry) Unsubscribe(ccSID string, ch chan wire.Envelope) {
 }
 
 // SetOwner records ownerClientID using compare-and-set. Returns true if this call set the owner.
-func (r *Registry) SetOwner(ccSID, clientID string) bool {
+func (r *Registry) SetOwner(sid, clientID string) bool {
 	r.mu.RLock()
-	e, ok := r.sessions[ccSID]
+	e, ok := r.sessions[sid]
 	r.mu.RUnlock()
 	if !ok {
 		return false
@@ -227,17 +227,17 @@ func (r *Registry) SetOwner(ccSID, clientID string) bool {
 }
 
 // IsLive returns true if the session exists and is actively tracked.
-func (r *Registry) IsLive(ccSID string) bool {
+func (r *Registry) IsLive(sid string) bool {
 	r.mu.RLock()
-	_, ok := r.sessions[ccSID]
+	_, ok := r.sessions[sid]
 	r.mu.RUnlock()
 	return ok
 }
 
-// IsOwner returns true if clientID is the recorded owner of ccSID.
-func (r *Registry) IsOwner(ccSID, clientID string) bool {
+// IsOwner returns true if clientID is the recorded owner of sid.
+func (r *Registry) IsOwner(sid, clientID string) bool {
 	r.mu.RLock()
-	e, ok := r.sessions[ccSID]
+	e, ok := r.sessions[sid]
 	r.mu.RUnlock()
 	if !ok {
 		return false

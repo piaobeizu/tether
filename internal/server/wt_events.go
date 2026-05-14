@@ -36,19 +36,19 @@ func handleWTEvents(reg *session.Registry, wts *webtransport.Server, authState *
 func serveEvents(r *http.Request, wtsess *webtransport.Session, reg *session.Registry, clientID string) {
 	defer wtsess.CloseWithError(0, "")
 
-	ccSID := r.URL.Query().Get("sid")
-	if ccSID == "" {
+	sid := r.URL.Query().Get("sid")
+	if sid == "" {
 		return
 	}
 
 	// Owner must use /wt/chat, not /wt/events — silently close.
-	if reg.IsOwner(ccSID, clientID) {
+	if reg.IsOwner(sid, clientID) {
 		return
 	}
 
 	subCh := make(chan wire.Envelope, 64)
-	reg.Subscribe(ccSID, subCh)
-	defer reg.Unsubscribe(ccSID, subCh)
+	reg.Subscribe(sid, subCh)
+	defer reg.Unsubscribe(sid, subCh)
 
 	for {
 		select {
@@ -58,7 +58,7 @@ func serveEvents(r *http.Request, wtsess *webtransport.Session, reg *session.Reg
 			if !ok {
 				return
 			}
-			env.SessionID = ccSID
+			env.SessionID = sid
 			stream, err := wtsess.OpenUniStreamSync(wtsess.Context())
 			if err != nil {
 				return // client disconnected

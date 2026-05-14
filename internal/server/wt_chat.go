@@ -59,11 +59,21 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 		return
 	}
 
-	agentSess, err := reg.GetOrSpawn(ctx, ccSID, providerName)
+	entry, err := reg.GetOrSpawnEntry(ctx, ccSID, providerName)
 	if err != nil {
 		sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindError, Payload: err.Error()})
 		return
 	}
+	agentSess := entry.Session()
+
+	// Subscribe by entry pointer BEFORE sending the first prompt. The sid is
+	// only published AFTER cc consumes a prompt, so a sid-keyed Subscribe
+	// after the prompt-reader goroutine starts would race with fanOut. By
+	// attaching the channel to the entry directly, every event the agent
+	// emits has a destination from the moment it's emitted.
+	subCh := make(chan wire.Envelope, 32)
+	entry.Subscribe(subCh)
+	defer entry.Unsubscribe(subCh)
 
 	// Accept bidi stream BEFORE waiting for SessionID. cc's stream-json
 	// `--input-format` mode does NOT emit system/init until the first user
@@ -105,6 +115,10 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 	// is delivered on cc stdin by the goroutine above).
 	realSID := agentSess.SessionID()
 	slog.Info("serveChat: SessionID resolved", "sid", realSID)
+	if realSID == "" {
+		sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindError, Payload: "agent exited before emitting session id"})
+		return
+	}
 
 	// Claim ownership (CAS — first caller wins).
 	if clientID != "" {
@@ -118,11 +132,6 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 		"type":      "session_ready",
 		"sessionId": realSID,
 	}})
-
-	// Subscribe to broadcast events; forward to browser until ctx done.
-	subCh := make(chan wire.Envelope, 32)
-	reg.Subscribe(realSID, subCh)
-	defer reg.Unsubscribe(realSID, subCh)
 
 	for {
 		select {

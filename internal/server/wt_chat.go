@@ -91,6 +91,11 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 			if err := agentSess.SendPrompt(ctx, msg.Text); err != nil {
 				slog.Warn("send prompt", "err", err)
 			}
+			// Record user message; sid is resolved after SessionID() returns.
+			go func(text string) {
+				sid := agentSess.SessionID()
+				reg.RecordUserMessage(sid, text)
+			}(msg.Text)
 		}
 	}()
 

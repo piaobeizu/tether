@@ -423,13 +423,26 @@ body {
 .sb-cell .dot { background: var(--ink-quat); box-shadow: none; }
 .sb-cell .dot.live { background: var(--success); }
 
-/* ── Streaming cursor ───────────────────────────────────────── */
+/* ── Streaming cursor (inline, in accumulating message) ─────── */
 @keyframes tether-blink { 0%,100% { opacity: 1 } 50% { opacity: 0 } }
 .tether-cursor {
   display: inline-block; width: 2px; height: 1em;
   background: currentColor; vertical-align: text-bottom; margin-left: 1px;
   animation: tether-blink 1s step-start infinite;
 }
+
+/* ── Thinking dots (waiting for first token, NOT a cursor) ───── */
+@keyframes thinking-bounce {
+  0%,60%,100% { opacity: .3 }
+  30%          { opacity: 1 }
+}
+.thinking-dots {
+  display: inline-block;
+  font-size: 16px; letter-spacing: 2px;
+  color: var(--ink-quat);
+}
+.thinking-dots::before { content: '···'; }
+.thinking-dots::after { content: ''; animation: thinking-bounce 1.4s infinite; }
 
 /* ── Mobile drawer ──────────────────────────────────────────── */
 .m-drawer-overlay {

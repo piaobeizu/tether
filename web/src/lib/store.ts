@@ -32,6 +32,7 @@ interface AppState {
   streamingMsgId: string | null   // id of the in-progress assistant bubble
 
   setSessionId: (id: string) => void
+  loadHistory: (msgs: Message[]) => void
   addMessage: (msg: Message) => void
   setPendingPermission: (req: PermissionRequest | null) => void
   setConnected: (v: boolean) => void
@@ -48,7 +49,11 @@ export const useStore = create<AppState>((set) => ({
   streamingMsgId: null,
   connection: { state: 'connecting', latency: 0, attempt: 0 },
 
-  setSessionId: (id) => set({ sessionId: id }),
+  setSessionId: (id) => {
+    localStorage.setItem('tether_last_sid', id)
+    set({ sessionId: id })
+  },
+  loadHistory: (msgs) => set({ messages: msgs, streamingMsgId: null, streaming: false }),
   addMessage: (msg) => set((s) => ({ messages: [...s.messages, msg] })),
   setPendingPermission: (req) => set({ pendingPermission: req }),
   setConnected: (v) => v

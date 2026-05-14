@@ -91,6 +91,15 @@ func Run(cfg *Config) error {
 	if _, err := tetherDataDir(); err != nil {
 		return err
 	}
+
+	// Step 2a: wire up session history store.
+	if cfg.Registry.History == nil {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			histDir := filepath.Join(home, ".tether", "sessions")
+			cfg.Registry.History = session.NewHistoryStore(histDir)
+		}
+	}
 	binDir, err := tetherBinDir()
 	if err != nil {
 		return err

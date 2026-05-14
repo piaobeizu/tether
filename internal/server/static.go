@@ -9,6 +9,17 @@ import (
 	"github.com/piaobeizu/tether/web"
 )
 
+// noCacheWriter injects Cache-Control: no-cache at WriteHeader time so the
+// header survives even when http.FileServer/ServeContent resets headers internally.
+type noCacheWriter struct {
+	http.ResponseWriter
+}
+
+func (n *noCacheWriter) WriteHeader(code int) {
+	n.ResponseWriter.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	n.ResponseWriter.WriteHeader(code)
+}
+
 // spy404 wraps a ResponseWriter and intercepts 404 responses so the caller
 // can detect them and serve a fallback without opening the file twice.
 type spy404 struct {
@@ -46,20 +57,36 @@ func newStaticHandler(devFrontendURL string) http.Handler {
 	if err != nil {
 		panic("embed.FS sub failed: " + err.Error())
 	}
+	// Read index.html once at startup — it's embedded, never changes at runtime.
+	indexHTML, indexErr := fs.ReadFile(sub, "index.html")
+
+	serveIndex := func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		if indexErr != nil {
+			http.Error(w, "index.html not found", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(indexHTML)
+	}
+
 	fileServer := http.FileServer(http.FS(sub))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// SPA shell paths: always serve index.html with no-cache.
+		p := r.URL.Path
+		if p == "/" || p == "/index.html" || p == "/auth" {
+			serveIndex(w)
+			return
+		}
 		spy := &spy404{ResponseWriter: w}
 		fileServer.ServeHTTP(spy, r)
 		if spy.code == http.StatusNotFound {
-			// Clear headers poisoned by the 404 probe (e.g. Content-Type: text/plain).
-			// http.FileServer only sets Content-Type when it's absent, so we must
-			// clear it before serving index.html or it will stay as text/plain.
+			// Unknown path (client-side route): serve index.html.
 			for k := range w.Header() {
 				delete(w.Header(), k)
 			}
-			r2 := r.Clone(r.Context())
-			r2.URL.Path = "/"
-			fileServer.ServeHTTP(w, r2)
+			serveIndex(w)
 		}
 	})
 }

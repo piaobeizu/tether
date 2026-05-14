@@ -54,14 +54,10 @@ export default function ShellPane() {
       pump().catch(() => {})
     }
 
-    if (sessionId !== null) {
-      connect().catch((err: unknown) => {
-        const msg = err instanceof Error ? err.message : String(err)
-        term.write(`\r\n[tether] shell connect failed: ${msg}\r\n`)
-      })
-    } else {
-      term.write('[tether] waiting for session…\r\n')
-    }
+    connect().catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err)
+      term.write(`\r\n[tether] shell connect failed: ${msg}\r\n`)
+    })
 
     const onResize = () => fitAddon.fit()
     window.addEventListener('resize', onResize)

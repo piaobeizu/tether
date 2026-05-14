@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -52,29 +51,50 @@ func (p *OpenCodeProvider) Spawn(ctx context.Context, cfg SpawnConfig) (Session,
 		return nil, fmt.Errorf("opencode serve: %w", err)
 	}
 
-	if err := waitReady(ctx, baseURL+"/global/health", 10*time.Second); err != nil {
+	sess := &opencodeSession{
+		baseURL:       baseURL,
+		serve:         serve,
+		workdir:       workdir,
+		events:        make(chan Event, 64),
+		sidCh:         make(chan struct{}),
+		serveExitDone: make(chan struct{}),
+		resumeSID:     cfg.ResumeSessionID,
+	}
+	// Single goroutine owns serve.Wait(); waitReady checks done non-blocking,
+	// Close() reads done blocking. Catches the TOCTOU port-grab window
+	// between net.Listen() and opencode binding — if the port was stolen,
+	// opencode exits ~immediately and we get a clear error instead of
+	// "timeout after 10s".
+	go func() {
+		err := serve.Wait()
+		sess.serveExitErr = err
+		close(sess.serveExitDone)
+	}()
+
+	if err := sess.waitReady(ctx, 10*time.Second); err != nil {
 		_ = serve.Process.Kill()
+		<-sess.serveExitDone
 		return nil, fmt.Errorf("opencode serve not ready: %w", err)
 	}
 
-	sess := &opencodeSession{
-		baseURL:   baseURL,
-		serve:     serve,
-		workdir:   workdir,
-		events:    make(chan Event, 64),
-		sidCh:     make(chan struct{}),
-		resumeSID: cfg.ResumeSessionID,
-	}
 	go sess.sseLoop(ctx)
 	return sess, nil
 }
 
-func waitReady(ctx context.Context, url string, timeout time.Duration) error {
+// waitReady polls /global/health until the serve subprocess is responsive,
+// the deadline elapses, or the subprocess exits early.
+func (s *opencodeSession) waitReady(ctx context.Context, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	url := s.baseURL + "/global/health"
 	client := &http.Client{Timeout: 500 * time.Millisecond}
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		select {
+		case <-s.serveExitDone:
+			return fmt.Errorf("opencode serve exited during startup (port grab? missing binary?): %w", s.serveExitErr)
+		default:
 		}
 		resp, err := client.Get(url)
 		if err == nil && resp.StatusCode == http.StatusOK {
@@ -90,16 +110,57 @@ func waitReady(ctx context.Context, url string, timeout time.Duration) error {
 }
 
 type opencodeSession struct {
-	baseURL   string
-	serve     *exec.Cmd
-	workdir   string
-	busy      atomic.Bool
-	events    chan Event
-	mu        sync.RWMutex
-	sid       string
-	sidCh     chan struct{}
-	sidOnce   sync.Once
-	resumeSID string
+	baseURL  string
+	serve    *exec.Cmd
+	workdir  string
+	busy     atomic.Bool
+	events   chan Event
+	eventsMu sync.RWMutex // guards closed
+	closed   bool
+	mu       sync.RWMutex
+	sid      string
+	sidCh    chan struct{}
+	sidOnce  sync.Once
+	// Set once by the serve-monitor goroutine right before serveExitDone
+	// closes; safe to read after <-serveExitDone without a lock.
+	serveExitErr  error
+	serveExitDone chan struct{}
+	resumeSID     string
+}
+
+// emit safely sends ev to s.events; drops if the channel has been closed by
+// sseLoop's defer, preventing the closed-channel send panic.
+func (s *opencodeSession) emit(ev Event) {
+	s.eventsMu.RLock()
+	defer s.eventsMu.RUnlock()
+	if s.closed {
+		return
+	}
+	select {
+	case s.events <- ev:
+	default:
+	}
+}
+
+// closeEvents marks the session closed and shuts events down exactly once.
+// Must be the sole caller of close(s.events).
+func (s *opencodeSession) closeEvents() {
+	s.eventsMu.Lock()
+	defer s.eventsMu.Unlock()
+	if s.closed {
+		return
+	}
+	s.closed = true
+	close(s.events)
+}
+
+// unblockSID closes s.sidCh exactly once. Use to either publish a real sid
+// (after also setting s.sid under s.mu) or release waiters when opencode
+// exited before emitting session.created (SessionID() then returns "").
+func (s *opencodeSession) unblockSID() {
+	s.sidOnce.Do(func() {
+		close(s.sidCh)
+	})
 }
 
 func (s *opencodeSession) SessionID() string {
@@ -113,15 +174,16 @@ func (s *opencodeSession) Events() <-chan Event { return s.events }
 
 func (s *opencodeSession) SendPrompt(ctx context.Context, text string) error {
 	if !s.busy.CompareAndSwap(false, true) {
-		select {
-		case s.events <- Event{Kind: EventError, Err: fmt.Errorf("busy: another prompt is running")}:
-		default:
-		}
+		s.emit(Event{Kind: EventError, Err: fmt.Errorf("busy: another prompt is running")})
 		return nil
 	}
 
 	go func() {
 		defer s.busy.Store(false)
+		// Always release SessionID() waiters when this goroutine exits — if
+		// opencode crashed before emitting session.created, sidCh would
+		// otherwise stay open forever.
+		defer s.unblockSID()
 
 		args := []string{"run", "--attach", s.baseURL, "--format", "json"}
 		s.mu.RLock()
@@ -140,11 +202,11 @@ func (s *opencodeSession) SendPrompt(ctx context.Context, text string) error {
 
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
-			slog.Warn("opencode run: stdout pipe", "err", err)
+			s.emit(Event{Kind: EventError, Err: fmt.Errorf("opencode run: stdout pipe: %w", err)})
 			return
 		}
 		if err := cmd.Start(); err != nil {
-			slog.Warn("opencode run: start", "err", err)
+			s.emit(Event{Kind: EventError, Err: fmt.Errorf("opencode run: start: %w", err)})
 			return
 		}
 
@@ -168,13 +230,15 @@ func (s *opencodeSession) SendPrompt(ctx context.Context, text string) error {
 				})
 			}
 		}
-		_ = cmd.Wait()
+		if err := sc.Err(); err != nil {
+			s.emit(Event{Kind: EventError, Err: fmt.Errorf("opencode run: stdout scan: %w", err)})
+		}
+		if err := cmd.Wait(); err != nil && ctx.Err() == nil {
+			s.emit(Event{Kind: EventError, Err: fmt.Errorf("opencode run exited: %w", err)})
+		}
 		// Emit EventResult after opencode run exits — more reliable than
 		// session.idle SSE (which can fire spuriously before text is done).
-		select {
-		case s.events <- Event{Kind: EventResult, Text: "stop"}:
-		default:
-		}
+		s.emit(Event{Kind: EventResult, Text: "stop"})
 	}()
 	return nil
 }
@@ -185,18 +249,16 @@ func (s *opencodeSession) Close() error {
 	if s.serve.Process != nil {
 		_ = s.serve.Process.Kill()
 	}
-	return s.serve.Wait()
+	<-s.serveExitDone
+	return s.serveExitErr
 }
 
 func (s *opencodeSession) sseLoop(ctx context.Context) {
-	defer close(s.events)
-
-	emit := func(ev Event) {
-		select {
-		case s.events <- ev:
-		default:
-		}
-	}
+	defer s.closeEvents()
+	// Also unblock SessionID() waiters on shutdown — sseLoop is the goroutine
+	// that publishes the real sid via session.created; without this fallback,
+	// a waiter on s.sidCh would hang forever if the loop exits before sid.
+	defer s.unblockSID()
 
 	client := &http.Client{}
 	url := s.baseURL + "/global/event"
@@ -219,7 +281,7 @@ func (s *opencodeSession) sseLoop(ctx context.Context) {
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
-		s.readSSE(ctx, resp.Body, emit)
+		s.readSSE(ctx, resp.Body, s.emit)
 		resp.Body.Close()
 
 		if ctx.Err() != nil {

@@ -10,11 +10,20 @@ package session
 
 import (
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 )
+
+// MaxAssistantBufBytes caps the in-memory accumulator per session so that a
+// single very long streaming response can't grow unbounded. When exceeded,
+// the buffer is truncated with a marker and accumulation stops until the
+// next FinalizeAssistant clears state. 4 MiB tracks Anthropic's max-tokens
+// ceiling for a single response with headroom.
+const MaxAssistantBufBytes = 4 << 20
 
 // HistoryMessage is one turn stored in the JSONL history file.
 type HistoryMessage struct {
@@ -25,14 +34,15 @@ type HistoryMessage struct {
 
 // HistoryStore manages per-session message history files.
 type HistoryStore struct {
-	baseDir string        // ~/.tether/sessions
-	mu      sync.Mutex    // guards pending map
+	baseDir string                   // ~/.tether/sessions
+	mu      sync.Mutex               // guards pending map
 	pending map[string]*assistantBuf // accumulated assistant text per sid
 }
 
 type assistantBuf struct {
-	text string
-	ts   int64
+	text     string
+	ts       int64
+	overflow bool // true once we've truncated; subsequent chunks are dropped
 }
 
 // NewHistoryStore creates a store rooted at baseDir.
@@ -55,7 +65,9 @@ func (h *HistoryStore) RecordUser(sid, text string) {
 	})
 }
 
-// AccumulateAssistant buffers an assistant text chunk (streaming).
+// AccumulateAssistant buffers an assistant text chunk (streaming). Capped at
+// MaxAssistantBufBytes; once exceeded, a truncation marker is appended and
+// subsequent chunks are dropped until FinalizeAssistant clears state.
 func (h *HistoryStore) AccumulateAssistant(sid, chunk string) {
 	if sid == "" || chunk == "" {
 		return
@@ -66,6 +78,21 @@ func (h *HistoryStore) AccumulateAssistant(sid, chunk string) {
 	if !ok {
 		buf = &assistantBuf{ts: time.Now().UnixMilli()}
 		h.pending[sid] = buf
+	}
+	if buf.overflow {
+		return
+	}
+	if len(buf.text)+len(chunk) > MaxAssistantBufBytes {
+		remaining := MaxAssistantBufBytes - len(buf.text)
+		if remaining > 0 {
+			buf.text += chunk[:remaining]
+		}
+		buf.text += "\n\n[... response truncated at " +
+			strconv.Itoa(MaxAssistantBufBytes) + " bytes ...]"
+		buf.overflow = true
+		slog.Warn("history: assistant response truncated",
+			"sid", sid, "limit_bytes", MaxAssistantBufBytes)
+		return
 	}
 	buf.text += chunk
 }
@@ -92,8 +119,11 @@ func (h *HistoryStore) FinalizeAssistant(sid string) {
 	})
 }
 
-// LoadHistory reads all messages for a session from disk.
-// Returns empty slice (not error) if no history exists yet.
+// LoadHistory reads all messages for a session from disk. Returns an empty
+// slice (not an error) if no history exists yet; "no history" is the
+// common case for a fresh session and we don't want to noise the logs with
+// ENOENT every read. All other I/O / parse failures are surfaced via slog
+// so they're recoverable in incident review.
 func (h *HistoryStore) LoadHistory(sid string) []HistoryMessage {
 	if sid == "" {
 		return nil
@@ -101,18 +131,24 @@ func (h *HistoryStore) LoadHistory(sid string) []HistoryMessage {
 	path := h.historyPath(sid)
 	data, err := os.ReadFile(path)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn("history: load failed", "sid", sid, "err", err)
+		}
 		return nil
 	}
 
 	var msgs []HistoryMessage
-	for _, line := range splitLines(data) {
+	for i, line := range splitLines(data) {
 		if len(line) == 0 {
 			continue
 		}
 		var m HistoryMessage
-		if err := json.Unmarshal(line, &m); err == nil {
-			msgs = append(msgs, m)
+		if err := json.Unmarshal(line, &m); err != nil {
+			slog.Warn("history: skip corrupt line",
+				"sid", sid, "line_index", i, "err", err)
+			continue
 		}
+		msgs = append(msgs, m)
 	}
 	return msgs
 }
@@ -121,6 +157,9 @@ func (h *HistoryStore) LoadHistory(sid string) []HistoryMessage {
 func (h *HistoryStore) ListSessions() []string {
 	entries, err := os.ReadDir(h.baseDir)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn("history: list sessions failed", "base_dir", h.baseDir, "err", err)
+		}
 		return nil
 	}
 	var sids []string
@@ -135,16 +174,20 @@ func (h *HistoryStore) ListSessions() []string {
 func (h *HistoryStore) append(sid string, msg HistoryMessage) {
 	path := h.historyPath(sid)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		slog.Warn("history: mkdir failed", "sid", sid, "path", path, "err", err)
 		return
 	}
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
+		slog.Warn("history: open failed", "sid", sid, "path", path, "err", err)
 		return
 	}
 	defer f.Close()
 	enc := json.NewEncoder(f)
 	enc.SetEscapeHTML(false)
-	_ = enc.Encode(msg) // Encode adds newline
+	if err := enc.Encode(msg); err != nil { // Encode adds newline
+		slog.Warn("history: write failed", "sid", sid, "path", path, "err", err)
+	}
 }
 
 func (h *HistoryStore) historyPath(sid string) string {

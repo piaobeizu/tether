@@ -223,15 +223,18 @@ func truncStr(s string, n int) string {
 
 // fanOut translates agent.Events into wire.Envelopes and broadcasts to all subscribers.
 // It also writes messages to HistoryStore when available.
+//
+// `sid` is captured from EventInit on the same goroutine, so it is never
+// read under a race; both providers (cc, opencode) emit EventInit before
+// any EventText / EventResult.
 func (r *Registry) fanOut(e *entry) {
-	// Resolve session ID for history (available after SessionID() unblocks).
 	var sid string
-	go func() {
-		sid = e.sess.SessionID()
-	}()
 
 	for ev := range e.sess.Events() {
-		slog.Info("fanOut: agent event", "kind", ev.Kind, "text_preview", truncStr(ev.Text, 60))
+		if ev.Kind == agent.EventInit && ev.SessionID != "" {
+			sid = ev.SessionID
+		}
+		slog.Debug("fanOut: agent event", "kind", ev.Kind, "text_preview", truncStr(ev.Text, 60))
 
 		// Persist to history.
 		if r.History != nil && sid != "" {
@@ -250,7 +253,7 @@ func (r *Registry) fanOut(e *entry) {
 		e.subsMu.RLock()
 		nsub := len(e.subs)
 		e.subsMu.RUnlock()
-		slog.Info("fanOut: broadcasting", "wire_kind", env.Kind, "nsub", nsub)
+		slog.Debug("fanOut: broadcasting", "wire_kind", env.Kind, "nsub", nsub)
 		e.subsMu.RLock()
 		for ch := range e.subs {
 			select {

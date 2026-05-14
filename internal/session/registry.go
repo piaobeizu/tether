@@ -183,6 +183,14 @@ func (r *Registry) SetOwner(ccSID, clientID string) bool {
 	return true
 }
 
+// IsLive returns true if the session exists and is actively tracked.
+func (r *Registry) IsLive(ccSID string) bool {
+	r.mu.RLock()
+	_, ok := r.sessions[ccSID]
+	r.mu.RUnlock()
+	return ok
+}
+
 // IsOwner returns true if clientID is the recorded owner of ccSID.
 func (r *Registry) IsOwner(ccSID, clientID string) bool {
 	r.mu.RLock()

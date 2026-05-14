@@ -28,6 +28,10 @@ func (p *ClaudeCodeProvider) Spawn(ctx context.Context, cfg SpawnConfig) (Sessio
 		"--output-format", "stream-json",
 		"--input-format", "stream-json",
 		"--verbose",
+		// Emit token-level text deltas via `stream_event` lines (D-05a §3).
+		// Without this, `assistant` arrives as one complete block, which the UI
+		// renders as a sudden full-message reveal instead of streaming.
+		"--include-partial-messages",
 		// Force "default" permission mode so PreToolUse hooks ALWAYS fire,
 		// regardless of user's ~/.claude/settings.json `defaultMode` setting.
 		// Without this, users with `defaultMode: "auto"` or `bypassPermissions`
@@ -141,11 +145,12 @@ func (s *ccSession) readLoop(scanner *bufio.Scanner) {
 
 // rawStreamEvent is the top-level stream-json event shape (D-05a §3).
 type rawStreamEvent struct {
-	Type      string          `json:"type"`
-	Subtype   string          `json:"subtype,omitempty"`
-	SessionID string          `json:"session_id,omitempty"`
-	Message   *rawAssistMsg   `json:"message,omitempty"`
-	Result    string          `json:"result,omitempty"`
+	Type      string             `json:"type"`
+	Subtype   string             `json:"subtype,omitempty"`
+	SessionID string             `json:"session_id,omitempty"`
+	Message   *rawAssistMsg      `json:"message,omitempty"`
+	Result    string             `json:"result,omitempty"`
+	Event     *rawPartialMessage `json:"event,omitempty"` // populated when type=="stream_event"
 }
 
 type rawAssistMsg struct {
@@ -158,6 +163,17 @@ type rawContentBlock struct {
 	ID    string          `json:"id,omitempty"`
 	Name  string          `json:"name,omitempty"`
 	Input json.RawMessage `json:"input,omitempty"`
+}
+
+// rawPartialMessage is the Anthropic-native SSE event embedded in stream_event
+// lines when --include-partial-messages is on. We only care about the
+// content_block_delta variant with delta.type=="text_delta".
+type rawPartialMessage struct {
+	Type  string `json:"type"` // "content_block_delta", "message_start", etc.
+	Delta struct {
+		Type string `json:"type"` // "text_delta", "input_json_delta", "signature_delta"
+		Text string `json:"text"`
+	} `json:"delta"`
 }
 
 func (s *ccSession) parseLine(line []byte) *Event {
@@ -176,12 +192,25 @@ func (s *ccSession) parseLine(line []byte) *Event {
 		return &Event{Kind: EventInit, SessionID: raw.SessionID}
 	}
 
+	// stream_event lines carry token-level deltas (--include-partial-messages).
+	// We forward text_delta as EventText and skip everything else (signature
+	// deltas for thinking blocks; partial JSON for tool_use args is handled
+	// via the final `assistant` event below, which carries the complete input).
+	if raw.Type == "stream_event" && raw.Event != nil {
+		if raw.Event.Type == "content_block_delta" &&
+			raw.Event.Delta.Type == "text_delta" &&
+			raw.Event.Delta.Text != "" {
+			return &Event{Kind: EventText, Text: raw.Event.Delta.Text}
+		}
+		return nil
+	}
+
+	// `assistant` events arrive after all deltas have streamed. Text blocks are
+	// redundant (already streamed via stream_event); only tool_use blocks carry
+	// information we haven't emitted yet.
 	if raw.Type == "assistant" && raw.Message != nil {
 		for _, block := range raw.Message.Content {
-			switch block.Type {
-			case "text":
-				return &Event{Kind: EventText, Text: block.Text}
-			case "tool_use":
+			if block.Type == "tool_use" {
 				// tool_use is a content block, NOT a top-level event (D-05a §3, Risk #4).
 				return &Event{
 					Kind: EventToolUse,
@@ -193,6 +222,7 @@ func (s *ccSession) parseLine(line []byte) *Event {
 				}
 			}
 		}
+		return nil
 	}
 
 	if raw.Type == "result" {

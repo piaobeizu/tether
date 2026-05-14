@@ -51,8 +51,10 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 	providerName := r.URL.Query().Get("provider")
 
 	// If resuming an existing session, verify ownership before spawning.
-	// Note: ccSID == realSID for resumed sessions (registry is keyed by the same ID).
-	if ccSID != "" && clientID != "" && !reg.IsOwner(ccSID, clientID) {
+	// Only reject if the session EXISTS and is owned by a different client.
+	// If the session doesn't exist (e.g. server restart), silently ignore the
+	// stale sid and fall through to spawn a fresh session below.
+	if ccSID != "" && clientID != "" && reg.IsLive(ccSID) && !reg.IsOwner(ccSID, clientID) {
 		sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindError, Payload: "session owned by another client; use /wt/events to attach read-only"})
 		return
 	}

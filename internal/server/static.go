@@ -2,12 +2,22 @@ package server
 
 import (
 	"io/fs"
+	"mime"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path"
+	"strings"
 
 	"github.com/piaobeizu/tether/web"
 )
+
+func init() {
+	// Go's built-in mime database doesn't map .webmanifest. Without this,
+	// http.FileServer falls back to sniffing JSON as text/plain, which makes
+	// Lighthouse and strict PWA validators reject the manifest.
+	_ = mime.AddExtensionType(".webmanifest", "application/manifest+json")
+}
 
 // noCacheWriter injects Cache-Control: no-cache at WriteHeader time so the
 // header survives even when http.FileServer/ServeContent resets headers internally.
@@ -81,12 +91,28 @@ func newStaticHandler(devFrontendURL string) http.Handler {
 		}
 		spy := &spy404{ResponseWriter: w}
 		fileServer.ServeHTTP(spy, r)
-		if spy.code == http.StatusNotFound {
-			// Unknown path (client-side route): serve index.html.
-			for k := range w.Header() {
-				delete(w.Header(), k)
-			}
-			serveIndex(w)
+		if spy.code != http.StatusNotFound {
+			return
 		}
+		// Clear headers poisoned by the 404 probe (e.g. Content-Type: text/plain).
+		// http.FileServer only sets Content-Type when it's absent, so we must
+		// clear it before writing our own response.
+		for k := range w.Header() {
+			delete(w.Header(), k)
+		}
+		// Static-asset-like paths (favicon.ico, foo.png, etc.) must return a
+		// real 404 rather than the SPA shell — otherwise browsers happily
+		// "render" index.html as a favicon and tools like Lighthouse complain.
+		if isStaticAssetPath(r.URL.Path) {
+			http.Error(w, "404 page not found", http.StatusNotFound)
+			return
+		}
+		serveIndex(w)
 	})
+}
+
+// isStaticAssetPath reports whether p looks like a request for a static file
+// (final path segment contains a dot) rather than an SPA route.
+func isStaticAssetPath(p string) bool {
+	return strings.Contains(path.Base(p), ".")
 }

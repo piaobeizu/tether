@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.4.1 — 2026-05-28 (PR #71–#85)
+
+UI v2 + streaming + auth-hardening increment on the v0.4 line. No API or schema breaks;
+drop-in over v0.4.0.
+
+### Added
+- **v2 UI**: three-tab layout (chat / shell / events), settings pane, and desktop chrome —
+  titlebar + statusbar + chat bubbles + workspace tree (#80, #81).
+- **Token-level streaming**: cc + opencode now stream at token granularity with per-session
+  history restore (#82, #84); IME composition fix for CJK input (#82).
+
+### Fixed
+- **WebTransport auth ticket**: Chrome's WT CONNECT does not carry the auth Cookie, so the
+  server issues a short-lived ticket exchanged on the WT handshake (#74, #75); redirect to
+  `/auth` when the wt-ticket returns 401 (#78).
+- **Stream indicator** (F.3): blinking cursor + input disabled while a turn streams (#76);
+  `tool_use` stream-state fix (F.2) (#75).
+- **Static assets**: `manifest.json` → `.webmanifest` (auth-exempt suffix) (#77); register the
+  `.webmanifest` MIME type and serve a real 404 for missing static paths instead of the SPA
+  fallback (#85).
+- **Session liveness**: accept a stale `?sid=` after a server restart via an `IsLive` check
+  rather than hard-rejecting (#83).
+- **Token paste**: trim whitespace before verifying a pasted access token (#79).
+
+### Docs
+- K.8 troubleshooting expanded — K.8.1 VPN/TUN details + K.8.6 `serverCertificateHashes` vs
+  CA cert (#71).
+- K.9 performance baseline — in-process benchmarks + E2E measurement script (#72).
+- v1.0 release-gate docs — CHANGELOG + upgrade-path + known-limitations + release-gate (#73).
+
 ## v0.4.0 — 2026-05-12 (PR #68, #69, #70)
 
 ### Added

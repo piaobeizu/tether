@@ -30,6 +30,21 @@ Initial release. See [CHANGELOG](../CHANGELOG.md#v010--2026-05-09).
 - Design token system + dark-mode body override.
 - WebTransport + SPA routing fixes.
 
+### v0.4.0 → v0.4.1 (2026-05-28)
+
+UI/streaming/auth increment on the v0.4 line — drop-in over v0.4.0, no API or schema breaks.
+
+- **v2 UI**: three-tab layout, settings pane, desktop chrome (titlebar/statusbar/chat
+  bubbles/workspace tree).
+- **Token-level streaming**: cc + opencode token-granularity streaming + per-session history.
+- **WebTransport auth ticket**: Chrome WT CONNECT carries no Cookie → short-lived ticket
+  exchanged on handshake; `/auth` redirect on 401.
+- **Static assets**: `.webmanifest` rename + MIME registration; real 404 for missing static
+  paths (no SPA fallback).
+- **Docs**: K.8 troubleshooting + K.9 benchmarks + v1.0 release-gate docs.
+
+See [CHANGELOG](../CHANGELOG.md#v041--2026-05-28).
+
 ---
 
 ## Upcoming

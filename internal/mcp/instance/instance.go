@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -76,7 +77,26 @@ type MCPInstance struct {
 
 	skipInject bool
 	started    bool
+	// lastActive is updated on Start() and on each authorized loopback request.
+	lastActive time.Time
+	// extraServers records the stdio servers passed to Start().
+	extraServers map[string]mcphost.ServerConfig
+	// baseCtx scopes the child MCP server processes to the instance lifetime
+	// (cancelled in Stop) rather than to the request context that triggered a
+	// start/wake — so children survive the HTTP request that spawned them.
+	baseCtx    context.Context
+	baseCancel context.CancelFunc
 	mu         sync.Mutex
+
+	// dormant is true while the instance is hibernated: external child MCP
+	// servers are stopped to reclaim resources, but the loopback and builtin
+	// tools keep serving. The next external tool call triggers Wake.
+	dormant atomic.Bool
+	// suppressSrv, while true, makes the registry observer skip *mcp.Server
+	// tool add/remove so the advertised tool set stays stable across a
+	// hibernate/wake transition. Read via atomic, never under i.mu: the
+	// observer fires from mgr.Start/StopAll while Wake/Hibernate hold i.mu.
+	suppressSrv atomic.Bool
 }
 
 // New constructs (but does not start) an MCPInstance from cfg.
@@ -113,25 +133,36 @@ func New(cfg InstanceConfig) (*MCPInstance, error) {
 	}
 
 	gw := gateway.New(mgr, reg, cfg.PermManager, logger)
-	srv := buildServer(gw, bi, reg, cfg.TaskSlug)
 
-	lb, err := newLoopback(cfg.Port, srv, token)
-	if err != nil {
-		return nil, fmt.Errorf("mcp/instance: loopback init: %w", err)
-	}
-
-	return &MCPInstance{
+	// Construct the instance first (minus srv/loopback) so buildServer's
+	// observer and per-tool handlers can capture it for hibernate/wake wiring.
+	baseCtx, baseCancel := context.WithCancel(context.Background())
+	inst := &MCPInstance{
 		TaskID:     cfg.TaskID,
 		TaskSlug:   cfg.TaskSlug,
 		WsRoot:     cfg.WsRoot,
-		Port:       lb.port,
 		Token:      token,
 		mgr:        mgr,
 		reg:        reg,
-		srv:        srv,
-		loopback:   lb,
 		skipInject: cfg.SkipInject,
-	}, nil
+		baseCtx:    baseCtx,
+		baseCancel: baseCancel,
+	}
+
+	srv := buildServer(gw, bi, reg, cfg.TaskSlug, inst)
+	inst.srv = srv
+
+	lb, err := newLoopback(cfg.Port, srv, token)
+	if err != nil {
+		baseCancel()
+		return nil, fmt.Errorf("mcp/instance: loopback init: %w", err)
+	}
+	inst.Port = lb.port
+	inst.loopback = lb
+	// Wire loopback activity back to the instance so authorized requests
+	// keep the idle clock fresh.
+	lb.onActivity = inst.Touch
+	return inst, nil
 }
 
 // Start binds the loopback listener, starts any configured extra servers,
@@ -144,9 +175,15 @@ func (i *MCPInstance) Start(ctx context.Context, extraServers map[string]mcphost
 		return nil
 	}
 
+	i.extraServers = extraServers
+	i.lastActive = time.Now()
+
 	if len(extraServers) > 0 {
 		cfg := &mcphost.Config{Servers: extraServers}
-		if err := i.mgr.Start(ctx, cfg); err != nil {
+		// Use the instance-scoped context so child servers outlive the request
+		// that triggered Start; the passed ctx (often r.Context()) would kill
+		// them when the HTTP handler returns.
+		if err := i.mgr.Start(i.baseCtx, cfg); err != nil {
 			return fmt.Errorf("mcp/instance %s: start extra servers: %w", i.TaskSlug, err)
 		}
 	}
@@ -190,6 +227,9 @@ func (i *MCPInstance) Stop(ctx context.Context) error {
 		errs = append(errs, fmt.Errorf("loopback shutdown: %w", err))
 	}
 	i.mgr.StopAll()
+	if i.baseCancel != nil {
+		i.baseCancel()
+	}
 
 	if !i.skipInject {
 		name := "tether-" + i.TaskSlug
@@ -198,6 +238,8 @@ func (i *MCPInstance) Stop(ctx context.Context) error {
 		}
 	}
 
+	i.dormant.Store(false)
+	i.suppressSrv.Store(false)
 	i.started = false
 	slog.Info("mcp/instance: stopped",
 		"task_id", i.TaskID,
@@ -209,6 +251,97 @@ func (i *MCPInstance) Stop(ctx context.Context) error {
 	return nil
 }
 
+// Hibernate stops the instance's external child MCP servers to reclaim
+// resources while keeping the loopback listener and in-process builtin tools
+// serving. The advertised tool set is preserved (clients keep seeing the now
+// cold external tools); the next external tool call triggers Wake. It is a
+// no-op if the instance is not started, is already dormant, or has no external
+// servers to reclaim.
+func (i *MCPInstance) Hibernate(_ context.Context) error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if !i.started || i.dormant.Load() || len(i.extraServers) == 0 {
+		return nil
+	}
+	// Observer keeps srv tool defs through the teardown (Deregister → Removed).
+	i.suppressSrv.Store(true)
+	// Set dormant BEFORE teardown so a tool call arriving mid-StopAll takes the
+	// lazy-wake path (serialized on i.mu) instead of routing to a child that is
+	// being deregistered.
+	i.dormant.Store(true)
+	i.mgr.StopAll()
+	slog.Info("mcp/instance: hibernated", "task_id", i.TaskID, "task_slug", i.TaskSlug)
+	return nil
+}
+
+// Wake re-spawns the external child MCP servers of a hibernated instance and
+// restores the registry routing table. It is safe under concurrent calls
+// (later callers observe a no-op once awake) and a no-op if not dormant.
+func (i *MCPInstance) Wake(_ context.Context) error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if !i.dormant.Load() {
+		return nil
+	}
+	// suppressSrv is already true (set at Hibernate); keep it set through
+	// mgr.Start so the observer's Added events don't double-register tools the
+	// server still advertises. Clear it only once the servers are back.
+	if len(i.extraServers) > 0 {
+		cfg := &mcphost.Config{Servers: i.extraServers}
+		if err := i.mgr.Start(i.baseCtx, cfg); err != nil {
+			// Roll back any partially-started children so they don't leak. The
+			// instance stays dormant (suppressSrv still true → tools stay cold)
+			// and the next external tool call retries Wake cleanly.
+			i.mgr.StopAll()
+			return fmt.Errorf("mcp/instance %s: wake: %w", i.TaskSlug, err)
+		}
+	}
+	i.suppressSrv.Store(false)
+	i.dormant.Store(false)
+	slog.Info("mcp/instance: woke", "task_id", i.TaskID, "task_slug", i.TaskSlug)
+	return nil
+}
+
+// Dormant reports whether the instance is currently hibernated.
+func (i *MCPInstance) Dormant() bool { return i.dormant.Load() }
+
+// Touch records that the instance is active as of now.
+func (i *MCPInstance) Touch() {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.lastActive = time.Now()
+}
+
+// IdleFor returns how long the instance has been idle relative to now
+// (now.Sub(lastActive)).
+func (i *MCPInstance) IdleFor(now time.Time) time.Duration {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return now.Sub(i.lastActive)
+}
+
+// LastActive returns the timestamp of the most recent activity.
+func (i *MCPInstance) LastActive() time.Time {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return i.lastActive
+}
+
+// ExtraServers returns a snapshot of the stdio MCP servers that were passed to
+// Start(). The returned map is a shallow copy safe for the caller to read.
+func (i *MCPInstance) ExtraServers() map[string]mcphost.ServerConfig {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.extraServers == nil {
+		return nil
+	}
+	out := make(map[string]mcphost.ServerConfig, len(i.extraServers))
+	for k, v := range i.extraServers {
+		out[k] = v
+	}
+	return out
+}
+
 // Server returns the underlying *mcp.Server so callers can mount it on
 // additional HTTP handlers (e.g. the HTTPS /mcp route).
 // Valid after New(); do not call AddTool/RemoveTool directly.
@@ -217,7 +350,7 @@ func (i *MCPInstance) Server() *mcp.Server { return i.srv }
 // buildServer constructs a *mcp.Server wired to the gateway and builtins.
 // This is an instance-scoped variant of server.BuildMCPServer; it lives here
 // to avoid an import cycle (server ← instance ← server).
-func buildServer(gw *gateway.Gateway, bi *builtin.Registry, reg *mcpreg.Registry, taskSlug string) *mcp.Server {
+func buildServer(gw *gateway.Gateway, bi *builtin.Registry, reg *mcpreg.Registry, taskSlug string, inst *MCPInstance) *mcp.Server {
 	srv := mcp.NewServer(
 		&mcp.Implementation{Name: "tether-" + taskSlug, Version: "v0.4.0"},
 		nil,
@@ -227,6 +360,15 @@ func buildServer(gw *gateway.Gateway, bi *builtin.Registry, reg *mcpreg.Registry
 		t := entry.Tool
 		t.Name = entry.PrefixedName
 		srv.AddTool(&t, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			// Lazy wake: an external tool call on a hibernated instance
+			// re-spawns its child servers (repopulating the registry) before
+			// the call is routed. Builtin tools are registered directly on srv
+			// (not through addOne), so they never wake a dormant instance.
+			if inst.dormant.Load() {
+				if err := inst.Wake(ctx); err != nil {
+					return nil, fmt.Errorf("mcp/instance: wake before tool %q: %w", entry.PrefixedName, err)
+				}
+			}
 			return gw.CallTool(ctx, gateway.CallRequest{
 				ToolName:  entry.PrefixedName,
 				Arguments: req.Params.Arguments,
@@ -240,6 +382,13 @@ func buildServer(gw *gateway.Gateway, bi *builtin.Registry, reg *mcpreg.Registry
 	bi.RegisterInto(srv)
 
 	reg.AddObserver(func(e mcpreg.RegistryEvent) {
+		// During a hibernate/wake transition keep the advertised tool set
+		// stable: skip srv mutations while only the registry routing table and
+		// child processes are toggling. (Registry entries still change so
+		// gateway routing stays correct once awake.)
+		if inst.suppressSrv.Load() {
+			return
+		}
 		if len(e.Removed) > 0 {
 			names := make([]string, len(e.Removed))
 			for idx, t := range e.Removed {
@@ -263,6 +412,9 @@ type loopback struct {
 	port    int
 	token   string
 	handler http.Handler
+	// onActivity, if non-nil, is invoked after a request passes the bearer
+	// check and before it is forwarded to the handler.
+	onActivity func()
 }
 
 func newLoopback(port int, mcpSrv *mcp.Server, token string) (*loopback, error) {
@@ -294,6 +446,9 @@ func (l *loopback) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	if l.onActivity != nil {
+		l.onActivity()
+	}
 	l.handler.ServeHTTP(w, r)
 }
 
@@ -318,5 +473,3 @@ func generateToken() (string, error) {
 	}
 	return hex.EncodeToString(b), nil
 }
-
-

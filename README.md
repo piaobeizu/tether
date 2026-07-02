@@ -43,6 +43,7 @@ Checks: `cc-binary`, `data-dir`, `cert-state`, `port-bindable`, `cc-settings-hoo
 | `TETHER_NO_PERMISSION_HOOK` | `""` | Set to `1` to skip hook injection (auto-allows all tools) |
 | `TETHER_HOST` | `127.0.0.1` | Hostname for startup log URL |
 | `IS_SANDBOX` | auto-set if root | Injected into cc subprocess when running as root |
+| `TETHER_MCP_IDLE_TIMEOUT` | `15m` | Idle time before a per-task MCP instance is hibernated (child servers stopped, revived on next tool call). Set `0` to disable the watchdog. Accepts Go durations (e.g. `30m`). |
 
 ## CLI reference
 
@@ -51,6 +52,30 @@ tether server [--port PORT] [--cert-file F] [--key-file F] [--dev] [--dev-url UR
 tether doctor [--port PORT] [--verbose] [--json]
 tether version
 ```
+
+## Per-task MCP servers (v0.5)
+
+A task can declare its own MCP servers in `<workspace>/.tether/task-config.json`. `tether` starts
+them with the task and stops them on pause/wrap. File entries are merged with any `extra_servers`
+passed to the task-MCP REST API — request keys win on collision.
+
+```json
+{
+  "version": 1,
+  "servers": {
+    "playwright": {
+      "command": ["npx", "-y", "@modelcontextprotocol/server-playwright"],
+      "env": { "HEADLESS": "1" },
+      "prefix": "pw",
+      "inherit_env": ["PATH", "HOME"]
+    }
+  }
+}
+```
+
+Idle task instances are hibernated by a watchdog (see `TETHER_MCP_IDLE_TIMEOUT`): their child MCP
+servers are stopped to reclaim resources while the loopback and builtin tools keep serving, and the
+next tool call transparently revives them.
 
 ---
 

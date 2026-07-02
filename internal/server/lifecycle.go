@@ -191,9 +191,24 @@ func Run(cfg *Config) error {
 		}
 	}
 
-	// Step 3c: per-task MCP lifecycle manager (v0.4).
+	// Step 3c: per-task MCP lifecycle manager (v0.4) + idle watchdog (v0.5).
+	// The watchdog hibernates task instances idle past TETHER_MCP_IDLE_TIMEOUT
+	// (default 15m; set "0" to disable); a hibernated instance is revived on its
+	// next tool call.
 	if cfg.MCPLifecycle == nil {
-		cfg.MCPLifecycle = mcplifecycle.New()
+		idleTimeout := 15 * time.Minute
+		if v := os.Getenv("TETHER_MCP_IDLE_TIMEOUT"); v != "" {
+			switch d, err := time.ParseDuration(v); {
+			case err != nil:
+				slog.Warn("invalid TETHER_MCP_IDLE_TIMEOUT; using default", "value", v, "default", idleTimeout)
+			case d < 0:
+				slog.Warn("negative TETHER_MCP_IDLE_TIMEOUT disables the idle watchdog", "value", v)
+				idleTimeout = d // <= 0 disables the watchdog in WithIdleWatchdog
+			default:
+				idleTimeout = d
+			}
+		}
+		cfg.MCPLifecycle = mcplifecycle.New(mcplifecycle.WithIdleWatchdog(idleTimeout, 0))
 	}
 
 	// Step 4: load or generate cert.

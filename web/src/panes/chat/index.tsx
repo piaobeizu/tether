@@ -48,6 +48,13 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   const [_elapsed, setElapsed] = useState('')
   const [slashOpen, setSlashOpen] = useState(false)
   const [isComposing, setIsComposing] = useState(false)
+  // Which message ids have their fenced block expanded to the full variant.
+  const [expandedBlocks, setExpandedBlocks] = useState<Set<string>>(() => new Set())
+  const toggleBlock = (id: string) => setExpandedBlocks(prev => {
+    const next = new Set(prev)
+    if (next.has(id)) next.delete(id); else next.add(id)
+    return next
+  })
   const writerRef = useRef<WritableStreamDefaultWriter<Uint8Array> | null>(null)
   const wtRef = useRef<TetherWT | null>(null)
   const attemptRef = useRef(0)
@@ -253,12 +260,23 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
                 <span className="msg-ai-name">tether</span>
                 <span className="msg-ai-time">{fmtTime(m.ts)}</span>
               </div>
-              <div className="msg-ai-body">
-                {m.text}
-                {streaming && m.id === streamingMsgId && (
-                  <span className="tether-cursor" aria-label="Claude is responding" />
-                )}
-              </div>
+              {m.block && (
+                <div className="msg-ai-block">
+                  <FencedBlockView
+                    block={m.block}
+                    expanded={expandedBlocks.has(m.id)}
+                    onToggle={() => toggleBlock(m.id)}
+                  />
+                </div>
+              )}
+              {(m.text || (!m.block && streaming && m.id === streamingMsgId)) && (
+                <div className="msg-ai-body">
+                  {m.text}
+                  {streaming && m.id === streamingMsgId && (
+                    <span className="tether-cursor" aria-label="Claude is responding" />
+                  )}
+                </div>
+              )}
             </div>
           )
         })}
@@ -360,15 +378,25 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
         </div>
       </div>
 
-      {/* Validate fenced-block imports compile */}
-      <DummyFencedBlockDemo />
     </>
   )
 }
 
-function DummyFencedBlockDemo() {
-  const _: FencedBlock[] = []
-  void _
-  return null
+interface FencedBlockViewProps {
+  block: FencedBlock
+  expanded: boolean
+  onToggle: () => void
 }
-void DagBlock; void FormBlock; void CandidatesBlock; void MediaBlock
+
+// Dispatch a FencedBlock to its renderer by `kind` (D-19 §10.B.4).
+// Unknown kinds fall back to a compact raw view rather than throwing.
+function FencedBlockView({ block, expanded, onToggle }: FencedBlockViewProps) {
+  switch (block.kind) {
+    case 'dag':        return <DagBlock block={block} expanded={expanded} onToggle={onToggle} />
+    case 'form':       return <FormBlock block={block} expanded={expanded} onToggle={onToggle} />
+    case 'candidates': return <CandidatesBlock block={block} expanded={expanded} onToggle={onToggle} />
+    case 'media':      return <MediaBlock block={block} expanded={expanded} onToggle={onToggle} />
+    default:
+      return <div className="fb-fallback mono">unknown block: {block.kind}</div>
+  }
+}

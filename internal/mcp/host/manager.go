@@ -16,6 +16,7 @@ type Manager struct {
 	mu      sync.RWMutex
 	conns   map[string]ServerConn
 	cancels map[string]context.CancelFunc
+	gen     map[string]uint64 // per-name generation counter; guards stale deregister/delete
 	reg     ToolRegistry
 	logger  HistoryLogger
 }
@@ -25,6 +26,7 @@ func NewManager(reg ToolRegistry, logger HistoryLogger) *Manager {
 	return &Manager{
 		conns:   make(map[string]ServerConn),
 		cancels: make(map[string]context.CancelFunc),
+		gen:     make(map[string]uint64),
 		reg:     reg,
 		logger:  logger,
 	}
@@ -90,9 +92,24 @@ func (m *Manager) startOne(ctx context.Context, cfg ServerConfig) error {
 	}
 
 	m.mu.Lock()
+	// Bump the generation BEFORE storing conn/cancel so this supervisor's
+	// deregister/delete become no-ops once a newer Start supersedes it.
+	m.gen[cfg.Name]++
+	g := m.gen[cfg.Name]
 	m.conns[cfg.Name] = conn
 	m.cancels[cfg.Name] = cancel
 	m.mu.Unlock()
+
+	// deregister only removes tools if this generation is still current;
+	// a stale supervisor's cleanup must not wipe a newer generation's tools.
+	deregister := func() {
+		m.mu.Lock()
+		current := m.gen[cfg.Name] == g
+		m.mu.Unlock()
+		if current {
+			m.reg.Deregister(cfg.Name)
+		}
+	}
 
 	// connectFn for supervisor retries: creates a new connection and updates m.conns.
 	connectFn := func() (ServerConn, []mcp.Tool, error) {
@@ -101,19 +118,26 @@ func (m *Manager) startOne(ctx context.Context, cfg ServerConfig) error {
 			return nil, nil, err
 		}
 		m.mu.Lock()
-		m.conns[cfg.Name] = c
+		if m.gen[cfg.Name] == g {
+			m.conns[cfg.Name] = c
+		}
 		m.mu.Unlock()
 		return c, t, nil
 	}
 
-	sup := NewSupervisor(cfg, m.reg, m.logger, conn, connectFn)
+	sup := NewSupervisor(cfg, m.reg, m.logger, conn, connectFn, deregister)
 	go func() {
 		sup.Run(supCtx)
 		// C2: clear stale conn when supervisor exits (retries exhausted or ctx cancelled).
+		// Only touch the maps if this generation is still current, so a fast
+		// Stop→Start for the same name is not clobbered by the old supervisor.
 		m.mu.Lock()
-		delete(m.conns, cfg.Name)
+		if m.gen[cfg.Name] == g {
+			delete(m.conns, cfg.Name)
+			delete(m.cancels, cfg.Name)
+		}
 		m.mu.Unlock()
-		m.reg.Deregister(cfg.Name)
+		deregister()
 	}()
 
 	return nil
@@ -126,6 +150,9 @@ func (m *Manager) Stop(name string) error {
 	conn, hasConn := m.conns[name]
 	delete(m.cancels, name)
 	delete(m.conns, name)
+	// Invalidate the stopped generation so the exiting supervisor's async
+	// deregister/delete cannot wipe a subsequent Start's tools/conn.
+	m.gen[name]++
 	m.mu.Unlock()
 
 	if hasCancel {

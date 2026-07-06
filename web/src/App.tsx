@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useStore } from './lib/store'
 import { Icon } from './lib/icons'
-import { Settings } from './Settings'
+import { Settings, type SettingsTab } from './Settings'
 import WorkspacePane from './panes/workspace'
 import SkillPane from './panes/skill'
 import ShellPane from './panes/shell'
@@ -54,7 +54,7 @@ function ColResizer({ onDelta }: { onDelta: (dx: number) => void }) {
 export default function App() {
   const [rightTab, setRightTab] = useState<RightTab>('chat')
   const [drawerOpen, setDrawerOpen] = useState(false)
-  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null)
   const [leftW,  setLeftW]  = useState(() => loadWidth(STORAGE_KEY_LEFT,  240))
   const [rightW, setRightW] = useState(() => loadWidth(STORAGE_KEY_RIGHT, 380))
   // Local-only UI dismissals; reset whenever the underlying connection state
@@ -136,7 +136,7 @@ export default function App() {
             <span className="dot" />
             {connLabel}
           </span>
-          <button className="icon-btn" title="Settings" onClick={() => setSettingsOpen(true)}>
+          <button className="icon-btn" title="Settings" onClick={() => setSettingsTab('connection')}>
             <Icon name="settings" size={14} />
           </button>
         </div>
@@ -217,14 +217,14 @@ export default function App() {
             <div style={{ display: rightTab === 'chat' ? 'flex' : 'none', flexDirection: 'column', flex: '1 1 0', minHeight: 0 }}>
               <ChatPane onMenuClick={() => setDrawerOpen(true)} />
             </div>
-            {rightTab === 'skill' && <SkillPane />}
+            {rightTab === 'skill' && <SkillPane onManage={() => setSettingsTab('skills')} />}
             {rightTab === 'shell' && <ShellPane />}
           </div>
         </section>
       </div>
 
       {/* ── Settings panel ────────────────────────────────────── */}
-      {settingsOpen && <Settings onClose={() => setSettingsOpen(false)} />}
+      {settingsTab && <Settings initialTab={settingsTab} onClose={() => setSettingsTab(null)} />}
 
       {/* ── Mobile drawer ─────────────────────────────────────── */}
       {drawerOpen && (

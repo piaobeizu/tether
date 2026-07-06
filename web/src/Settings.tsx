@@ -1,14 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
 import { useStore } from './lib/store'
 import { Icon } from './lib/icons'
+import { APP_VERSION } from './lib/version'
 
 // Fired after a skill is installed/removed so other views (right-pane
 // SkillPane) can refetch. Mirrors the existing tether:provider-changed event.
 const SKILLS_CHANGED = 'tether:skills-changed'
 
 export type SettingsTab = 'account' | 'skills' | 'appearance' | 'connection' | 'about'
-
-const APP_VERSION = 'v0.5.0'
 
 interface Skill {
   id: string

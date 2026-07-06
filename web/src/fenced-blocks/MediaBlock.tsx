@@ -29,7 +29,14 @@ export function MediaBlock({ block, expanded, onToggle }: Props) {
   // ── Compact: thumbnail + title + meta ──────────────────────
   if (!expanded) {
     return (
-      <div className="fb fb-compact media-compact" onClick={onToggle} role="button" tabIndex={0}>
+      <div
+        className="fb fb-compact media-compact"
+        onClick={onToggle}
+        onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onToggle() } }}
+        role="button"
+        tabIndex={0}
+        aria-label={`Expand ${title}`}
+      >
         <div className="media-thumb">
           {data.url
             ? <img src={data.url} alt={title} />

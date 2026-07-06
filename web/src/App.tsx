@@ -54,6 +54,15 @@ function ColResizer({ onDelta }: { onDelta: (dx: number) => void }) {
 
 export default function App() {
   const [rightTab, setRightTab] = useState<RightTab>('chat')
+  // Keep panes mounted after first visit so switching tabs doesn't tear down the
+  // PTY (Shell) or refetch (Skills). Chat is always mounted.
+  const [visitedTabs, setVisitedTabs] = useState<Record<RightTab, boolean>>({ chat: true, skill: false, shell: false })
+  const selectTab = (t: RightTab) => {
+    setRightTab(t)
+    setVisitedTabs(v => (v[t] ? v : { ...v, [t]: true }))
+    // xterm measures 0 while display:none; nudge a refit once Shell is visible again.
+    if (t === 'shell') requestAnimationFrame(() => window.dispatchEvent(new Event('resize')))
+  }
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null)
   const [leftW,  setLeftW]  = useState(() => loadWidth(STORAGE_KEY_LEFT,  240))
@@ -137,7 +146,7 @@ export default function App() {
             <span className="dot" />
             {connLabel}
           </span>
-          <button className="icon-btn" title="Settings" onClick={() => setSettingsTab('connection')}>
+          <button className="icon-btn" title="Settings" aria-label="Settings" onClick={() => setSettingsTab('connection')}>
             <Icon name="settings" size={14} />
           </button>
         </div>
@@ -212,7 +221,7 @@ export default function App() {
               <button
                 key={t}
                 className={`dt-right-tab${rightTab === t ? ' on' : ''}`}
-                onClick={() => setRightTab(t)}
+                onClick={() => selectTab(t)}
               >
                 {t === 'chat' ? 'Chat' : t === 'skill' ? 'Skills' : 'Shell'}
               </button>
@@ -222,8 +231,16 @@ export default function App() {
             <div style={{ display: rightTab === 'chat' ? 'flex' : 'none', flexDirection: 'column', flex: '1 1 0', minHeight: 0 }}>
               <ChatPane onMenuClick={() => setDrawerOpen(true)} />
             </div>
-            {rightTab === 'skill' && <SkillPane onManage={() => setSettingsTab('skills')} />}
-            {rightTab === 'shell' && <ShellPane />}
+            {visitedTabs.skill && (
+              <div style={{ display: rightTab === 'skill' ? 'flex' : 'none', flexDirection: 'column', flex: '1 1 0', minHeight: 0 }}>
+                <SkillPane onManage={() => setSettingsTab('skills')} />
+              </div>
+            )}
+            {visitedTabs.shell && (
+              <div style={{ display: rightTab === 'shell' ? 'flex' : 'none', flexDirection: 'column', flex: '1 1 0', minHeight: 0 }}>
+                <ShellPane />
+              </div>
+            )}
           </div>
         </section>
       </div>

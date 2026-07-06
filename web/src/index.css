@@ -113,6 +113,10 @@ body {
 .mono  { font-family: var(--font-mono);  font-feature-settings: "ss02","ss03","calt"; }
 .serif { font-family: var(--font-serif); }
 
+/* Keyboard focus ring for interactive elements that lack a custom focus style.
+   Inputs that set outline:none (composer, fb-input) keep their own treatment. */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
 .kbd {
   font-family: var(--font-mono);
   font-size: 11px; line-height: 1;
@@ -336,6 +340,12 @@ body {
 .tree-row.active { background: var(--accent-tint); color: var(--accent-deep); box-shadow: inset 2px 0 0 var(--accent); }
 .ws-dot { width: 7px; height: 7px; border-radius: 999px; background: var(--ink-quat); flex-shrink: 0; }
 .ws-dot.live { background: var(--success); box-shadow: 0 0 0 3px rgba(47,125,91,.2); }
+.ws-remove-btn {
+  background: none; border: 0; color: var(--ink-quat); cursor: pointer;
+  padding: 0 2px; font-size: 13px; line-height: 1; flex-shrink: 0;
+  opacity: 0; transition: opacity .1s;
+}
+.tree-row:hover .ws-remove-btn, .ws-remove-btn:focus-visible { opacity: 1; }
 .tree-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dirty-dot { width: 6px; height: 6px; border-radius: 999px; background: var(--accent); margin-left: auto; flex-shrink: 0; }
 
@@ -560,21 +570,7 @@ body {
   border-bottom: 1px solid var(--line-soft);
   flex-shrink: 0;
 }
-.settings-tabs {
-  display: flex; gap: 0;
-  border-bottom: 1px solid var(--line-soft);
-  flex-shrink: 0;
-  padding: 0 8px;
-}
-.settings-tab {
-  padding: 8px 14px; font-size: 12px; font-weight: 500;
-  background: transparent; border: 0;
-  color: var(--ink-tertiary); cursor: pointer;
-  border-bottom: 2px solid transparent;
-  margin-bottom: -1px;
-}
-.settings-tab:hover { color: var(--ink-primary); }
-.settings-tab.on { color: var(--ink-primary); border-bottom-color: var(--accent); }
+/* (removed dead .settings-tabs / .settings-tab — Settings uses .settings-nav* now) */
 .settings-body {
   flex: 1; overflow: auto;
   padding: 16px;

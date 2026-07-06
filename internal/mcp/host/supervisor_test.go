@@ -17,7 +17,7 @@ import (
 
 // fakeConn is a ServerConn whose Wait() blocks until Close() is called.
 type fakeConn struct {
-	crashErr error      // nil → clean close; non-nil → crash
+	crashErr error // nil → clean close; non-nil → crash
 	closeCh  chan struct{}
 	listResp []mcp.Tool
 }
@@ -73,7 +73,7 @@ func TestSupervisorExhaustsRetries(t *testing.T) {
 	go initialConn.Close()
 
 	cfg := host.ServerConfig{Name: "test-srv"}
-	sup := host.NewSupervisor(cfg, reg, logger, initialConn, connectFn)
+	sup := host.NewSupervisor(cfg, reg, logger, initialConn, connectFn, func() { reg.Deregister(cfg.Name) })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -106,7 +106,7 @@ func TestSupervisorCleanShutdown(t *testing.T) {
 	initialConn := newFakeConn(nil)
 
 	cfg := host.ServerConfig{Name: "srv2"}
-	sup := host.NewSupervisor(cfg, reg, logger, initialConn, connectFn)
+	sup := host.NewSupervisor(cfg, reg, logger, initialConn, connectFn, func() { reg.Deregister(cfg.Name) })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -154,7 +154,7 @@ func TestSupervisorDeregistersBeforeRetry(t *testing.T) {
 	reg.Register(cfg, tools)
 	go initialConn.Close()
 
-	sup := host.NewSupervisor(cfg, reg, logger, initialConn, connectFn)
+	sup := host.NewSupervisor(cfg, reg, logger, initialConn, connectFn, func() { reg.Deregister(cfg.Name) })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -164,5 +164,66 @@ func TestSupervisorDeregistersBeforeRetry(t *testing.T) {
 		if e.ServerName == "srv3" {
 			t.Fatalf("registry still has tool from crashed server: %+v", e)
 		}
+	}
+}
+
+// TestSupervisorDeregisterHonorsGenerationGuard proves the supervisor routes its
+// deregister through the injected callback, and that a generation-guarded closure
+// makes a stale generation's clean-shutdown deregister a no-op — so a newer Start
+// that has re-registered the same name keeps its tools.
+func TestSupervisorDeregisterHonorsGenerationGuard(t *testing.T) {
+	reg := registry.New()
+	logger := &crashLogger{}
+
+	cfg := host.ServerConfig{Name: "srvG"}
+	tools := []mcp.Tool{{Name: "foo"}}
+	// Register the tool as a (newer) generation's Start would.
+	if err := reg.Register(cfg, tools); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// genCur models the Manager's current generation; myGen is this supervisor's.
+	var genCur atomic.Int64
+	genCur.Store(1)
+	const myGen = 1
+	dereg := func() {
+		if genCur.Load() == myGen {
+			reg.Deregister("srvG")
+		}
+	}
+
+	// Clean-shutdown fakeConn (nil crashErr): Wait() unblocks on Close().
+	initialConn := newFakeConn(nil)
+	connectFn := func() (host.ServerConn, []mcp.Tool, error) {
+		return newFakeConn(nil), nil, nil
+	}
+	sup := host.NewSupervisor(cfg, reg, logger, initialConn, connectFn, dereg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { sup.Run(ctx); close(done) }()
+
+	// A newer generation supersedes this supervisor before it cleans up.
+	genCur.Store(2)
+
+	// Trigger the clean-shutdown deregister path.
+	cancel()
+	initialConn.Close()
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("supervisor did not stop after context cancel")
+	}
+
+	// The stale-generation deregister must have no-op'd: the tool survives.
+	found := false
+	for _, e := range reg.ListAll() {
+		if e.ServerName == "srvG" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("stale-generation deregister wiped a newer generation's tool")
 	}
 }

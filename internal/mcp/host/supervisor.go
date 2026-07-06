@@ -35,12 +35,15 @@ type Supervisor struct {
 	logger      HistoryLogger
 	initialConn ServerConn // already-established conn; Run starts with this
 	connectFn   ConnectFn  // called only for retries
+	deregister  func()     // generation-guarded deregister; supersedes raw reg.Deregister
 }
 
 // NewSupervisor creates a Supervisor. Call Run(ctx) to start it.
 // initialConn is the already-established connection; connectFn is called only for retries.
-func NewSupervisor(cfg ServerConfig, reg ToolRegistry, logger HistoryLogger, initialConn ServerConn, connectFn ConnectFn) *Supervisor {
-	return &Supervisor{cfg: cfg, reg: reg, logger: logger, initialConn: initialConn, connectFn: connectFn}
+// deregister removes this server's tools; the Manager guards it with a generation
+// counter so a stale supervisor's cleanup cannot wipe a newer generation's tools.
+func NewSupervisor(cfg ServerConfig, reg ToolRegistry, logger HistoryLogger, initialConn ServerConn, connectFn ConnectFn, deregister func()) *Supervisor {
+	return &Supervisor{cfg: cfg, reg: reg, logger: logger, initialConn: initialConn, connectFn: connectFn, deregister: deregister}
 }
 
 // Run blocks until the server is permanently stopped (ctx cancelled or retries exhausted).
@@ -56,14 +59,14 @@ func (s *Supervisor) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			_ = conn.Close()
-			s.reg.Deregister(s.cfg.Name)
+			s.deregister()
 			return
 		default:
 		}
 
 		// Crash.
 		slog.Warn("mcp/supervisor: server crashed", "server", s.cfg.Name, "attempt", attempt, "err", waitErr)
-		s.reg.Deregister(s.cfg.Name)
+		s.deregister()
 		_ = conn.Close()
 
 		// Always backoff before reconnect (even after failed connectFn — fixes I2).
@@ -87,7 +90,7 @@ func (s *Supervisor) Run(ctx context.Context) {
 				// I6: collision on re-register — exit loudly rather than silently losing tools.
 				slog.Error("mcp/supervisor: re-register collision — server unrecoverable", "server", s.cfg.Name, "err", regErr)
 				_ = conn.Close()
-				s.reg.Deregister(s.cfg.Name)
+				s.deregister()
 				_ = s.logger.Append("mcp_server_unrecoverable", map[string]any{
 					"server": s.cfg.Name, "reason": regErr.Error(),
 				})
@@ -98,7 +101,7 @@ func (s *Supervisor) Run(ctx context.Context) {
 
 	// All retries exhausted — clean up.
 	_ = conn.Close()
-	s.reg.Deregister(s.cfg.Name)
+	s.deregister()
 	_ = s.logger.Append("mcp_server_crashed", map[string]any{
 		"server":        s.cfg.Name,
 		"attempt_count": maxRetries,

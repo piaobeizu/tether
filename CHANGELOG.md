@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.5.0 — 2026-07-06 (PR #87)
+
+Per-task MCP server configuration and idle-instance resource management. Drop-in over
+v0.4.1; no breaking API changes.
+
+### Added
+- **Per-task external MCP servers via `.tether/task-config.json`**: a task declares its own
+  stdio MCP servers in `<workspace>/.tether/task-config.json` (`{ "version": 1, "servers": {…} }`);
+  they are merged with any inline `extra_servers` on the task-MCP REST API, request keys winning
+  on collision. A missing file is a no-op; a malformed file fails task start with a descriptive
+  error.
+- **Idle-instance watchdog**: `LifecycleManager` hibernates per-task MCP instances idle past a
+  threshold — child servers are stopped to reclaim resources while the loopback, in-process
+  builtins, and cold external tool defs stay advertised. The next external tool call lazily wakes
+  the instance (re-spawns children, repopulates routing) before dispatch. Configurable via
+  `TETHER_MCP_IDLE_TIMEOUT` (default `15m`; `0` or a negative value disables).
+
+### Fixed
+- Per-task child MCP servers are now scoped to an instance-level context (cancelled on `Stop`)
+  instead of the request context that triggered start/wake — they no longer die when that HTTP
+  request returns.
+
 ## v0.4.1 — 2026-05-28 (PR #71–#85)
 
 UI v2 + streaming + auth-hardening increment on the v0.4 line. No API or schema breaks;

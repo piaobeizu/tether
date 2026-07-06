@@ -356,6 +356,13 @@ body {
 .crumb       { color: var(--ink-primary); font-weight: 500; }
 .dt-mid-actions { display: flex; gap: 6px; }
 .dt-mid-body { padding: 16px; overflow: auto; min-height: 0; }
+.dt-mid-empty {
+  height: 100%; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 8px;
+  text-align: center; padding: 24px; color: var(--ink-quat);
+}
+.dt-mid-empty-title { font-size: 18px; font-style: italic; color: var(--ink-tertiary); }
+.dt-mid-empty-sub { font-size: 12px; color: var(--ink-quat); max-width: 260px; line-height: 1.55; }
 
 /* ── Right pane (tabbed: Chat / Skills / Shell) ─────────────── */
 .dt-right {

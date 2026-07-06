@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useStore } from './lib/store'
 import { Icon } from './lib/icons'
 import { Settings, type SettingsTab } from './Settings'
+import { APP_VERSION } from './lib/version'
 import WorkspacePane from './panes/workspace'
 import SkillPane from './panes/skill'
 import ShellPane from './panes/shell'
@@ -192,8 +193,12 @@ export default function App() {
             </div>
           </div>
           <div className="dt-mid-body scroll-thin">
-            <div style={{ color: 'var(--ink-quat)', fontSize: 12, fontFamily: 'var(--font-mono)', padding: 8 }}>
-              — workspace artifacts will appear here —
+            <div className="dt-mid-empty">
+              <Icon name="folder-open" size={26} />
+              <div className="serif dt-mid-empty-title">no artifacts yet</div>
+              <div className="dt-mid-empty-sub">
+                Files, diffs, and skill output from this workspace show up here as tether works.
+              </div>
             </div>
           </div>
         </main>
@@ -301,7 +306,7 @@ export default function App() {
         </span>
         <span className="sb-cell mono">main</span>
         <span style={{ flex: 1 }} />
-        <span className="sb-cell mono">v0.4.0</span>
+        <span className="sb-cell mono">{APP_VERSION}</span>
       </div>
     </div>
   )

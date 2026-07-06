@@ -45,16 +45,22 @@ UI/streaming/auth increment on the v0.4 line — drop-in over v0.4.0, no API or 
 
 See [CHANGELOG](../CHANGELOG.md#v041--2026-05-28).
 
+### v0.4.1 → v0.5.0 (2026-07-06)
+
+Per-task MCP configuration + idle-instance resource management — drop-in over v0.4.1.
+
+- **Per-task external MCP server config**: tasks declare their own stdio servers in
+  `.tether/task-config.json`; merged with inline `extra_servers` (request wins).
+- **Idle-instance watchdog**: hibernates idle task instances (stops child servers, keeps the
+  loopback + builtins + cold tool defs) and lazily wakes them on the next external tool call.
+  Config via `TETHER_MCP_IDLE_TIMEOUT` (default 15m; `0`/negative disables).
+- **Fix**: per-task child servers scoped to instance lifetime, not the triggering request ctx.
+
+See [CHANGELOG](../CHANGELOG.md#v050--2026-07-06).
+
 ---
 
 ## Upcoming
-
-### v0.4 → v0.5 (planned)
-
-- **Per-task external MCP server config**: tasks declare their own servers in
-  `.tether/task-config.json`; `LifecycleManager` starts/stops them with the task.
-- **Watchdog GC for idle MCP instances**: idle instances stopped after a threshold;
-  revived on next tool call.
 
 ### v0.5 → v1.0 (roadmap)
 

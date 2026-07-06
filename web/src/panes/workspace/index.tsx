@@ -77,7 +77,7 @@ export default function WorkspacePane() {
     <>
       <div className="dt-left-head">
         <span className="section-label">Workspaces</span>
-        <button className="icon-btn-sm" onClick={addWorkspace} title="Add workspace">
+        <button className="icon-btn-sm" onClick={addWorkspace} title="Add workspace" aria-label="Add workspace">
           <Icon name="plus" size={12} />
         </button>
       </div>
@@ -118,8 +118,8 @@ export default function WorkspacePane() {
               <button
                 onClick={e => remove(ws.id, e)}
                 className="ws-remove-btn"
-                title="Remove"
-                style={{ background: 'none', border: 'none', color: 'var(--ink-quat)', cursor: 'pointer', padding: '0 2px', fontSize: 13, lineHeight: 1, flexShrink: 0, opacity: 0 }}
+                title="Remove workspace"
+                aria-label={`Remove workspace ${ws.name}`}
               >×</button>
             </div>
             {activeId === ws.id && (
@@ -190,8 +190,6 @@ export default function WorkspacePane() {
         {workspaces.length} workspace{workspaces.length !== 1 ? 's' : ''}
         {liveCount > 0 && ` · ${liveCount} live`}
       </div>
-
-      <style>{`.ws-remove-btn { transition: opacity .1s } .tree-row:hover .ws-remove-btn { opacity: 1 !important }`}</style>
     </>
   )
 }

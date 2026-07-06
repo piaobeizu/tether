@@ -47,6 +47,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   const [sessionStart, setSessionStart] = useState<number | null>(null)
   const [_elapsed, setElapsed] = useState('')
   const [slashOpen, setSlashOpen] = useState(false)
+  const [slashIndex, setSlashIndex] = useState(0)
   const [isComposing, setIsComposing] = useState(false)
   // Which message ids have their fenced block expanded to the full variant.
   const [expandedBlocks, setExpandedBlocks] = useState<Set<string>>(() => new Set())
@@ -225,10 +226,19 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
 
   const handleInputChange = (v: string) => {
     setInput(v)
-    setSlashOpen(v.startsWith('/') && v.length > 0)
+    // Only while typing the command token itself (no space yet). Once args begin,
+    // close the menu so Enter sends the message instead of re-picking the command.
+    setSlashOpen(v.startsWith('/') && !v.includes(' '))
+    setSlashIndex(0)
   }
 
   const filteredSlash = SLASH_CMDS.filter(c => c.cmd.startsWith(input.split(' ')[0]))
+
+  const pickSlash = (c: { cmd: string }) => {
+    setInput(c.cmd + ' ')
+    setSlashOpen(false)
+    setSlashIndex(0)
+  }
 
   return (
     <>
@@ -329,12 +339,13 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
             {filteredSlash.map((c, i) => (
               <div
                 key={c.cmd}
-                className={`slash-row${i === 0 ? ' on' : ''}`}
-                onClick={() => { setInput(c.cmd + ' '); setSlashOpen(false) }}
+                className={`slash-row${i === slashIndex ? ' on' : ''}`}
+                onMouseEnter={() => setSlashIndex(i)}
+                onClick={() => pickSlash(c)}
               >
                 <span className="slash-cmd">{c.cmd}</span>
                 <span className="slash-desc">{c.desc}</span>
-                <span className="kbd">↵</span>
+                {i === slashIndex && <span className="kbd">↵</span>}
               </div>
             ))}
           </div>
@@ -363,6 +374,16 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
               onCompositionStart={() => setIsComposing(true)}
               onCompositionEnd={() => setIsComposing(false)}
               onKeyDown={e => {
+                const slashActive = slashOpen && filteredSlash.length > 0
+                if (slashActive && e.key === 'ArrowDown') {
+                  e.preventDefault(); setSlashIndex(i => (i + 1) % filteredSlash.length); return
+                }
+                if (slashActive && e.key === 'ArrowUp') {
+                  e.preventDefault(); setSlashIndex(i => (i - 1 + filteredSlash.length) % filteredSlash.length); return
+                }
+                if (slashActive && (e.key === 'Tab' || e.key === 'Enter') && !isComposing) {
+                  e.preventDefault(); pickSlash(filteredSlash[Math.min(slashIndex, filteredSlash.length - 1)]); return
+                }
                 if (e.key === 'Enter' && !e.shiftKey && !isComposing) { e.preventDefault(); void sendMessage() }
                 if (e.key === 'Escape') setSlashOpen(false)
               }}
@@ -376,12 +397,14 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
               className="send-btn"
               disabled={connState !== 'connected'}
               onClick={() => void sendMessage()}
+              aria-label="Send message"
+              title="Send message"
             >
               <Icon name="arrow-up" size={13} />
             </button>
           </div>
           <div className="composer-foot">
-            <span className="mono" style={{ fontSize: 10.5, color: 'var(--ink-tertiary)' }}>⌘↵ send · shift+↵ newline</span>
+            <span className="mono" style={{ fontSize: 10.5, color: 'var(--ink-tertiary)' }}>↵ send · / for commands</span>
             {sessionId && (
               <span className="mono" style={{ fontSize: 10.5, color: 'var(--ink-tertiary)', marginLeft: 'auto' }}>
                 {selectedProvider}

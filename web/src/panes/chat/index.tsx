@@ -189,6 +189,19 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
 
   const manualRetry = () => { attemptRef.current = 0; doConnect() }
 
+  // Keep a live ref to manualRetry so the window listener (attached once) always
+  // invokes the latest closure without re-binding on every render.
+  const manualRetryRef = useRef(manualRetry)
+  manualRetryRef.current = manualRetry
+
+  // App-level error UI (banner "retry now", catch-up modal "reconnect",
+  // WT pill) asks this pane — owner of the WT connection — to retry.
+  useEffect(() => {
+    const onRetry = () => manualRetryRef.current()
+    window.addEventListener('tether:retry-connection', onRetry)
+    return () => window.removeEventListener('tether:retry-connection', onRetry)
+  }, [])
+
   useEffect(() => {
     unmountedRef.current = false
     doConnect()

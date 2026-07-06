@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useStore } from './lib/store'
 import { Icon } from './lib/icons'
 import { Settings } from './Settings'
@@ -57,7 +57,16 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [leftW,  setLeftW]  = useState(() => loadWidth(STORAGE_KEY_LEFT,  240))
   const [rightW, setRightW] = useState(() => loadWidth(STORAGE_KEY_RIGHT, 380))
+  // Local-only UI dismissals; reset whenever the underlying connection state
+  // changes so a fresh failure/reconnect re-surfaces the affordance.
+  const [bannerDismissed, setBannerDismissed] = useState(false)
+  const [modalDismissed, setModalDismissed] = useState(false)
   const { connection, sessionId } = useStore()
+
+  useEffect(() => {
+    setBannerDismissed(false)
+    setModalDismissed(false)
+  }, [connection.state])
 
   const connPillClass =
     connection.state === 'live' ? 'live' :
@@ -69,8 +78,27 @@ export default function App() {
     connection.state === 'connecting' ? 'connecting…' :
     'dropped'
 
-  const showBanner = connection.state === 'reconnecting' ||
-    (connection.state === 'dropped' && sessionId !== null)
+  // Ask ChatPane (owner of the WT connection) to retry immediately.
+  const retryConnection = () => window.dispatchEvent(new CustomEvent('tether:retry-connection'))
+
+  const showBanner = !bannerDismissed && (
+    connection.state === 'reconnecting' ||
+    (connection.state === 'dropped' && sessionId !== null))
+
+  // Catch-up-failed = a resumable session that the daemon could not re-attach
+  // after exhausting reconnect attempts (ChatPane sets state → 'dropped').
+  const showCatchupFailed = !modalDismissed &&
+    connection.state === 'dropped' && sessionId !== null
+
+  // WT transport is actively re-establishing.
+  const showWtPill = connection.state === 'reconnecting'
+
+  // "new session" — drop the resumable session id and reload so ChatPane
+  // opens a fresh WT session instead of trying to catch up the dead one.
+  const startNewSession = () => {
+    localStorage.removeItem('tether_last_sid')
+    location.reload()
+  }
 
   const resizeLeft = (dx: number) => {
     setLeftW(w => {
@@ -124,6 +152,17 @@ export default function App() {
               ? `retrying · attempt ${connection.attempt}…`
               : 'check connection'}
           </span>
+          <button className="btn-ghost-sm dt-error-retry" onClick={retryConnection}>
+            retry now
+          </button>
+          <button
+            className="icon-btn-sm"
+            title="Dismiss"
+            aria-label="Dismiss banner"
+            onClick={() => setBannerDismissed(true)}
+          >
+            <Icon name="x" size={13} />
+          </button>
         </div>
       )}
 
@@ -193,6 +232,64 @@ export default function App() {
           <div className="m-drawer-panel" onClick={e => e.stopPropagation()}>
             <WorkspacePane />
           </div>
+        </div>
+      )}
+
+      {/* ── Catch-up-failed modal ─────────────────────────────── */}
+      {showCatchupFailed && (
+        <div className="dt-catchup-overlay">
+          <div className="dt-catchup-card" role="alertdialog" aria-modal="true">
+            <div className="dt-catchup-icon">
+              <Icon name="x" size={22} />
+            </div>
+            <div className="serif dt-catchup-title">session catch-up failed</div>
+            <div className="dt-catchup-body">
+              The catch-up snapshot from{' '}
+              <span className="mono">daemon@{sessionId?.slice(0, 4)}</span>{' '}
+              couldn't be replayed — the daemon dropped after the reconnect
+              attempts were exhausted.
+            </div>
+            <div className="dt-catchup-trace mono">
+              <div className="dt-catchup-trace-err">err: session.catchup_failed</div>
+              <div>at reconnect (attempt {connection.attempt})</div>
+              <div>sid={sessionId?.slice(0, 8)}  state={connection.state}</div>
+            </div>
+            <div className="dt-catchup-actions">
+              <button
+                className="btn-ghost-sm"
+                disabled
+                title="No raw-log endpoint yet — inspect the browser console for WT errors"
+              >
+                view raw log
+              </button>
+              <span style={{ flex: 1 }} />
+              <button className="btn-ghost-sm" onClick={startNewSession}>
+                new session
+              </button>
+              <button
+                className="btn-primary-sm"
+                onClick={() => { setModalDismissed(true); retryConnection() }}
+              >
+                reconnect
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── WT reconnecting pill ──────────────────────────────── */}
+      {showWtPill && (
+        <div className="dt-wt-pill">
+          <span className="dt-wt-dot" />
+          <span className="mono">WT · reconnecting</span>
+          <button
+            className="icon-btn-sm"
+            title="Retry now"
+            aria-label="Retry connection"
+            onClick={retryConnection}
+          >
+            <Icon name="arrow-up" size={12} />
+          </button>
         </div>
       )}
 

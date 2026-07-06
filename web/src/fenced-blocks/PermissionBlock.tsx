@@ -22,24 +22,18 @@ export function PermissionBlock({ toolName, input, requestId }: Props) {
   }
 
   return (
-    <div style={{ background: '#1e1208', border: '1px solid #5c3a00', borderRadius: 6, padding: 12, marginBottom: 8 }}>
-      <div style={{ fontSize: 12, color: '#e8a040', marginBottom: 6 }}>
+    <div className="perm-block">
+      <div className="perm-title">
         Tool request: <strong>{toolName}</strong>
       </div>
-      <pre style={{ fontSize: 11, color: '#bbb', marginBottom: 10, maxHeight: 120, overflow: 'auto', background: '#111', padding: 8, borderRadius: 4 }}>
+      <pre className="perm-input">
         {JSON.stringify(input, null, 2)}
       </pre>
-      <div style={{ display: 'flex', gap: 8 }}>
-        <button
-          onClick={() => decide(true)}
-          style={{ background: '#1a3a1a', border: '1px solid #2e7d32', borderRadius: 4, padding: '5px 14px', color: '#81c784', cursor: 'pointer', fontSize: 12 }}
-        >
+      <div className="perm-actions">
+        <button className="perm-btn perm-btn-allow" onClick={() => decide(true)}>
           Allow
         </button>
-        <button
-          onClick={() => decide(false)}
-          style={{ background: '#3a1a1a', border: '1px solid #7d2e2e', borderRadius: 4, padding: '5px 14px', color: '#e57373', cursor: 'pointer', fontSize: 12 }}
-        >
+        <button className="perm-btn perm-btn-deny" onClick={() => decide(false)}>
           Deny
         </button>
       </div>

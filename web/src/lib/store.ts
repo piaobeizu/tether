@@ -1,11 +1,13 @@
 import { create } from 'zustand'
-import type { Envelope } from './wire.gen'
+import type { Envelope, FencedBlock } from './wire.gen'
 
 export interface Message {
   id: string
   role: 'user' | 'assistant' | 'system'
   text: string
   ts: number
+  /** Optional D-19 fenced block rendered inline in this message bubble. */
+  block?: FencedBlock
 }
 
 export interface PermissionRequest {
@@ -108,6 +110,24 @@ export const useStore = create<AppState>((set) => ({
       case 'result':
         set({ streaming: false, streamingMsgId: null })
         break
+      case 'fenced': {
+        // D-19 fenced block: append as its own assistant message carrying the
+        // block. This ends any in-progress text stream so the block renders as
+        // a discrete bubble (mirrors how permission requests interrupt text).
+        const fb = env.payload as FencedBlock | undefined
+        if (!fb || typeof fb.kind !== 'string') break
+        set((s) => ({
+          streamingMsgId: null,
+          messages: [...s.messages, {
+            id: crypto.randomUUID(),
+            role: 'assistant' as const,
+            text: '',
+            ts: Date.now(),
+            block: fb,
+          }],
+        }))
+        break
+      }
       case 'permission':
         set({ pendingPermission: env.payload as PermissionRequest })
         break

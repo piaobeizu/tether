@@ -8,70 +8,60 @@ interface Skill {
   addedAt: string
 }
 
-export default function SkillPane() {
+interface Props {
+  /** Open Settings on the skills sub-page (management lives there now). */
+  onManage: () => void
+}
+
+// Right-pane Skills tab: a read-only glance at installed skills. Management
+// (install / remove / enable) moved to the Settings "skills" sub-page — this
+// tab points there via onManage. See .claude/claude-design.md freeze-rule 3.
+export default function SkillPane({ onManage }: Props) {
   const [skills, setSkills] = useState<Skill[]>([])
   const [error, setError] = useState<string | null>(null)
 
-  const load = async () => {
-    try {
-      const res = await fetch('/api/v1/skills')
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      setSkills(await res.json())
-      setError(null)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+  useEffect(() => {
+    let alive = true
+    const load = () => {
+      fetch('/api/v1/skills')
+        .then(res => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`)
+          return res.json()
+        })
+        .then((list: Skill[]) => { if (alive) { setSkills(list); setError(null) } })
+        .catch(e => { if (alive) setError(e instanceof Error ? e.message : String(e)) })
     }
-  }
-
-  useEffect(() => { void load() }, [])
-
-  const install = async () => {
-    const sourcePath = prompt('Skill source path:')
-    if (!sourcePath) return
-    const name = prompt('Skill name:', sourcePath.split('/').pop() ?? sourcePath) ?? sourcePath
-    try {
-      const res = await fetch('/api/v1/skills', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, sourcePath }),
-      })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      await load()
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    }
-  }
-
-  const remove = async (id: string) => {
-    await fetch(`/api/v1/skills/${id}`, { method: 'DELETE' })
-    await load()
-  }
+    load()
+    // Refetch when skills are installed/removed from the Settings sub-page.
+    window.addEventListener('tether:skills-changed', load)
+    return () => { alive = false; window.removeEventListener('tether:skills-changed', load) }
+  }, [])
 
   return (
     <>
-      <div style={{ padding: '8px 12px', display: 'flex', justifyContent: 'flex-end', borderBottom: '1px solid var(--line-soft)', flexShrink: 0 }}>
-        <button onClick={install} className="btn-ghost-sm">+ Install</button>
+      <div style={{ padding: '8px 12px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid var(--line-soft)', flexShrink: 0 }}>
+        <span style={{ fontSize: 11, color: 'var(--ink-tertiary)', fontFamily: 'var(--font-mono)' }}>
+          {skills.length} installed
+        </span>
+        <button onClick={onManage} className="btn-ghost-sm">Manage in Settings →</button>
       </div>
       <div className="pane-body">
         {error && <div style={{ color: 'var(--danger)', fontSize: 11, marginBottom: 8 }}>{error}</div>}
-        {skills.length === 0 && (
-          <div style={{ color: 'var(--ink-secondary)', fontSize: 12 }}>No skills installed.</div>
+        {!error && skills.length === 0 && (
+          <div style={{ color: 'var(--ink-secondary)', fontSize: 12 }}>
+            No skills installed. <button onClick={onManage} className="btn-link">Install one →</button>
+          </div>
         )}
-        {skills.map((sk) => (
+        {skills.map(sk => (
           <div
             key={sk.id}
-            style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, padding: '6px 8px', background: 'var(--bg-surface)', borderRadius: 4 }}
+            style={{ marginBottom: 8, padding: '6px 8px', background: 'var(--bg-surface)', borderRadius: 4 }}
           >
-            <div>
-              <div style={{ fontSize: 13, fontWeight: 500 }}>{sk.name}</div>
-              <div style={{ fontSize: 10, color: 'var(--ink-tertiary)', fontFamily: 'monospace' }}>{sk.sourcePath}</div>
-            </div>
-            <button
-              onClick={() => remove(sk.id)}
-              style={{ background: 'none', border: 'none', color: 'var(--ink-tertiary)', cursor: 'pointer', fontSize: 14 }}
-            >
-              ×
-            </button>
+            <div style={{ fontSize: 13, fontWeight: 500 }}>{sk.name}</div>
+            {sk.description && (
+              <div style={{ fontSize: 11, color: 'var(--ink-secondary)' }}>{sk.description}</div>
+            )}
+            <div style={{ fontSize: 10, color: 'var(--ink-tertiary)', fontFamily: 'var(--font-mono)', wordBreak: 'break-all' }}>{sk.sourcePath}</div>
           </div>
         ))}
       </div>

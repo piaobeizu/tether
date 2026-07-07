@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { TetherWT } from '../../lib/wt'
+import { ControlClient } from '../../lib/control'
 import { useStore } from '../../lib/store'
 import { Icon } from '../../lib/icons'
 import type { FencedBlock, ProviderListResponse } from '../../lib/wire.gen'
@@ -59,6 +60,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   })
   const writerRef = useRef<WritableStreamDefaultWriter<Uint8Array> | null>(null)
   const wtRef = useRef<TetherWT | null>(null)
+  const controlRef = useRef<ControlClient | null>(null)
   const attemptRef = useRef(0)
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -171,6 +173,9 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
     writerRef.current = null
     old?.close()
 
+    controlRef.current?.stop()
+    controlRef.current = null
+
     // Resume last session if available — keeps history consistent across refreshes.
     const lastSid = localStorage.getItem('tether_last_sid') ?? ''
     const url = `https://${location.host}/wt/chat?provider=${encodeURIComponent(selectedProvider)}${lastSid ? `&sid=${encodeURIComponent(lastSid)}` : ''}`
@@ -179,6 +184,8 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
       onEnvelope: useStore.getState().handleEnvelope,
       onClose: () => {
         useStore.getState().setConnected(false)
+        controlRef.current?.stop()
+        controlRef.current = null
         if (!unmountedRef.current) scheduleReconnect()
       },
     })
@@ -190,6 +197,13 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
       setConnState('connected')
       const stream = await wt.openBidiStream()
       writerRef.current = stream.writable.getWriter()
+
+      // Start the control channel (ping/pong RTT) only after the main
+      // connection is live — setConnected(true) already reset latency:0,
+      // so pushing samples now won't be immediately clobbered.
+      const control = new ControlClient()
+      controlRef.current = control
+      void control.start()
     }).catch((err: unknown) => {
       const msg = err instanceof Error ? err.message : String(err)
       console.error('[tether] chat connect failed:', msg)
@@ -221,6 +235,8 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
       cancelPendingReconnect()
       writerRef.current?.releaseLock()
       wtRef.current?.close()
+      controlRef.current?.stop()
+      controlRef.current = null
     }
   }, [])
 

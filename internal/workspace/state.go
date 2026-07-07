@@ -53,6 +53,18 @@ func (r *Registry) List() []Workspace {
 	return out
 }
 
+// Get returns the workspace with the given ID, and whether it was found.
+func (r *Registry) Get(id string) (Workspace, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, w := range r.workspaces {
+		if w.ID == id {
+			return w, true
+		}
+	}
+	return Workspace{}, false
+}
+
 // Add registers a new workspace (deduplicated by path).
 func (r *Registry) Add(name, path string) (Workspace, error) {
 	abs, err := filepath.Abs(path)

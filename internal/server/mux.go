@@ -32,6 +32,7 @@ import (
 //	/wt/chat        → stream-json chat channel (s4)
 //	/wt/shell       → PTY shell channel stub (s6)
 //	/wt/events      → broadcast events channel (s4)
+//	/wt/control     → client→server control channel: ping/pong RTT, action callbacks (tether#8 F1)
 //	/wt/_smoke      → WT bidi pure-byte echo (D-22 §6 #2 acceptance gate)
 func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *session.Registry, pm *permission.Manager, authState *auth.State, mcpSrv *mcp.Server, mcpTokens *apitoken.Store, oauthH *oauth.Handlers, lm *mcplifecycle.LifecycleManager) http.Handler {
 	mux := http.NewServeMux()
@@ -83,6 +84,9 @@ func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *ses
 	// s4: chat + events WT channels.
 	mux.HandleFunc("/wt/chat", handleWTChat(reg, wts, authState))
 	mux.HandleFunc("/wt/events", handleWTEvents(reg, wts, authState))
+
+	// tether#8 F1: client→server control channel (ping/pong RTT, action callbacks).
+	mux.HandleFunc("/wt/control", handleWTControl(reg, wts, authState))
 
 	// s5: permission API (canonical + alias).
 	broadcastFn := func(req *permission.Request) {

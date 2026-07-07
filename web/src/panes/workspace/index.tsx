@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Icon } from '../../lib/icons'
 import { useStore } from '../../lib/store'
+import WorkspaceTree from './WorkspaceTree'
 
 interface Workspace {
   id: string
@@ -178,6 +179,7 @@ export default function WorkspacePane() {
                 )}
               </div>
             )}
+            {activeId === ws.id && <WorkspaceTree workspaceId={ws.id} />}
           </div>
         ))}
       </div>

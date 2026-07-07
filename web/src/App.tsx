@@ -157,6 +157,7 @@ export default function App() {
           <span className={`pill ${connPillClass}`}>
             <span className="dot" />
             {connLabel}
+            {connection.state === 'live' && connection.latency > 0 && ` · ${connection.latency}ms`}
           </span>
           <button className="icon-btn" title="Settings" aria-label="Settings" onClick={() => setSettingsTab('connection')}>
             <Icon name="settings" size={14} />

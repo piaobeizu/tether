@@ -77,3 +77,34 @@ export interface FencedBlock {
 export interface ProviderListResponse {
   providers: string[];
 }
+/**
+ * ClientFrameKind is the discriminator for client→server frames sent on
+ * the /wt/control bidi stream.
+ */
+export type ClientFrameKind = string;
+export const ClientFramePing: ClientFrameKind = "ping";
+export const ClientFrameAction: ClientFrameKind = "action";
+/**
+ * ClientFrame is a client→server message on /wt/control. Kind selects the
+ * interpretation of the remaining fields: "ping" carries only TS (RTT
+ * probe); "action" carries BlockID/Action/Skill (fenced-block callback,
+ * reserved for future use).
+ */
+export interface ClientFrame {
+  kind: ClientFrameKind;
+  ts?: number /* int64 */;
+  blockId?: string;
+  action?: string;
+  skill?: string;
+}
+/**
+ * ControlFrame is a server→client message on /wt/control.
+ */
+export interface ControlFrame {
+  kind: string;
+  ts?: number /* int64 */;
+}
+/**
+ * ControlPong is the ControlFrame.Kind sent in reply to a ClientFramePing.
+ */
+export const ControlPong = "pong";

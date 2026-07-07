@@ -2,15 +2,20 @@ package workspace
 
 import (
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"net/http"
 	"strings"
+
+	"github.com/piaobeizu/tether/internal/mcp/builtin"
 )
 
 // RegisterAPI wires workspace REST endpoints into mux (s7).
 //
-//	GET    /api/v1/workspaces          → list all workspaces
-//	POST   /api/v1/workspaces          → add workspace {"name":"...","path":"..."}
-//	DELETE /api/v1/workspaces/{id}     → remove workspace by ID
+//	GET    /api/v1/workspaces               → list all workspaces
+//	POST   /api/v1/workspaces               → add workspace {"name":"...","path":"..."}
+//	DELETE /api/v1/workspaces/{id}          → remove workspace by ID
+//	GET    /api/v1/workspaces/{id}/files    → list files directly under {dir} (default: root)
 func RegisterAPI(mux *http.ServeMux, reg *Registry) {
 	mux.HandleFunc("/api/v1/workspaces", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -38,8 +43,26 @@ func RegisterAPI(mux *http.ServeMux, reg *Registry) {
 	})
 
 	mux.HandleFunc("/api/v1/workspaces/", func(w http.ResponseWriter, r *http.Request) {
-		id := strings.TrimPrefix(r.URL.Path, "/api/v1/workspaces/")
-		if id == "" || strings.Contains(id, "/") {
+		rest := strings.TrimPrefix(r.URL.Path, "/api/v1/workspaces/")
+		if rest == "" {
+			http.NotFound(w, r)
+			return
+		}
+
+		if id, ok := strings.CutSuffix(rest, "/files"); ok {
+			if id == "" || strings.Contains(id, "/") {
+				http.NotFound(w, r)
+				return
+			}
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			handleFiles(w, r, reg, id)
+			return
+		}
+
+		if strings.Contains(rest, "/") {
 			http.NotFound(w, r)
 			return
 		}
@@ -47,12 +70,45 @@ func RegisterAPI(mux *http.ServeMux, reg *Registry) {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if err := reg.Remove(id); err != nil {
+		if err := reg.Remove(rest); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
+}
+
+// handleFiles serves GET /api/v1/workspaces/{id}/files?dir=<rel>.
+func handleFiles(w http.ResponseWriter, r *http.Request, reg *Registry, id string) {
+	ws, ok := reg.Get(id)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	root, err := builtin.New(ws.Path)
+	if err != nil {
+		http.Error(w, "workspace root not accessible", http.StatusInternalServerError)
+		return
+	}
+
+	dir := r.URL.Query().Get("dir")
+	absDir, err := root.SafeJoin(dir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			http.NotFound(w, r) // well-formed path, target dir just doesn't exist
+			return
+		}
+		http.Error(w, "invalid dir: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	entries, err := listFiles(absDir)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	jsonResp(w, entries)
 }
 
 func jsonResp(w http.ResponseWriter, v any) {

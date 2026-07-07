@@ -1,7 +1,7 @@
 import type { CSSProperties } from 'react'
 
 export type IconName =
-  | 'tether' | 'chevron' | 'chev-down' | 'folder' | 'folder-open'
+  | 'tether' | 'chevron' | 'chev-down' | 'folder' | 'folder-open' | 'file'
   | 'search' | 'plus' | 'settings' | 'phone' | 'bolt' | 'arrow-up'
   | 'x' | 'back' | 'menu' | 'ellipsis'
 
@@ -36,6 +36,8 @@ export function Icon({ name, size = 16, style }: IconProps) {
       return <svg {...shared}><path d="M1 5c0-1.1.9-2 2-2h3.2L8 5h5a1 1 0 011 1v6a1 1 0 01-1 1H3a2 2 0 01-2-2V5z"/></svg>
     case 'folder-open':
       return <svg {...shared}><path d="M1 7c0-1.1.9-2 2-2h3.2L8 5h5l1 6H2L1 7z"/></svg>
+    case 'file':
+      return <svg {...shared}><path d="M4 2h4.5L12 5.5V14H4z"/><path d="M8.5 2v3.5H12"/></svg>
     case 'search':
       return <svg {...shared}><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>
     case 'plus':

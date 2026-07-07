@@ -54,3 +54,33 @@ type FencedBlock struct {
 type ProviderListResponse struct {
 	Providers []string `json:"providers"`
 }
+
+// ClientFrameKind is the discriminator for client→server frames sent on
+// the /wt/control bidi stream.
+type ClientFrameKind string
+
+const (
+	ClientFramePing   ClientFrameKind = "ping"
+	ClientFrameAction ClientFrameKind = "action"
+)
+
+// ClientFrame is a client→server message on /wt/control. Kind selects the
+// interpretation of the remaining fields: "ping" carries only TS (RTT
+// probe); "action" carries BlockID/Action/Skill (fenced-block callback,
+// reserved for future use).
+type ClientFrame struct {
+	Kind    ClientFrameKind `json:"kind"`
+	TS      int64           `json:"ts,omitempty"`
+	BlockID string          `json:"blockId,omitempty"`
+	Action  string          `json:"action,omitempty"`
+	Skill   string          `json:"skill,omitempty"`
+}
+
+// ControlFrame is a server→client message on /wt/control.
+type ControlFrame struct {
+	Kind string `json:"kind"`
+	TS   int64  `json:"ts,omitempty"`
+}
+
+// ControlPong is the ControlFrame.Kind sent in reply to a ClientFramePing.
+const ControlPong = "pong"

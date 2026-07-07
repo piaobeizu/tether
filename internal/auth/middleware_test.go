@@ -68,7 +68,7 @@ func TestMiddleware_WTPaths_Exempt(t *testing.T) {
 		innerCalled++
 		w.WriteHeader(http.StatusOK)
 	}))
-	for _, p := range []string{"/wt/chat", "/wt/events", "/wt/shell", "/wt/_smoke"} {
+	for _, p := range []string{"/wt/chat", "/wt/events", "/wt/shell", "/wt/_smoke", "/wt/control"} {
 		rr := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", p, nil)
 		h.ServeHTTP(rr, req)
@@ -77,8 +77,8 @@ func TestMiddleware_WTPaths_Exempt(t *testing.T) {
 			t.Fatalf("path %q: expected 200 (exempt from cookie check), got %d", p, rr.Code)
 		}
 	}
-	if innerCalled != 4 {
-		t.Fatalf("inner handler hit %d times, want 4", innerCalled)
+	if innerCalled != 5 {
+		t.Fatalf("inner handler hit %d times, want 5", innerCalled)
 	}
 }
 

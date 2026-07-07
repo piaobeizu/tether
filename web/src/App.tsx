@@ -1,12 +1,15 @@
-import { useEffect, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useRef, useState } from 'react'
 import { useStore } from './lib/store'
 import { Icon } from './lib/icons'
 import { Settings, type SettingsTab } from './Settings'
 import { APP_VERSION } from './lib/version'
 import WorkspacePane from './panes/workspace'
 import SkillPane from './panes/skill'
-import ShellPane from './panes/shell'
 import ChatPane from './panes/chat'
+
+// Shell pulls in xterm (~the bulk of the JS bundle); load it only when the
+// Shell tab is first opened so it stays out of the initial download.
+const ShellPane = lazy(() => import('./panes/shell'))
 
 type RightTab = 'chat' | 'skill' | 'shell'
 
@@ -247,7 +250,9 @@ export default function App() {
             )}
             {visitedTabs.shell && (
               <div style={{ display: rightTab === 'shell' ? 'flex' : 'none', flexDirection: 'column', flex: '1 1 0', minHeight: 0 }}>
-                <ShellPane />
+                <Suspense fallback={<div className="pane-body mono" style={{ color: 'var(--ink-quat)', fontSize: 12 }}>loading shell…</div>}>
+                  <ShellPane />
+                </Suspense>
               </div>
             )}
           </div>

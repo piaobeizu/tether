@@ -110,6 +110,15 @@ export default function App() {
     location.reload()
   }
 
+  // Esc dismisses the catch-up-failed modal — but not while Settings is open on top
+  // of it (Settings owns Esc then, so one Esc closes only the topmost dialog).
+  useEffect(() => {
+    if (!showCatchupFailed) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && settingsTab === null) setModalDismissed(true) }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [showCatchupFailed, settingsTab])
+
   const resizeLeft = (dx: number) => {
     setLeftW(w => {
       const next = Math.max(MIN_LEFT, Math.min(MAX_LEFT, w + dx))

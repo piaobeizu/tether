@@ -601,6 +601,12 @@ body {
 
 /* Skills install form (Settings skills sub-page) */
 .skill-install { display: flex; flex-direction: column; gap: 6px; }
+.ws-add-form {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.chat-empty { padding: 40px 16px; text-align: center; color: var(--ink-quat); font-size: 12px; }
 .skill-input {
   font-size: 12px; padding: 7px 9px;
   border: 1px solid var(--line); border-radius: var(--r-2);

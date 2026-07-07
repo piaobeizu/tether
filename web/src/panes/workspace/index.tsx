@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Icon } from '../../lib/icons'
 import { useStore } from '../../lib/store'
 
@@ -18,6 +18,10 @@ export default function WorkspacePane() {
   const [sessionsOpen, setSessionsOpen] = useState(false)
   const currentSid = useStore(s => s.sessionId)
   const [filter, setFilter] = useState('')
+  const filterRef = useRef<HTMLInputElement>(null)
+  const [adding, setAdding] = useState(false)
+  const [newPath, setNewPath] = useState('')
+  const [newName, setNewName] = useState('')
 
   const loadSessions = async () => {
     try {
@@ -41,10 +45,22 @@ export default function WorkspacePane() {
 
   useEffect(() => { void load(); void loadSessions() }, [])
 
+  // ⌘P / Ctrl+P focuses the workspace filter.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'p') {
+        e.preventDefault()
+        filterRef.current?.focus()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
   const addWorkspace = async () => {
-    const path = prompt('Workspace path:')
+    const path = newPath.trim()
     if (!path) return
-    const name = prompt('Workspace name:', path.split('/').pop() ?? path) ?? path
+    const name = newName.trim() || (path.split('/').pop() ?? path)
     try {
       const res = await fetch('/api/v1/workspaces', {
         method: 'POST',
@@ -52,6 +68,9 @@ export default function WorkspacePane() {
         body: JSON.stringify({ name, path }),
       })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      setNewPath('')
+      setNewName('')
+      setAdding(false)
       await load()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -77,14 +96,39 @@ export default function WorkspacePane() {
     <>
       <div className="dt-left-head">
         <span className="section-label">Workspaces</span>
-        <button className="icon-btn-sm" onClick={addWorkspace} title="Add workspace" aria-label="Add workspace">
+        <button className="icon-btn-sm" onClick={() => setAdding(a => !a)} title="Add workspace" aria-label="Add workspace">
           <Icon name="plus" size={12} />
         </button>
       </div>
 
+      {adding && (
+        <div className="ws-add-form">
+          <input
+            className="skill-input"
+            placeholder="workspace path"
+            autoFocus
+            value={newPath}
+            onChange={e => setNewPath(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') void addWorkspace(); if (e.key === 'Escape') setAdding(false) }}
+          />
+          <input
+            className="skill-input"
+            placeholder="name (optional)"
+            value={newName}
+            onChange={e => setNewName(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') void addWorkspace(); if (e.key === 'Escape') setAdding(false) }}
+          />
+          <div style={{ display: 'flex', gap: 6 }}>
+            <button className="btn-primary-sm" disabled={!newPath.trim()} onClick={() => void addWorkspace()}>Add</button>
+            <button className="btn-ghost-sm" onClick={() => { setAdding(false); setNewPath(''); setNewName('') }}>Cancel</button>
+          </div>
+        </div>
+      )}
+
       <div className="dt-search">
         <Icon name="search" size={12} style={{ color: 'var(--ink-quat)', flexShrink: 0 }} />
         <input
+          ref={filterRef}
           value={filter}
           onChange={e => setFilter(e.target.value)}
           placeholder="filter…"

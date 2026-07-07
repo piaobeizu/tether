@@ -42,6 +42,10 @@ export function Settings({ onClose, initialTab = 'connection' }: Props) {
 
   // Guards against setState after the overlay is closed mid-request.
   const mounted = useRef(true)
+  const panelRef = useRef<HTMLDivElement>(null)
+  // Latest onClose without re-running the mount-only focus/Esc effect.
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
 
   const loadSkills = async () => {
     try {
@@ -65,6 +69,19 @@ export function Settings({ onClose, initialTab = 'connection' }: Props) {
       .catch(() => {})
     void loadSkills()
     return () => { mounted.current = false }
+  }, [])
+
+  // Esc closes; focus moves into the panel on open and back to the opener on close.
+  // Mount/unmount only — Settings mounts when opened and unmounts when closed, so we
+  // must NOT depend on onClose (an inline arrow from App that changes every render,
+  // which would re-run this effect and yank focus back to the panel mid-typing).
+  useEffect(() => {
+    const opener = document.activeElement as HTMLElement | null
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onCloseRef.current() }
+    document.addEventListener('keydown', onKey)
+    panelRef.current?.focus()
+    return () => { document.removeEventListener('keydown', onKey); opener?.focus?.() }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const toggleTheme = () => {
@@ -132,7 +149,15 @@ export function Settings({ onClose, initialTab = 'connection' }: Props) {
 
   return (
     <div className="settings-overlay" onClick={onClose}>
-      <div className="settings-panel" onClick={e => e.stopPropagation()}>
+      <div
+        className="settings-panel"
+        ref={panelRef}
+        tabIndex={-1}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Settings"
+        onClick={e => e.stopPropagation()}
+      >
 
         {/* Header */}
         <div className="settings-header">

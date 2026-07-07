@@ -49,6 +49,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   const [slashOpen, setSlashOpen] = useState(false)
   const [slashIndex, setSlashIndex] = useState(0)
   const [isComposing, setIsComposing] = useState(false)
+  const [showEmpty, setShowEmpty] = useState(false)
   // Which message ids have their fenced block expanded to the full variant.
   const [expandedBlocks, setExpandedBlocks] = useState<Set<string>>(() => new Set())
   const toggleBlock = (id: string) => setExpandedBlocks(prev => {
@@ -126,6 +127,15 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
       el.scrollTop = el.scrollHeight
     }
   }, [messages.length, lastMsgText, streaming])
+
+  // Empty-state hint, debounced so it doesn't flash on session resume before
+  // history arrives (connState flips to 'connected' before /messages loads).
+  useEffect(() => {
+    const empty = messages.length === 0 && connState === 'connected' && !streaming && !pendingPermission
+    if (!empty) { setShowEmpty(false); return }
+    const t = setTimeout(() => setShowEmpty(true), 500)
+    return () => clearTimeout(t)
+  }, [messages.length, connState, streaming, pendingPermission])
 
   const cancelPendingReconnect = () => {
     if (reconnectTimerRef.current !== null) { clearTimeout(reconnectTimerRef.current); reconnectTimerRef.current = null }
@@ -303,6 +313,10 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
             </div>
           )
         })}
+
+        {showEmpty && (
+          <div className="chat-empty mono">message tether to start a session</div>
+        )}
 
         {/* Thinking indicator: animated dots (not a cursor) while waiting for first token */}
         {streaming && !streamingMsgId && (

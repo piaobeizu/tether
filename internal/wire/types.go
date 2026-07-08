@@ -6,11 +6,11 @@ package wire
 type EnvelopeKind string
 
 const (
-	KindMessage    EnvelopeKind = "message"     // assistant text / tool output (s4)
-	KindPermission EnvelopeKind = "permission"  // PreToolUse callback (s5)
-	KindFenced     EnvelopeKind = "fenced"      // D-19 fenced-block structured output (s4)
-	KindError      EnvelopeKind = "error"       // daemon-side error surfaced to UI
-	KindResult     EnvelopeKind = "result"      // turn complete; payload is stop reason string
+	KindMessage    EnvelopeKind = "message"    // assistant text / tool output (s4)
+	KindPermission EnvelopeKind = "permission" // PreToolUse callback (s5)
+	KindFenced     EnvelopeKind = "fenced"     // D-19 fenced-block structured output (s4)
+	KindError      EnvelopeKind = "error"      // daemon-side error surfaced to UI
+	KindResult     EnvelopeKind = "result"     // turn complete; payload is stop reason string
 )
 
 // Envelope is the top-level wrapper for all events sent over /wt/events
@@ -66,14 +66,17 @@ const (
 
 // ClientFrame is a client→server message on /wt/control. Kind selects the
 // interpretation of the remaining fields: "ping" carries only TS (RTT
-// probe); "action" carries BlockID/Action/Skill (fenced-block callback,
-// reserved for future use).
+// probe); "action" carries SessionID/BlockID/Action/Skill — a fenced-block
+// callback (D-19 §5) routed to the named session (tether#8 T8). The
+// /wt/control channel is not otherwise session-scoped, so SessionID is the
+// only way the daemon knows which session an action targets.
 type ClientFrame struct {
-	Kind    ClientFrameKind `json:"kind"`
-	TS      int64           `json:"ts,omitempty"`
-	BlockID string          `json:"blockId,omitempty"`
-	Action  string          `json:"action,omitempty"`
-	Skill   string          `json:"skill,omitempty"`
+	Kind      ClientFrameKind `json:"kind"`
+	TS        int64           `json:"ts,omitempty"`
+	SessionID string          `json:"sessionId,omitempty"`
+	BlockID   string          `json:"blockId,omitempty"`
+	Action    string          `json:"action,omitempty"`
+	Skill     string          `json:"skill,omitempty"`
 }
 
 // ControlFrame is a server→client message on /wt/control.

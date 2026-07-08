@@ -87,12 +87,15 @@ export const ClientFrameAction: ClientFrameKind = "action";
 /**
  * ClientFrame is a client→server message on /wt/control. Kind selects the
  * interpretation of the remaining fields: "ping" carries only TS (RTT
- * probe); "action" carries BlockID/Action/Skill (fenced-block callback,
- * reserved for future use).
+ * probe); "action" carries SessionID/BlockID/Action/Skill — a fenced-block
+ * callback (D-19 §5) routed to the named session (tether#8 T8). The
+ * /wt/control channel is not otherwise session-scoped, so SessionID is the
+ * only way the daemon knows which session an action targets.
  */
 export interface ClientFrame {
   kind: ClientFrameKind;
   ts?: number /* int64 */;
+  sessionId?: string;
   blockId?: string;
   action?: string;
   skill?: string;

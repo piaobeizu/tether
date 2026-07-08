@@ -243,6 +243,13 @@ func (s *opencodeSession) SendPrompt(ctx context.Context, text string) error {
 	return nil
 }
 
+// Interrupt is a documented no-op for opencode (tether#8 T9 targets cc's
+// stream-json control_request interrupt only — see ccSession.Interrupt in
+// claude_provider.go). opencode's `serve` HTTP backend has no equivalent
+// interrupt call wired here, so a DAG-card pause click against an opencode
+// session currently does nothing observable. This asymmetry is intentional
+// scope for T9, not an oversight — extending pause to opencode is future
+// work, not tracked as a wi here.
 func (s *opencodeSession) Interrupt() error { return nil }
 
 func (s *opencodeSession) Close() error {

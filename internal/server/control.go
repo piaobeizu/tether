@@ -40,7 +40,7 @@ func handleWTControl(reg *session.Registry, wts *webtransport.Server, authState 
 	}
 }
 
-func serveControl(wtsess *webtransport.Session, _ *session.Registry) {
+func serveControl(wtsess *webtransport.Session, reg *session.Registry) {
 	defer wtsess.CloseWithError(0, "")
 	ctx := wtsess.Context()
 
@@ -86,6 +86,10 @@ func serveControl(wtsess *webtransport.Session, _ *session.Registry) {
 			if err := json.Unmarshal(raw, &frame); err != nil {
 				continue
 			}
+			if frame.Kind == wire.ClientFrameAction {
+				handleActionFrame(reg, frame)
+				continue
+			}
 			resp, ok := RespondToControl(frame)
 			if !ok {
 				continue
@@ -109,4 +113,41 @@ func RespondToControl(f wire.ClientFrame) (*wire.ControlFrame, bool) {
 		return &wire.ControlFrame{Kind: wire.ControlPong, TS: f.TS}, true
 	}
 	return nil, false
+}
+
+// handleActionFrame routes an "action" ClientFrame (D-19 §5) to its target
+// session, keyed by f.SessionID — the /wt/control channel is not otherwise
+// session-scoped, so SessionID is the only routing key available.
+//
+//   - "approve" is delivered to the session's agent via
+//     Registry.DeliverAction, wrapped as a __tether_action__ control
+//     payload the emitting skill recognizes (docs/wire/fenced-contract.md
+//     §5). The daemon never interprets DAG semantics itself (D-20).
+//   - "pause" (tether#8 T9) routes to Registry.InterruptSession, which calls
+//     the session's agent.Session.Interrupt() directly (NOT SendPrompt /
+//     __tether_action__ — this is a transport-level interrupt, not a chat
+//     message). For cc this writes a stream-json control_request on stdin
+//     instead of SIGINT-ing the subprocess, so the process stays alive and
+//     the session is immediately resumable.
+//   - "rollback" and any unrecognized action are ignored: aihub has no
+//     rollback primitive, so the button/action stays permanently unwired.
+//
+// An unknown or already-ended SessionID is a normal race (the frontend
+// can't atomically know the session outlived the click), never a crash:
+// DeliverAction's error is logged and dropped.
+func handleActionFrame(reg *session.Registry, f wire.ClientFrame) {
+	switch f.Action {
+	case "approve":
+		if err := reg.DeliverAction(f.SessionID, f.Action, f.BlockID, f.Skill); err != nil {
+			slog.Warn("serveControl: action delivery failed",
+				"sid", f.SessionID, "blockId", f.BlockID, "action", f.Action, "err", err)
+		}
+	case "pause":
+		if err := reg.InterruptSession(f.SessionID); err != nil {
+			slog.Warn("serveControl: interrupt failed",
+				"sid", f.SessionID, "blockId", f.BlockID, "action", f.Action, "err", err)
+		}
+	default:
+		// "rollback" and anything else: not wired, ignore.
+	}
 }

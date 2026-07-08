@@ -3,6 +3,7 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -30,6 +31,7 @@ type Entry struct {
 	subs          map[chan wire.Envelope]struct{}
 	subsMu        sync.RWMutex
 	ownerClientID string
+	fenceParser   *FenceParser // D-19 fenced-block extraction (tether#8 T6); one per session
 }
 
 // Session returns the underlying agent.Session.
@@ -114,7 +116,7 @@ func (r *Registry) GetOrSpawnEntry(ctx context.Context, sid, providerName string
 		return nil, fmt.Errorf("spawn: %w", err)
 	}
 
-	e := &Entry{sess: sess, subs: make(map[chan wire.Envelope]struct{})}
+	e := &Entry{sess: sess, subs: make(map[chan wire.Envelope]struct{}), fenceParser: NewFenceParser()}
 
 	// Register entry under a synthetic placeholder key BEFORE waiting for
 	// SessionID. This breaks the deadlock: cc's stream-json `--input-format`
@@ -247,6 +249,73 @@ func (r *Registry) IsOwner(sid, clientID string) bool {
 	return e.ownerClientID == clientID
 }
 
+// tetherAction is the inner payload of a __tether_action__ control message
+// (see tetherActionPayload).
+type tetherAction struct {
+	Action  string `json:"action"`
+	BlockID string `json:"blockId"`
+	Skill   string `json:"skill"`
+}
+
+// tetherActionPayload is the SendPrompt-delivered control payload for a
+// fenced-block action callback (D-19 §5, tether#8 T8). It is wrapped in the
+// "__tether_action__" marker so the emitting skill can recognize it as a
+// control input rather than ordinary user text — documented verbatim in
+// docs/wire/fenced-contract.md §5. The daemon (D-20) never interprets DAG
+// semantics itself; only the skill decides what "approve" means.
+type tetherActionPayload struct {
+	Action tetherAction `json:"__tether_action__"`
+}
+
+// DeliverAction routes a fenced-block action callback (D-19 §5) to sid's
+// underlying agent session by calling SendPrompt with a single-line JSON
+// tetherActionPayload. Delivery is generic — DeliverAction does not itself
+// decide which actions are meaningful; callers (serveControl) choose which
+// actions to deliver at all (only "approve" goes through here; "pause"
+// routes to InterruptSession below instead, "rollback" is never wired).
+//
+// Returns an error (never panics) if sid names no live session. The
+// /wt/control channel is not otherwise session-scoped, so an action frame
+// naming an unknown or already-ended session is an expected race, not a
+// bug — callers should log and drop, not crash.
+func (r *Registry) DeliverAction(sid, action, blockID, skill string) error {
+	r.mu.RLock()
+	e, ok := r.sessions[sid]
+	r.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("deliver action %q: unknown session %q", action, sid)
+	}
+	b, err := json.Marshal(tetherActionPayload{
+		Action: tetherAction{Action: action, BlockID: blockID, Skill: skill},
+	})
+	if err != nil {
+		return fmt.Errorf("deliver action %q: marshal: %w", action, err)
+	}
+	return e.sess.SendPrompt(context.Background(), string(b))
+}
+
+// InterruptSession routes a DAG-card "pause" click (D-19 §5, tether#8 T9) to
+// sid's underlying agent session by calling its agent.Session.Interrupt().
+// Unlike DeliverAction, this does NOT go through SendPrompt/
+// __tether_action__ — it signals the agent transport directly. For cc that
+// means a stream-json control_request{subtype:"interrupt"} written to
+// stdin (ccSession.Interrupt in claude_provider.go), which aborts the
+// current turn but leaves the subprocess running — the session stays
+// resumable via a subsequent SendPrompt/DeliverAction, no respawn needed.
+//
+// Returns an error (never panics) if sid names no live session — the same
+// expected race as DeliverAction (an unknown or already-ended SessionID);
+// callers (handleActionFrame) log and drop, they don't crash.
+func (r *Registry) InterruptSession(sid string) error {
+	r.mu.RLock()
+	e, ok := r.sessions[sid]
+	r.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("interrupt session: unknown session %q", sid)
+	}
+	return e.sess.Interrupt()
+}
+
 // Providers returns the names of all registered providers, sorted.
 func (r *Registry) Providers() []string {
 	names := make([]string, 0, len(r.providers))
@@ -270,51 +339,106 @@ func truncStr(s string, n int) string {
 // `sid` is captured from EventInit on the same goroutine, so it is never
 // read under a race; both providers (cc, opencode) emit EventInit before
 // any EventText / EventResult.
+//
+// EventText and EventResult get special handling here (rather than going
+// through translateEvent) because they run every assistant text chunk
+// through e.fenceParser (D-19, tether#8 T6): fenced ```<kind>:<skill>
+// blocks are extracted as KindFenced envelopes and suppressed from the
+// KindMessage stream — HistoryStore.AccumulateAssistant is fed the
+// SUPPRESSED (passthrough) text only, so raw fence JSON never pollutes
+// history, EXCEPT the bounded-buffer bail path (D-19 fix #1): a fence body
+// that overruns FenceParser's cap is surfaced as ordinary text and DOES
+// reach both chat and history, by design (see fenceparser.go doc comment).
+// A completed Block is itself ALSO persisted to history (tether#8 T7,
+// HistoryStore.AppendBlock), in stream order relative to the surrounding
+// text — see emitSegments below — so a page reload can reconstruct the
+// same DAG cards the live broadcast rendered, instead of losing them.
+// EventResult flushes any text the parser is still holding (e.g. a
+// trailing partial line, or an unclosed fence which is discarded) before
+// the turn-end KindResult envelope goes out.
+//
+// EventInit additionally calls e.fenceParser.ResetTurn() on every turn
+// (claude-code's cc re-emits system/init per turn — a metadata refresh, not
+// a new-session boundary — while it still carries the (unchanged) session
+// id every time; opencode's EventInit only fires once at session creation).
+// This is a defensive backstop for turns whose EventResult never arrives
+// (dropped, or the turn was interrupted): without it a stale open fence
+// from the previous turn would swallow the next turn's text forever.
 func (r *Registry) fanOut(e *Entry) {
 	var sid string
+
+	emitSegments := func(segs []Segment) {
+		for _, seg := range segs {
+			switch {
+			case seg.Block != nil:
+				if r.History != nil && sid != "" {
+					// Flush any buffered assistant text first so the JSONL
+					// order matches the live broadcast order: text-before-
+					// block, block, text-after-block (tether#8 T7).
+					r.History.FinalizeAssistant(sid)
+					r.History.AppendBlock(sid, *seg.Block)
+				}
+				r.broadcast(e, wire.Envelope{Kind: wire.KindFenced, Payload: *seg.Block})
+			case seg.Text != "":
+				if r.History != nil && sid != "" {
+					r.History.AccumulateAssistant(sid, seg.Text)
+				}
+				r.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: seg.Text})
+			}
+		}
+	}
 
 	for ev := range e.sess.Events() {
 		if ev.Kind == agent.EventInit && ev.SessionID != "" {
 			sid = ev.SessionID
+			e.fenceParser.ResetTurn()
 		}
 		slog.Debug("fanOut: agent event", "kind", ev.Kind, "text_preview", truncStr(ev.Text, 60))
 
-		// Persist to history.
-		if r.History != nil && sid != "" {
-			switch ev.Kind {
-			case agent.EventText:
-				r.History.AccumulateAssistant(sid, ev.Text)
-			case agent.EventResult:
+		switch ev.Kind {
+		case agent.EventText:
+			emitSegments(e.fenceParser.Feed(ev.Text))
+			continue
+
+		case agent.EventResult:
+			emitSegments(e.fenceParser.Flush())
+			if r.History != nil && sid != "" {
 				r.History.FinalizeAssistant(sid)
 			}
+			r.broadcast(e, wire.Envelope{Kind: wire.KindResult, Payload: ev.Text})
+			continue
 		}
 
 		env := translateEvent(ev)
 		if env == nil {
 			continue
 		}
-		e.subsMu.RLock()
-		nsub := len(e.subs)
-		e.subsMu.RUnlock()
-		slog.Debug("fanOut: broadcasting", "wire_kind", env.Kind, "nsub", nsub)
-		e.subsMu.RLock()
-		for ch := range e.subs {
-			select {
-			case ch <- *env:
-			default:
-				slog.Warn("fanOut: slow subscriber, envelope dropped", "kind", env.Kind)
-			}
+		r.broadcast(e, *env)
+	}
+}
+
+// broadcast sends env to every current subscriber of e, dropping (with a
+// warning) on any subscriber whose channel is full rather than blocking
+// the whole session's fanOut loop.
+func (r *Registry) broadcast(e *Entry, env wire.Envelope) {
+	e.subsMu.RLock()
+	defer e.subsMu.RUnlock()
+	slog.Debug("fanOut: broadcasting", "wire_kind", env.Kind, "nsub", len(e.subs))
+	for ch := range e.subs {
+		select {
+		case ch <- env:
+		default:
+			slog.Warn("fanOut: slow subscriber, envelope dropped", "kind", env.Kind)
 		}
-		e.subsMu.RUnlock()
 	}
 }
 
 // translateEvent converts an agent.Event to a wire.Envelope.
 // Returns nil for events that don't need to be forwarded to the browser.
+// EventText and EventResult are handled directly in fanOut (fence-parser
+// passthrough) and never reach here.
 func translateEvent(ev agent.Event) *wire.Envelope {
 	switch ev.Kind {
-	case agent.EventText:
-		return &wire.Envelope{Kind: wire.KindMessage, Payload: ev.Text}
 	case agent.EventToolUse:
 		if ev.ToolUse != nil {
 			return &wire.Envelope{Kind: wire.KindMessage, Payload: map[string]any{
@@ -324,8 +448,6 @@ func translateEvent(ev agent.Event) *wire.Envelope {
 				"input": ev.ToolUse.Input,
 			}}
 		}
-	case agent.EventResult:
-		return &wire.Envelope{Kind: wire.KindResult, Payload: ev.Text}
 	case agent.EventError:
 		return &wire.Envelope{Kind: wire.KindError, Payload: ev.Err.Error()}
 	}

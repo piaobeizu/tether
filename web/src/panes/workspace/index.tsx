@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Icon } from '../../lib/icons'
-import { useStore } from '../../lib/store'
+import { useStore, historyEntryToMessage, type HistoryEntry } from '../../lib/store'
 import WorkspaceTree from './WorkspaceTree'
 
 interface Workspace {
@@ -207,14 +207,9 @@ export default function WorkspacePane() {
                   onClick={() => {
                     fetch(`/api/v1/sessions/${encodeURIComponent(sid)}/messages`)
                       .then(r => r.ok ? r.json() : [])
-                      .then((msgs: Array<{ role: string; text: string; ts: number }>) => {
+                      .then((msgs: HistoryEntry[]) => {
                         if (msgs.length > 0) {
-                          useStore.getState().loadHistory(msgs.map(m => ({
-                            id: crypto.randomUUID(),
-                            role: m.role as 'user' | 'assistant',
-                            text: m.text,
-                            ts: m.ts,
-                          })))
+                          useStore.getState().loadHistory(msgs.map(historyEntryToMessage))
                           useStore.getState().setSessionId(sid)
                         }
                       })

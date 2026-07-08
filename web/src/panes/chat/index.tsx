@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
 import { TetherWT } from '../../lib/wt'
 import { ControlClient } from '../../lib/control'
-import { useStore } from '../../lib/store'
+import { useStore, historyEntryToMessage, type HistoryEntry } from '../../lib/store'
 import { Icon } from '../../lib/icons'
 import type { FencedBlock, ProviderListResponse } from '../../lib/wire.gen'
+import { ClientFrameAction } from '../../lib/wire.gen'
 import { authedFetch } from '../../lib/auth'
 import { DagBlock } from '../../fenced-blocks/DagBlock'
 import { FormBlock } from '../../fenced-blocks/FormBlock'
@@ -93,14 +94,9 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
     if (!sessionId) return
     fetch(`/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`)
       .then(r => r.ok ? r.json() : [])
-      .then((msgs: Array<{ role: string; text: string; ts: number }>) => {
+      .then((msgs: HistoryEntry[]) => {
         if (msgs.length > 0) {
-          useStore.getState().loadHistory(msgs.map(m => ({
-            id: crypto.randomUUID(),
-            role: m.role as 'user' | 'assistant',
-            text: m.text,
-            ts: m.ts,
-          })))
+          useStore.getState().loadHistory(msgs.map(historyEntryToMessage))
         }
       })
       .catch(() => {})
@@ -245,9 +241,49 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
     if (!text || !writerRef.current) return
     setSlashOpen(false)
     useStore.getState().addMessage({ id: crypto.randomUUID(), role: 'user', text, ts: Date.now() })
+    // Light up the "thinking" indicator immediately: `streaming` otherwise
+    // only flips true on the first agent event, leaving a blind gap after send
+    // where the user can't tell whether the agent is working or stalled.
+    // streamingMsgId stays null so the thinking-dots (not a text cursor) show.
+    useStore.setState({ streaming: true, streamingMsgId: null })
     const line = JSON.stringify({ text }) + '\n'
     try { await writerRef.current.write(new TextEncoder().encode(line)) } catch (err) { console.error('[tether] send failed:', err) }
     setInput('')
+  }
+
+  // D-19 §5 / tether#8 T8 — DagBlock's approve button. Sends an "action"
+  // ClientFrame on the /wt/control channel, which is not otherwise
+  // session-scoped, so the current sessionId travels in the frame itself;
+  // the daemon routes it to that session's agent (Registry.DeliverAction).
+  // Best-effort like the ping/pong RTT probe: no ack is awaited, and if
+  // sessionId or blockId aren't known yet the click is a no-op.
+  const sendApprove = (block: FencedBlock) => {
+    const sessionId = useStore.getState().sessionId
+    if (!sessionId || !block.blockId) return
+    void controlRef.current?.sendAction({
+      kind: ClientFrameAction,
+      sessionId,
+      blockId: block.blockId,
+      action: 'approve',
+      skill: block.skill,
+    })
+  }
+
+  // D-19 §5 / tether#8 T9 — DagBlock's pause button. Mirrors sendApprove
+  // exactly (same frame shape, same best-effort no-ack semantics); only the
+  // `action` value differs. The daemon routes "pause" to
+  // Registry.InterruptSession (agent.Session.Interrupt) instead of
+  // DeliverAction/SendPrompt — see docs/wire/fenced-contract.md §5.
+  const sendPause = (block: FencedBlock) => {
+    const sessionId = useStore.getState().sessionId
+    if (!sessionId || !block.blockId) return
+    void controlRef.current?.sendAction({
+      kind: ClientFrameAction,
+      sessionId,
+      blockId: block.blockId,
+      action: 'pause',
+      skill: block.skill,
+    })
   }
 
   const handleInputChange = (v: string) => {
@@ -315,6 +351,8 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
                     block={m.block}
                     expanded={expandedBlocks.has(m.id)}
                     onToggle={() => toggleBlock(m.id)}
+                    onApprove={sendApprove}
+                    onPause={sendPause}
                   />
                 </div>
               )}
@@ -452,13 +490,17 @@ interface FencedBlockViewProps {
   block: FencedBlock
   expanded: boolean
   onToggle: () => void
+  /** D-19 §5 approve callback (tether#8 T8); only 'dag' wires it so far. */
+  onApprove: (block: FencedBlock) => void
+  /** D-19 §5 pause callback (tether#8 T9); only 'dag' wires it so far. */
+  onPause: (block: FencedBlock) => void
 }
 
 // Dispatch a FencedBlock to its renderer by `kind` (D-19 §10.B.4).
 // Unknown kinds fall back to a compact raw view rather than throwing.
-function FencedBlockView({ block, expanded, onToggle }: FencedBlockViewProps) {
+function FencedBlockView({ block, expanded, onToggle, onApprove, onPause }: FencedBlockViewProps) {
   switch (block.kind) {
-    case 'dag':        return <DagBlock block={block} expanded={expanded} onToggle={onToggle} />
+    case 'dag':        return <DagBlock block={block} expanded={expanded} onToggle={onToggle} onApprove={() => onApprove(block)} onPause={() => onPause(block)} />
     case 'form':       return <FormBlock block={block} expanded={expanded} onToggle={onToggle} />
     case 'candidates': return <CandidatesBlock block={block} expanded={expanded} onToggle={onToggle} />
     case 'media':      return <MediaBlock block={block} expanded={expanded} onToggle={onToggle} />

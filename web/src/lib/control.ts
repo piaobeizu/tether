@@ -88,6 +88,22 @@ export class ControlClient {
     }
   }
 
+  /**
+   * sendAction writes an "action" ClientFrame on the control stream (D-19
+   * §5, tether#8 T8) — e.g. the DAG card's approve button. Best-effort, like
+   * sendPing: silently drops if the control stream isn't currently
+   * connected, and there's no ack to await.
+   */
+  async sendAction(frame: ClientFrame): Promise<void> {
+    if (!this.writer) return
+    const line = JSON.stringify(frame) + '\n'
+    try {
+      await this.writer.write(new TextEncoder().encode(line))
+    } catch {
+      // write failure — stream likely closed.
+    }
+  }
+
   private async readPongs(readable: ReadableStream<Uint8Array>): Promise<void> {
     const reader = readable.getReader()
     let buf = ''

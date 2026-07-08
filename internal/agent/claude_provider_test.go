@@ -1,6 +1,9 @@
 package agent
 
 import (
+	"bytes"
+	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -89,5 +92,112 @@ func TestParseLine_Result(t *testing.T) {
 	}
 	if ev.Text != "1, 2, 3" {
 		t.Errorf("Text = %q, want 1, 2, 3", ev.Text)
+	}
+}
+
+// TestParseLine_ControlResponseIgnored — cc's reply to an outbound
+// control_request (e.g. the T9 interrupt request written by
+// ccSession.Interrupt) must be silently dropped: no Event, and critically
+// not a bad/error Event that would surface as noise in the chat stream.
+func TestParseLine_ControlResponseIgnored(t *testing.T) {
+	s := &ccSession{sidReady: make(chan struct{})}
+	line := []byte(`{"type":"control_response","response":{"subtype":"success","request_id":"tether-interrupt-1"}}`)
+	if ev := s.parseLine(line); ev != nil {
+		t.Errorf("expected nil for control_response, got %+v", ev)
+	}
+}
+
+// TestParseLine_ControlResponseErrorIgnored — an error-subtype
+// control_response (e.g. cc rejecting an interrupt request it couldn't
+// honor) must also be dropped quietly, not surfaced as EventError; T9
+// doesn't correlate/await control_request replies at all.
+func TestParseLine_ControlResponseErrorIgnored(t *testing.T) {
+	s := &ccSession{sidReady: make(chan struct{})}
+	line := []byte(`{"type":"control_response","response":{"subtype":"error","request_id":"tether-interrupt-1","error":"no active turn"}}`)
+	if ev := s.parseLine(line); ev != nil {
+		t.Errorf("expected nil for control_response error, got %+v", ev)
+	}
+}
+
+// ─── Interrupt (tether#8 T9) ────────────────────────────────────────────────
+//
+// Interrupt used to send SIGINT to the cc subprocess. tether holds cc's
+// stdin open across the whole session (--input-format stream-json), so
+// killing/signaling the process would defeat resumability; these tests pin
+// the replacement behavior: a stream-json control_request written through
+// the same mu-guarded encoder SendPrompt uses, and NO process signaling.
+
+// TestInterrupt_WritesControlRequest asserts the emitted JSON shape:
+// {"type":"control_request","request_id":"<non-empty>","request":{"subtype":"interrupt"}}.
+func TestInterrupt_WritesControlRequest(t *testing.T) {
+	var buf bytes.Buffer
+	s := &ccSession{enc: json.NewEncoder(&buf), sidReady: make(chan struct{})}
+
+	if err := s.Interrupt(); err != nil {
+		t.Fatalf("Interrupt: %v", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("Interrupt did not write valid JSON: %v (%q)", err, buf.String())
+	}
+	if got["type"] != "control_request" {
+		t.Errorf(`type = %v, want "control_request"`, got["type"])
+	}
+	reqID, _ := got["request_id"].(string)
+	if reqID == "" {
+		t.Error("request_id is empty, want a unique non-empty id")
+	}
+	req, ok := got["request"].(map[string]any)
+	if !ok {
+		t.Fatalf("request field missing or not an object: %+v", got)
+	}
+	if req["subtype"] != "interrupt" {
+		t.Errorf(`request.subtype = %v, want "interrupt"`, req["subtype"])
+	}
+}
+
+// TestInterrupt_UniqueRequestIDsPerCall ensures repeated Interrupt() calls
+// (e.g. rapid double-clicks on the pause button) don't reuse a request_id.
+func TestInterrupt_UniqueRequestIDsPerCall(t *testing.T) {
+	var buf bytes.Buffer
+	s := &ccSession{enc: json.NewEncoder(&buf), sidReady: make(chan struct{})}
+
+	if err := s.Interrupt(); err != nil {
+		t.Fatalf("Interrupt #1: %v", err)
+	}
+	if err := s.Interrupt(); err != nil {
+		t.Fatalf("Interrupt #2: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 written lines, got %d: %q", len(lines), buf.String())
+	}
+	var a, b map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &a); err != nil {
+		t.Fatalf("line 1 not valid JSON: %v", err)
+	}
+	if err := json.Unmarshal([]byte(lines[1]), &b); err != nil {
+		t.Fatalf("line 2 not valid JSON: %v", err)
+	}
+	if a["request_id"] == b["request_id"] {
+		t.Errorf("expected distinct request_id per call, got %q both times", a["request_id"])
+	}
+}
+
+// TestInterrupt_DoesNotSignalProcess pins the core T9 behavior change: the
+// old implementation dereferenced s.cmd.Process to send SIGINT — with s.cmd
+// left as its zero value (nil *exec.Cmd), that would panic. Interrupt must
+// never touch s.cmd at all now; it only writes to the stdin encoder.
+func TestInterrupt_DoesNotSignalProcess(t *testing.T) {
+	var buf bytes.Buffer
+	s := &ccSession{enc: json.NewEncoder(&buf), sidReady: make(chan struct{})}
+
+	if err := s.Interrupt(); err != nil {
+		t.Fatalf("Interrupt: %v", err)
+	}
+	if s.cmd != nil {
+		t.Errorf("s.cmd = %+v, want nil — Interrupt must not touch/signal the process", s.cmd)
 	}
 }

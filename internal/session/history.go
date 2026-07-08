@@ -1,11 +1,16 @@
 // Package session — message history persistence.
 //
 // Each session's history is stored as JSONL in:
-//   ~/.tether/sessions/<sid>/history.jsonl
 //
-// Format: one JSON object per line.
-//   {"role":"user","text":"...","ts":1234567890000}
-//   {"role":"assistant","text":"...","ts":1234567890000}
+//	~/.tether/sessions/<sid>/history.jsonl
+//
+// Format: one JSON object per line, in stream order. A line is either a
+// plain text turn or a completed fenced block (D-19, tether#8 T7) — never
+// both:
+//
+//	{"role":"user","text":"...","ts":1234567890000}
+//	{"role":"assistant","text":"...","ts":1234567890000}
+//	{"role":"assistant","text":"","ts":1234567890000,"block":{"kind":"dag","skill":"s","content":"...","blockId":"s-0"}}
 package session
 
 import (
@@ -16,6 +21,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/piaobeizu/tether/internal/wire"
 )
 
 // MaxAssistantBufBytes caps the in-memory accumulator per session so that a
@@ -25,11 +32,15 @@ import (
 // ceiling for a single response with headroom.
 const MaxAssistantBufBytes = 4 << 20
 
-// HistoryMessage is one turn stored in the JSONL history file.
+// HistoryMessage is one entry stored in the JSONL history file: either a
+// plain text turn (Block nil) or a completed fenced block (D-19, tether#8
+// T7) recorded in stream order alongside surrounding text, so a page
+// reload can reconstruct DAG cards exactly as they rendered live.
 type HistoryMessage struct {
-	Role string `json:"role"` // "user" | "assistant"
-	Text string `json:"text"`
-	Ts   int64  `json:"ts"` // Unix milliseconds
+	Role  string            `json:"role"` // "user" | "assistant"
+	Text  string            `json:"text"`
+	Ts    int64             `json:"ts"` // Unix milliseconds
+	Block *wire.FencedBlock `json:"block,omitempty"`
 }
 
 // HistoryStore manages per-session message history files.
@@ -116,6 +127,22 @@ func (h *HistoryStore) FinalizeAssistant(sid string) {
 		Role: "assistant",
 		Text: buf.text,
 		Ts:   buf.ts,
+	})
+}
+
+// AppendBlock appends a completed fenced block (D-19) to session history in
+// stream order. Callers must finalize any pending assistant text first
+// (FinalizeAssistant) so the JSONL order matches the live broadcast order —
+// text-before-block, block, text-after-block (tether#8 T7). Registry.fanOut's
+// emitSegments is the only caller and does this.
+func (h *HistoryStore) AppendBlock(sid string, block wire.FencedBlock) {
+	if sid == "" {
+		return
+	}
+	h.append(sid, HistoryMessage{
+		Role:  "assistant",
+		Block: &block,
+		Ts:    time.Now().UnixMilli(),
 	})
 }
 

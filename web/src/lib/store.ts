@@ -10,6 +10,36 @@ export interface Message {
   block?: FencedBlock
 }
 
+/**
+ * One entry as returned by GET /api/v1/sessions/{sid}/messages: either a
+ * plain text turn (block undefined) or a persisted D-19 fenced block,
+ * mirroring the daemon's session.HistoryMessage JSON shape (tether#8 T7).
+ */
+export interface HistoryEntry {
+  role: string
+  text: string
+  ts: number
+  block?: FencedBlock
+}
+
+/**
+ * historyEntryToMessage converts one /messages history entry into the chat
+ * Message shape — the same shape the live 'fenced' envelope produces in
+ * handleEnvelope below — so DagBlock (and friends) render identically
+ * whether the block arrived live or was reconstructed after a page reload
+ * (tether#8 T7).
+ */
+export function historyEntryToMessage(m: HistoryEntry): Message {
+  const msg: Message = {
+    id: crypto.randomUUID(),
+    role: m.role as Message['role'],
+    text: m.text,
+    ts: m.ts,
+  }
+  if (m.block) msg.block = m.block
+  return msg
+}
+
 export interface PermissionRequest {
   id: string
   toolName: string
@@ -55,7 +85,28 @@ export const useStore = create<AppState>((set) => ({
     localStorage.setItem('tether_last_sid', id)
     set({ sessionId: id })
   },
-  loadHistory: (msgs) => set({ messages: msgs, streamingMsgId: null, streaming: false }),
+  loadHistory: (msgs) => set(() => {
+    // Mirror the live 'fenced' replace-by-BlockID reduction (contract §3):
+    // a block re-emitted with the same BlockID is persisted as multiple
+    // history entries, but must collapse to ONE card — the LAST occurrence's
+    // content at the FIRST occurrence's position — so a reloaded viewer sees
+    // exactly what the live viewer saw (tether#8 T7/T8 reconciliation).
+    const reduced: Message[] = []
+    const blockPos = new Map<string, number>()
+    for (const m of msgs) {
+      const bid = m.block?.blockId
+      if (bid) {
+        const at = blockPos.get(bid)
+        if (at !== undefined) {
+          reduced[at] = { ...reduced[at], block: m.block }
+          continue
+        }
+        blockPos.set(bid, reduced.length)
+      }
+      reduced.push(m)
+    }
+    return { messages: reduced, streamingMsgId: null, streaming: false }
+  }),
   addMessage: (msg) => set((s) => ({ messages: [...s.messages, msg] })),
   setPendingPermission: (req) => set({ pendingPermission: req }),
   setConnected: (v) => v
@@ -110,22 +161,47 @@ export const useStore = create<AppState>((set) => ({
       case 'result':
         set({ streaming: false, streamingMsgId: null })
         break
+      case 'error':
+        // Clear the thinking/streaming indicator on a daemon-surfaced error so
+        // the UI doesn't get stuck showing "Claude is thinking…" forever.
+        set({ streaming: false, streamingMsgId: null })
+        break
       case 'fenced': {
-        // D-19 fenced block: append as its own assistant message carrying the
-        // block. This ends any in-progress text stream so the block renders as
-        // a discrete bubble (mirrors how permission requests interrupt text).
+        // D-19 fenced block, live-replace-by-BlockID (tether#8 T8, contract §3):
+        // if a message already carries a block with this BlockID, replace that
+        // message's block IN PLACE (same message id, so expandedBlocks/expand
+        // state survives) — this is how a re-emitted block (e.g. DAG progress)
+        // animates instead of appending a duplicate card. A new/absent BlockID
+        // appends a new block message.
+        //
+        // On a NEW block (append) we close the in-progress text bubble
+        // (streamingMsgId: null) so subsequent text deltas start a fresh
+        // bubble AFTER the card — this keeps live rendering in stream order
+        // ([before][card][after]), matching what the reload path reconstructs
+        // from history. On a re-emit (replace-in-place, same BlockID) we leave
+        // streaming untouched — a card update is not a text boundary.
         const fb = env.payload as FencedBlock | undefined
         if (!fb || typeof fb.kind !== 'string') break
-        set((s) => ({
-          streamingMsgId: null,
-          messages: [...s.messages, {
-            id: crypto.randomUUID(),
-            role: 'assistant' as const,
-            text: '',
-            ts: Date.now(),
-            block: fb,
-          }],
-        }))
+        set((s) => {
+          const idx = fb.blockId
+            ? s.messages.findIndex((m) => m.block?.blockId === fb.blockId)
+            : -1
+          if (idx >= 0) {
+            const messages = s.messages.slice()
+            messages[idx] = { ...messages[idx], block: fb }
+            return { messages }
+          }
+          return {
+            streamingMsgId: null,
+            messages: [...s.messages, {
+              id: crypto.randomUUID(),
+              role: 'assistant' as const,
+              text: '',
+              ts: Date.now(),
+              block: fb,
+            }],
+          }
+        })
         break
       }
       case 'permission':

@@ -92,6 +92,7 @@ type ccSession struct {
 	sid      string
 	sidReady chan struct{}
 	sidOnce  sync.Once
+	reqSeq   int // control_request id counter (T9 pause/interrupt), guarded by mu
 }
 
 func (s *ccSession) SessionID() string {
@@ -114,11 +115,45 @@ func (s *ccSession) SendPrompt(_ context.Context, text string) error {
 
 func (s *ccSession) Events() <-chan Event { return s.events }
 
+// Interrupt aborts the in-flight turn WITHOUT killing the cc subprocess
+// (tether#8 T9). Earlier this sent SIGINT to s.cmd.Process, which cc treats
+// like a Ctrl-C from a real terminal — acceptable for a bare `claude` REPL,
+// but tether drives cc with `--input-format stream-json` and holds its
+// stdin open across turns (see Spawn/SendPrompt above), so the process is
+// meant to stay alive and resumable across the whole session lifetime, not
+// just the current turn. Instead we write a stream-json control_request on
+// the same mu-guarded encoder SendPrompt uses:
+//
+//	{"type":"control_request","request_id":"<unique>","request":{"subtype":"interrupt"}}
+//
+// cc aborts the current turn and stays running; the caller (Registry.
+// InterruptSession) treats the session as immediately resumable via a
+// subsequent SendPrompt — no respawn, no --resume flag needed.
+//
+// request_id only needs to be unique per-session (cc doesn't require a
+// global namespace); a mutex-guarded counter avoids pulling in time/rand
+// for something this local. We do not wait for the matching
+// control_response — this is fire-and-remember, like SendPrompt; readLoop
+// (see parseLine) recognizes and drops the control_response line so it
+// never surfaces as a spurious event.
+//
+// VERIFY: this shape is confirmed against tether v1's production
+// implementation (v0/internal/backend/claude/message.go
+// OutboundControlRequest + session.go SendInterrupt, which shipped this
+// exact interrupt flow), not against upstream `claude` CLI docs directly —
+// re-confirm against the pinned cc version if this ever misbehaves.
 func (s *ccSession) Interrupt() error {
-	if s.cmd.Process == nil {
-		return nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reqSeq++
+	req := map[string]any{
+		"type":       "control_request",
+		"request_id": fmt.Sprintf("tether-interrupt-%d", s.reqSeq),
+		"request": map[string]any{
+			"subtype": "interrupt",
+		},
 	}
-	return s.cmd.Process.Signal(os.Interrupt)
+	return s.enc.Encode(req)
 }
 
 func (s *ccSession) Close() error {
@@ -231,6 +266,17 @@ func (s *ccSession) parseLine(line []byte) *Event {
 
 	if raw.Type == "rate_limit_event" {
 		return &Event{Kind: EventRateLimit}
+	}
+
+	// control_response is cc's reply to a control_request WE sent (currently
+	// only the T9 interrupt request from ccSession.Interrupt). It carries no
+	// user-visible content and Interrupt() doesn't correlate/await it, so
+	// this is intentionally a no-op — matched explicitly (rather than
+	// relying on the catch-all `return nil` below) so a future contributor
+	// adding a new fallthrough Event doesn't accidentally turn cc's ack into
+	// a spurious EventError/bad event in the chat stream.
+	if raw.Type == "control_response" {
+		return nil
 	}
 
 	return nil

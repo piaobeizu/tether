@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/piaobeizu/tether/internal/wire"
 )
 
 // TestHistory_AccumulateAndFinalize exercises the happy path: stream a few
@@ -81,6 +83,54 @@ func TestHistory_LoadCorruptLineSkipped(t *testing.T) {
 	}
 	if msgs[0].Text != "first" || msgs[1].Text != "reply" {
 		t.Errorf("got %+v %+v, want first/reply", msgs[0], msgs[1])
+	}
+}
+
+// TestHistory_AppendBlockPreservesOrder — (tether#8 T7) a session that
+// streams text, then a fenced block, then more text must persist all three
+// as separate ordered entries — never collapsed into one concatenated
+// assistant message — with the block payload intact, so a page reload can
+// reconstruct the DAG card in the same position it rendered live. Mirrors
+// how Registry.fanOut's emitSegments drives HistoryStore (FinalizeAssistant
+// before AppendBlock).
+func TestHistory_AppendBlockPreservesOrder(t *testing.T) {
+	dir := t.TempDir()
+	h := NewHistoryStore(dir)
+
+	h.RecordUser("sid-block", "do the thing")
+	h.AccumulateAssistant("sid-block", "before text\n")
+	h.FinalizeAssistant("sid-block")
+	h.AppendBlock("sid-block", wire.FencedBlock{
+		Kind:    wire.FencedBlockDag,
+		Skill:   "s",
+		Content: `{"a":1}`,
+		BlockID: "s-0",
+	})
+	h.AccumulateAssistant("sid-block", "after text")
+	h.FinalizeAssistant("sid-block")
+
+	msgs := h.LoadHistory("sid-block")
+	if len(msgs) != 4 {
+		t.Fatalf("len(msgs) = %d, want 4: %+v", len(msgs), msgs)
+	}
+	if msgs[0].Role != "user" || msgs[0].Text != "do the thing" {
+		t.Errorf("msgs[0] = %+v, want user/do the thing", msgs[0])
+	}
+	if msgs[1].Role != "assistant" || msgs[1].Text != "before text\n" || msgs[1].Block != nil {
+		t.Errorf("msgs[1] = %+v, want assistant/before text, no block", msgs[1])
+	}
+	if msgs[2].Block == nil {
+		t.Fatalf("msgs[2].Block = nil, want a FencedBlock: %+v", msgs[2])
+	}
+	want := wire.FencedBlock{Kind: wire.FencedBlockDag, Skill: "s", Content: `{"a":1}`, BlockID: "s-0"}
+	if *msgs[2].Block != want {
+		t.Errorf("msgs[2].Block = %+v, want %+v", *msgs[2].Block, want)
+	}
+	if msgs[2].Text != "" {
+		t.Errorf("msgs[2].Text = %q, want empty (block-only entry)", msgs[2].Text)
+	}
+	if msgs[3].Role != "assistant" || msgs[3].Text != "after text" || msgs[3].Block != nil {
+		t.Errorf("msgs[3] = %+v, want assistant/after text, no block", msgs[3])
 	}
 }
 

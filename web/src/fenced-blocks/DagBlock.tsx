@@ -7,6 +7,17 @@ interface Props {
   block: FencedBlock
   expanded: boolean
   onToggle: () => void
+  /** D-19 §5 approve callback (tether#8 T8) — sends an action frame on /wt/control. */
+  onApprove: () => void
+  /**
+   * D-19 §5 pause callback (tether#8 T9) — sends an action frame on
+   * /wt/control routed by the daemon to Registry.InterruptSession, which
+   * writes a stream-json control_request interrupt to cc's stdin. The
+   * agent process stays alive; the session remains resumable. This wi only
+   * wires the interrupt — full pause/resume UX (and the skill calling
+   * pf_pause_attempt) is the deferred emitter sibling's job.
+   */
+  onPause: () => void
 }
 
 // Auto-layout: place nodes on a serpentine grid so any node count renders
@@ -50,7 +61,7 @@ function BlockFallback({ label }: { label: string }) {
   return <div className="fb-fallback mono">{label}: unreadable block content</div>
 }
 
-export function DagBlock({ block, expanded, onToggle }: Props) {
+export function DagBlock({ block, expanded, onToggle, onApprove, onPause }: Props) {
   const data = useMemo(() => parseContent<DagContent>(block.content), [block.content])
   const nodes = useMemo<DagNode[]>(
     () => (Array.isArray(data?.nodes) ? data.nodes : []),
@@ -187,15 +198,25 @@ export function DagBlock({ block, expanded, onToggle }: Props) {
               </div>
             )}
           </div>
-          {/* No daemon action API exists yet (D-19 action callbacks are a
-              future step): render the controls disabled with a TODO title so
-              the affordance is visible without inventing a backend call. */}
+          {/* approve (T8) and pause (T9) are wired: both send an "action"
+              ClientFrame on /wt/control, routed by the daemon to the
+              running agent/skill (D-19 §5) — approve via
+              Registry.DeliverAction (SendPrompt), pause via
+              Registry.InterruptSession (agent.Session.Interrupt, i.e. a cc
+              stdin control_request, NOT a chat message). rollback has no
+              aihub primitive (§5) and stays disabled. */}
           <div className="fb-side-actions">
-            <button type="button" className="btn-ghost-sm" disabled title="action callbacks not wired yet">
+            <button
+              type="button"
+              className="btn-ghost-sm"
+              onClick={onPause}
+              disabled={data.paused}
+              title={data.paused ? 'resume is not wired yet — see fenced-contract §5' : undefined}
+            >
               {data.paused ? '▶ resume' : '❚❚ pause'}
             </button>
-            <button type="button" className="btn-ghost-sm" disabled title="action callbacks not wired yet">↺ rollback</button>
-            <button type="button" className="btn-ghost-sm" disabled title="action callbacks not wired yet">✓ approve</button>
+            <button type="button" className="btn-ghost-sm" disabled title="rollback is not wired — no aihub primitive">↺ rollback</button>
+            <button type="button" className="btn-ghost-sm" onClick={onApprove}>✓ approve</button>
           </div>
         </aside>
       </div>

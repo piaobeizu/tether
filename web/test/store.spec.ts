@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { useStore } from '../src/lib/store'
+import { useStore, historyEntryToMessage, type HistoryEntry } from '../src/lib/store'
 import type { Envelope } from '../src/lib/wire.gen'
 
-const reset = () => useStore.setState({ messages: [], sessionId: null, streaming: false, connected: false })
+const reset = () => useStore.setState({ messages: [], sessionId: null, streaming: false, streamingMsgId: null, connected: false })
 
 describe('useStore.handleEnvelope', () => {
   beforeEach(reset)
@@ -22,6 +22,13 @@ describe('useStore.handleEnvelope', () => {
     const env: Envelope = { kind: 'result', payload: 'end_turn' }
     useStore.getState().handleEnvelope(env)
     expect(useStore.getState().streaming).toBe(false)
+  })
+
+  it('error envelope clears streaming (no stuck "thinking" indicator)', () => {
+    useStore.setState({ streaming: true, streamingMsgId: null })
+    useStore.getState().handleEnvelope({ kind: 'error', payload: 'boom' })
+    expect(useStore.getState().streaming).toBe(false)
+    expect(useStore.getState().streamingMsgId).toBeNull()
   })
 
   it('session_ready payload sets sessionId without adding a message', () => {
@@ -76,5 +83,165 @@ describe('useStore.handleEnvelope', () => {
     }
     useStore.getState().handleEnvelope(env)
     expect(useStore.getState().pendingPermission?.id).toBe('req-1')
+  })
+})
+
+// tether#8 T7 — page-reload persistence: GET /messages now returns fenced
+// blocks alongside text, and loadHistory must reconstruct them with the
+// same `block` shape the live 'fenced' envelope path produces above, so
+// DagBlock renders identically after a reload.
+describe('historyEntryToMessage / loadHistory (tether#8 T7 block persistence)', () => {
+  beforeEach(reset)
+
+  it('reconstructs a block-message from a /messages payload containing a block', () => {
+    const payload: HistoryEntry[] = [
+      { role: 'user', text: 'build a plan', ts: 1 },
+      { role: 'assistant', text: 'before text\n', ts: 2 },
+      {
+        role: 'assistant',
+        text: '',
+        ts: 3,
+        block: { kind: 'dag', skill: 's', content: '{"x":1}', blockId: 's-0' },
+      },
+      { role: 'assistant', text: 'after text', ts: 4 },
+    ]
+
+    useStore.getState().loadHistory(payload.map(historyEntryToMessage))
+    const { messages } = useStore.getState()
+
+    expect(messages).toHaveLength(4)
+    expect(messages[0]?.role).toBe('user')
+    expect(messages[0]?.block).toBeUndefined()
+    expect(messages[1]?.text).toBe('before text\n')
+    expect(messages[1]?.block).toBeUndefined()
+
+    // The block entry: same shape DagBlock consumes from a live 'fenced'
+    // envelope (see the 'fenced' case in handleEnvelope above).
+    expect(messages[2]?.block).toEqual({
+      kind: 'dag', skill: 's', content: '{"x":1}', blockId: 's-0',
+    })
+    expect(messages[2]?.text).toBe('')
+
+    expect(messages[3]?.text).toBe('after text')
+    expect(messages[3]?.block).toBeUndefined()
+  })
+
+  it('a text-only payload is unchanged (regression)', () => {
+    const payload: HistoryEntry[] = [
+      { role: 'user', text: 'hello', ts: 1 },
+      { role: 'assistant', text: 'hi there', ts: 2 },
+    ]
+
+    useStore.getState().loadHistory(payload.map(historyEntryToMessage))
+    const { messages } = useStore.getState()
+
+    expect(messages).toHaveLength(2)
+    expect(messages[0]).toMatchObject({ role: 'user', text: 'hello', ts: 1 })
+    expect(messages[0]?.block).toBeUndefined()
+    expect(messages[1]).toMatchObject({ role: 'assistant', text: 'hi there', ts: 2 })
+    expect(messages[1]?.block).toBeUndefined()
+  })
+})
+
+// tether#8 T8 — live DAG-card updates: a re-emitted 'fenced' envelope with
+// the SAME BlockID must update the existing block message in place (so the
+// card animates progress), not append a duplicate; a different BlockID
+// appends a new card. A NEW block append closes the in-progress text bubble
+// (streamingMsgId reset) so the card renders in stream order and the live
+// view matches what the reload path reconstructs from history.
+describe('handleEnvelope fenced — live replace-by-BlockID (tether#8 T8)', () => {
+  beforeEach(reset)
+
+  const dagEnv = (blockId: string, content: string): Envelope => ({
+    kind: 'fenced',
+    payload: { kind: 'dag', skill: 's', content, blockId },
+  })
+
+  it('same BlockID re-emitted updates the existing block message in place (no new bubble)', () => {
+    useStore.getState().handleEnvelope(dagEnv('s-0', '{"nodes":[{"id":"a","status":"running"}]}'))
+    const idAfterFirst = useStore.getState().messages[0]?.id
+    expect(idAfterFirst).toBeTruthy()
+
+    useStore.getState().handleEnvelope(dagEnv('s-0', '{"nodes":[{"id":"a","status":"done"}]}'))
+    const { messages } = useStore.getState()
+
+    expect(messages).toHaveLength(1)
+    expect(messages[0]?.id).toBe(idAfterFirst) // same message id -> expand state survives
+    expect(messages[0]?.block?.content).toBe('{"nodes":[{"id":"a","status":"done"}]}')
+  })
+
+  it('a different BlockID appends a second, separate block message', () => {
+    useStore.getState().handleEnvelope(dagEnv('s-0', '{}'))
+    useStore.getState().handleEnvelope(dagEnv('s-1', '{}'))
+    const { messages } = useStore.getState()
+
+    expect(messages).toHaveLength(2)
+    expect(messages[0]?.block?.blockId).toBe('s-0')
+    expect(messages[1]?.block?.blockId).toBe('s-1')
+  })
+
+  it('a NEW block append closes the text bubble; following text is a fresh bubble after the card (stream order)', () => {
+    // First text chunk opens a streaming assistant bubble.
+    useStore.getState().handleEnvelope({ kind: 'message', payload: 'hello ' })
+    const textId = useStore.getState().streamingMsgId
+    expect(textId).toBeTruthy()
+
+    // A NEW DAG block appends a card AND resets streamingMsgId, so the card
+    // renders in stream position and following text starts a separate bubble.
+    useStore.getState().handleEnvelope(dagEnv('s-0', '{"v":1}'))
+    expect(useStore.getState().streamingMsgId).toBeNull()
+
+    // Following text delta -> a NEW bubble after the card.
+    useStore.getState().handleEnvelope({ kind: 'message', payload: 'world' })
+    const afterId = useStore.getState().streamingMsgId
+    expect(afterId).toBeTruthy()
+    expect(afterId).not.toBe(textId)
+
+    // Re-emit same BlockID -> updates the card in place, streaming untouched.
+    useStore.getState().handleEnvelope(dagEnv('s-0', '{"v":2}'))
+    expect(useStore.getState().streamingMsgId).toBe(afterId)
+
+    const { messages } = useStore.getState()
+    expect(messages).toHaveLength(3) // [before-text, card, after-text]
+    expect(messages[0]?.id).toBe(textId)
+    expect(messages[0]?.text).toBe('hello ')
+    expect(messages[1]?.block?.blockId).toBe('s-0')
+    expect(messages[1]?.block?.content).toBe('{"v":2}')
+    expect(messages[2]?.id).toBe(afterId)
+    expect(messages[2]?.text).toBe('world')
+  })
+
+  // Integration invariant (the DAG-lane final review flagged this was untested):
+  // the LIVE path (handleEnvelope) and the RELOAD path (loadHistory) must render
+  // identical messages — same order, same collapsed cards — for the same stream.
+  it('live handleEnvelope and reload loadHistory render identical messages', () => {
+    const shape = () => useStore.getState().messages.map((m) => ({
+      role: m.role, text: m.text,
+      block: m.block?.blockId ?? null, content: m.block?.content ?? null,
+    }))
+
+    // Live: before-text, block(v1), after-text, re-emit block(v2).
+    useStore.getState().handleEnvelope({ kind: 'message', payload: 'before\n' })
+    useStore.getState().handleEnvelope(dagEnv('d0', '{"v":1}'))
+    useStore.getState().handleEnvelope({ kind: 'message', payload: 'after\n' })
+    useStore.getState().handleEnvelope(dagEnv('d0', '{"v":2}'))
+    const live = shape()
+
+    // Reload: history persists the block twice (v1, v2); loadHistory must
+    // collapse to one card (last content, first position), matching live.
+    reset()
+    const history: HistoryEntry[] = [
+      { role: 'assistant', text: 'before\n', ts: 1 },
+      { role: 'assistant', text: '', ts: 2, block: { kind: 'dag', skill: 's', content: '{"v":1}', blockId: 'd0' } },
+      { role: 'assistant', text: 'after\n', ts: 3 },
+      { role: 'assistant', text: '', ts: 4, block: { kind: 'dag', skill: 's', content: '{"v":2}', blockId: 'd0' } },
+    ]
+    useStore.getState().loadHistory(history.map(historyEntryToMessage))
+    const reloaded = shape()
+
+    expect(reloaded).toEqual(live)
+    expect(live).toHaveLength(3)          // [before, card, after]
+    expect(live[1]?.block).toBe('d0')
+    expect(live[1]?.content).toBe('{"v":2}') // last content wins
   })
 })

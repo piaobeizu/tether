@@ -32,6 +32,12 @@ type Entry struct {
 	subsMu        sync.RWMutex
 	ownerClientID string
 	fenceParser   *FenceParser // D-19 fenced-block extraction (tether#8 T6); one per session
+	// evicted is set true by Registry.evict once this session's fanOut loop
+	// has returned (session ended / client disconnected). Guarded by
+	// Registry.mu (NOT subsMu). It exists so the re-key goroutine in
+	// GetOrSpawnEntry, if it wins the race and runs AFTER eviction, refuses to
+	// re-insert this dead entry under its real sid (tether#12).
+	evicted bool
 }
 
 // Session returns the underlying agent.Session.
@@ -137,7 +143,10 @@ func (r *Registry) GetOrSpawnEntry(ctx context.Context, sid, providerName string
 		sid := sess.SessionID()
 		r.mu.Lock()
 		delete(r.sessions, tempKey)
-		if sid != "" {
+		// Skip the re-key if the session already ended and fanOut evicted the
+		// entry while we were parked in SessionID() (tether#12). Without this
+		// guard a fast session teardown could be resurrected here and leak.
+		if sid != "" && !e.evicted {
 			r.sessions[sid] = e
 		}
 		r.mu.Unlock()
@@ -155,6 +164,43 @@ func (r *Registry) GetOrSpawn(ctx context.Context, sid, providerName string) (ag
 		return nil, err
 	}
 	return e.sess, nil
+}
+
+// evict removes e from the sessions map after its session has terminated —
+// called from fanOut's defer, i.e. once the agent's Events() channel has
+// closed. serveChat binds the agent subprocess to the client-connection
+// context (exec.CommandContext with wtsess.Context()), and both providers
+// close Events() when that context is cancelled — cc via readLoop's
+// `defer close(events)` after the SIGKILL'd subprocess EOFs, opencode via its
+// ctx-done goroutine (closeEvents). So a client disconnect (ctx cancel) closes
+// Events() and lands here, the same path as a session that ends on its own.
+// That single trigger covers BOTH "session ended" and "client disconnected",
+// which is why no idle timer or grace period is needed — the connection
+// context already bounds the subprocess lifetime (tether#12).
+//
+// Eviction is by value: it deletes whatever key maps to e, catching the entry
+// whether it is keyed under its real sid or still under the pending-%p
+// placeholder from GetOrSpawnEntry. The placeholder case matters — a session
+// that dies before emitting system/init parks the re-key goroutine forever in
+// ccSession.SessionID() (sidReady never closes), so this by-value scan is the
+// only path that reclaims that map slot. Setting e.evicted first makes a
+// late-waking re-key goroutine refuse to re-insert the entry (see
+// GetOrSpawnEntry). Deleting during range is safe per the Go spec, and this
+// runs once per session lifetime — not on a hot path.
+//
+// r.locks is deliberately NOT cleaned here: the per-sid SessionLock is shared
+// with shell sessions (handleWTShell calls GetLock for the same sid), so its
+// lifetime is not bound to this chat Entry — reclaiming it safely needs a
+// cross-surface refcount, tracked as a separate follow-up.
+func (r *Registry) evict(e *Entry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e.evicted = true
+	for k, v := range r.sessions {
+		if v == e {
+			delete(r.sessions, k)
+		}
+	}
 }
 
 // RecordUserMessage persists a user-sent message to session history.
@@ -365,6 +411,12 @@ func truncStr(s string, n int) string {
 // (dropped, or the turn was interrupted): without it a stale open fence
 // from the previous turn would swallow the next turn's text forever.
 func (r *Registry) fanOut(e *Entry) {
+	// When the range below returns, the agent's Events() channel has closed —
+	// the session has ended (subprocess exited, or the client disconnected and
+	// cancelled the Spawn context that bounds the subprocess). Evict the entry
+	// so long-running daemons don't leak dead sessions in r.sessions (tether#12).
+	defer r.evict(e)
+
 	var sid string
 
 	emitSegments := func(segs []Segment) {

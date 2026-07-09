@@ -21,13 +21,24 @@ import (
 type fakeSession struct {
 	sid    string
 	events chan agent.Event
+	// sidReady, when non-nil, gates SessionID() until it is closed — mimics
+	// ccSession.SessionID() blocking on system/init, used by the tether#12
+	// eviction-race test to end a session while the re-key goroutine is still
+	// parked in SessionID(). Nil (the default) returns the sid immediately,
+	// preserving every other test's behavior.
+	sidReady chan struct{}
 
 	mu             sync.Mutex
 	prompts        []string
 	interruptCalls int
 }
 
-func (f *fakeSession) SessionID() string { return f.sid }
+func (f *fakeSession) SessionID() string {
+	if f.sidReady != nil {
+		<-f.sidReady
+	}
+	return f.sid
+}
 func (f *fakeSession) SendPrompt(_ context.Context, text string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -498,5 +509,105 @@ func TestRegistry_InterruptSession_UnknownSession(t *testing.T) {
 	reg := NewRegistry()
 	if err := reg.InterruptSession("does-not-exist"); err == nil {
 		t.Fatal("InterruptSession: want error for unknown session, got nil")
+	}
+}
+
+// regLen returns how many entries the registry currently holds, read under
+// its lock. Same-package white-box access used by the tether#12 eviction
+// tests to assert the map is actually reclaimed — not just that one sid
+// lookup misses.
+func regLen(reg *Registry) int {
+	reg.mu.RLock()
+	defer reg.mu.RUnlock()
+	return len(reg.sessions)
+}
+
+// waitForEvicted polls until sid is no longer registered — i.e. fanOut ran
+// its eviction defer after Events() closed. Bounded so a genuine failure
+// (entry never evicted) fails fast instead of hanging.
+func waitForEvicted(t *testing.T, reg *Registry, sid string) {
+	t.Helper()
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if !reg.IsLive(sid) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("session %q never evicted after its Events() channel closed", sid)
+}
+
+// waitForCount polls until the registry holds exactly n entries. Bounded.
+func waitForCount(t *testing.T, reg *Registry, n int) {
+	t.Helper()
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if regLen(reg) == n {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("registry never reached %d entries; has %d", n, regLen(reg))
+}
+
+// TestRegistry_EvictsEntryOnSessionEnd — (tether#12) once a session's agent
+// Events() channel closes (subprocess exited, or the client disconnected and
+// cancelled the ctx that bounds the subprocess), fanOut returns and must
+// remove the entry from the registry. Before this fix a long-running daemon
+// leaked one map entry — plus its subscriber set and fence parser — for every
+// session ever opened.
+func TestRegistry_EvictsEntryOnSessionEnd(t *testing.T) {
+	fs := &fakeSession{sid: "sid-evict", events: make(chan agent.Event, 8)}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+
+	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	// Drive system/init so the entry is re-keyed under its real sid.
+	fs.events <- agent.Event{Kind: agent.EventInit, SessionID: "sid-evict"}
+	waitForRegistered(t, reg, "sid-evict")
+
+	// Session ends: closing Events() unblocks fanOut's range and runs its
+	// eviction defer.
+	close(fs.events)
+
+	waitForEvicted(t, reg, "sid-evict")
+	if n := regLen(reg); n != 0 {
+		t.Fatalf("registry holds %d entries after session end, want 0", n)
+	}
+}
+
+// TestRegistry_EvictedEntryNotResurrectedByRekey — (tether#12) guards the race
+// between fanOut's eviction and GetOrSpawnEntry's re-key goroutine. The
+// session ends BEFORE its sid is published (SessionID() is gated on sidReady),
+// so fanOut evicts the pending-keyed entry while the re-key goroutine is still
+// parked in SessionID(). When SessionID() is then released with a real sid,
+// the re-key goroutine must observe e.evicted and refuse to re-insert the dead
+// entry — otherwise it resurrects the very leak this task fixes.
+func TestRegistry_EvictedEntryNotResurrectedByRekey(t *testing.T) {
+	ready := make(chan struct{})
+	fs := &fakeSession{sid: "sid-race", events: make(chan agent.Event, 4), sidReady: ready}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+
+	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+
+	// End the session before init: fanOut evicts the pending entry while the
+	// re-key goroutine is blocked in SessionID() (ready not yet closed).
+	close(fs.events)
+	waitForCount(t, reg, 0)
+
+	// Release the re-key goroutine with a real sid; it must NOT re-insert.
+	close(ready)
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if reg.IsLive("sid-race") {
+			t.Fatal("evicted entry was resurrected by the re-key goroutine")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if n := regLen(reg); n != 0 {
+		t.Fatalf("registry holds %d entries, want 0 (re-key must not resurrect)", n)
 	}
 }

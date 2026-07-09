@@ -114,6 +114,13 @@ func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *ses
 		skill.RegisterAPI(mux, cfg.SkillRegistry)
 	}
 
+	// Task A2: curated read-only aihub work-item proxy. Registered
+	// unconditionally (even with a nil client) so /api/v1/work/* answers
+	// 503 "aihub not configured" itself, in the same auth-gated group as
+	// the workspace/skill APIs above, instead of falling through to the
+	// generic /api/v1/ 501 stub registered below.
+	RegisterWorkAPI(mux, cfg.AihubClient)
+
 	// /mcp on the HTTPS main port returns 501 until OAuth 2.1 lands in v0.4.
 	// The real /mcp endpoint is served by MCPLoopback on the loopback HTTP port.
 

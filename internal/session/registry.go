@@ -168,10 +168,12 @@ func (r *Registry) GetOrSpawn(ctx context.Context, sid, providerName string) (ag
 
 // evict removes e from the sessions map after its session has terminated —
 // called from fanOut's defer, i.e. once the agent's Events() channel has
-// closed. Both providers close Events() when their subprocess exits, and
-// serveChat binds that subprocess to the client-connection context
-// (exec.CommandContext with wtsess.Context()); so a client disconnect cancels
-// the context, kills the subprocess, closes Events(), and lands here too.
+// closed. serveChat binds the agent subprocess to the client-connection
+// context (exec.CommandContext with wtsess.Context()), and both providers
+// close Events() when that context is cancelled — cc via readLoop's
+// `defer close(events)` after the SIGKILL'd subprocess EOFs, opencode via its
+// ctx-done goroutine (closeEvents). So a client disconnect (ctx cancel) closes
+// Events() and lands here, the same path as a session that ends on its own.
 // That single trigger covers BOTH "session ended" and "client disconnected",
 // which is why no idle timer or grace period is needed — the connection
 // context already bounds the subprocess lifetime (tether#12).

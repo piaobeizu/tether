@@ -44,6 +44,8 @@ Checks: `cc-binary`, `data-dir`, `cert-state`, `port-bindable`, `cc-settings-hoo
 | `TETHER_HOST` | `127.0.0.1` | Hostname for startup log URL |
 | `IS_SANDBOX` | auto-set if root | Injected into cc subprocess when running as root |
 | `TETHER_MCP_IDLE_TIMEOUT` | `15m` | Idle time before a per-task MCP instance is hibernated (child servers stopped, revived on next tool call). Set `0` to disable the watchdog. Accepts Go durations (e.g. `30m`). |
+| `TETHER_AIHUB_URL` | `""` | aihub base URL backing the read-only Work-view proxy (`GET /api/v1/work/*`). Falls back to `~/.polyforge/config.toml` `[server].url`. If neither is set, `/api/v1/work/*` answer `503` and the rest of the daemon is unaffected. |
+| `TETHER_AIHUB_KEY` | `""` | aihub API key (sent as `Authorization: Bearer`) for the Work-view proxy — **server-side only, never sent to the browser**. Falls back to `~/.polyforge/config.toml` `[auth].api_key`. The proxy is read-only (GET-only; non-GET → 405) and single-operator (see decisions/2026-07-09-tether-aihub-read-proxy.md). |
 
 ## CLI reference
 

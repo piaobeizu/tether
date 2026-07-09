@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/piaobeizu/tether/internal/agent"
+	"github.com/piaobeizu/tether/internal/aihub"
 	"github.com/piaobeizu/tether/internal/auth"
 	"github.com/piaobeizu/tether/internal/auth/apitoken"
 	"github.com/piaobeizu/tether/internal/auth/oauth"
@@ -46,6 +47,13 @@ type Config struct {
 	WsRegistry     *workspace.Registry
 	SkillRegistry  *skill.Registry
 	acmeTLSBase    *tls.Config // populated by Run() when AcmeDomain is active
+
+	// AihubClient backs the curated /api/v1/work/* proxy (Task A2). If nil
+	// when Run() starts, Run() attempts aihub.LoadConfig() and constructs
+	// one; if that also fails (no env vars, no ~/.polyforge/config.toml),
+	// it is left nil and RegisterWorkAPI (mux.go) answers 503 for every
+	// /api/v1/work/* route rather than failing startup.
+	AihubClient *aihub.Client
 
 	// MCP fields (v0.3.1)
 	MCPPort       int    // loopback port; 0 = default 8899
@@ -120,6 +128,19 @@ func Run(cfg *Config) error {
 			slog.Warn("skill registry init failed", "err", err)
 		} else {
 			cfg.SkillRegistry = skReg
+		}
+	}
+
+	// Step 2c: aihub client for the curated /api/v1/work/* proxy (Task A2).
+	// Best-effort: LoadConfig looks at TETHER_AIHUB_URL/KEY, then falls back
+	// to ~/.polyforge/config.toml. A missing/incomplete config leaves
+	// cfg.AihubClient nil rather than failing startup — RegisterWorkAPI
+	// (mux.go) answers 503 for every /api/v1/work/* route in that case.
+	if cfg.AihubClient == nil {
+		if baseURL, key, ok := aihub.LoadConfig(); ok {
+			cfg.AihubClient = aihub.New(baseURL, key)
+		} else {
+			slog.Warn("aihub not configured; /api/v1/work/* will answer 503")
 		}
 	}
 

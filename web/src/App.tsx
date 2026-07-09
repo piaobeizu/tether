@@ -6,12 +6,13 @@ import { APP_VERSION } from './lib/version'
 import WorkspacePane from './panes/workspace'
 import SkillPane from './panes/skill'
 import ChatPane from './panes/chat'
+import WorkPane from './panes/work'
 
 // Shell pulls in xterm (~the bulk of the JS bundle); load it only when the
 // Shell tab is first opened so it stays out of the initial download.
 const ShellPane = lazy(() => import('./panes/shell'))
 
-type RightTab = 'chat' | 'skill' | 'shell'
+type RightTab = 'chat' | 'skill' | 'shell' | 'work'
 
 const STORAGE_KEY_LEFT  = 'tether_col_left'
 const STORAGE_KEY_RIGHT = 'tether_col_right'
@@ -59,7 +60,7 @@ export default function App() {
   const [rightTab, setRightTab] = useState<RightTab>('chat')
   // Keep panes mounted after first visit so switching tabs doesn't tear down the
   // PTY (Shell) or refetch (Skills). Chat is always mounted.
-  const [visitedTabs, setVisitedTabs] = useState<Record<RightTab, boolean>>({ chat: true, skill: false, shell: false })
+  const [visitedTabs, setVisitedTabs] = useState<Record<RightTab, boolean>>({ chat: true, skill: false, shell: false, work: false })
   const selectTab = (t: RightTab) => {
     setRightTab(t)
     setVisitedTabs(v => (v[t] ? v : { ...v, [t]: true }))
@@ -230,13 +231,13 @@ export default function App() {
         {/* Right: Chat / Skills / Shell tabs */}
         <section className="dt-right" style={{ width: rightW }}>
           <div className="dt-right-tabs">
-            {(['chat', 'skill', 'shell'] as RightTab[]).map(t => (
+            {(['chat', 'skill', 'shell', 'work'] as RightTab[]).map(t => (
               <button
                 key={t}
                 className={`dt-right-tab${rightTab === t ? ' on' : ''}`}
                 onClick={() => selectTab(t)}
               >
-                {t === 'chat' ? 'Chat' : t === 'skill' ? 'Skills' : 'Shell'}
+                {t === 'chat' ? 'Chat' : t === 'skill' ? 'Skills' : t === 'shell' ? 'Shell' : 'Work'}
               </button>
             ))}
           </div>
@@ -254,6 +255,11 @@ export default function App() {
                 <Suspense fallback={<div className="pane-body mono" style={{ color: 'var(--ink-quat)', fontSize: 12 }}>loading shell…</div>}>
                   <ShellPane />
                 </Suspense>
+              </div>
+            )}
+            {visitedTabs.work && (
+              <div style={{ display: rightTab === 'work' ? 'flex' : 'none', flexDirection: 'column', flex: '1 1 0', minHeight: 0 }}>
+                <WorkPane active={rightTab === 'work'} />
               </div>
             )}
           </div>

@@ -111,3 +111,103 @@ export interface ControlFrame {
  * ControlPong is the ControlFrame.Kind sent in reply to a ClientFramePing.
  */
 export const ControlPong = "pong";
+
+//////////
+// source: work.go
+
+/**
+ * WorkProject is the curated project descriptor for GET /api/v1/work/projects.
+ */
+export interface WorkProject {
+  name: string;
+}
+/**
+ * WorkReadyItem is a work item in the items/needsHumanSession/unclassified
+ * segments of WorkQueue.
+ */
+export interface WorkReadyItem {
+  id: string;
+  slug: string;
+  wiType?: string;
+  priority: string;
+  goal: string;
+  unblockedAt?: string;
+  createdAt?: string;
+}
+/**
+ * WorkRunningItem is a work item in the running/staleRunning segment of
+ * WorkQueue.
+ */
+export interface WorkRunningItem {
+  id: string;
+  slug: string;
+  goal: string;
+  ownerDisplay: string;
+  lastActiveAt: string;
+}
+/**
+ * WorkStalledItem is a work item in the stalled segment of WorkQueue.
+ */
+export interface WorkStalledItem {
+  id: string;
+  slug: string;
+  stallReason: string;
+  stalledSince: string;
+  lastActorDisplay: string;
+}
+/**
+ * WorkPausedItem is a work item in the paused segment of WorkQueue.
+ */
+export interface WorkPausedItem {
+  id: string;
+  slug: string;
+  pausedSince: string;
+  lastActorDisplay: string;
+  pauseReason?: string;
+}
+/**
+ * WorkQueue is the curated LCRS ready-queue response for
+ * GET /api/v1/work/queue.
+ */
+export interface WorkQueue {
+  items: WorkReadyItem[];
+  running: WorkRunningItem[];
+  stalled: WorkStalledItem[];
+  paused: WorkPausedItem[];
+  needsHumanSession: WorkReadyItem[];
+  unclassified: WorkReadyItem[];
+  staleRunning?: WorkRunningItem[];
+}
+/**
+ * WorkItemDetail merges the whitelisted work_item fields with the current
+ * step-machine state, for GET /api/v1/work/items/{id}.
+ */
+export interface WorkItemDetail {
+  id: string;
+  slug: string;
+  goal: string;
+  status: string;
+  priority: string;
+  wiType?: string;
+  labels: string[];
+  content?: string;
+  currentStep?: string;
+  currentStepStatus: string;
+}
+/**
+ * WorkEvent mirrors one agent_events row for
+ * GET /api/v1/work/items/{id}/events.
+ */
+export interface WorkEvent {
+  ts: string;
+  type: string;
+  payload?: unknown;
+}
+/**
+ * WorkEvents is the paginated event page returned by
+ * GET /api/v1/work/items/{id}/events.
+ */
+export interface WorkEvents {
+  events: WorkEvent[];
+  nextCursor?: string;
+}

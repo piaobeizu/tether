@@ -15,8 +15,9 @@ import (
 // pure parsing/lifecycle helpers without spawning any real subprocess.
 func newTestOCSession() *opencodeSession {
 	return &opencodeSession{
-		events: make(chan Event, 64),
-		sidCh:  make(chan struct{}),
+		spawnCtx: context.Background(), // emit's terminal branch selects on this; nil would panic
+		events:   make(chan Event, 64),
+		sidCh:    make(chan struct{}),
 	}
 }
 

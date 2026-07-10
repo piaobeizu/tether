@@ -195,10 +195,26 @@ type opencodeSession struct {
 
 // emit safely sends ev to s.events; drops if the channel has been closed by
 // closeEvents, preventing the closed-channel send panic.
+//
+// Terminal events (isTerminal) block until delivered instead of being dropped:
+// a lost EventResult/EventError leaves the consumer's turn open forever
+// (tether#14). This is safe against a permanent hang because fanOut drains
+// Events() unconditionally until close, so the send always makes progress; the
+// spawnCtx guard is the escape when the session is torn down mid-send (the
+// same ctx the Spawn teardown goroutine uses to call closeEvents, so on cancel
+// this returns and releases eventsMu before closeEvents needs the write lock —
+// no deadlock). Non-terminal events keep the non-blocking backpressure drop.
 func (s *opencodeSession) emit(ev Event) {
 	s.eventsMu.RLock()
 	defer s.eventsMu.RUnlock()
 	if s.closed {
+		return
+	}
+	if isTerminal(ev.Kind) {
+		select {
+		case s.events <- ev:
+		case <-s.spawnCtx.Done():
+		}
 		return
 	}
 	select {

@@ -25,6 +25,18 @@ type Event struct {
 	Err       error // EventError
 }
 
+// isTerminal reports whether k is a turn-closing event that MUST be delivered
+// reliably — never dropped under backpressure. Losing one leaves the consumer's
+// turn open forever: the frontend clears its "thinking…" indicator on both the
+// result and error envelopes (tether#14), and some opencode error paths return
+// before emitting any EventResult, so the error is the only turn-closer. All
+// other kinds (EventText token deltas, tool_use, init, rate_limit) stay
+// best-effort and may be dropped when the buffer is full — intentional
+// backpressure for high-frequency output.
+func isTerminal(k EventKind) bool {
+	return k == EventResult || k == EventError
+}
+
 // ToolUseEvent carries a tool_use content block extracted from an assistant event.
 // NOTE: tool_use is a CONTENT BLOCK inside assistant.message.content[], NOT a
 // top-level stream event (D-05a §3, Risk #4). chat_translate.go extracts these.

@@ -133,6 +133,26 @@ func (c *Client) Projects(ctx context.Context) ([]Project, error) {
 	return wrapper.Items, nil
 }
 
+// ListWorkItems fetches work items for a project, optionally filtered by
+// status (e.g. []string{"wrapped","cancelled"} for the done/recent view).
+// GET /v1/work_items?project=<project>&status=<csv>&limit=<limit>
+func (c *Client) ListWorkItems(ctx context.Context, project string, statuses []string, limit int) (*WorkItemList, error) {
+	q := url.Values{}
+	q.Set("project", project)
+	if len(statuses) > 0 {
+		q.Set("status", strings.Join(statuses, ","))
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+
+	var out WorkItemList
+	if err := c.getJSON(ctx, "/v1/work_items?"+q.Encode(), &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // ReadyQueue mirrors aihub's GET /v1/work_items/ready response
 // (internal/domain.ReadyQueue in aihub).
 type ReadyQueue struct {
@@ -224,4 +244,25 @@ type EventsResponse struct {
 // (internal/domain.Project in aihub).
 type Project struct {
 	Name string `json:"name"`
+}
+
+// WorkItemSummary mirrors the whitelisted fields of one work_items row as
+// returned in the GET /v1/work_items list — a subset of the full row, enough
+// for the done/recent history view.
+type WorkItemSummary struct {
+	ID        string  `json:"id"`
+	Slug      string  `json:"slug"`
+	Goal      string  `json:"goal"`
+	Status    string  `json:"status"`
+	Priority  string  `json:"priority"`
+	WIType    *string `json:"wi_type"`
+	ClosedAt  *string `json:"closed_at"`
+	UpdatedAt string  `json:"updated_at,omitempty"`
+}
+
+// WorkItemList mirrors aihub's GET /v1/work_items list response
+// ({"items":[...],"next_cursor":...}).
+type WorkItemList struct {
+	Items      []WorkItemSummary `json:"items"`
+	NextCursor *string           `json:"next_cursor,omitempty"`
 }

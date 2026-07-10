@@ -91,3 +91,24 @@ type WorkEvents struct {
 	Events     []WorkEvent `json:"events"`
 	NextCursor *string     `json:"nextCursor,omitempty"`
 }
+
+// WorkRecentItem is a terminal (wrapped/cancelled) work item in the
+// done/recent history list for GET /api/v1/work/recent.
+type WorkRecentItem struct {
+	ID       string  `json:"id"`
+	Slug     string  `json:"slug"`
+	Goal     string  `json:"goal"`
+	Status   string  `json:"status"`
+	Priority string  `json:"priority"`
+	WIType   *string `json:"wiType,omitempty"`
+	ClosedAt *string `json:"closedAt,omitempty"`
+}
+
+// WorkRecent is the curated done/recent history response for
+// GET /api/v1/work/recent (terminal work items). aihub currently returns these
+// in created-order (no closed_at sort param upstream), so the SPA re-sorts by
+// closedAt for display; a server-side closed_at ordering is a tracked aihub
+// follow-up.
+type WorkRecent struct {
+	Items []WorkRecentItem `json:"items"`
+}

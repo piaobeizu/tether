@@ -607,6 +607,12 @@ body {
   background: var(--bg-tint); color: var(--ink-secondary);
 }
 .work-badge-warn { background: var(--warn-tint); color: #7A5410; }
+.work-badge-done { background: var(--bg-tint); color: var(--ink-quat); }
+
+/* Done/recent history section (tether#19) */
+.work-recent-head { cursor: pointer; user-select: none; }
+.work-recent-caret { color: var(--ink-quat); font-size: 10px; }
+.work-row-slug { margin-left: auto; color: var(--ink-quat); font-size: 11px; }
 
 .work-detail-head {
   display: flex; align-items: center; gap: 8px;

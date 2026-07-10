@@ -282,8 +282,8 @@ func TestWorkAPI_ReadOnlyAndUnknownPaths(t *testing.T) {
 		t.Errorf("GET /work/bogus: status = %d, want 404", rec2.Code)
 	}
 
-	// Also cover the other three GET-only routes for good measure.
-	for _, path := range []string{"/api/v1/work/projects", "/api/v1/work/items/wi_1", "/api/v1/work/items/wi_1/events"} {
+	// Also cover the other GET-only routes for good measure.
+	for _, path := range []string{"/api/v1/work/projects", "/api/v1/work/recent?project=x", "/api/v1/work/items/wi_1", "/api/v1/work/items/wi_1/events"} {
 		req := httptest.NewRequest(http.MethodPost, path, nil)
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, req)
@@ -314,6 +314,7 @@ func TestWorkAPI_NeverLeaksAPIKey(t *testing.T) {
 	for _, path := range []string{
 		"/api/v1/work/projects",
 		"/api/v1/work/queue?project=x",
+		"/api/v1/work/recent?project=x",
 		"/api/v1/work/items/wi_1",
 		"/api/v1/work/items/wi_1/events",
 	} {
@@ -343,6 +344,7 @@ func TestWorkAPI_NilClient(t *testing.T) {
 	for _, path := range []string{
 		"/api/v1/work/projects",
 		"/api/v1/work/queue?project=x",
+		"/api/v1/work/recent?project=x",
 		"/api/v1/work/items/wi_1",
 		"/api/v1/work/items/wi_1/events",
 	} {
@@ -379,5 +381,102 @@ func TestWorkQueue_MaxOverride(t *testing.T) {
 	}
 	if gotMax != strconv.Itoa(25) {
 		t.Errorf("upstream max query = %q, want 25", gotMax)
+	}
+}
+
+// 9. GET /work/recent?project=x → 200, terminal items mapped; the default
+// status filter (wrapped,cancelled) and limit (20) are forwarded upstream;
+// missing project → 400. (tether#19 done/recent view.)
+func TestWorkRecent_MapsItems(t *testing.T) {
+	var gotPath, gotStatus, gotLimit, gotProject string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotStatus = r.URL.Query().Get("status")
+		gotLimit = r.URL.Query().Get("limit")
+		gotProject = r.URL.Query().Get("project")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[
+			{"id":"wi_18","slug":"tether#18","goal":"origin guard","status":"wrapped","priority":"high","wi_type":"fix_bug","closed_at":"2026-07-10T09:09:24Z"},
+			{"id":"wi_13","slug":"tether#13","goal":"live-replace","status":"cancelled","priority":"normal","wi_type":"fix_bug","closed_at":"2026-07-08T09:53:21Z"}
+		],"next_cursor":null}`))
+	}))
+	defer srv.Close()
+
+	mux := newTestMux(aihub.New(srv.URL, "k"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/work/recent?project=tether", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got wire.WorkRecent
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v; body=%s", err, rec.Body.String())
+	}
+	if len(got.Items) != 2 {
+		t.Fatalf("Items = %+v, want 2", got.Items)
+	}
+	if got.Items[0].Slug != "tether#18" || got.Items[0].Status != "wrapped" {
+		t.Errorf("Items[0] = %+v, want tether#18/wrapped", got.Items[0])
+	}
+	if got.Items[0].ClosedAt == nil || *got.Items[0].ClosedAt == "" {
+		t.Errorf("Items[0].ClosedAt should be set")
+	}
+	if got.Items[0].WIType == nil || *got.Items[0].WIType != "fix_bug" {
+		t.Errorf("Items[0].WIType = %v, want fix_bug", got.Items[0].WIType)
+	}
+	if got.Items[1].Status != "cancelled" {
+		t.Errorf("Items[1].Status = %q, want cancelled", got.Items[1].Status)
+	}
+
+	if gotPath != "/v1/work_items" {
+		t.Errorf("upstream path = %q, want /v1/work_items", gotPath)
+	}
+	if gotProject != "tether" {
+		t.Errorf("upstream project = %q, want tether", gotProject)
+	}
+	if gotStatus != "wrapped,cancelled,failed" {
+		t.Errorf("upstream status = %q, want default wrapped,cancelled,failed", gotStatus)
+	}
+	if gotLimit != "20" {
+		t.Errorf("upstream limit = %q, want default 20", gotLimit)
+	}
+
+	// Missing project → 400.
+	req2 := httptest.NewRequest(http.MethodGet, "/api/v1/work/recent", nil)
+	rec2 := httptest.NewRecorder()
+	mux.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusBadRequest {
+		t.Fatalf("missing project: status = %d, want 400", rec2.Code)
+	}
+}
+
+// 10. GET /work/recent with explicit ?status=&limit= overrides the defaults
+// and forwards them upstream (regression guard for the override parsing).
+func TestWorkRecent_StatusLimitOverride(t *testing.T) {
+	var gotStatus, gotLimit string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotStatus = r.URL.Query().Get("status")
+		gotLimit = r.URL.Query().Get("limit")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[],"next_cursor":null}`))
+	}))
+	defer srv.Close()
+
+	mux := newTestMux(aihub.New(srv.URL, "k"))
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/work/recent?project=x&status=wrapped&limit=5", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if gotStatus != "wrapped" {
+		t.Errorf("upstream status = %q, want override \"wrapped\"", gotStatus)
+	}
+	if gotLimit != "5" {
+		t.Errorf("upstream limit = %q, want override \"5\"", gotLimit)
 	}
 }

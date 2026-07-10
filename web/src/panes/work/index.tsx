@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { Icon } from '../../lib/icons'
-import { AihubError, fetchEvents, fetchItem, fetchProjects, fetchQueue } from '../../lib/aihub'
+import { AihubError, fetchEvents, fetchItem, fetchProjects, fetchQueue, fetchRecent } from '../../lib/aihub'
 import type {
   WorkEvent,
   WorkItemDetail,
@@ -9,6 +9,7 @@ import type {
   WorkProject,
   WorkQueue,
   WorkReadyItem,
+  WorkRecentItem,
   WorkRunningItem,
   WorkStalledItem,
 } from '../../lib/wire.gen'
@@ -75,6 +76,12 @@ export default function WorkPane({ active }: Props) {
   const [queueLoading, setQueueLoading] = useState(false)
   const [lastRefreshed, setLastRefreshed] = useState<Date | null>(null)
 
+  // Done/recent history (terminal wrapped/cancelled items). Loaded alongside
+  // the queue; own epoch guard so a slow fetch can't clobber after a switch.
+  const [recent, setRecent] = useState<WorkRecentItem[] | null>(null)
+  const [recentError, setRecentError] = useState<string | null>(null)
+  const recentEpoch = useRef(0)
+
   const [view, setView] = useState<'queue' | 'detail'>('queue')
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [item, setItem] = useState<WorkItemDetail | null>(null)
@@ -129,15 +136,33 @@ export default function WorkPane({ active }: Props) {
     }
   }
 
+  // Load the done/recent history for a project (epoch-guarded like loadQueue).
+  const loadRecent = async (p: string) => {
+    if (!p) return
+    const epoch = ++recentEpoch.current
+    try {
+      const r = await fetchRecent(p)
+      if (epoch !== recentEpoch.current) return
+      setRecent(r.items)
+      setRecentError(null)
+    } catch (e) {
+      if (epoch !== recentEpoch.current) return
+      setRecentError(describeError(e))
+    }
+  }
+
   // ── Queue: (re)load whenever the selected project changes; drop any
   // open detail view since it may belong to the previous project. ───────
   useEffect(() => {
     setQueue(null)
     setQueueError(null)
+    setRecent(null)
+    setRecentError(null)
     setView('queue')
     setSelectedId(null)
     if (!project) return
     void loadQueue(project)
+    void loadRecent(project)
   }, [project])
 
   // ── Polling: only while this tab is active AND the document is visible.
@@ -153,6 +178,9 @@ export default function WorkPane({ active }: Props) {
       fetchQueue(project)
         .then(q => { if (alive) { setQueue(q); setQueueError(null); setLastRefreshed(new Date()) } })
         .catch(e => { if (alive) setQueueError(describeError(e)) })
+      fetchRecent(project)
+        .then(r => { if (alive) { setRecent(r.items); setRecentError(null) } })
+        .catch(e => { if (alive) setRecentError(describeError(e)) })
     }
 
     const startTimer = () => {
@@ -311,7 +339,7 @@ export default function WorkPane({ active }: Props) {
           {projects.length === 0 && <option value="">no projects</option>}
           {projects.map(p => <option key={p.name} value={p.name}>{p.name}</option>)}
         </select>
-        <button className="icon-btn-sm" title="Refresh" aria-label="Refresh queue" onClick={() => void loadQueue(project)}>
+        <button className="icon-btn-sm" title="Refresh" aria-label="Refresh queue" onClick={() => { void loadQueue(project); void loadRecent(project) }}>
           <Icon name="bolt" size={13} />
         </button>
       </div>
@@ -323,7 +351,7 @@ export default function WorkPane({ active }: Props) {
         {queueError && <div className="work-error">{queueError}</div>}
         {queue && (
           isQueueEmpty(queue) ? (
-            <div className="work-empty">no work items</div>
+            <div className="work-empty">no active work items</div>
           ) : (
             <>
               <ReadySection title="Ready" items={queue.items} onOpen={openItem} />
@@ -337,6 +365,11 @@ export default function WorkPane({ active }: Props) {
         )}
         {!queue && !queueError && queueLoading && <div className="work-empty">loading…</div>}
         {!queue && !queueError && !queueLoading && <div className="work-empty">select a project</div>}
+
+        {/* Done / recent history — independent of the ready queue (a project
+            whose queue is empty can still have completed work). */}
+        {recentError && <div className="work-error">{recentError}</div>}
+        {recent && recent.length > 0 && <RecentSection items={recent} onOpen={openItem} />}
       </div>
 
       <div className="work-foot mono">
@@ -423,5 +456,32 @@ function PausedSection({ items, onOpen }: { items: WorkPausedItem[]; onOpen: (id
         </div>
       ))}
     </Section>
+  )
+}
+
+// RecentSection renders the done/recent history (terminal wrapped/cancelled
+// items). Collapsible (default open); rows open the same detail/timeline view.
+function RecentSection({ items, onOpen }: { items: WorkRecentItem[]; onOpen: (id: string) => void }) {
+  const [open, setOpen] = useState(true)
+  // aihub returns these in created-order; re-sort newest-closed-first for
+  // display (ISO strings compare lexicographically; missing closedAt sinks).
+  const sorted = [...items].sort((a, b) => (b.closedAt ?? '').localeCompare(a.closedAt ?? ''))
+  return (
+    <div className="work-section">
+      <div className="section-label work-section-head work-recent-head" role="button" onClick={() => setOpen(o => !o)}>
+        <span className="work-recent-caret">{open ? '▾' : '▸'}</span> Done / recent{' '}
+        <span className="work-section-count">{items.length}</span>
+      </div>
+      {open && sorted.map(it => (
+        <div key={it.id} className="work-row" onClick={() => onOpen(it.id)}>
+          <div className="work-row-top">
+            <span className={`work-badge ${it.status === 'cancelled' ? 'work-badge-warn' : 'work-badge-done'}`}>{it.status}</span>
+            {it.wiType && <span className="work-badge">{it.wiType}</span>}
+            <span className="mono work-row-slug">{it.slug}</span>
+          </div>
+          <div className="work-row-goal">{it.goal}</div>
+        </div>
+      ))}
+    </div>
   )
 }

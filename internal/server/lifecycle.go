@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -31,6 +32,7 @@ import (
 	"github.com/piaobeizu/tether/internal/session"
 	"github.com/piaobeizu/tether/internal/skill"
 	"github.com/piaobeizu/tether/internal/workspace"
+	"github.com/piaobeizu/tether/web"
 )
 
 // Config holds all server startup parameters.
@@ -264,6 +266,17 @@ func Run(cfg *Config) error {
 		return fmt.Errorf("auth secret: %w", err)
 	}
 	authState := auth.NewState(accessToken, jwtSecret)
+	// Production: decide static-asset cookie exemption by real-file existence
+	// in the embedded dist (fail-closed; tether#17). In dev mode the SPA is
+	// reverse-proxied to Vite, so the embedded dist doesn't describe live
+	// assets — leave staticFS unset and fall back to the suffix heuristic.
+	if cfg.DevFrontendURL == "" {
+		if distSub, err := fs.Sub(web.DistFS, "dist"); err == nil {
+			authState = authState.WithStaticFS(distSub)
+		} else {
+			slog.Warn("auth: embedded dist sub-FS failed; static exemption uses suffix heuristic", "err", err)
+		}
+	}
 
 	// Step 4d: open API token store for external MCP clients (v0.3.2).
 	apiTokensPath := cfg.APITokensPath

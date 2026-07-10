@@ -63,6 +63,7 @@ func (p *ClaudeCodeProvider) Spawn(ctx context.Context, cfg SpawnConfig) (Sessio
 
 	sess := &ccSession{
 		cmd:       cmd,
+		ctx:       ctx,
 		stdin:     stdin,
 		enc:       enc,
 		events:    make(chan Event, 64),
@@ -85,6 +86,7 @@ func buildEnv(extra []string) []string {
 // ccSession is a live ClaudeCode stream-json session.
 type ccSession struct {
 	cmd      *exec.Cmd
+	ctx      context.Context // Spawn ctx; escape for the blocking terminal-event send
 	stdin    interface{ Close() error }
 	enc      *json.Encoder
 	events   chan Event
@@ -161,6 +163,28 @@ func (s *ccSession) Close() error {
 	return s.cmd.Wait()
 }
 
+// emit sends ev to s.events. Terminal events (isTerminal) block until delivered
+// so a full buffer can't drop them — a lost EventResult/EventError leaves the
+// consumer's turn open forever (tether#14). fanOut drains Events() until close,
+// so the send always makes progress; s.ctx is the escape when the session is
+// torn down (client disconnect cancels ctx, which also kills the subprocess).
+// readLoop is the sole sender and closes s.events only after it returns, so
+// there is no concurrent send/close here. Non-terminal events (token deltas
+// etc.) keep the non-blocking backpressure drop.
+func (s *ccSession) emit(ev Event) {
+	if isTerminal(ev.Kind) {
+		select {
+		case s.events <- ev:
+		case <-s.ctx.Done():
+		}
+		return
+	}
+	select {
+	case s.events <- ev:
+	default:
+	}
+}
+
 // readLoop consumes stream-json lines from cc stdout and emits Events.
 func (s *ccSession) readLoop(scanner *bufio.Scanner) {
 	scanner.Buffer(make([]byte, 1<<20), 100<<20)
@@ -171,10 +195,7 @@ func (s *ccSession) readLoop(scanner *bufio.Scanner) {
 		if ev == nil {
 			continue
 		}
-		select {
-		case s.events <- *ev:
-		default:
-		}
+		s.emit(*ev)
 	}
 }
 

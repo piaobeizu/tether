@@ -211,3 +211,26 @@ export interface WorkEvents {
   events: WorkEvent[];
   nextCursor?: string;
 }
+/**
+ * WorkRecentItem is a terminal (wrapped/cancelled) work item in the
+ * done/recent history list for GET /api/v1/work/recent.
+ */
+export interface WorkRecentItem {
+  id: string;
+  slug: string;
+  goal: string;
+  status: string;
+  priority: string;
+  wiType?: string;
+  closedAt?: string;
+}
+/**
+ * WorkRecent is the curated done/recent history response for
+ * GET /api/v1/work/recent (terminal work items). aihub currently returns these
+ * in created-order (no closed_at sort param upstream), so the SPA re-sorts by
+ * closedAt for display; a server-side closed_at ordering is a tracked aihub
+ * follow-up.
+ */
+export interface WorkRecent {
+  items: WorkRecentItem[];
+}

@@ -3,7 +3,7 @@
 // SPA (see lib/auth.ts) — plain `fetch`, no explicit credentials needed since
 // these calls never leave the origin.
 
-import type { WorkProject, WorkQueue, WorkItemDetail, WorkEvents } from './wire.gen'
+import type { WorkProject, WorkQueue, WorkItemDetail, WorkEvents, WorkRecent } from './wire.gen'
 
 /**
  * Thrown on any non-2xx response from a work/* endpoint. Carries the HTTP
@@ -40,4 +40,9 @@ export function fetchItem(id: string): Promise<WorkItemDetail> {
 export function fetchEvents(id: string, cursor?: string): Promise<WorkEvents> {
   const qs = cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''
   return getJSON<WorkEvents>(`/api/v1/work/items/${encodeURIComponent(id)}/events${qs}`)
+}
+
+/** Terminal (wrapped/cancelled) work items for the done/recent history view. */
+export function fetchRecent(project: string): Promise<WorkRecent> {
+  return getJSON<WorkRecent>(`/api/v1/work/recent?project=${encodeURIComponent(project)}`)
 }

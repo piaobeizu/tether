@@ -240,3 +240,56 @@ func TestProjects_UnwrapsItemsEnvelope(t *testing.T) {
 		t.Errorf("request path = %q, want /v1/projects", gotPath)
 	}
 }
+
+func TestListWorkItems(t *testing.T) {
+	const canned = `{"items":[
+		{"id":"wi_18","slug":"tether#18","goal":"origin guard fix","status":"wrapped","priority":"high","wi_type":"fix_bug","closed_at":"2026-07-10T09:09:24Z"},
+		{"id":"wi_13","slug":"tether#13","goal":"live-replace","status":"cancelled","priority":"normal","wi_type":"fix_bug","closed_at":"2026-07-08T09:53:21Z"}
+	],"next_cursor":null}`
+	var gotPath, gotQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(canned))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "test-key")
+	list, err := c.ListWorkItems(context.Background(), "tether", []string{"wrapped", "cancelled"}, 20)
+	if err != nil {
+		t.Fatalf("ListWorkItems: %v", err)
+	}
+	if len(list.Items) != 2 {
+		t.Fatalf("Items = %+v, want 2", list.Items)
+	}
+	if list.Items[0].Slug != "tether#18" || list.Items[0].Status != "wrapped" {
+		t.Errorf("Items[0] = %+v, unexpected", list.Items[0])
+	}
+	if list.Items[0].ClosedAt == nil || *list.Items[0].ClosedAt == "" {
+		t.Errorf("Items[0].ClosedAt should be set")
+	}
+	if list.Items[0].WIType == nil || *list.Items[0].WIType != "fix_bug" {
+		t.Errorf("Items[0].WIType = %v, want fix_bug", list.Items[0].WIType)
+	}
+	if list.Items[1].Status != "cancelled" {
+		t.Errorf("Items[1].Status = %q, want cancelled", list.Items[1].Status)
+	}
+
+	if gotPath != "/v1/work_items" {
+		t.Errorf("request path = %q, want /v1/work_items", gotPath)
+	}
+	q, err := url.ParseQuery(gotQuery)
+	if err != nil {
+		t.Fatalf("parse query %q: %v", gotQuery, err)
+	}
+	if q.Get("project") != "tether" {
+		t.Errorf("query project = %q, want tether", q.Get("project"))
+	}
+	if q.Get("status") != "wrapped,cancelled" {
+		t.Errorf("query status = %q, want wrapped,cancelled", q.Get("status"))
+	}
+	if q.Get("limit") != "20" {
+		t.Errorf("query limit = %q, want 20", q.Get("limit"))
+	}
+}

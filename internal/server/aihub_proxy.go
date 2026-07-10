@@ -16,16 +16,22 @@ import (
 const (
 	defaultQueueMax    = 10
 	defaultEventsLimit = 50
+	defaultRecentLimit = 20
 )
+
+// recentStatuses is the default status filter for the done/recent view:
+// terminal work items (wrapped + cancelled + failed).
+var recentStatuses = []string{"wrapped", "cancelled", "failed"}
 
 // RegisterWorkAPI wires the curated, read-only /api/v1/work/* endpoints
 // that proxy the polyforge aihub backend for the tether workbench MVP
 // (tether spec §10.K, Task A2):
 //
-//	GET /api/v1/work/projects              → []wire.WorkProject
-//	GET /api/v1/work/queue?project=&max=   → wire.WorkQueue
-//	GET /api/v1/work/items/{id}            → wire.WorkItemDetail
-//	GET /api/v1/work/items/{id}/events     → wire.WorkEvents
+//	GET /api/v1/work/projects                       → []wire.WorkProject
+//	GET /api/v1/work/queue?project=&max=            → wire.WorkQueue
+//	GET /api/v1/work/recent?project=&status=&limit= → wire.WorkRecent
+//	GET /api/v1/work/items/{id}                     → wire.WorkItemDetail
+//	GET /api/v1/work/items/{id}/events              → wire.WorkEvents
 //
 // Every route is GET-only (405 otherwise) and unrecognised sub-paths 404.
 // client may be nil — e.g. aihub.LoadConfig() found no usable credentials
@@ -90,6 +96,40 @@ func RegisterWorkAPI(mux *http.ServeMux, client *aihub.Client) {
 			return
 		}
 		writeJSON(w, workQueueFromReadyQueue(rq))
+	})
+
+	mux.HandleFunc("/api/v1/work/recent", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		project := r.URL.Query().Get("project")
+		if project == "" {
+			http.Error(w, "project is required", http.StatusBadRequest)
+			return
+		}
+		if client == nil {
+			http.Error(w, "aihub not configured", http.StatusServiceUnavailable)
+			return
+		}
+
+		statuses := recentStatuses
+		if v := r.URL.Query().Get("status"); v != "" {
+			statuses = strings.Split(v, ",")
+		}
+		limit := defaultRecentLimit
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				limit = n
+			}
+		}
+
+		list, err := client.ListWorkItems(r.Context(), project, statuses, limit)
+		if err != nil {
+			writeAihubError(w, err)
+			return
+		}
+		writeJSON(w, workRecentFromList(list))
 	})
 
 	mux.HandleFunc("/api/v1/work/items/", func(w http.ResponseWriter, r *http.Request) {
@@ -269,6 +309,24 @@ func workPausedItems(items []aihub.PausedItem) []wire.WorkPausedItem {
 		}
 	}
 	return out
+}
+
+// workRecentFromList maps an aihub.WorkItemList onto the whitelisted
+// wire.WorkRecent shape the browser consumes for the done/recent view.
+func workRecentFromList(list *aihub.WorkItemList) wire.WorkRecent {
+	out := make([]wire.WorkRecentItem, len(list.Items))
+	for i, it := range list.Items {
+		out[i] = wire.WorkRecentItem{
+			ID:       it.ID,
+			Slug:     it.Slug,
+			Goal:     it.Goal,
+			Status:   it.Status,
+			Priority: it.Priority,
+			WIType:   it.WIType,
+			ClosedAt: it.ClosedAt,
+		}
+	}
+	return wire.WorkRecent{Items: out}
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

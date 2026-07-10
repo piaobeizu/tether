@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -14,11 +15,26 @@ import (
 type State struct {
 	token  string
 	secret []byte
+	// staticFS is the embedded SPA dist (production). When set, static-asset
+	// cookie exemption is decided by real-file existence (fail-closed); when
+	// nil (dev mode, assets proxied to Vite) a suffix heuristic is used. See
+	// isStaticAsset (tether#17).
+	staticFS fs.FS
 }
 
 // NewState initialises auth from pre-loaded token and secret.
 func NewState(token string, secret []byte) *State {
 	return &State{token: token, secret: secret}
+}
+
+// WithStaticFS attaches the embedded SPA dist filesystem so static-asset
+// exemption is decided by real-file existence rather than a suffix heuristic.
+// Call only in production (embedded assets); leave unset in dev mode, where the
+// SPA is reverse-proxied to Vite and the dist FS does not describe live assets.
+// Returns s for chaining.
+func (s *State) WithStaticFS(fsys fs.FS) *State {
+	s.staticFS = fsys
+	return s
 }
 
 // Middleware wraps h, requiring a valid tether_session cookie on non-exempt routes.
@@ -177,18 +193,47 @@ func (s *State) isExempt(r *http.Request) bool {
 		p == "/oauth/token",
 		p == "/.well-known/oauth-authorization-server":
 		return true
-	// Static-asset suffixes (.js/.css/fonts/favicon/manifest) are exempt from
-	// the cookie check ONLY outside protected namespaces. The SPA and all its
-	// assets are served by the catch-all "/" handler (embed.FS) — never under
-	// /api, /wt, or /mcp. Gating on the suffix alone let a client-controlled
-	// trailing path segment (e.g. /api/v1/work/items/x.js) masquerade as a
-	// static asset and bypass cookie auth, reaching a handler that calls aihub
-	// with the daemon's server-side key (tether#16).
-	case !isProtectedNamespace(p) &&
-		hasSuffix(p, ".js", ".css", ".ico", ".png", ".svg", ".woff2", ".woff", ".ttf", ".webmanifest"):
+	// Static SPA assets are served by the catch-all "/" handler (embed.FS),
+	// never under /api, /wt, or /mcp. Exempt them from the cookie check — but
+	// fail-closed so a client-controlled trailing segment can't masquerade as
+	// an asset and reach a privileged handler with the daemon's server-side
+	// key (tether#16 / tether#17). See isStaticAsset.
+	case s.isStaticAsset(p):
 		return true
 	}
 	return false
+}
+
+// isStaticAsset reports whether p is exempt from the cookie check as a static
+// SPA asset. It NEVER exempts a protected namespace (/api,/wt,/mcp). In
+// production (staticFS set) a path is exempt only if it resolves to a real
+// embedded dist file — so any future non-/api privileged prefix (e.g.
+// /admin/x.js) that isn't a shipped asset stays auth-gated (fail-closed),
+// closing tether#16's latent fail-open where a suffix match alone sufficed
+// (tether#17). In dev (staticFS nil; assets are reverse-proxied to Vite and
+// not described by the embedded dist) it falls back to the static-suffix
+// heuristic, still gated behind isProtectedNamespace.
+func (s *State) isStaticAsset(p string) bool {
+	if isProtectedNamespace(p) {
+		return false
+	}
+	if s.staticFS != nil {
+		return staticFileExists(s.staticFS, p)
+	}
+	return hasSuffix(p, ".js", ".css", ".ico", ".png", ".svg", ".woff2", ".woff", ".ttf", ".webmanifest")
+}
+
+// staticFileExists reports whether URL path p maps to a regular file in fsys
+// (the embedded dist). fs paths are relative, slash-separated, with no leading
+// slash and no "." / ".." elements; fs.ValidPath rejects the traversal forms,
+// so an attacker can't escape the dist tree.
+func staticFileExists(fsys fs.FS, p string) bool {
+	name := strings.TrimPrefix(p, "/")
+	if name == "" || !fs.ValidPath(name) {
+		return false
+	}
+	info, err := fs.Stat(fsys, name)
+	return err == nil && !info.IsDir()
 }
 
 // isProtectedNamespace reports whether p lives under a namespace that must

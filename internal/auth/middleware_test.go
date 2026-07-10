@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"testing/fstest"
 
 	"github.com/piaobeizu/tether/internal/auth"
 )
@@ -219,6 +220,56 @@ func TestIsExempt_StaticSuffixOnlyOutsideProtected(t *testing.T) {
 		req := httptest.NewRequest("GET", p, nil)
 		if s.IsExemptForTest(req) {
 			t.Errorf("protected path %q must NOT be exempt via suffix", p)
+		}
+	}
+}
+
+// TestIsExempt_ProdExemptsOnlyRealDistFiles pins tether#17: in production
+// (staticFS set) a static-asset path is exempt ONLY if it resolves to a real
+// embedded dist file. This is fail-closed against a future non-/api privileged
+// prefix (e.g. /admin/x.js) that a mere suffix match would have exempted.
+func TestIsExempt_ProdExemptsOnlyRealDistFiles(t *testing.T) {
+	dist := fstest.MapFS{
+		"assets/index-abc.js":  {Data: []byte("x")},
+		"assets/index-abc.css": {Data: []byte("x")},
+		"icons/icon-192.png":   {Data: []byte("x")},
+		"manifest.webmanifest": {Data: []byte("x")},
+		"manifest.json":        {Data: []byte("x")},
+		"index.html":           {Data: []byte("x")},
+	}
+	s := auth.NewState("tok", []byte("0123456789abcdef0123456789abcdef")).WithStaticFS(dist)
+
+	exempt := []string{
+		"/assets/index-abc.js",
+		"/assets/index-abc.css",
+		"/icons/icon-192.png",
+		"/manifest.webmanifest",
+		// Behavior delta vs tether#16 (pin it): these real dist files are now
+		// exempt where suffix-mode did not list .html/.json. Both are public
+		// (the SPA shell is already served unauthenticated at /auth; manifest
+		// is PWA metadata), so exempting them leaks nothing.
+		"/index.html",
+		"/manifest.json",
+	}
+	notExempt := []string{
+		"/api/v1/work/items/x.js", // protected namespace — never exempt
+		"/admin/config.js",        // FUTURE non-/api privileged prefix: not a shipped asset → fail-closed
+		"/debug/pprof/heap.png",   // ditto
+		"/assets/missing.js",      // asset-shaped but not shipped
+		"/nope.png",               // root asset-shaped but absent
+		"/assets/../secret.js",    // traversal — fs.ValidPath rejects
+		"//api/v1/work/queue.js",  // double slash: residual leading slash after trim → ValidPath rejects
+		"/assets",                 // directory — fs.Stat IsDir
+		"/assets/",                // directory w/ trailing slash — ValidPath rejects
+	}
+	for _, p := range exempt {
+		if !s.IsExemptForTest(httptest.NewRequest("GET", p, nil)) {
+			t.Errorf("prod: %q should be exempt (real dist file)", p)
+		}
+	}
+	for _, p := range notExempt {
+		if s.IsExemptForTest(httptest.NewRequest("GET", p, nil)) {
+			t.Errorf("prod: %q must NOT be exempt", p)
 		}
 	}
 }

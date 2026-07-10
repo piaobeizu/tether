@@ -167,20 +167,38 @@ func (s *State) isExempt(r *http.Request) bool {
 		p == "/api/v1/auth/verify",
 		p == "/api/v1/auth/logout",
 		p == "/cert-hash",
-		// WebTransport CONNECT uses a new QUIC connection that may not carry
-		// SameSite=Strict cookies. Auth is checked inside the handler instead.
-		strings.HasPrefix(p, "/wt/"),
 		p == "/cert-hash-spki",
 		p == "/mcp",
 		strings.HasPrefix(p, "/mcp/"),
+		// WebTransport CONNECT uses a new QUIC connection that may not carry
+		// SameSite=Strict cookies. Auth is checked inside the handler instead.
 		strings.HasPrefix(p, "/wt/"),
 		p == "/oauth/authorize",
 		p == "/oauth/token",
-		p == "/.well-known/oauth-authorization-server",
+		p == "/.well-known/oauth-authorization-server":
+		return true
+	// Static-asset suffixes (.js/.css/fonts/favicon/manifest) are exempt from
+	// the cookie check ONLY outside protected namespaces. The SPA and all its
+	// assets are served by the catch-all "/" handler (embed.FS) — never under
+	// /api, /wt, or /mcp. Gating on the suffix alone let a client-controlled
+	// trailing path segment (e.g. /api/v1/work/items/x.js) masquerade as a
+	// static asset and bypass cookie auth, reaching a handler that calls aihub
+	// with the daemon's server-side key (tether#16).
+	case !isProtectedNamespace(p) &&
 		hasSuffix(p, ".js", ".css", ".ico", ".png", ".svg", ".woff2", ".woff", ".ttf", ".webmanifest"):
 		return true
 	}
 	return false
+}
+
+// isProtectedNamespace reports whether p lives under a namespace that must
+// always be authenticated (cookie in the middleware, or a ticket/session
+// inside the handler for /wt and /mcp). Static-asset suffix exemption must
+// never apply to these, since their trailing path segments are client-controlled.
+func isProtectedNamespace(p string) bool {
+	return strings.HasPrefix(p, "/api/") ||
+		strings.HasPrefix(p, "/wt/") ||
+		p == "/mcp" || strings.HasPrefix(p, "/mcp/")
 }
 
 // IsExemptForTest exposes isExempt for whitebox testing.

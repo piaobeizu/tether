@@ -177,3 +177,68 @@ func TestIsExempt_OAuthAndWellKnownExact(t *testing.T) {
 		}
 	}
 }
+
+// TestIsExempt_StaticSuffixOnlyOutsideProtected pins tether#16: the static-asset
+// suffix exemption must apply to SPA assets served at root, but NEVER to a
+// client-controlled trailing segment under a protected namespace (/api, /wt, /mcp).
+func TestIsExempt_StaticSuffixOnlyOutsideProtected(t *testing.T) {
+	s := auth.NewState("tok", []byte("0123456789abcdef0123456789abcdef"))
+
+	// Genuine static assets served by the catch-all "/" handler.
+	exempt := []string{
+		"/assets/index-abc123.js",
+		"/assets/index-abc123.css",
+		"/favicon.ico",
+		"/logo.svg",
+		"/apple-touch-icon.png",
+		"/fonts/Inter.woff2",
+		"/manifest.webmanifest",
+	}
+	// Client-controlled trailing segments under protected namespaces that
+	// happen to end in an asset suffix — must NOT slip past the cookie check.
+	notExempt := []string{
+		"/api/v1/work/items/x.js",
+		"/api/v1/work/items/evil.css",
+		"/api/v1/sessions/foo.png",
+		"/api/v1/skills/bar.svg",
+		"/api/v1/work/projects.js",
+		// Lock the OTHER protected sub-namespaces too, so the guard is proven
+		// to cover the whole privileged surface, not just /api/v1/work.
+		"/api/v1/permission/x.svg",
+		"/api/v1/tasks/foo.css",
+		"/api/v1/mcp/tokens/x.png",
+	}
+
+	for _, p := range exempt {
+		req := httptest.NewRequest("GET", p, nil)
+		if !s.IsExemptForTest(req) {
+			t.Errorf("static asset %q should be exempt", p)
+		}
+	}
+	for _, p := range notExempt {
+		req := httptest.NewRequest("GET", p, nil)
+		if s.IsExemptForTest(req) {
+			t.Errorf("protected path %q must NOT be exempt via suffix", p)
+		}
+	}
+}
+
+// TestMiddleware_APISuffixLookAlikeNotExempt is the end-to-end guard for tether#16:
+// an unauthenticated /api path whose trailing segment ends in ".js" must get 401
+// and must never reach the inner handler.
+func TestMiddleware_APISuffixLookAlikeNotExempt(t *testing.T) {
+	s := auth.NewState("tok", []byte("0123456789abcdef0123456789abcdef"))
+	innerCalled := false
+	h := s.Middleware(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		innerCalled = true
+	}))
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/v1/work/items/x.js", nil)
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("unauth GET /api/v1/work/items/x.js: expected 401, got %d", rr.Code)
+	}
+	if innerCalled {
+		t.Fatal("inner handler must NOT be reached for a .js-suffixed /api path without a cookie")
+	}
+}

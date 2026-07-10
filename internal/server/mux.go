@@ -199,15 +199,26 @@ func WithOriginGuard(port int, h http.Handler) http.Handler {
 
 // originAllowed returns true when origin matches one of the daemon's own HTTPS
 // origins (127.0.0.1, localhost, or TETHER_HOST at the given port).
+//
+// Browsers omit the port for the default HTTPS port (443), so a page served
+// from a :443 deployment sends same-origin requests with Origin "https://<host>"
+// (no ":443"). Accept both the explicit-port and the bare form on 443, mirroring
+// the OAuth-issuer normalization in Run() (lifecycle.go). Without this, every
+// non-safe-method request (login, wt-ticket) is rejected 403 on a :443 host.
 func originAllowed(origin string, port int) bool {
-	portSuffix := fmt.Sprintf(":%d", port)
+	suffixes := []string{fmt.Sprintf(":%d", port)}
+	if port == 443 {
+		suffixes = append(suffixes, "")
+	}
 	hosts := []string{"127.0.0.1", "localhost"}
 	if h := os.Getenv("TETHER_HOST"); h != "" {
 		hosts = append(hosts, h)
 	}
 	for _, h := range hosts {
-		if origin == "https://"+h+portSuffix {
-			return true
+		for _, suffix := range suffixes {
+			if origin == "https://"+h+suffix {
+				return true
+			}
 		}
 	}
 	return false

@@ -685,10 +685,10 @@ body {
 .rdag-status-pending .rdag-node-rect { fill: var(--bg-tint); }
 .rdag-status-default .rdag-node-rect { fill: var(--bg-surface); }
 
-/* ── Work knowledge-graph (tether#23, d3-force, middle canvas) ──────
-   A force blob is roughly square, so a viewBox fit (unlike the dagre
-   relationship layout) does not squash it. Pan = drag, zoom = wheel;
-   the container hides overflow (pan moves the viewBox, not a scrollbar). */
+/* ── Work relationship map (tether#23; cards + deterministic columns as
+   of tether#25) ── Each wi is a labeled card in its status column; layout
+   is pure arithmetic (no physics). Pan = drag, zoom = wheel; the container
+   hides overflow (pan moves the viewBox, not a scrollbar). */
 .work-graph-view { width: 100%; height: 100%; display: flex; flex-direction: column; min-height: 0; }
 .work-graph-hint, .work-detail-hint { padding: 14px 4px; }
 
@@ -723,18 +723,19 @@ body {
 .fg-edge-block { stroke: var(--warn); stroke-dasharray: 4 3; }
 
 .fg-node { cursor: pointer; }
-.fg-node-dot { stroke: var(--bg-sunken); stroke-width: 1.5; }
-.fg-node:hover .fg-node-dot { stroke: var(--ink-tertiary); }
-.fg-node-selected .fg-node-dot { stroke: var(--accent); stroke-width: 2.5; }
-.fg-node-label { font-size: 11px; fill: var(--ink-primary); font-family: var(--font-sans); }
-.fg-node-selected .fg-node-label { fill: var(--accent-deep); font-weight: 500; }
-.fg-node-sub { font-size: 9px; fill: var(--ink-tertiary); font-family: var(--font-mono); }
+.fg-card { fill: var(--bg-surface); stroke: var(--line); stroke-width: 1; }
+.fg-node:hover .fg-card { stroke: var(--ink-tertiary); }
+.fg-node-selected .fg-card { stroke: var(--accent); stroke-width: 2; }
+.fg-card-bar { fill: var(--ink-tertiary); } /* left status bar; status class overrides */
+.fg-card-slug { font-size: 11px; fill: var(--ink-primary); font-family: var(--font-mono); }
+.fg-node-selected .fg-card-slug { fill: var(--accent-deep); font-weight: 500; }
+.fg-card-type { font-size: 9px; fill: var(--ink-tertiary); font-family: var(--font-mono); }
 
-.fg-status-done .fg-node-dot { fill: var(--success); }
-.fg-status-running .fg-node-dot { fill: var(--accent); }
-.fg-status-failed .fg-node-dot { fill: var(--danger); }
-.fg-status-pending .fg-node-dot { fill: var(--ink-quat); }
-.fg-status-default .fg-node-dot { fill: var(--ink-tertiary); }
+.fg-status-done .fg-card-bar { fill: var(--success); }
+.fg-status-running .fg-card-bar { fill: var(--accent); }
+.fg-status-failed .fg-card-bar { fill: var(--danger); }
+.fg-status-pending .fg-card-bar { fill: var(--ink-quat); }
+.fg-status-default .fg-card-bar { fill: var(--ink-tertiary); }
 
 /* ── Canvas (middle-pane detail/file view, tether#20) ───────────── */
 .canvas-view { display: flex; flex-direction: column; }

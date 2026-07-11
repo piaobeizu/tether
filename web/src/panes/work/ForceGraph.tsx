@@ -1,43 +1,36 @@
-// ForceGraph.tsx — force-directed knowledge-graph renderer for the wi
-// relationship graph (tether#23, scaled in tether#24). Presentational: the
-// caller owns data + selection, this component lays nodes out with d3-force
-// and paints them.
+// ForceGraph.tsx — Work relationship map: deterministic column-card layout.
+// (The file keeps its historical name; the d3-force physics it was named for
+// was removed in tether#25 — layout is now pure arithmetic.) Presentational:
+// the caller owns data + selection; this component places each wi as a labeled
+// CARD in its status column and paints the relationship edges.
 //
-// Positions are computed ONCE per distinct graph SHAPE, synchronously, to a
-// settled state (no animation loop): a useMemo keyed on a CONTENT key (sorted
-// ids + structural edges + status), NOT array identity — so an 8s poll that
-// returns the same graph in a fresh array reuses positions and the map does
-// NOT reshuffle (tether#23 F4/F5). Status/label render from LIVE props.
+// Layout is PURE ARITHMETIC (no physics): x = status column, y = the card's
+// sorted row within that column. Columns: blocked | running | ready | paused |
+// done. Within a column, cards sort by priority (urgent first) then seq (newest
+// first) and stack top-to-bottom under the column header — so a mostly-
+// disconnected set reads as tidy ordered lists instead of scattered dots with
+// big gaps (the "empty dots" complaint that drove tether#25).
 //
-// Scale features (tether#24):
-//   - status CLUSTERING: forceX pulls each node toward its status column
-//     (blocked | running | ready | paused | done), so a mostly-disconnected
-//     set reads as ordered columns instead of a hairball. Column headers are
-//     drawn at the top.
-//   - semantic-zoom LABELS: dots always render; a node's label renders only
-//     when it is selected, hovered, or the current zoom is past a threshold —
-//     so labels don't overlap into mush at scale.
+// Positions are memoized on a CONTENT key (sorted ids + status column +
+// priority/seq order + structural edges), NOT array identity — so an 8s poll
+// returning the same graph in a fresh array reuses positions and the map does
+// NOT reshuffle. A status change re-places that card WITHOUT resetting the
+// user's pan/zoom (structure-key vs layout-key split, tether#24). Status and
+// labels render from LIVE props.
 //
-// Block edges are an OVERLAY (drawn, excluded from the sim, tether#23 F1). Pan
-// = pointer-drag past 4px (NO setPointerCapture); zoom = non-passive native
-// wheel (tether#22 F2). Lazy-loaded behind WorkGraphView.
+// Block edges are an OVERLAY (drawn; they never shape the arithmetic layout).
+// Pan = pointer-drag past 4px (NO setPointerCapture, tether#20); zoom =
+// non-passive native wheel (tether#22). Lazy-loaded behind WorkGraphView.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent } from 'react'
-import {
-  forceCollide,
-  forceLink,
-  forceManyBody,
-  forceSimulation,
-  forceX,
-  forceY,
-} from 'd3-force'
-import type { SimulationLinkDatum, SimulationNodeDatum } from 'd3-force'
 
 export interface FGNode {
   id: string
   label: string
   status?: string
   sub?: string
+  priority?: string
+  title?: string // hover tooltip (e.g. the wi goal); falls back to label
 }
 
 export interface FGEdge {
@@ -53,18 +46,15 @@ export interface ForceGraphProps {
   onSelect?: (id: string) => void
 }
 
-interface SimNode extends SimulationNodeDatum {
-  id: string
-}
-interface SimLink extends SimulationLinkDatum<SimNode> {}
-
-const NODE_R = 7
-const LABEL_DX = NODE_R + 6
-const TICKS = 300
+const CARD_W = 132
+const CARD_H = 34
+const ROW_GAP = 10
+const COL_GAP = 210
+const HEAD_H = 24
+const BAR_W = 4
+const PAD = 28
 const MIN_SCALE = 0.3
 const MAX_SCALE = 4
-const COL_GAP = 220
-const LABEL_ZOOM = 1.15 // show all labels once zoomed past this
 const COL_LABELS = ['blocked', 'running', 'ready', 'paused', 'done']
 
 type Pt = { x: number; y: number }
@@ -83,7 +73,7 @@ interface Col {
 }
 
 interface Positions {
-  pos: Map<string, Pt>
+  pos: Map<string, Pt> // card CENTER
   box: Box
   cols: Col[]
 }
@@ -126,91 +116,97 @@ function statusClass(status: string | undefined): string {
   }
 }
 
-/** Settle a d3-force layout synchronously with status-column clustering.
- *  Only STRUCTURAL edges (non-block) drive the layout. Returns node positions,
- *  a padded bounding box, and the present status columns (for headers). */
-function computePositions(nodes: FGNode[], edges: FGEdge[]): Positions {
-  const statusOf = new Map(nodes.map((n) => [n.id, n.status]))
-  const simNodes: SimNode[] = nodes.map((n) => ({ id: n.id }))
-  const byId = new Map(simNodes.map((n) => [n.id, n]))
-  const simLinks: SimLink[] = edges
-    .filter((e) => e.kind !== 'block' && byId.has(e.from) && byId.has(e.to))
-    .map((e) => ({ source: e.from, target: e.to }))
-
-  const sim = forceSimulation<SimNode>(simNodes)
-    .force('charge', forceManyBody<SimNode>().strength(-160))
-    .force(
-      'link',
-      forceLink<SimNode, SimLink>(simLinks)
-        .id((d) => d.id)
-        .distance(70)
-        .strength(0.25),
-    )
-    .force('x', forceX<SimNode>((d) => statusCol(statusOf.get(d.id)) * COL_GAP).strength(0.4))
-    .force('y', forceY<SimNode>(0).strength(0.06))
-    .force('collide', forceCollide<SimNode>(30))
-    .stop()
-  for (let i = 0; i < TICKS; i++) sim.tick()
-
-  const pos = new Map<string, Pt>()
-  for (const n of simNodes) pos.set(n.id, { x: n.x ?? 0, y: n.y ?? 0 })
-
-  let minX = Infinity
-  let minY = Infinity
-  let maxX = -Infinity
-  let maxY = -Infinity
-  for (const n of nodes) {
-    const p = pos.get(n.id)
-    if (!p) continue
-    const labelW = LABEL_DX + n.label.length * 6.7 + 6
-    minX = Math.min(minX, p.x - NODE_R)
-    maxX = Math.max(maxX, p.x + labelW)
-    minY = Math.min(minY, p.y - NODE_R - 4)
-    maxY = Math.max(maxY, p.y + NODE_R + 4)
+/** Sort rank for priority (lower = higher priority = nearer the top). */
+function priorityRank(p: string | undefined): number {
+  switch (p) {
+    case 'urgent':
+      return 0
+    case 'high':
+      return 1
+    case 'low':
+      return 3
+    default:
+      return 2 // normal / unknown
   }
-  if (!Number.isFinite(minX)) {
-    minX = -100
-    minY = -100
-    maxX = 100
-    maxY = 100
-  }
-  // Column headers sit above the nodes; reserve room for them.
-  const headPad = 22
-  const pad = 28
-  const box: Box = {
-    x: minX - pad,
-    y: minY - pad - headPad,
-    w: maxX - minX + pad * 2,
-    h: maxY - minY + pad * 2 + headPad,
-  }
+}
 
-  const colCount = new Map<number, number>()
+/** Parse the trailing seq from a slug like "tether#25" → 25 (0 if absent). */
+function parseSeq(label: string): number {
+  const m = /#(\d+)/.exec(label)
+  return m ? Number(m[1]) : 0
+}
+
+/** Place each node as a card: x = status column, y = its sorted row in that
+ *  column. Pure arithmetic — no physics. Returns card CENTER positions, a
+ *  padded bounding box, and the present status columns (for headers). */
+function computePositions(nodes: FGNode[]): Positions {
+  const buckets = new Map<number, FGNode[]>()
   for (const n of nodes) {
     const c = statusCol(n.status)
-    colCount.set(c, (colCount.get(c) ?? 0) + 1)
+    const arr = buckets.get(c)
+    if (arr) arr.push(n)
+    else buckets.set(c, [n])
   }
-  const cols: Col[] = [...colCount.entries()]
-    .sort((a, b) => a[0] - b[0])
-    .map(([c, count]) => ({ label: COL_LABELS[c] ?? 'other', x: c * COL_GAP, count }))
+
+  const topY = HEAD_H + CARD_H / 2 // center-y of each column's first row
+  const pos = new Map<string, Pt>()
+  let maxRows = 0
+  for (const [c, arr] of buckets) {
+    arr.sort((a, b) => {
+      const pr = priorityRank(a.priority) - priorityRank(b.priority)
+      if (pr !== 0) return pr
+      return parseSeq(b.label) - parseSeq(a.label) // newer (higher seq) first
+    })
+    maxRows = Math.max(maxRows, arr.length)
+    arr.forEach((n, i) => {
+      pos.set(n.id, { x: c * COL_GAP, y: topY + i * (CARD_H + ROW_GAP) })
+    })
+  }
+
+  const presentCols = [...buckets.keys()].sort((a, b) => a - b)
+  const minCol = presentCols[0] ?? 0
+  const maxCol = presentCols[presentCols.length - 1] ?? 0
+  const minX = minCol * COL_GAP - CARD_W / 2 - PAD
+  const maxX = maxCol * COL_GAP + CARD_W / 2 + PAD
+  const minY = -PAD
+  const rowsH = maxRows > 0 ? topY + (maxRows - 1) * (CARD_H + ROW_GAP) + CARD_H / 2 : topY
+  const maxY = rowsH + PAD
+  const box: Box = { x: minX, y: minY, w: maxX - minX, h: maxY - minY }
+
+  const cols: Col[] = presentCols.map((c) => ({
+    label: COL_LABELS[c] ?? 'other',
+    x: c * COL_GAP,
+    count: buckets.get(c)?.length ?? 0,
+  }))
 
   return { pos, box, cols }
 }
 
+/** Curved edge anchored at the facing card edges (horizontal), or centers when
+ *  the two cards share a column. */
 function edgePath(s: Pt, t: Pt): string {
-  const mx = (s.x + t.x) / 2
+  let sx = s.x
+  let tx = t.x
+  if (t.x > s.x) {
+    sx = s.x + CARD_W / 2
+    tx = t.x - CARD_W / 2
+  } else if (t.x < s.x) {
+    sx = s.x - CARD_W / 2
+    tx = t.x + CARD_W / 2
+  }
+  const mx = (sx + tx) / 2
   const my = (s.y + t.y) / 2
-  const dx = t.x - s.x
+  const dx = tx - sx
   const dy = t.y - s.y
   const cx = mx - dy * 0.12
   const cy = my + dx * 0.12
-  return `M ${s.x} ${s.y} Q ${cx} ${cy} ${t.x} ${t.y}`
+  return `M ${sx} ${s.y} Q ${cx} ${cy} ${tx} ${t.y}`
 }
 
 export default function ForceGraph({ nodes, edges, selectedId, onSelect }: ForceGraphProps) {
   // Structure key drives the viewport RESET: only a change to the node SET or
-  // structural edges refits/recenters the map. A status change must NOT reset
-  // the user's pan/zoom (or drop the labels they zoomed in to read) — that
-  // regressed tether#23's poll-stability (tether#24 review F1).
+  // structural edges refits/recenters the map. A status/priority change must
+  // NOT reset the user's pan/zoom (tether#24 review F1).
   const structureKey = useMemo(() => {
     const ids = nodes.map((n) => n.id).sort().join('|')
     const es = edges
@@ -221,16 +217,19 @@ export default function ForceGraph({ nodes, edges, selectedId, onSelect }: Force
     return `${ids}::${es}`
   }, [nodes, edges])
 
-  // Layout key ALSO folds in each node's status column, so a status change
-  // re-clusters that node into its new column — in place, WITHOUT a viewport
+  // Layout key ALSO folds in each node's column + priority + seq, so a status
+  // or priority change re-places that card — in place, WITHOUT a viewport
   // reset. Poll-stable: an unchanged poll yields an identical key.
   const layoutKey = useMemo(() => {
-    const withStatus = nodes.map((n) => `${n.id}:${statusCol(n.status)}`).sort().join('|')
-    return `${withStatus}::${structureKey}`
+    const withOrder = nodes
+      .map((n) => `${n.id}:${statusCol(n.status)}:${priorityRank(n.priority)}:${parseSeq(n.label)}`)
+      .sort()
+      .join('|')
+    return `${withOrder}::${structureKey}`
   }, [nodes, structureKey])
 
   // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on layoutKey (content), not the array refs
-  const layout = useMemo(() => computePositions(nodes, edges), [layoutKey])
+  const layout = useMemo(() => computePositions(nodes), [layoutKey])
 
   const baseRef = useRef<Box>(layout.box)
   baseRef.current = layout.box
@@ -242,8 +241,6 @@ export default function ForceGraph({ nodes, edges, selectedId, onSelect }: Force
     setView(layout.box)
   }
   const effectiveView = resetKey === structureKey ? view : layout.box
-
-  const [hoveredId, setHoveredId] = useState<string | null>(null)
 
   const svgRef = useRef<SVGSVGElement>(null)
   const drag = useRef<{ startX: number; startY: number; lastX: number; lastY: number } | null>(null)
@@ -305,14 +302,11 @@ export default function ForceGraph({ nodes, edges, selectedId, onSelect }: Force
     .map((e, i) => {
       const s = layout.pos.get(e.from)
       const t = layout.pos.get(e.to)
-      return s && t ? { key: `${e.from}->${e.to}-${i}`, d: edgePath(s, t), block: e.kind === 'block' } : null
+      return s && t
+        ? { key: `${e.from}->${e.to}-${i}`, d: edgePath(s, t), block: e.kind === 'block' }
+        : null
     })
     .filter((e): e is { key: string; d: string; block: boolean } => e !== null)
-
-  // Semantic zoom: labels only when zoomed past LABEL_ZOOM, or per-node when
-  // selected/hovered. scale = base width / current viewBox width.
-  const scale = effectiveView.w > 0 ? layout.box.w / effectiveView.w : 1
-  const showAllLabels = scale >= LABEL_ZOOM
 
   return (
     <div className="fg-scroll">
@@ -327,7 +321,7 @@ export default function ForceGraph({ nodes, edges, selectedId, onSelect }: Force
       >
         <g className="fg-cols">
           {layout.cols.map((c) => (
-            <text key={c.label} className="fg-col-head" x={c.x} y={layout.box.y + 14} textAnchor="middle">
+            <text key={c.label} className="fg-col-head" x={c.x} y={14} textAnchor="middle">
               {c.label} · {c.count}
             </text>
           ))}
@@ -342,35 +336,31 @@ export default function ForceGraph({ nodes, edges, selectedId, onSelect }: Force
             const p = layout.pos.get(n.id)
             if (!p) return null
             const selected = n.id === selectedId
-            const showLabel = selected || hoveredId === n.id || showAllLabels
             return (
               <g
                 key={n.id}
                 className={`fg-node ${statusClass(n.status)} ${selected ? 'fg-node-selected' : ''}`}
-                transform={`translate(${p.x}, ${p.y})`}
+                transform={`translate(${p.x - CARD_W / 2}, ${p.y - CARD_H / 2})`}
                 onClick={() => {
                   if (didDrag.current) return
                   onSelect?.(n.id)
                 }}
-                onPointerOver={() => setHoveredId(n.id)}
-                onPointerOut={(e) => {
-                  // ignore transitions to a child of this node group
-                  if (e.currentTarget.contains(e.relatedTarget as Node | null)) return
-                  setHoveredId((cur) => (cur === n.id ? null : cur))
-                }}
                 role={onSelect ? 'button' : undefined}
               >
-                <circle className="fg-node-dot" r={NODE_R} />
-                {showLabel && (
-                  <text className="fg-node-label" x={LABEL_DX} y={3}>
-                    {n.label}
-                  </text>
-                )}
-                {showLabel && n.sub && (
-                  <text className="fg-node-sub" x={LABEL_DX} y={15}>
+                <rect className="fg-card" width={CARD_W} height={CARD_H} rx={5} />
+                <rect className="fg-card-bar" width={BAR_W} height={CARD_H} />
+                <text className="fg-card-slug" x={BAR_W + 9} y={14}>
+                  {n.label}
+                </text>
+                {n.sub && (
+                  <text className="fg-card-type" x={BAR_W + 9} y={26}>
                     {n.sub}
                   </text>
                 )}
+                <title>
+                  {n.label}
+                  {n.title ? ` — ${n.title}` : ''}
+                </title>
               </g>
             )
           })}

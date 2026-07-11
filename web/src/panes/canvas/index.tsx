@@ -118,7 +118,7 @@ function DetailMode({ id }: { id: string }) {
             {steps && dagNodes.length === 0 && !stepsError && <div className="work-empty">no steps</div>}
             {steps && dagNodes.length > 0 && (
               <div className="canvas-dag-wrap">
-                <Dag nodes={dagNodes} edges={dagEdges} direction="LR" />
+                <Dag nodes={dagNodes} edges={dagEdges} direction="TB" />
               </div>
             )}
           </div>

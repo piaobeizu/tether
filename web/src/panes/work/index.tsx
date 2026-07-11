@@ -250,6 +250,7 @@ export default function WorkPane({ active }: Props) {
               edges={dagEdges}
               selectedId={selectedWiId ?? undefined}
               onSelect={onSelectNode}
+              direction="LR"
             />
           </div>
         )}

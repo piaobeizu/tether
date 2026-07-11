@@ -21,6 +21,10 @@ afterEach(() => {
   cleanup()
 })
 
+function vbWidth(svg: SVGSVGElement): number {
+  return parseFloat((svg.getAttribute('viewBox') ?? '0 0 0 0').split(/\s+/)[2])
+}
+
 describe('Dag', () => {
   it('renders every node label', () => {
     render(<Dag nodes={nodes} edges={edges} />)
@@ -39,30 +43,41 @@ describe('Dag', () => {
 
   it('marks the selected node', () => {
     const { container } = render(<Dag nodes={nodes} edges={edges} selectedId="c" />)
-    const selected = container.querySelector('.dag-node-selected')
+    const selected = container.querySelector('.rdag-node-selected')
     expect(selected?.textContent).toContain('Node C')
   })
 
-  // Regression (tether#20 live bug): a pan drag on the svg must NOT trigger
-  // node selection, but a plain tap must. Previously setPointerCapture on the
-  // svg stole the click entirely, so no node was ever selectable.
-  it('suppresses node click after a pan drag, but selects on a tap', () => {
-    const onSelect = vi.fn()
-    const { container } = render(<Dag nodes={nodes} edges={edges} onSelect={onSelect} />)
-    const svg = container.querySelector('svg.dag-svg') as SVGSVGElement
-    const nodeB = screen.getByText('Node B')
+  // Renders inside a scroll container so many nodes stay reachable (the
+  // pane scrolls) rather than being squeezed to fit.
+  it('wraps the svg in a scroll container', () => {
+    const { container } = render(<Dag nodes={nodes} edges={edges} />)
+    const scroll = container.querySelector('.rdag-scroll')
+    expect(scroll).toBeTruthy()
+    expect(scroll?.querySelector('svg.rdag-svg')).toBeTruthy()
+  })
 
-    // drag: down → move >4px → up, then click → must NOT select
-    fireEvent.pointerDown(svg, { clientX: 10, clientY: 10 })
-    fireEvent.pointerMove(svg, { clientX: 60, clientY: 60 })
-    fireEvent.pointerUp(svg, { clientX: 60, clientY: 60 })
-    fireEvent.click(nodeB)
-    expect(onSelect).not.toHaveBeenCalled()
+  // Natural size at scale 1: the SVG's pixel width equals its viewBox width
+  // (1 user unit == 1 px), so node text renders at its authored size instead
+  // of being shrunk to fit the pane.
+  it('renders at natural size (svg width == viewBox width) at scale 1', () => {
+    const { container } = render(<Dag nodes={nodes} edges={edges} />)
+    const svg = container.querySelector('svg.rdag-svg') as SVGSVGElement
+    const w = parseFloat(svg.getAttribute('width') ?? '0')
+    expect(w).toBeGreaterThan(0)
+    expect(w).toBeCloseTo(vbWidth(svg), 3)
+  })
 
-    // tap: down → up (no move) → click → selects
-    fireEvent.pointerDown(svg, { clientX: 10, clientY: 10 })
-    fireEvent.pointerUp(svg, { clientX: 10, clientY: 10 })
-    fireEvent.click(nodeB)
-    expect(onSelect).toHaveBeenCalledWith('b')
+  // Plain wheel is left to the scroll container (native pan) — it must not
+  // resize/zoom the graph. Only Ctrl/Cmd+wheel zooms (scales the svg).
+  it('ignores a plain wheel (native scroll), zooms on Ctrl+wheel', () => {
+    const { container } = render(<Dag nodes={nodes} edges={edges} />)
+    const svg = container.querySelector('svg.rdag-svg') as SVGSVGElement
+    const w0 = parseFloat(svg.getAttribute('width') ?? '0')
+
+    fireEvent.wheel(svg, { deltaY: -100 }) // no modifier → no zoom
+    expect(parseFloat(svg.getAttribute('width') ?? '0')).toBeCloseTo(w0, 3)
+
+    fireEvent.wheel(svg, { deltaY: -100, ctrlKey: true }) // zoom in
+    expect(parseFloat(svg.getAttribute('width') ?? '0')).toBeGreaterThan(w0)
   })
 })

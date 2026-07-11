@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -70,7 +72,16 @@ func (s *aihubStub) server() *httptest.Server {
 
 func newTestMux(client *aihub.Client) http.Handler {
 	mux := http.NewServeMux()
-	server.RegisterWorkAPI(mux, client)
+	server.RegisterWorkAPI(mux, client, "")
+	return mux
+}
+
+// newTestMuxWithRoot is like newTestMux but wires a non-empty workspaceRoot,
+// for the /steps endpoint (tether#20 Task 5) which resolves a scenario graph
+// file under workspaceRoot/.repo.
+func newTestMuxWithRoot(client *aihub.Client, workspaceRoot string) http.Handler {
+	mux := http.NewServeMux()
+	server.RegisterWorkAPI(mux, client, workspaceRoot)
 	return mux
 }
 
@@ -283,7 +294,7 @@ func TestWorkAPI_ReadOnlyAndUnknownPaths(t *testing.T) {
 	}
 
 	// Also cover the other GET-only routes for good measure.
-	for _, path := range []string{"/api/v1/work/projects", "/api/v1/work/recent?project=x", "/api/v1/work/items/wi_1", "/api/v1/work/items/wi_1/events"} {
+	for _, path := range []string{"/api/v1/work/projects", "/api/v1/work/recent?project=x", "/api/v1/work/graph?project=x", "/api/v1/work/items/wi_1", "/api/v1/work/items/wi_1/events", "/api/v1/work/items/wi_1/dependencies", "/api/v1/work/items/wi_1/steps"} {
 		req := httptest.NewRequest(http.MethodPost, path, nil)
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, req)
@@ -315,8 +326,11 @@ func TestWorkAPI_NeverLeaksAPIKey(t *testing.T) {
 		"/api/v1/work/projects",
 		"/api/v1/work/queue?project=x",
 		"/api/v1/work/recent?project=x",
+		"/api/v1/work/graph?project=x",
 		"/api/v1/work/items/wi_1",
 		"/api/v1/work/items/wi_1/events",
+		"/api/v1/work/items/wi_1/dependencies",
+		"/api/v1/work/items/wi_1/steps",
 	} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		rec := httptest.NewRecorder()
@@ -345,8 +359,11 @@ func TestWorkAPI_NilClient(t *testing.T) {
 		"/api/v1/work/projects",
 		"/api/v1/work/queue?project=x",
 		"/api/v1/work/recent?project=x",
+		"/api/v1/work/graph?project=x",
 		"/api/v1/work/items/wi_1",
 		"/api/v1/work/items/wi_1/events",
+		"/api/v1/work/items/wi_1/dependencies",
+		"/api/v1/work/items/wi_1/steps",
 	} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		rec := httptest.NewRecorder()
@@ -478,5 +495,232 @@ func TestWorkRecent_StatusLimitOverride(t *testing.T) {
 	}
 	if gotLimit != "5" {
 		t.Errorf("upstream limit = %q, want override \"5\"", gotLimit)
+	}
+}
+
+// 11. GET /work/graph?project=x → 200, nodes mapped (including parent);
+// missing project → 400. (tether#20 Work view graph.)
+func TestWorkGraph_MapsParent(t *testing.T) {
+	var gotPath, gotStatus, gotLimit, gotProject string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotStatus = r.URL.Query().Get("status")
+		gotLimit = r.URL.Query().Get("limit")
+		gotProject = r.URL.Query().Get("project")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[
+			{"id":"wi_1","slug":"tether#1","goal":"epic","status":"running","priority":"high","wi_type":"epic"},
+			{"id":"wi_2","slug":"tether#2","goal":"child task","status":"queued","priority":"normal","wi_type":"feature","parent_work_item_id":"wi_1"}
+		],"next_cursor":null}`))
+	}))
+	defer srv.Close()
+
+	mux := newTestMux(aihub.New(srv.URL, "k"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/work/graph?project=tether", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got wire.WorkGraph
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v; body=%s", err, rec.Body.String())
+	}
+	if len(got.Nodes) != 2 {
+		t.Fatalf("Nodes = %+v, want 2", got.Nodes)
+	}
+	if got.Nodes[0].ID != "wi_1" || got.Nodes[0].Parent != nil {
+		t.Errorf("Nodes[0] = %+v, want wi_1 with no parent", got.Nodes[0])
+	}
+	if got.Nodes[1].ID != "wi_2" || got.Nodes[1].Parent == nil || *got.Nodes[1].Parent != "wi_1" {
+		t.Errorf("Nodes[1] = %+v, want wi_2 with parent wi_1", got.Nodes[1])
+	}
+
+	if gotPath != "/v1/work_items" {
+		t.Errorf("upstream path = %q, want /v1/work_items", gotPath)
+	}
+	if gotProject != "tether" {
+		t.Errorf("upstream project = %q, want tether", gotProject)
+	}
+	if gotStatus == "" {
+		t.Errorf("upstream status should be a non-empty status filter, got empty")
+	}
+	if gotLimit == "" {
+		t.Errorf("upstream limit should be set, got empty")
+	}
+
+	// Missing project → 400.
+	req2 := httptest.NewRequest(http.MethodGet, "/api/v1/work/graph", nil)
+	rec2 := httptest.NewRecorder()
+	mux.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusBadRequest {
+		t.Fatalf("missing project: status = %d, want 400", rec2.Code)
+	}
+}
+
+// 12. GET /work/items/{id}/dependencies → 200, blocking/blockedBy mapped.
+// (tether#20 Work view dependency panel.)
+func TestWorkItemDependencies(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"blocking": [
+				{"id":"wi_2","slug":"tether-2","project":"tether","kind":"blocks","note":"needs api first"}
+			],
+			"blocked_by": [
+				{"id":"wi_3","slug":"tether-3","project":"tether","kind":"blocks","note":""}
+			]
+		}`))
+	}))
+	defer srv.Close()
+
+	mux := newTestMux(aihub.New(srv.URL, "k"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/work/items/wi_1/dependencies", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got wire.WorkDependencies
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v; body=%s", err, rec.Body.String())
+	}
+	if len(got.Blocking) != 1 || got.Blocking[0].ID != "wi_2" || got.Blocking[0].Slug != "tether-2" {
+		t.Fatalf("Blocking = %+v, want one entry wi_2/tether-2", got.Blocking)
+	}
+	if got.Blocking[0].Note != "needs api first" || got.Blocking[0].Kind != "blocks" {
+		t.Errorf("Blocking[0] = %+v, unexpected fields", got.Blocking[0])
+	}
+	if len(got.BlockedBy) != 1 || got.BlockedBy[0].ID != "wi_3" || got.BlockedBy[0].Slug != "tether-3" {
+		t.Fatalf("BlockedBy = %+v, want one entry wi_3/tether-3", got.BlockedBy)
+	}
+
+	if gotPath != "/v1/work_items/wi_1/dependencies" {
+		t.Errorf("upstream path = %q, want /v1/work_items/wi_1/dependencies", gotPath)
+	}
+}
+
+// 13. GET /work/items/{id}/steps → 200, scenario graph resolved from
+// workspaceRoot/.repo, nodes annotated with done/current/pending status from
+// step_completed events + the current-step state. (tether#20 Task 5.)
+func TestWorkSteps_GraphWithStatus(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, ".repo", "tether")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	md := "## Step: a\n" +
+		"first step\n" +
+		"## Step: b\n" +
+		"second step, no explicit reference\n" +
+		"## Step: c\n" +
+		`x = previous_steps["a"]` + "\n"
+	if err := os.WriteFile(filepath.Join(repoDir, "feature.tether.md"), []byte(md), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/work_items/wi_1":
+			_, _ = w.Write([]byte(`{"id":"wi_1","slug":"tether-1","goal":"g","status":"running","priority":"high","wi_type":"feature","project":"tether","labels":[],"content":null}`))
+		case "/v1/work_items/wi_1/step":
+			_, _ = w.Write([]byte(`{"current_step":"b","current_step_status":"in_progress"}`))
+		case "/v1/events":
+			_, _ = w.Write([]byte(`{"events":[
+				{"created_at":"2026-01-01T00:00:00Z","event_type":"step_completed","payload":{"step":"a"}},
+				{"created_at":"2026-01-01T00:01:00Z","event_type":"note","payload":{"x":1}}
+			],"next_cursor":null}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	mux := newTestMuxWithRoot(aihub.New(srv.URL, "k"), root)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/work/items/wi_1/steps", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got wire.WorkSteps
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v; body=%s", err, rec.Body.String())
+	}
+	if got.Degraded {
+		t.Errorf("Degraded = true, want false (scenario graph resolved)")
+	}
+	if len(got.Nodes) != 3 {
+		t.Fatalf("Nodes = %+v, want 3 nodes", got.Nodes)
+	}
+	a, b, c := got.Nodes[0], got.Nodes[1], got.Nodes[2]
+	if a.ID != "a" || a.Status != "done" {
+		t.Errorf("Nodes[0] = %+v, want a/done", a)
+	}
+	if b.ID != "b" || b.Status != "current" || len(b.Prev) != 1 || b.Prev[0] != "a" {
+		t.Errorf("Nodes[1] = %+v, want b/current with Prev=[a] (sequential fallback)", b)
+	}
+	if c.ID != "c" || c.Status != "pending" || len(c.Prev) != 1 || c.Prev[0] != "a" {
+		t.Errorf("Nodes[2] = %+v, want c/pending with Prev=[a] (explicit reference)", c)
+	}
+}
+
+// 14. GET /work/items/{id}/steps with no resolvable scenario file →
+// Degraded=true, nodes synthesized best-effort from step_completed events +
+// current step. (tether#20 Task 5.)
+func TestWorkSteps_DegradedNoScenario(t *testing.T) {
+	root := t.TempDir() // no .repo dir at all
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/work_items/wi_1":
+			_, _ = w.Write([]byte(`{"id":"wi_1","slug":"tether-1","goal":"g","status":"running","priority":"high","wi_type":"feature","project":"tether","labels":[],"content":null}`))
+		case "/v1/work_items/wi_1/step":
+			_, _ = w.Write([]byte(`{"current_step":"x","current_step_status":"in_progress"}`))
+		case "/v1/events":
+			_, _ = w.Write([]byte(`{"events":[
+				{"created_at":"2026-01-01T00:00:00Z","event_type":"step_completed","payload":{"step":"y"}}
+			],"next_cursor":null}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	mux := newTestMuxWithRoot(aihub.New(srv.URL, "k"), root)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/work/items/wi_1/steps", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got wire.WorkSteps
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v; body=%s", err, rec.Body.String())
+	}
+	if !got.Degraded {
+		t.Errorf("Degraded = false, want true (no scenario graph resolvable)")
+	}
+	byID := map[string]wire.WorkStepNode{}
+	for _, n := range got.Nodes {
+		byID[n.ID] = n
+	}
+	if n, ok := byID["y"]; !ok || n.Status != "done" {
+		t.Errorf("Nodes missing y/done, got %+v", got.Nodes)
+	}
+	if n, ok := byID["x"]; !ok || n.Status != "current" {
+		t.Errorf("Nodes missing x/current, got %+v", got.Nodes)
 	}
 }

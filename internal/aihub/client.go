@@ -100,6 +100,16 @@ func (c *Client) StepState(ctx context.Context, id string) (*StepState, error) {
 	return &out, nil
 }
 
+// Dependencies fetches the blocking/blocked-by dependency edges for a work
+// item. GET /v1/work_items/<id>/dependencies
+func (c *Client) Dependencies(ctx context.Context, id string) (*Dependencies, error) {
+	var out Dependencies
+	if err := c.getJSON(ctx, "/v1/work_items/"+url.PathEscape(id)+"/dependencies", &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // Events fetches a page of agent events for a work item.
 // GET /v1/events?work_item_id=<id>&limit=<limit>&cursor=<cursor>
 func (c *Client) Events(ctx context.Context, id string, limit int, cursor string) (*EventsResponse, error) {
@@ -205,7 +215,9 @@ type PausedItem struct {
 }
 
 // WorkItem mirrors the MVP-whitelisted fields of aihub's work_items row
-// (internal/domain.WorkItem in aihub).
+// (internal/domain.WorkItem in aihub). Project is added for tether#20 Task 5
+// (the /steps endpoint needs it to resolve the scenario graph file), mirroring
+// the project field aihub already surfaces per-entry on DependencyEntry.
 type WorkItem struct {
 	ID       string   `json:"id"`
 	Slug     string   `json:"slug"`
@@ -215,6 +227,7 @@ type WorkItem struct {
 	WIType   *string  `json:"wi_type"`
 	Labels   []string `json:"labels"`
 	Content  *string  `json:"content"`
+	Project  string   `json:"project"`
 }
 
 // StepState mirrors the MVP-whitelisted fields of aihub's
@@ -250,14 +263,15 @@ type Project struct {
 // returned in the GET /v1/work_items list — a subset of the full row, enough
 // for the done/recent history view.
 type WorkItemSummary struct {
-	ID        string  `json:"id"`
-	Slug      string  `json:"slug"`
-	Goal      string  `json:"goal"`
-	Status    string  `json:"status"`
-	Priority  string  `json:"priority"`
-	WIType    *string `json:"wi_type"`
-	ClosedAt  *string `json:"closed_at"`
-	UpdatedAt string  `json:"updated_at,omitempty"`
+	ID               string  `json:"id"`
+	Slug             string  `json:"slug"`
+	Goal             string  `json:"goal"`
+	Status           string  `json:"status"`
+	Priority         string  `json:"priority"`
+	WIType           *string `json:"wi_type"`
+	ClosedAt         *string `json:"closed_at"`
+	UpdatedAt        string  `json:"updated_at,omitempty"`
+	ParentWorkItemID *string `json:"parent_work_item_id"`
 }
 
 // WorkItemList mirrors aihub's GET /v1/work_items list response
@@ -265,4 +279,20 @@ type WorkItemSummary struct {
 type WorkItemList struct {
 	Items      []WorkItemSummary `json:"items"`
 	NextCursor *string           `json:"next_cursor,omitempty"`
+}
+
+// DependencyEntry is one dependency edge as returned by aihub's
+// GET /v1/work_items/:id/dependencies (internal/domain.DependencyEntry).
+type DependencyEntry struct {
+	ID      string `json:"id"`
+	Slug    string `json:"slug"`
+	Project string `json:"project"`
+	Kind    string `json:"kind"`
+	Note    string `json:"note"`
+}
+
+// Dependencies mirrors aihub's GET /v1/work_items/:id/dependencies response.
+type Dependencies struct {
+	Blocking  []DependencyEntry `json:"blocking"`
+	BlockedBy []DependencyEntry `json:"blocked_by"`
 }

@@ -54,6 +54,13 @@ export interface Connection {
   attempt: number
 }
 
+/** A selected file within a workspace, identified by workspace id + path
+ *  relative to the workspace root (matches fetchFile's `path` param). */
+export interface SelectedFile {
+  wsId: string
+  path: string
+}
+
 interface AppState {
   sessionId: string | null
   messages: Message[]
@@ -63,6 +70,12 @@ interface AppState {
   connection: Connection
   streamingMsgId: string | null   // id of the in-progress assistant bubble
 
+  // Middle-canvas selection (tether#20): exactly one of the two is ever set.
+  // Selecting a work item clears the file selection and vice-versa; passing
+  // `null` clears both (e.g. deselect / no artifact focused).
+  selectedWiId: string | null
+  selectedFile: SelectedFile | null
+
   setSessionId: (id: string) => void
   loadHistory: (msgs: Message[]) => void
   addMessage: (msg: Message) => void
@@ -70,6 +83,7 @@ interface AppState {
   setConnected: (v: boolean) => void
   setConnection: (patch: Partial<Connection>) => void
   handleEnvelope: (env: Envelope) => void
+  select: (sel: { wiId?: string; file?: SelectedFile } | null) => void
 }
 
 export const useStore = create<AppState>((set) => ({
@@ -80,6 +94,8 @@ export const useStore = create<AppState>((set) => ({
   streaming: false,
   streamingMsgId: null,
   connection: { state: 'connecting', latency: 0, attempt: 0 },
+  selectedWiId: null,
+  selectedFile: null,
 
   setSessionId: (id) => {
     localStorage.setItem('tether_last_sid', id)
@@ -210,5 +226,17 @@ export const useStore = create<AppState>((set) => ({
       default:
         break
     }
+  },
+
+  select: (sel) => {
+    if (!sel || sel.wiId === undefined && sel.file === undefined) {
+      set({ selectedWiId: null, selectedFile: null })
+      return
+    }
+    if (sel.wiId !== undefined) {
+      set({ selectedWiId: sel.wiId, selectedFile: null })
+      return
+    }
+    set({ selectedWiId: null, selectedFile: sel.file ?? null })
   },
 }))

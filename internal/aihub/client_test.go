@@ -243,7 +243,7 @@ func TestProjects_UnwrapsItemsEnvelope(t *testing.T) {
 
 func TestListWorkItems(t *testing.T) {
 	const canned = `{"items":[
-		{"id":"wi_18","slug":"tether#18","goal":"origin guard fix","status":"wrapped","priority":"high","wi_type":"fix_bug","closed_at":"2026-07-10T09:09:24Z"},
+		{"id":"wi_18","slug":"tether#18","goal":"origin guard fix","status":"wrapped","priority":"high","wi_type":"fix_bug","closed_at":"2026-07-10T09:09:24Z","parent_work_item_id":"wi_1"},
 		{"id":"wi_13","slug":"tether#13","goal":"live-replace","status":"cancelled","priority":"normal","wi_type":"fix_bug","closed_at":"2026-07-08T09:53:21Z"}
 	],"next_cursor":null}`
 	var gotPath, gotQuery string
@@ -272,8 +272,14 @@ func TestListWorkItems(t *testing.T) {
 	if list.Items[0].WIType == nil || *list.Items[0].WIType != "fix_bug" {
 		t.Errorf("Items[0].WIType = %v, want fix_bug", list.Items[0].WIType)
 	}
+	if list.Items[0].ParentWorkItemID == nil || *list.Items[0].ParentWorkItemID != "wi_1" {
+		t.Errorf("Items[0].ParentWorkItemID = %v, want wi_1", list.Items[0].ParentWorkItemID)
+	}
 	if list.Items[1].Status != "cancelled" {
 		t.Errorf("Items[1].Status = %q, want cancelled", list.Items[1].Status)
+	}
+	if list.Items[1].ParentWorkItemID != nil {
+		t.Errorf("Items[1].ParentWorkItemID = %v, want nil", list.Items[1].ParentWorkItemID)
 	}
 
 	if gotPath != "/v1/work_items" {
@@ -291,5 +297,42 @@ func TestListWorkItems(t *testing.T) {
 	}
 	if q.Get("limit") != "20" {
 		t.Errorf("query limit = %q, want 20", q.Get("limit"))
+	}
+}
+
+func TestDependencies(t *testing.T) {
+	const canned = `{
+		"blocking": [
+			{"id":"wi_2","slug":"tether-2","project":"tether","kind":"blocks","note":"needs api first"}
+		],
+		"blocked_by": [
+			{"id":"wi_3","slug":"tether-3","project":"tether","kind":"blocks","note":""}
+		]
+	}`
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(canned))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "test-key")
+	deps, err := c.Dependencies(context.Background(), "wi_1")
+	if err != nil {
+		t.Fatalf("Dependencies: %v", err)
+	}
+	if len(deps.Blocking) != 1 || deps.Blocking[0].ID != "wi_2" || deps.Blocking[0].Slug != "tether-2" {
+		t.Fatalf("Blocking = %+v, want one entry wi_2/tether-2", deps.Blocking)
+	}
+	if deps.Blocking[0].Project != "tether" || deps.Blocking[0].Kind != "blocks" || deps.Blocking[0].Note != "needs api first" {
+		t.Errorf("Blocking[0] = %+v, unexpected fields", deps.Blocking[0])
+	}
+	if len(deps.BlockedBy) != 1 || deps.BlockedBy[0].ID != "wi_3" || deps.BlockedBy[0].Slug != "tether-3" {
+		t.Fatalf("BlockedBy = %+v, want one entry wi_3/tether-3", deps.BlockedBy)
+	}
+
+	if gotPath != "/v1/work_items/wi_1/dependencies" {
+		t.Errorf("request path = %q, want /v1/work_items/wi_1/dependencies", gotPath)
 	}
 }

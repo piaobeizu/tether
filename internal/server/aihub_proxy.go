@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/piaobeizu/tether/internal/aihub"
+	"github.com/piaobeizu/tether/internal/scenario"
 	"github.com/piaobeizu/tether/internal/wire"
 )
 
@@ -19,9 +21,23 @@ const (
 	defaultRecentLimit = 20
 )
 
+// stepsEventsLimit bounds the event page fetched to compute step-completion
+// status for the /steps endpoint (Task 5): generous enough to cover a whole
+// scenario run's step_completed events without paging.
+const stepsEventsLimit = 200
+
 // recentStatuses is the default status filter for the done/recent view:
 // terminal work items (wrapped + cancelled + failed).
 var recentStatuses = []string{"wrapped", "cancelled", "failed"}
+
+// graphStatuses is the status filter for the work graph view: active plus
+// recently terminal work items, so the graph reflects the current state of
+// the tree (tether#20 Work view).
+var graphStatuses = []string{"queued", "running", "blocked", "paused", "wrapped", "cancelled", "failed"}
+
+// defaultGraphLimit is a generous cap on the number of work items fetched
+// for the graph view.
+const defaultGraphLimit = 200
 
 // RegisterWorkAPI wires the curated, read-only /api/v1/work/* endpoints
 // that proxy the polyforge aihub backend for the tether workbench MVP
@@ -30,8 +46,11 @@ var recentStatuses = []string{"wrapped", "cancelled", "failed"}
 //	GET /api/v1/work/projects                       → []wire.WorkProject
 //	GET /api/v1/work/queue?project=&max=            → wire.WorkQueue
 //	GET /api/v1/work/recent?project=&status=&limit= → wire.WorkRecent
+//	GET /api/v1/work/graph?project=                 → wire.WorkGraph
 //	GET /api/v1/work/items/{id}                     → wire.WorkItemDetail
 //	GET /api/v1/work/items/{id}/events              → wire.WorkEvents
+//	GET /api/v1/work/items/{id}/dependencies        → wire.WorkDependencies
+//	GET /api/v1/work/items/{id}/steps               → wire.WorkSteps
 //
 // Every route is GET-only (405 otherwise) and unrecognised sub-paths 404.
 // client may be nil — e.g. aihub.LoadConfig() found no usable credentials
@@ -39,7 +58,12 @@ var recentStatuses = []string{"wrapped", "cancelled", "failed"}
 // "aihub not configured" rather than dereferencing a nil pointer. The mux
 // registration happens unconditionally (mux.go) so that 503 behavior is
 // reachable instead of falling through to the generic /api/v1/ 501 stub.
-func RegisterWorkAPI(mux *http.ServeMux, client *aihub.Client) {
+//
+// workspaceRoot anchors the scenario-graph resolution for /steps (Task 5):
+// scenario md files are looked up under workspaceRoot/.repo. An empty
+// workspaceRoot simply means /steps never resolves a scenario file and
+// always answers degraded (see handleWorkItemSteps).
+func RegisterWorkAPI(mux *http.ServeMux, client *aihub.Client, workspaceRoot string) {
 	mux.HandleFunc("/api/v1/work/projects", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -132,6 +156,29 @@ func RegisterWorkAPI(mux *http.ServeMux, client *aihub.Client) {
 		writeJSON(w, workRecentFromList(list))
 	})
 
+	mux.HandleFunc("/api/v1/work/graph", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		project := r.URL.Query().Get("project")
+		if project == "" {
+			http.Error(w, "project is required", http.StatusBadRequest)
+			return
+		}
+		if client == nil {
+			http.Error(w, "aihub not configured", http.StatusServiceUnavailable)
+			return
+		}
+
+		list, err := client.ListWorkItems(r.Context(), project, graphStatuses, defaultGraphLimit)
+		if err != nil {
+			writeAihubError(w, err)
+			return
+		}
+		writeJSON(w, workGraphFromList(list))
+	})
+
 	mux.HandleFunc("/api/v1/work/items/", func(w http.ResponseWriter, r *http.Request) {
 		rest := strings.TrimPrefix(r.URL.Path, "/api/v1/work/items/")
 		if rest == "" {
@@ -153,6 +200,40 @@ func RegisterWorkAPI(mux *http.ServeMux, client *aihub.Client) {
 				return
 			}
 			handleWorkItemEvents(w, r, client, id)
+			return
+		}
+
+		if id, ok := strings.CutSuffix(rest, "/dependencies"); ok {
+			if id == "" || strings.Contains(id, "/") {
+				http.NotFound(w, r)
+				return
+			}
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			if client == nil {
+				http.Error(w, "aihub not configured", http.StatusServiceUnavailable)
+				return
+			}
+			handleWorkItemDependencies(w, r, client, id)
+			return
+		}
+
+		if id, ok := strings.CutSuffix(rest, "/steps"); ok {
+			if id == "" || strings.Contains(id, "/") {
+				http.NotFound(w, r)
+				return
+			}
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			if client == nil {
+				http.Error(w, "aihub not configured", http.StatusServiceUnavailable)
+				return
+			}
+			handleWorkItemSteps(w, r, client, workspaceRoot, id)
 			return
 		}
 
@@ -237,6 +318,138 @@ func handleWorkItemEvents(w http.ResponseWriter, r *http.Request, client *aihub.
 		events[i] = wire.WorkEvent{Ts: e.CreatedAt, Type: e.EventType, Payload: e.Payload}
 	}
 	writeJSON(w, wire.WorkEvents{Events: events, NextCursor: resp.NextCursor})
+}
+
+// handleWorkItemDependencies serves GET /api/v1/work/items/{id}/dependencies.
+func handleWorkItemDependencies(w http.ResponseWriter, r *http.Request, client *aihub.Client, id string) {
+	deps, err := client.Dependencies(r.Context(), id)
+	if err != nil {
+		writeAihubError(w, err)
+		return
+	}
+	writeJSON(w, wire.WorkDependencies{
+		Blocking:  workDepEntries(deps.Blocking),
+		BlockedBy: workDepEntries(deps.BlockedBy),
+	})
+}
+
+// handleWorkItemSteps serves GET /api/v1/work/items/{id}/steps: it resolves
+// the polyforge-coding scenario graph file for the work item's (wi_type,
+// project) under workspaceRoot/.repo, parses it into a step DAG (Task 4),
+// and annotates each node with its progress status (done/current/pending)
+// from the step-machine current-step state and step_completed events.
+//
+// If no scenario file can be resolved (or it fails to parse), the response
+// degrades gracefully: Degraded=true and Nodes is synthesized best-effort
+// from the completed-step set and the current step, with no Prev edges.
+func handleWorkItemSteps(w http.ResponseWriter, r *http.Request, client *aihub.Client, workspaceRoot, id string) {
+	item, err := client.WorkItem(r.Context(), id)
+	if err != nil {
+		writeAihubError(w, err)
+		return
+	}
+	wiType := ""
+	if item.WIType != nil {
+		wiType = *item.WIType
+	}
+
+	// Best-effort: an item without step-machine history yet degrades to an
+	// empty current step rather than failing the whole request.
+	var current string
+	var inProgress bool
+	if st, err := client.StepState(r.Context(), id); err == nil {
+		if st.CurrentStep != nil {
+			current = *st.CurrentStep
+		}
+		inProgress = st.CurrentStepStatus == "in_progress"
+	}
+
+	// Best-effort: an events fetch error just means no steps show as done.
+	completed := map[string]bool{}
+	if resp, err := client.Events(r.Context(), id, stepsEventsLimit, ""); err == nil {
+		for _, e := range resp.Events {
+			if e.EventType != "step_completed" {
+				continue
+			}
+			var payload struct {
+				Step string `json:"step"`
+			}
+			if err := json.Unmarshal(e.Payload, &payload); err == nil && payload.Step != "" {
+				completed[payload.Step] = true
+			}
+		}
+	}
+
+	var graph *scenario.StepGraph
+	if path, ok := scenario.ResolveScenarioFile(workspaceRoot, wiType, item.Project); ok {
+		graph, _ = scenario.ParseStepGraph(path)
+	}
+
+	if graph == nil {
+		writeJSON(w, wire.WorkSteps{
+			Nodes:    synthesizeDegradedSteps(completed, current, inProgress),
+			Degraded: true,
+		})
+		return
+	}
+
+	nodes := make([]wire.WorkStepNode, len(graph.Nodes))
+	for i, n := range graph.Nodes {
+		nodes[i] = wire.WorkStepNode{
+			ID:     n.ID,
+			Status: stepStatus(n.ID, completed, current, inProgress),
+			Prev:   n.Prev,
+		}
+	}
+	writeJSON(w, wire.WorkSteps{Nodes: nodes, Degraded: false})
+}
+
+// stepStatus classifies a single step id as "done" (in the completed set),
+// "current" (it's the in-progress current step), or "pending" (neither).
+func stepStatus(id string, completed map[string]bool, current string, inProgress bool) string {
+	switch {
+	case completed[id]:
+		return "done"
+	case id == current && inProgress:
+		return "current"
+	default:
+		return "pending"
+	}
+}
+
+// synthesizeDegradedSteps builds a best-effort, edge-less node list from the
+// completed-step set and the current step, for when no scenario graph file
+// could be resolved. Completed step ids are sorted for determinism; the
+// current step (if not already completed) is appended last.
+func synthesizeDegradedSteps(completed map[string]bool, current string, inProgress bool) []wire.WorkStepNode {
+	ids := make([]string, 0, len(completed)+1)
+	for id := range completed {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	if current != "" && !completed[current] {
+		ids = append(ids, current)
+	}
+
+	nodes := make([]wire.WorkStepNode, len(ids))
+	for i, id := range ids {
+		nodes[i] = wire.WorkStepNode{ID: id, Status: stepStatus(id, completed, current, inProgress)}
+	}
+	return nodes
+}
+
+func workDepEntries(entries []aihub.DependencyEntry) []wire.WorkDepEntry {
+	out := make([]wire.WorkDepEntry, len(entries))
+	for i, e := range entries {
+		out[i] = wire.WorkDepEntry{
+			ID:      e.ID,
+			Slug:    e.Slug,
+			Project: e.Project,
+			Kind:    e.Kind,
+			Note:    e.Note,
+		}
+	}
+	return out
 }
 
 // workQueueFromReadyQueue maps an aihub.ReadyQueue onto the whitelisted
@@ -327,6 +540,25 @@ func workRecentFromList(list *aihub.WorkItemList) wire.WorkRecent {
 		}
 	}
 	return wire.WorkRecent{Items: out}
+}
+
+// workGraphFromList maps an aihub.WorkItemList onto the whitelisted
+// wire.WorkGraph shape the browser consumes for the work graph view,
+// carrying each item's parent through to WorkGraphNode.Parent.
+func workGraphFromList(list *aihub.WorkItemList) wire.WorkGraph {
+	out := make([]wire.WorkGraphNode, len(list.Items))
+	for i, it := range list.Items {
+		out[i] = wire.WorkGraphNode{
+			ID:       it.ID,
+			Slug:     it.Slug,
+			Goal:     it.Goal,
+			Status:   it.Status,
+			Priority: it.Priority,
+			WIType:   it.WIType,
+			Parent:   it.ParentWorkItemID,
+		}
+	}
+	return wire.WorkGraph{Nodes: out}
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

@@ -234,3 +234,62 @@ export interface WorkRecentItem {
 export interface WorkRecent {
   items: WorkRecentItem[];
 }
+/**
+ * WorkGraphNode is a single work item node in the dependency/parent graph for
+ * GET /api/v1/work/graph.
+ */
+export interface WorkGraphNode {
+  id: string;
+  slug: string;
+  goal: string;
+  status: string;
+  priority: string;
+  wiType?: string;
+  parent?: string;
+}
+/**
+ * WorkGraph is the curated response for GET /api/v1/work/graph.
+ */
+export interface WorkGraph {
+  nodes: WorkGraphNode[];
+}
+/**
+ * WorkDepEntry is one dependency edge for
+ * GET /api/v1/work/items/{id}/dependencies.
+ */
+export interface WorkDepEntry {
+  id: string;
+  slug: string;
+  project: string;
+  kind: string;
+  note: string;
+}
+/**
+ * WorkDependencies is the curated response for
+ * GET /api/v1/work/items/{id}/dependencies.
+ */
+export interface WorkDependencies {
+  blocking: WorkDepEntry[];
+  blockedBy: WorkDepEntry[];
+}
+/**
+ * WorkStepNode is a single step-graph node for
+ * GET /api/v1/work/items/{id}/steps, annotated with its progress status.
+ * Status is one of "done", "current", or "pending".
+ */
+export interface WorkStepNode {
+  id: string;
+  status: string;
+  prev?: string[];
+}
+/**
+ * WorkSteps is the curated response for GET /api/v1/work/items/{id}/steps.
+ * Degraded is true when no scenario graph file could be resolved for the
+ * work item (e.g. no matching .repo/<repo>/<wiType>[.<project>].md), in
+ * which case Nodes is synthesized best-effort from step-completion events
+ * without Prev edges.
+ */
+export interface WorkSteps {
+  nodes: WorkStepNode[];
+  degraded: boolean;
+}

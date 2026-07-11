@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -334,4 +335,195 @@ func getFiles(t *testing.T, mux *http.ServeMux, id, dir string) []FileEntry {
 		t.Fatalf("decode response: %v", err)
 	}
 	return entries
+}
+
+// ---- ReadFileContent (tether#20 Task 6) ----
+
+func TestReadFileContent_ReadsSmallFileFully(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "hello.txt"), []byte("hello world"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	content, truncated, err := ReadFileContent(root, "hello.txt")
+	if err != nil {
+		t.Fatalf("ReadFileContent: %v", err)
+	}
+	if truncated {
+		t.Errorf("truncated = true, want false for a small file")
+	}
+	if content != "hello world" {
+		t.Errorf("content = %q, want %q", content, "hello world")
+	}
+}
+
+func TestReadFileContent_TruncatesOverOneMiB(t *testing.T) {
+	root := t.TempDir()
+	const oneMiB = 1 << 20
+	big := bytes.Repeat([]byte("a"), oneMiB+100)
+	if err := os.WriteFile(filepath.Join(root, "big.txt"), big, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	content, truncated, err := ReadFileContent(root, "big.txt")
+	if err != nil {
+		t.Fatalf("ReadFileContent: %v", err)
+	}
+	if !truncated {
+		t.Errorf("truncated = false, want true for a file over 1 MiB")
+	}
+	if len(content) != oneMiB {
+		t.Errorf("len(content) = %d, want %d (exactly 1 MiB)", len(content), oneMiB)
+	}
+}
+
+func TestReadFileContent_DirReturnsError(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "adir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := ReadFileContent(root, "adir"); err == nil {
+		t.Errorf("ReadFileContent on a directory: err = nil, want error")
+	}
+}
+
+func TestReadFileContent_PathTraversalReturnsError(t *testing.T) {
+	root := t.TempDir()
+
+	if _, _, err := ReadFileContent(root, "../etc/passwd"); err == nil {
+		t.Errorf("ReadFileContent with traversal path: err = nil, want error")
+	}
+}
+
+// ---- /api/v1/workspaces/{id}/file handler (tether#20 Task 6) ----
+
+func TestFileHandler_ReadsFileContent(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "note.txt"), []byte("hi there"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reg, id := newTestRegistry(t, root)
+	mux := http.NewServeMux()
+	RegisterAPI(mux, reg)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/workspaces/"+id+"/file?path=note.txt", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	var got struct {
+		Path      string `json:"path"`
+		Content   string `json:"content"`
+		Truncated bool   `json:"truncated"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.Path != "note.txt" || got.Content != "hi there" || got.Truncated {
+		t.Errorf("got = %+v, want path=note.txt content=\"hi there\" truncated=false", got)
+	}
+}
+
+func TestFileHandler_MissingPathParam400(t *testing.T) {
+	root := t.TempDir()
+	reg, id := newTestRegistry(t, root)
+	mux := http.NewServeMux()
+	RegisterAPI(mux, reg)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/workspaces/"+id+"/file", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+// TestFileHandler_TraversalPath400 uses a traversal target that actually
+// exists on disk (a sibling file outside the workspace root), so SafeJoin
+// hits the explicit "escapes workspace root" branch (400) rather than the
+// "path not accessible" / ENOENT branch (which the handler maps to 404 — see
+// TestFileHandler_MissingFile404 — since a nonexistent traversal target is
+// indistinguishable from a plain missing file once EvalSymlinks fails).
+func TestFileHandler_TraversalPath400(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "ws")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(parent, "secret.txt"), []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reg, id := newTestRegistry(t, root)
+	mux := http.NewServeMux()
+	RegisterAPI(mux, reg)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/workspaces/"+id+"/file?path=../secret.txt", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestFileHandler_MissingFile404(t *testing.T) {
+	root := t.TempDir()
+	reg, id := newTestRegistry(t, root)
+	mux := http.NewServeMux()
+	RegisterAPI(mux, reg)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/workspaces/"+id+"/file?path=nope.txt", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestFileHandler_DirPath400(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "adir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	reg, id := newTestRegistry(t, root)
+	mux := http.NewServeMux()
+	RegisterAPI(mux, reg)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/workspaces/"+id+"/file?path=adir", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestFileHandler_UnknownWorkspace404(t *testing.T) {
+	reg := &Registry{path: filepath.Join(t.TempDir(), "workspaces.json")}
+	mux := http.NewServeMux()
+	RegisterAPI(mux, reg)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/workspaces/does-not-exist/file?path=a.txt", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestFileHandler_MethodNotAllowed(t *testing.T) {
+	root := t.TempDir()
+	reg, id := newTestRegistry(t, root)
+	mux := http.NewServeMux()
+	RegisterAPI(mux, reg)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workspaces/"+id+"/file?path=a.txt", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", rec.Code)
+	}
 }

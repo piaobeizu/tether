@@ -173,6 +173,11 @@ func Run(cfg *Config) error {
 		wsRoot = filepath.Join(home, ".tether", "workspace")
 		_ = os.MkdirAll(wsRoot, 0o700)
 	}
+	// Reflect the resolved default back onto cfg so RegisterWorkAPI (mux.go,
+	// invoked later via newServer/buildMux) sees the real workspace root
+	// instead of an empty string when --workspace-root wasn't passed
+	// (tether#20 Task 5: the scenario-graph resolver needs a real root).
+	cfg.WorkspaceRoot = wsRoot
 	mcpCfg, err := loadMCPConfig(cfg.MCPConfigPath)
 	if err != nil {
 		return fmt.Errorf("mcp config: %w", err)

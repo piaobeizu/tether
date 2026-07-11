@@ -17,16 +17,36 @@ afterEach(() => {
   cleanup()
 })
 
-function vb(svg: SVGSVGElement) {
-  return (svg.getAttribute('viewBox') ?? '0 0 0 0').split(/\s+/).map(Number)
+function vbWidth(svg: SVGSVGElement) {
+  return Number((svg.getAttribute('viewBox') ?? '0 0 0 0').split(/\s+/)[2])
+}
+function txX(el: Element): number {
+  const m = /translate\(([-\d.]+)/.exec(el.getAttribute('transform') ?? '')
+  return m ? parseFloat(m[1]) : NaN
 }
 
 describe('ForceGraph', () => {
-  it('renders every node label', () => {
-    render(<ForceGraph nodes={nodes} edges={edges} />)
-    expect(screen.getByText('tether#1')).toBeTruthy()
+  it('renders a dot for every node', () => {
+    const { container } = render(<ForceGraph nodes={nodes} edges={edges} />)
+    expect(container.querySelectorAll('.fg-node-dot').length).toBe(3)
+  })
+
+  // Semantic zoom: labels are hidden at the default fit-scale to avoid overlap.
+  it('hides node labels at default zoom', () => {
+    const { container } = render(<ForceGraph nodes={nodes} edges={edges} />)
+    expect(container.querySelectorAll('.fg-node-label').length).toBe(0)
+  })
+
+  it('shows the selected node label', () => {
+    render(<ForceGraph nodes={nodes} edges={edges} selectedId="b" />)
     expect(screen.getByText('tether#2')).toBeTruthy()
-    expect(screen.getByText('tether#3')).toBeTruthy()
+  })
+
+  it('shows a node label on hover', () => {
+    const { container } = render(<ForceGraph nodes={nodes} edges={edges} />)
+    const first = container.querySelectorAll('.fg-node')[0]
+    fireEvent.pointerOver(first)
+    expect(screen.getByText('tether#1')).toBeTruthy()
   })
 
   it('renders one edge path per valid edge', () => {
@@ -43,8 +63,8 @@ describe('ForceGraph', () => {
 
   it('calls onSelect with the clicked node id (no drag)', () => {
     const onSelect = vi.fn()
-    render(<ForceGraph nodes={nodes} edges={edges} onSelect={onSelect} />)
-    fireEvent.click(screen.getByText('tether#2'))
+    const { container } = render(<ForceGraph nodes={nodes} edges={edges} onSelect={onSelect} />)
+    fireEvent.click(container.querySelectorAll('.fg-node')[1]) // node 'b'
     expect(onSelect).toHaveBeenCalledWith('b')
   })
 
@@ -58,25 +78,52 @@ describe('ForceGraph', () => {
     const onSelect = vi.fn()
     const { container } = render(<ForceGraph nodes={nodes} edges={edges} onSelect={onSelect} />)
     const svg = container.querySelector('svg.fg-svg') as SVGSVGElement
-    const nodeB = screen.getByText('tether#2')
+    const nodeB = () => container.querySelectorAll('.fg-node')[1]
 
     fireEvent.pointerDown(svg, { clientX: 10, clientY: 10 })
     fireEvent.pointerMove(svg, { clientX: 80, clientY: 80 })
     fireEvent.pointerUp(svg, { clientX: 80, clientY: 80 })
-    fireEvent.click(nodeB)
+    fireEvent.click(nodeB())
     expect(onSelect).not.toHaveBeenCalled()
 
     fireEvent.pointerDown(svg, { clientX: 10, clientY: 10 })
     fireEvent.pointerUp(svg, { clientX: 10, clientY: 10 })
-    fireEvent.click(nodeB)
+    fireEvent.click(nodeB())
     expect(onSelect).toHaveBeenCalledWith('b')
   })
 
   it('zooms the viewBox on wheel', () => {
     const { container } = render(<ForceGraph nodes={nodes} edges={edges} />)
     const svg = container.querySelector('svg.fg-svg') as SVGSVGElement
-    const w0 = vb(svg)[2]
+    const w0 = vbWidth(svg)
     fireEvent.wheel(svg, { deltaY: 100 }) // zoom out → wider viewBox
-    expect(vb(svg)[2]).toBeGreaterThan(w0)
+    expect(vbWidth(svg)).toBeGreaterThan(w0)
+  })
+
+  it('clusters nodes into status columns (x ordered by status)', () => {
+    // render order: done, blocked, running, queued → columns 4,0,1,2
+    const cnodes: FGNode[] = [
+      { id: 'd', label: 'D', status: 'done' },
+      { id: 'bl', label: 'BL', status: 'blocked' },
+      { id: 'r', label: 'R', status: 'running' },
+      { id: 'q', label: 'Q', status: 'queued' },
+    ]
+    const { container } = render(<ForceGraph nodes={cnodes} edges={[]} />)
+    const g = container.querySelectorAll('.fg-node')
+    const x = { d: txX(g[0]), bl: txX(g[1]), r: txX(g[2]), q: txX(g[3]) }
+    expect(x.bl).toBeLessThan(x.r)
+    expect(x.r).toBeLessThan(x.q)
+    expect(x.q).toBeLessThan(x.d)
+  })
+
+  it('renders a header per present status column', () => {
+    const cnodes: FGNode[] = [
+      { id: 'd', label: 'D', status: 'done' },
+      { id: 'bl', label: 'BL', status: 'blocked' },
+      { id: 'r', label: 'R', status: 'running' },
+      { id: 'q', label: 'Q', status: 'queued' },
+    ]
+    const { container } = render(<ForceGraph nodes={cnodes} edges={[]} />)
+    expect(container.querySelectorAll('.fg-col-head').length).toBe(4)
   })
 })

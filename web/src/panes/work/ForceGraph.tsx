@@ -7,20 +7,25 @@
 // Layout is PURE ARITHMETIC (no physics): x = status column, y = the card's
 // sorted row within that column. Columns: blocked | running | ready | paused |
 // done. Within a column, cards sort by priority (urgent first) then seq (newest
-// first) and stack top-to-bottom under the column header — so a mostly-
-// disconnected set reads as tidy ordered lists instead of scattered dots with
-// big gaps (the "empty dots" complaint that drove tether#25).
+// first) and stack top-to-bottom under the column header.
+//
+// RESPONSIVE (tether#27): the map lives in the narrow right Work tab (tether#26),
+// so column/card sizes are computed from the measured container WIDTH — present
+// columns pack left-to-right and shrink to fit, capped at the natural size, and
+// below a threshold cards drop to a compact form (slug + status bar only). The
+// initial viewBox is a width-fit window (scale ≈ 1, readable) with vertical PAN
+// for tall columns — NOT a shrink-everything-to-fit meet, which is what made the
+// map illegible in the narrow pane.
 //
 // Positions are memoized on a CONTENT key (sorted ids + status column +
-// priority/seq order + structural edges), NOT array identity — so an 8s poll
-// returning the same graph in a fresh array reuses positions and the map does
-// NOT reshuffle. A status change re-places that card WITHOUT resetting the
-// user's pan/zoom (structure-key vs layout-key split, tether#24). Status and
-// labels render from LIVE props.
+// priority/seq order + structural edges + container-width bucket), NOT array
+// identity — an 8s poll returning the same graph reuses positions (no reshuffle);
+// a status change re-places a card WITHOUT resetting pan/zoom (structure-key vs
+// layout-key split, tether#24); a container resize re-fits.
 //
-// Block edges are an OVERLAY (drawn; they never shape the arithmetic layout).
-// Pan = pointer-drag past 4px (NO setPointerCapture, tether#20); zoom =
-// non-passive native wheel (tether#22). Lazy-loaded behind WorkGraphView.
+// Block edges are an OVERLAY (drawn; never shape the layout). Pan = pointer-drag
+// past 4px (NO setPointerCapture, tether#20); zoom = non-passive native wheel
+// (tether#22). Lazy-loaded behind WorkGraphView.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent } from 'react'
 
@@ -46,15 +51,21 @@ export interface ForceGraphProps {
   onSelect?: (id: string) => void
 }
 
-const CARD_W = 132
+const MAX_CARD_W = 132 // natural card width (cap in a wide pane)
+const MIN_CARD_W = 64
+const MAX_COL_GAP = 210 // natural column center-to-center spacing (cap)
+const COL_MARGIN = 14 // horizontal gap between a card and its column slot edge
+const COMPACT_THRESHOLD = 96 // cardW below this → compact card (slug + bar only)
 const CARD_H = 34
+const CARD_H_COMPACT = 22
 const ROW_GAP = 10
-const COL_GAP = 210
 const HEAD_H = 24
 const BAR_W = 4
 const PAD = 28
 const MIN_SCALE = 0.3
 const MAX_SCALE = 4
+const CW_BUCKET = 20 // quantise the measured width so a 1px resize doesn't thrash
+const CHAR_W = 6.6 // ~mono glyph advance at the 11px slug font, for truncation
 const COL_LABELS = ['blocked', 'running', 'ready', 'paused', 'done']
 
 type Pt = { x: number; y: number }
@@ -76,6 +87,9 @@ interface Positions {
   pos: Map<string, Pt> // card CENTER
   box: Box
   cols: Col[]
+  cardW: number
+  cardH: number
+  compact: boolean
 }
 
 /** Column index (0..4) a status clusters into. */
@@ -136,10 +150,19 @@ function parseSeq(label: string): number {
   return m ? Number(m[1]) : 0
 }
 
-/** Place each node as a card: x = status column, y = its sorted row in that
- *  column. Pure arithmetic — no physics. Returns card CENTER positions, a
- *  padded bounding box, and the present status columns (for headers). */
-function computePositions(nodes: FGNode[]): Positions {
+/** Truncate a label to fit an available pixel width at the slug font. */
+function fitText(label: string, availPx: number): string {
+  const max = Math.max(1, Math.floor(availPx / CHAR_W))
+  if (label.length <= max) return label
+  if (max <= 1) return label.slice(0, 1)
+  return label.slice(0, max - 1) + '…'
+}
+
+/** Place each node as a card sized to the container width `cw`: present columns
+ *  pack left-to-right and shrink to fit; cards cap at the natural size and drop
+ *  to a compact form when narrow. Pure arithmetic — no physics. `cw <= 0`
+ *  (unmeasured / no ResizeObserver) falls back to the natural sizes. */
+export function computePositions(nodes: FGNode[], cw: number): Positions {
   const buckets = new Map<number, FGNode[]>()
   for (const n of nodes) {
     const c = statusCol(n.status)
@@ -147,8 +170,28 @@ function computePositions(nodes: FGNode[]): Positions {
     if (arr) arr.push(n)
     else buckets.set(c, [n])
   }
+  const presentCols = [...buckets.keys()].sort((a, b) => a - b)
+  const nCols = Math.max(presentCols.length, 1)
 
-  const topY = HEAD_H + CARD_H / 2 // center-y of each column's first row
+  // Responsive column/card sizing from the container width.
+  let colGap: number
+  let cardW: number
+  if (cw <= 0) {
+    colGap = MAX_COL_GAP
+    cardW = MAX_CARD_W
+  } else {
+    const slot = Math.max((cw - PAD * 2) / nCols, MIN_CARD_W + COL_MARGIN)
+    colGap = Math.min(slot, MAX_COL_GAP)
+    cardW = Math.min(Math.max(colGap - COL_MARGIN, MIN_CARD_W), MAX_CARD_W)
+  }
+  const compact = cardW < COMPACT_THRESHOLD
+  const cardH = compact ? CARD_H_COMPACT : CARD_H
+  const topY = HEAD_H + cardH / 2 // center-y of each column's first row
+
+  // pack present columns left-to-right (index in presentCols, not statusCol)
+  const packIndex = new Map<number, number>()
+  presentCols.forEach((c, i) => packIndex.set(c, i))
+
   const pos = new Map<string, Pt>()
   let maxRows = 0
   for (const [c, arr] of buckets) {
@@ -158,41 +201,39 @@ function computePositions(nodes: FGNode[]): Positions {
       return parseSeq(b.label) - parseSeq(a.label) // newer (higher seq) first
     })
     maxRows = Math.max(maxRows, arr.length)
+    const cx = (packIndex.get(c) ?? 0) * colGap
     arr.forEach((n, i) => {
-      pos.set(n.id, { x: c * COL_GAP, y: topY + i * (CARD_H + ROW_GAP) })
+      pos.set(n.id, { x: cx, y: topY + i * (cardH + ROW_GAP) })
     })
   }
 
-  const presentCols = [...buckets.keys()].sort((a, b) => a - b)
-  const minCol = presentCols[0] ?? 0
-  const maxCol = presentCols[presentCols.length - 1] ?? 0
-  const minX = minCol * COL_GAP - CARD_W / 2 - PAD
-  const maxX = maxCol * COL_GAP + CARD_W / 2 + PAD
+  const minX = -cardW / 2 - PAD
+  const maxX = (nCols - 1) * colGap + cardW / 2 + PAD
   const minY = -PAD
-  const rowsH = maxRows > 0 ? topY + (maxRows - 1) * (CARD_H + ROW_GAP) + CARD_H / 2 : topY
+  const rowsH = maxRows > 0 ? topY + (maxRows - 1) * (cardH + ROW_GAP) + cardH / 2 : topY
   const maxY = rowsH + PAD
   const box: Box = { x: minX, y: minY, w: maxX - minX, h: maxY - minY }
 
   const cols: Col[] = presentCols.map((c) => ({
     label: COL_LABELS[c] ?? 'other',
-    x: c * COL_GAP,
+    x: (packIndex.get(c) ?? 0) * colGap,
     count: buckets.get(c)?.length ?? 0,
   }))
 
-  return { pos, box, cols }
+  return { pos, box, cols, cardW, cardH, compact }
 }
 
 /** Curved edge anchored at the facing card edges (horizontal), or centers when
  *  the two cards share a column. */
-function edgePath(s: Pt, t: Pt): string {
+function edgePath(s: Pt, t: Pt, cardW: number): string {
   let sx = s.x
   let tx = t.x
   if (t.x > s.x) {
-    sx = s.x + CARD_W / 2
-    tx = t.x - CARD_W / 2
+    sx = s.x + cardW / 2
+    tx = t.x - cardW / 2
   } else if (t.x < s.x) {
-    sx = s.x - CARD_W / 2
-    tx = t.x + CARD_W / 2
+    sx = s.x - cardW / 2
+    tx = t.x + cardW / 2
   }
   const mx = (sx + tx) / 2
   const my = (s.y + t.y) / 2
@@ -204,9 +245,32 @@ function edgePath(s: Pt, t: Pt): string {
 }
 
 export default function ForceGraph({ nodes, edges, selectedId, onSelect }: ForceGraphProps) {
-  // Structure key drives the viewport RESET: only a change to the node SET or
-  // structural edges refits/recenters the map. A status/priority change must
-  // NOT reset the user's pan/zoom (tether#24 review F1).
+  const containerRef = useRef<HTMLDivElement>(null)
+  // Measured container size (bucketed). {0,0} until the ResizeObserver fires
+  // (or forever under jsdom, which has no ResizeObserver) → natural-size fallback.
+  const [size, setSize] = useState<{ cw: number; ch: number }>({ cw: 0, ch: 0 })
+
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el || typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver((entries) => {
+      const r = entries[0]?.contentRect
+      if (!r) return
+      const cw = Math.round(r.width / CW_BUCKET) * CW_BUCKET
+      const ch = Math.round(r.height / CW_BUCKET) * CW_BUCKET // bucket too (no per-px re-render)
+      setSize((prev) => (prev.cw === cw && prev.ch === ch ? prev : { cw, ch }))
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
+  // Structure key drives the viewport RE-FIT: a change to the node SET,
+  // structural edges, container SIZE, or the present-COLUMN COUNT refits/
+  // recenters. Adding/removing a column repacks the whole geometry
+  // (colGap/cardW/box), so a frozen frame would clip it (tether#27 review F1);
+  // a resize refits (F2). A status/priority change that keeps the same set of
+  // columns must NOT reset pan/zoom (tether#24 review F1) — and doesn't, since
+  // nCols is unchanged and packing-by-index keeps the moved card's x stable.
   const structureKey = useMemo(() => {
     const ids = nodes.map((n) => n.id).sort().join('|')
     const es = edges
@@ -214,12 +278,12 @@ export default function ForceGraph({ nodes, edges, selectedId, onSelect }: Force
       .map((e) => `${e.from}>${e.to}`)
       .sort()
       .join('|')
-    return `${ids}::${es}`
-  }, [nodes, edges])
+    const nCols = new Set(nodes.map((n) => statusCol(n.status))).size
+    return `${ids}::${es}::w${size.cw}::h${size.ch}::n${nCols}`
+  }, [nodes, edges, size.cw, size.ch])
 
-  // Layout key ALSO folds in each node's column + priority + seq, so a status
-  // or priority change re-places that card — in place, WITHOUT a viewport
-  // reset. Poll-stable: an unchanged poll yields an identical key.
+  // Layout key ALSO folds in each node's column + priority + seq, so a status or
+  // priority change re-places that card — in place, WITHOUT a viewport reset.
   const layoutKey = useMemo(() => {
     const withOrder = nodes
       .map((n) => `${n.id}:${statusCol(n.status)}:${priorityRank(n.priority)}:${parseSeq(n.label)}`)
@@ -228,19 +292,25 @@ export default function ForceGraph({ nodes, edges, selectedId, onSelect }: Force
     return `${withOrder}::${structureKey}`
   }, [nodes, structureKey])
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on layoutKey (content), not the array refs
-  const layout = useMemo(() => computePositions(nodes), [layoutKey])
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on layoutKey (content + width), not the array refs
+  const layout = useMemo(() => computePositions(nodes, size.cw), [layoutKey])
 
-  const baseRef = useRef<Box>(layout.box)
-  baseRef.current = layout.box
+  // Initial viewport = a width-fit window: viewBox width = box width so meet-fit
+  // renders at ~1:1 (readable); its height matches the container aspect so tall
+  // columns are reached by vertical PAN instead of being shrunk to fit.
+  const fitH = size.cw > 0 && size.ch > 0 ? (layout.box.w * size.ch) / size.cw : layout.box.h
+  const fitView: Box = { x: layout.box.x, y: layout.box.y, w: layout.box.w, h: fitH }
+
+  const baseRef = useRef<Box>(fitView)
+  baseRef.current = fitView
 
   const [resetKey, setResetKey] = useState(structureKey)
-  const [view, setView] = useState<Box>(layout.box)
+  const [view, setView] = useState<Box>(fitView)
   if (resetKey !== structureKey) {
     setResetKey(structureKey)
-    setView(layout.box)
+    setView(fitView)
   }
-  const effectiveView = resetKey === structureKey ? view : layout.box
+  const effectiveView = resetKey === structureKey ? view : fitView
 
   const svgRef = useRef<SVGSVGElement>(null)
   const drag = useRef<{ startX: number; startY: number; lastX: number; lastY: number } | null>(null)
@@ -303,13 +373,15 @@ export default function ForceGraph({ nodes, edges, selectedId, onSelect }: Force
       const s = layout.pos.get(e.from)
       const t = layout.pos.get(e.to)
       return s && t
-        ? { key: `${e.from}->${e.to}-${i}`, d: edgePath(s, t), block: e.kind === 'block' }
+        ? { key: `${e.from}->${e.to}-${i}`, d: edgePath(s, t, layout.cardW), block: e.kind === 'block' }
         : null
     })
     .filter((e): e is { key: string; d: string; block: boolean } => e !== null)
 
+  const slugAvail = layout.cardW - BAR_W - 13
+
   return (
-    <div className="fg-scroll">
+    <div className="fg-scroll" ref={containerRef}>
       <svg
         ref={svgRef}
         className="fg-svg"
@@ -340,21 +412,21 @@ export default function ForceGraph({ nodes, edges, selectedId, onSelect }: Force
               <g
                 key={n.id}
                 className={`fg-node ${statusClass(n.status)} ${selected ? 'fg-node-selected' : ''}`}
-                transform={`translate(${p.x - CARD_W / 2}, ${p.y - CARD_H / 2})`}
+                transform={`translate(${p.x - layout.cardW / 2}, ${p.y - layout.cardH / 2})`}
                 onClick={() => {
                   if (didDrag.current) return
                   onSelect?.(n.id)
                 }}
                 role={onSelect ? 'button' : undefined}
               >
-                <rect className="fg-card" width={CARD_W} height={CARD_H} rx={5} />
-                <rect className="fg-card-bar" width={BAR_W} height={CARD_H} />
-                <text className="fg-card-slug" x={BAR_W + 9} y={14}>
-                  {n.label}
+                <rect className="fg-card" width={layout.cardW} height={layout.cardH} rx={5} />
+                <rect className="fg-card-bar" width={BAR_W} height={layout.cardH} />
+                <text className="fg-card-slug" x={BAR_W + 9} y={layout.compact ? layout.cardH / 2 + 4 : 14}>
+                  {fitText(n.label, slugAvail)}
                 </text>
-                {n.sub && (
+                {!layout.compact && n.sub && (
                   <text className="fg-card-type" x={BAR_W + 9} y={26}>
-                    {n.sub}
+                    {fitText(n.sub, slugAvail)}
                   </text>
                 )}
                 <title>

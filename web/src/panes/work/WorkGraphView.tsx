@@ -22,6 +22,14 @@ function describeError(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
 }
 
+// Terminal statuses are hidden by the default 'active' filter (tether#24).
+const TERMINAL = new Set(['done', 'wrapped', 'cancelled', 'failed'])
+function isTerminal(status: string | undefined): boolean {
+  return !!status && TERMINAL.has(status)
+}
+
+type FilterMode = 'active' | 'done' | 'all'
+
 export default function WorkGraphView() {
   const project = useStore((s) => s.workProject)
   const selectedWiId = useStore((s) => s.selectedWiId)
@@ -30,6 +38,10 @@ export default function WorkGraphView() {
   const [graph, setGraph] = useState<WorkGraph | null>(null)
   const [graphError, setGraphError] = useState<string | null>(null)
   const [blockEdges, setBlockEdges] = useState<FGEdge[]>([])
+  // Scale filters (tether#24): default to active (non-terminal) wi so the map
+  // isn't buried under a long tail of finished work.
+  const [mode, setMode] = useState<FilterMode>('active')
+  const [typeF, setTypeF] = useState<string>('')
 
   // Monotonic token: a newer load/project-switch supersedes a slower in-flight
   // fetch so it can't clobber the current project's graph (stale-response guard).
@@ -118,32 +130,72 @@ export default function WorkGraphView() {
     return <div className="work-empty work-graph-hint">no active work items</div>
   }
 
-  const fgNodes: FGNode[] = graph.nodes.map((n) => ({
+  // Client-side filter of the already-fetched full graph (no backend change).
+  const wiTypes = [...new Set(graph.nodes.map((n) => n.wiType).filter((t): t is string => !!t))].sort()
+  const shown = graph.nodes.filter((n) => {
+    const terminal = isTerminal(n.status)
+    const passMode = mode === 'all' ? true : mode === 'done' ? terminal : !terminal
+    const passType = !typeF || n.wiType === typeF
+    return passMode && passType
+  })
+  const shownIds = new Set(shown.map((n) => n.id))
+  const fgNodes: FGNode[] = shown.map((n) => ({
     id: n.id,
     label: n.slug,
     status: n.status,
     sub: n.wiType,
   }))
-  const parentEdges: FGEdge[] = graph.nodes
-    .filter((n): n is WorkGraphNode & { parent: string } => !!n.parent)
+  const parentEdges: FGEdge[] = shown
+    .filter((n): n is WorkGraphNode & { parent: string } => !!n.parent && shownIds.has(n.parent))
     .map((n) => ({ from: n.parent, to: n.id, kind: 'parent' as const }))
-  const fgEdges = [...parentEdges, ...blockEdges]
+  const fgEdges = [
+    ...parentEdges,
+    ...blockEdges.filter((e) => shownIds.has(e.from) && shownIds.has(e.to)),
+  ]
 
   return (
     <div className="work-graph-view">
-      <Suspense fallback={<div className="work-empty work-graph-hint">loading graph…</div>}>
-        <ForceGraph
-          nodes={fgNodes}
-          edges={fgEdges}
-          selectedId={selectedWiId ?? undefined}
-          onSelect={(id) => {
-            select({ wiId: id })
-            // bring the right Work tab forward so the detail is visible even if
-            // the user was on Chat/Shell when they clicked a node (review F2)
-            window.dispatchEvent(new CustomEvent('tether:select-tab', { detail: 'work' }))
-          }}
-        />
-      </Suspense>
+      <div className="fg-filter">
+        <div className="fg-seg-group">
+          {(['active', 'done', 'all'] as const).map((m) => (
+            <button
+              key={m}
+              type="button"
+              className={`fg-seg${mode === m ? ' on' : ''}`}
+              onClick={() => setMode(m)}
+            >
+              {m}
+            </button>
+          ))}
+        </div>
+        {wiTypes.length > 0 && (
+          <select className="fg-type-select" value={typeF} onChange={(e) => setTypeF(e.target.value)}>
+            <option value="">all types</option>
+            {wiTypes.map((t) => <option key={t} value={t}>{t}</option>)}
+          </select>
+        )}
+        <span style={{ flex: 1 }} />
+        <span className="fg-filter-count mono">{shown.length}/{graph.nodes.length}</span>
+      </div>
+      <div className="fg-graph-slot">
+        {fgNodes.length === 0 ? (
+          <div className="work-empty work-graph-hint">no work items match the filter</div>
+        ) : (
+          <Suspense fallback={<div className="work-empty work-graph-hint">loading graph…</div>}>
+            <ForceGraph
+              nodes={fgNodes}
+              edges={fgEdges}
+              selectedId={selectedWiId ?? undefined}
+              onSelect={(id) => {
+                select({ wiId: id })
+                // bring the right Work tab forward so the detail is visible even
+                // if the user was on Chat/Shell when they clicked (tether#23 F2)
+                window.dispatchEvent(new CustomEvent('tether:select-tab', { detail: 'work' }))
+              }}
+            />
+          </Suspense>
+        )}
+      </div>
     </div>
   )
 }

@@ -689,8 +689,27 @@ body {
    A force blob is roughly square, so a viewBox fit (unlike the dagre
    relationship layout) does not squash it. Pan = drag, zoom = wheel;
    the container hides overflow (pan moves the viewBox, not a scrollbar). */
-.work-graph-view { width: 100%; height: 100%; }
+.work-graph-view { width: 100%; height: 100%; display: flex; flex-direction: column; min-height: 0; }
 .work-graph-hint, .work-detail-hint { padding: 14px 4px; }
+
+/* Filter bar (tether#24): status scope + wiType + count. */
+.fg-filter {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 6px 2px 8px; flex-shrink: 0;
+}
+.fg-seg-group { display: inline-flex; border: 1px solid var(--line); border-radius: var(--r-2); overflow: hidden; }
+.fg-seg {
+  font-size: 11px; padding: 3px 9px; background: var(--bg-surface);
+  color: var(--ink-secondary); border: 0; border-right: 1px solid var(--line); cursor: pointer;
+}
+.fg-seg:last-child { border-right: 0; }
+.fg-seg.on { background: var(--accent-tint); color: var(--accent-deep); }
+.fg-type-select {
+  font-size: 11px; padding: 3px 6px; border: 1px solid var(--line);
+  border-radius: var(--r-2); background: var(--bg-surface); color: var(--ink-secondary);
+}
+.fg-filter-count { font-size: 10.5px; color: var(--ink-quat); }
+.fg-graph-slot { flex: 1; min-height: 0; }
 
 .fg-scroll {
   width: 100%; height: 100%; overflow: hidden; position: relative;
@@ -698,6 +717,7 @@ body {
 }
 .fg-svg { width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; }
 .fg-svg:active { cursor: grabbing; }
+.fg-col-head { font-size: 10px; fill: var(--ink-tertiary); font-family: var(--font-mono); }
 
 .fg-edge { stroke: var(--ink-quat); stroke-width: 1.4; opacity: .7; }
 .fg-edge-block { stroke: var(--warn); stroke-dasharray: 4 3; }

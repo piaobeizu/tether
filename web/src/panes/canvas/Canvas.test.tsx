@@ -135,3 +135,12 @@ describe('Canvas — markdown XSS safety (tether#21)', () => {
     expect(container.querySelector('script')).toBeNull()
   })
 })
+
+describe('Canvas — default is the work graph view (tether#23)', () => {
+  it('renders WorkGraphView (project map) when nothing is selected', () => {
+    // no file selected + no workProject → WorkGraphView shows its hint; the
+    // wi-relationship graph replaced the old "no artifacts yet" empty state.
+    render(<Canvas />)
+    expect(screen.getByText('select a project')).toBeTruthy()
+  })
+})

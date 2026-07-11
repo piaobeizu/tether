@@ -76,6 +76,11 @@ interface AppState {
   selectedWiId: string | null
   selectedFile: SelectedFile | null
 
+  // Currently-focused Work project (tether#23): shared by the middle
+  // knowledge-graph (WorkGraphView) and the right Work detail pane so both
+  // render the same project. Empty string = none picked yet.
+  workProject: string
+
   setSessionId: (id: string) => void
   loadHistory: (msgs: Message[]) => void
   addMessage: (msg: Message) => void
@@ -84,6 +89,7 @@ interface AppState {
   setConnection: (patch: Partial<Connection>) => void
   handleEnvelope: (env: Envelope) => void
   select: (sel: { wiId?: string; file?: SelectedFile } | null) => void
+  setWorkProject: (p: string) => void
 }
 
 export const useStore = create<AppState>((set) => ({
@@ -96,6 +102,7 @@ export const useStore = create<AppState>((set) => ({
   connection: { state: 'connecting', latency: 0, attempt: 0 },
   selectedWiId: null,
   selectedFile: null,
+  workProject: '',
 
   setSessionId: (id) => {
     localStorage.setItem('tether_last_sid', id)
@@ -239,4 +246,6 @@ export const useStore = create<AppState>((set) => ({
     }
     set({ selectedWiId: null, selectedFile: sel.file ?? null })
   },
+
+  setWorkProject: (p) => set({ workProject: p }),
 }))

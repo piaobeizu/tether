@@ -1,23 +1,19 @@
-// Canvas — middle-pane artifact viewer (tether#20 Task 10/11, tether#21
-// markdown rendering).
+// Canvas — middle-pane view (tether#23).
 //
-// Reads the shared selection slice from the store (lib/store.ts `select`)
-// and renders one of three modes:
-//   - detail mode: a work item's goal/status/content + its scenario step DAG
-//   - file mode: a workspace file's content (from WorkspaceTree)
-//   - empty: neither selected — the original "no artifacts yet" placeholder
+// Reads the shared selection slice from the store (lib/store.ts) and renders:
+//   - file mode: a workspace file's content (from the left WorkspaceTree)
+//   - otherwise: the wi relationship knowledge-graph (WorkGraphView) for the
+//     current Work project — the always-present "project map".
 //
-// Markdown content (work item `content` and `.md` files) renders via the
-// lazy-loaded <Markdown> component (react-markdown + remark-gfm) so the
-// renderer stays out of the initial bundle. Non-markdown files keep the
-// plain <pre> fallback (no syntax highlighting yet).
+// The old wi-detail mode (goal/status/content + step DAG) moved to the right
+// pane (WorkDetail) in the tether#23 panel inversion. Markdown file rendering
+// (tether#21) stays: `.md` files render via the lazy-loaded <Markdown>
+// component (react-markdown + remark-gfm); non-markdown files keep the plain
+// <pre> fallback.
 import { lazy, Suspense, useEffect, useState } from 'react'
-import { Icon } from '../../lib/icons'
 import { useStore } from '../../lib/store'
-import { AihubError, fetchFile, fetchItem, fetchSteps } from '../../lib/aihub'
-import type { WorkItemDetail, WorkSteps } from '../../lib/wire.gen'
-import { Dag } from '../work/Dag'
-import type { DagEdge, DagNode } from '../work/Dag'
+import { AihubError, fetchFile } from '../../lib/aihub'
+import WorkGraphView from '../work/WorkGraphView'
 
 const Markdown = lazy(() => import('./Markdown'))
 
@@ -32,100 +28,10 @@ function describeError(e: unknown): string {
 }
 
 export default function Canvas() {
-  const selectedWiId = useStore(s => s.selectedWiId)
-  const selectedFile = useStore(s => s.selectedFile)
+  const selectedFile = useStore((s) => s.selectedFile)
 
-  if (selectedWiId) return <DetailMode id={selectedWiId} />
   if (selectedFile) return <FileMode wsId={selectedFile.wsId} path={selectedFile.path} />
-
-  return (
-    <div className="dt-mid-empty">
-      <Icon name="folder-open" size={26} />
-      <div className="serif dt-mid-empty-title">no artifacts yet</div>
-      <div className="dt-mid-empty-sub">
-        Files, diffs, and skill output from this workspace show up here as tether works.
-      </div>
-    </div>
-  )
-}
-
-function DetailMode({ id }: { id: string }) {
-  const [item, setItem] = useState<WorkItemDetail | null>(null)
-  const [itemError, setItemError] = useState<string | null>(null)
-  const [steps, setSteps] = useState<WorkSteps | null>(null)
-  const [stepsError, setStepsError] = useState<string | null>(null)
-
-  useEffect(() => {
-    let alive = true
-    setItem(null)
-    setItemError(null)
-    setSteps(null)
-    setStepsError(null)
-
-    fetchItem(id)
-      .then(d => { if (alive) setItem(d) })
-      .catch(e => { if (alive) setItemError(describeError(e)) })
-
-    fetchSteps(id)
-      .then(s => { if (alive) setSteps(s) })
-      .catch(e => { if (alive) setStepsError(describeError(e)) })
-
-    return () => { alive = false }
-  }, [id])
-
-  const dagNodes: DagNode[] = (steps?.nodes ?? []).map(n => ({ id: n.id, label: n.id, status: n.status }))
-  const dagEdges: DagEdge[] = (steps?.nodes ?? []).flatMap(n =>
-    (n.prev ?? []).map(p => ({ from: p, to: n.id, kind: 'step' as const }))
-  )
-
-  return (
-    <div className="canvas-view">
-      {itemError && <div className="work-error">{itemError}</div>}
-      {!itemError && !item && <div className="work-empty">loading…</div>}
-      {item && (
-        <>
-          <div className="canvas-head">
-            <span className="mono canvas-slug">{item.slug}</span>
-            <div className="canvas-goal">{item.goal}</div>
-            <div className="canvas-meta">
-              <span className="work-badge">{item.status}</span>
-              <span className="work-badge">{item.priority}</span>
-              {item.wiType && <span className="work-badge">{item.wiType}</span>}
-            </div>
-            {item.labels.length > 0 && (
-              <div className="work-labels">
-                {item.labels.map(l => <span key={l} className="work-label">{l}</span>)}
-              </div>
-            )}
-          </div>
-
-          {item.content && (
-            <div className="canvas-section">
-              <div className="section-label canvas-section-head">Content</div>
-              <Suspense fallback={<pre className="canvas-pre mono">{item.content}</pre>}>
-                <Markdown text={item.content} />
-              </Suspense>
-            </div>
-          )}
-
-          <div className="canvas-section">
-            <div className="section-label canvas-section-head">Scenario steps</div>
-            {stepsError && <div className="work-error">{stepsError}</div>}
-            {steps?.degraded && (
-              <div className="canvas-hint">scenario steps unavailable (no scenario clone)</div>
-            )}
-            {!steps && !stepsError && <div className="work-empty">loading…</div>}
-            {steps && dagNodes.length === 0 && !stepsError && <div className="work-empty">no steps</div>}
-            {steps && dagNodes.length > 0 && (
-              <div className="canvas-dag-wrap">
-                <Dag nodes={dagNodes} edges={dagEdges} direction="TB" />
-              </div>
-            )}
-          </div>
-        </>
-      )}
-    </div>
-  )
+  return <WorkGraphView />
 }
 
 function FileMode({ wsId, path }: { wsId: string; path: string }) {
@@ -137,8 +43,8 @@ function FileMode({ wsId, path }: { wsId: string; path: string }) {
     setData(null)
     setError(null)
     fetchFile(wsId, path)
-      .then(d => { if (alive) setData(d) })
-      .catch(e => { if (alive) setError(describeError(e)) })
+      .then((d) => { if (alive) setData(d) })
+      .catch((e) => { if (alive) setError(describeError(e)) })
     return () => { alive = false }
   }, [wsId, path])
 

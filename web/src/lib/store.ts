@@ -70,9 +70,10 @@ interface AppState {
   connection: Connection
   streamingMsgId: string | null   // id of the in-progress assistant bubble
 
-  // Middle-canvas selection (tether#20): exactly one of the two is ever set.
-  // Selecting a work item clears the file selection and vice-versa; passing
-  // `null` clears both (e.g. deselect / no artifact focused).
+  // Selection (tether#28): the middle file view (selectedFile) and the right
+  // Work wi drawer (selectedWiId) are INDEPENDENT and can be open at once.
+  // `select` only touches the field(s) passed; pass an explicit null field to
+  // clear just that one (e.g. drawer close), or `null` to clear both (reset).
   selectedWiId: string | null
   selectedFile: SelectedFile | null
 
@@ -88,7 +89,7 @@ interface AppState {
   setConnected: (v: boolean) => void
   setConnection: (patch: Partial<Connection>) => void
   handleEnvelope: (env: Envelope) => void
-  select: (sel: { wiId?: string; file?: SelectedFile } | null) => void
+  select: (sel: { wiId?: string | null; file?: SelectedFile | null } | null) => void
   setWorkProject: (p: string) => void
 }
 
@@ -236,15 +237,16 @@ export const useStore = create<AppState>((set) => ({
   },
 
   select: (sel) => {
-    if (!sel || sel.wiId === undefined && sel.file === undefined) {
+    // null clears both (reset / project switch); otherwise only the field(s)
+    // present are touched, so a file and a wi drawer can coexist (tether#28).
+    if (sel === null) {
       set({ selectedWiId: null, selectedFile: null })
       return
     }
-    if (sel.wiId !== undefined) {
-      set({ selectedWiId: sel.wiId, selectedFile: null })
-      return
-    }
-    set({ selectedWiId: null, selectedFile: sel.file ?? null })
+    const patch: { selectedWiId?: string | null; selectedFile?: SelectedFile | null } = {}
+    if ('wiId' in sel) patch.selectedWiId = sel.wiId ?? null
+    if ('file' in sel) patch.selectedFile = sel.file ?? null
+    set(patch)
   },
 
   setWorkProject: (p) => set({ workProject: p }),

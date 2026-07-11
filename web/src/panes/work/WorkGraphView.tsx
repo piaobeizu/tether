@@ -1,9 +1,9 @@
-// WorkGraphView — middle-canvas container for the wi relationship
-// knowledge-graph (tether#23). Owns the graph fetch + poll for the current
-// store.workProject and lazy-loads the d3-force <ForceGraph> renderer so
-// d3-force stays out of the initial bundle. Clicking a node routes to the
-// shared selection (store.select), which the right-pane Work detail reacts
-// to; the selected node's block edges are lazily overlaid.
+// WorkGraphView — middle-canvas container for the wi relationship map
+// (tether#23; cards + deterministic columns as of tether#25). Owns the graph
+// fetch + poll for the current store.workProject and lazy-loads the
+// <ForceGraph> renderer to keep it out of the initial bundle. Clicking a node
+// routes to the shared selection (store.select), which the right-pane Work
+// detail reacts to; the selected node's block edges are lazily overlaid.
 import { lazy, Suspense, useEffect, useRef, useState } from 'react'
 import { useStore } from '../../lib/store'
 import { AihubError, fetchDeps, fetchGraph } from '../../lib/aihub'
@@ -92,7 +92,7 @@ export default function WorkGraphView() {
   // SELECTION only (not `graph`), so an 8s poll doesn't clear+refetch it and
   // jitter the map; the current node set is read from a ref (tether#23 F1).
   // Block edges are drawn as an overlay only — ForceGraph excludes them from
-  // the force sim, so this never reshapes the layout. ──
+  // its structural layout key, so overlaying them never reshapes the columns. ──
   useEffect(() => {
     setBlockEdges([])
     const g = graphRef.current
@@ -144,6 +144,8 @@ export default function WorkGraphView() {
     label: n.slug,
     status: n.status,
     sub: n.wiType,
+    priority: n.priority,
+    title: n.goal,
   }))
   const parentEdges: FGEdge[] = shown
     .filter((n): n is WorkGraphNode & { parent: string } => !!n.parent && shownIds.has(n.parent))

@@ -42,4 +42,27 @@ describe('Dag', () => {
     const selected = container.querySelector('.dag-node-selected')
     expect(selected?.textContent).toContain('Node C')
   })
+
+  // Regression (tether#20 live bug): a pan drag on the svg must NOT trigger
+  // node selection, but a plain tap must. Previously setPointerCapture on the
+  // svg stole the click entirely, so no node was ever selectable.
+  it('suppresses node click after a pan drag, but selects on a tap', () => {
+    const onSelect = vi.fn()
+    const { container } = render(<Dag nodes={nodes} edges={edges} onSelect={onSelect} />)
+    const svg = container.querySelector('svg.dag-svg') as SVGSVGElement
+    const nodeB = screen.getByText('Node B')
+
+    // drag: down → move >4px → up, then click → must NOT select
+    fireEvent.pointerDown(svg, { clientX: 10, clientY: 10 })
+    fireEvent.pointerMove(svg, { clientX: 60, clientY: 60 })
+    fireEvent.pointerUp(svg, { clientX: 60, clientY: 60 })
+    fireEvent.click(nodeB)
+    expect(onSelect).not.toHaveBeenCalled()
+
+    // tap: down → up (no move) → click → selects
+    fireEvent.pointerDown(svg, { clientX: 10, clientY: 10 })
+    fireEvent.pointerUp(svg, { clientX: 10, clientY: 10 })
+    fireEvent.click(nodeB)
+    expect(onSelect).toHaveBeenCalledWith('b')
+  })
 })

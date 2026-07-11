@@ -147,7 +147,10 @@ export function Dag({ nodes, edges, selectedId, onSelect, direction = 'TB' }: Da
   const effectiveView = resetKey === nodesKey ? view : baseView
 
   const svgRef = useRef<SVGSVGElement>(null)
-  const drag = useRef<{ x: number; y: number } | null>(null)
+  const drag = useRef<{ startX: number; startY: number; lastX: number; lastY: number } | null>(null)
+  // Tracks whether the current pointer gesture became a pan. Read by the node
+  // onClick (which fires right after pointerup) to suppress selection on a drag.
+  const didDrag = useRef(false)
 
   const handleWheel = useCallback((e: ReactWheelEvent<SVGSVGElement>) => {
     e.preventDefault()
@@ -175,17 +178,28 @@ export function Dag({ nodes, edges, selectedId, onSelect, direction = 'TB' }: Da
   }, [baseView])
 
   const handlePointerDown = useCallback((e: ReactPointerEvent<SVGSVGElement>) => {
-    drag.current = { x: e.clientX, y: e.clientY }
-    svgRef.current?.setPointerCapture(e.pointerId)
+    drag.current = { startX: e.clientX, startY: e.clientY, lastX: e.clientX, lastY: e.clientY }
+    didDrag.current = false
+    // Deliberately NOT setPointerCapture: capturing on the <svg> steals the
+    // click from the node <g>, so node selection never fires. Instead we track
+    // drag distance and only suppress the click when an actual pan happened.
   }, [])
 
   const handlePointerMove = useCallback((e: ReactPointerEvent<SVGSVGElement>) => {
-    if (!drag.current) return
+    const d = drag.current
+    if (!d) return
     const svg = svgRef.current
     const rect = svg?.getBoundingClientRect()
-    const dxPx = e.clientX - drag.current.x
-    const dyPx = e.clientY - drag.current.y
-    drag.current = { x: e.clientX, y: e.clientY }
+    const dxPx = e.clientX - d.lastX
+    const dyPx = e.clientY - d.lastY
+    d.lastX = e.clientX
+    d.lastY = e.clientY
+    // Below a small threshold treat it as a tap (let the node click through),
+    // not a zero-distance pan.
+    if (!didDrag.current) {
+      if (Math.hypot(e.clientX - d.startX, e.clientY - d.startY) < 4) return
+      didDrag.current = true
+    }
     setView((vb) => {
       const scaleX = rect && rect.width > 0 ? vb.w / rect.width : 1
       const scaleY = rect && rect.height > 0 ? vb.h / rect.height : 1
@@ -193,9 +207,10 @@ export function Dag({ nodes, edges, selectedId, onSelect, direction = 'TB' }: Da
     })
   }, [])
 
-  const handlePointerUp = useCallback((e: ReactPointerEvent<SVGSVGElement>) => {
+  const handlePointerUp = useCallback((_e: ReactPointerEvent<SVGSVGElement>) => {
+    // Leave didDrag set until the next pointerdown so the click that fires
+    // immediately after this pointerup can see whether a drag occurred.
     drag.current = null
-    svgRef.current?.releasePointerCapture(e.pointerId)
   }, [])
 
   return (
@@ -227,7 +242,7 @@ export function Dag({ nodes, edges, selectedId, onSelect, direction = 'TB' }: Da
               key={n.id}
               className={`dag-node ${statusClass(n.status)} ${selected ? 'dag-node-selected' : ''}`}
               transform={`translate(${n.x - NODE_W / 2}, ${n.y - NODE_H / 2})`}
-              onClick={() => onSelect?.(n.id)}
+              onClick={() => { if (didDrag.current) return; onSelect?.(n.id) }}
               role={onSelect ? 'button' : undefined}
             >
               <rect className="dag-node-rect" width={NODE_W} height={NODE_H} rx={NODE_RX} ry={NODE_RX} />

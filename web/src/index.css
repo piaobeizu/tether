@@ -578,8 +578,48 @@ body {
   flex-shrink: 0;
 }
 .work-action-bar-slug { font-size: 11px; color: var(--ink-secondary); }
-.work-body { flex: 1; overflow: auto; padding: 8px 12px; min-height: 0; }
+/* Hosts the Work map (fills) + the bottom detail drawer (absolute overlay);
+   `position: relative` is the drawer's anchor (tether#26). */
+.work-body { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
+.work-body > .work-graph-view { flex: 1; min-height: 0; }
 .work-dag-wrap { height: 100%; min-height: 220px; }
+
+/* Detail drawer (tether#26): slides up from the bottom of the Work pane, over
+   the map. Overlay dims the map and is click-to-close (backdrop). */
+.work-drawer-overlay {
+  position: absolute; inset: 0; z-index: 20;
+  background: rgba(27, 26, 24, .35);
+  display: flex; align-items: flex-end;
+  animation: fade .15s;
+}
+.work-drawer-panel {
+  width: 100%; height: 85%;
+  background: var(--bg-surface);
+  border-top: 1px solid var(--line);
+  border-radius: var(--r-2) var(--r-2) 0 0;
+  box-shadow: 0 -6px 24px rgba(0, 0, 0, .18);
+  display: flex; flex-direction: column; min-height: 0;
+  animation: drawer-up .18s ease-out;
+}
+@keyframes drawer-up { from { transform: translateY(100%) } to { transform: translateY(0) } }
+@media (prefers-reduced-motion: reduce) {
+  .work-drawer-overlay, .work-drawer-panel { animation: none; }
+}
+.work-drawer-grip {
+  position: relative; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  padding: 6px 8px; border-bottom: 1px solid var(--line-soft);
+}
+.work-drawer-handle { width: 32px; height: 4px; border-radius: 2px; background: var(--ink-quat); }
+.work-drawer-grip .icon-btn-sm { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); }
+.work-drawer-body { flex: 1; min-height: 0; overflow: auto; padding: 8px 12px; }
+
+/* Middle canvas empty state (tether#26): the Work map moved to the right tab. */
+.canvas-empty {
+  display: flex; align-items: center; justify-content: center;
+  height: 100%; min-height: 160px; padding: 24px;
+  color: var(--ink-quat); font-size: 12.5px; text-align: center;
+}
 .work-foot {
   flex-shrink: 0; padding: 5px 12px;
   font-size: 10.5px; color: var(--ink-quat);
@@ -690,7 +730,7 @@ body {
    is pure arithmetic (no physics). Pan = drag, zoom = wheel; the container
    hides overflow (pan moves the viewBox, not a scrollbar). */
 .work-graph-view { width: 100%; height: 100%; display: flex; flex-direction: column; min-height: 0; }
-.work-graph-hint, .work-detail-hint { padding: 14px 4px; }
+.work-graph-hint { padding: 14px 4px; }
 
 /* Filter bar (tether#24): status scope + wiType + count. */
 .fg-filter {

@@ -1,19 +1,19 @@
-// WorkPane — right-pane Work tab (tether#23 panel inversion). Owns the
-// project selector (writes the shared store.workProject that the middle
-// WorkGraphView renders) and shows the selected wi's detail + scenario step
-// DAG + click-to-work action bar (WorkDetail). The relationship
-// knowledge-graph itself moved to the middle canvas (WorkGraphView); this
-// pane no longer fetches or renders the graph.
+// WorkPane — right-pane Work tab. Owns the project selector (writes the shared
+// store.workProject) and hosts the Work relationship map (WorkGraphView) that
+// moved here from the middle canvas in tether#26. Clicking a card selects a wi,
+// which slides a DetailDrawer (WorkDetail: detail + step DAG + action bar) up
+// from the bottom over the map; dismissing it clears the selection.
 import { useEffect, useState } from 'react'
 import { useStore } from '../../lib/store'
 import { AihubError, fetchProjects } from '../../lib/aihub'
 import type { WorkProject } from '../../lib/wire.gen'
-import WorkDetail from './WorkDetail'
+import WorkGraphView from './WorkGraphView'
+import DetailDrawer from './DetailDrawer'
 
 interface Props {
-  /** Whether the Work tab is the active right-pane tab. Unused now that the
-   *  graph (and its polling) live in the middle WorkGraphView; kept for the
-   *  App tab-mount contract. */
+  /** Whether the Work tab is the active right-pane tab. Gates the detail
+   *  drawer's global Esc-to-close so a drawer left mounted behind another tab
+   *  doesn't swallow Esc from Chat/Shell (tether#26 review F1). */
   active?: boolean
 }
 
@@ -26,7 +26,7 @@ function describeError(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
 }
 
-export default function WorkPane(_props: Props) {
+export default function WorkPane({ active }: Props) {
   const [projects, setProjects] = useState<WorkProject[]>([])
   const [projectsError, setProjectsError] = useState<string | null>(null)
 
@@ -68,11 +68,12 @@ export default function WorkPane(_props: Props) {
         </select>
       </div>
 
-      <div className="work-body scroll-thin">
+      <div className="work-body">
         {projectsError && <div className="work-error">{projectsError}</div>}
-        {selectedWiId
-          ? <WorkDetail id={selectedWiId} />
-          : <div className="work-empty work-detail-hint">从中间地图点一个 wi，查看详情与步骤</div>}
+        <WorkGraphView />
+        {selectedWiId && (
+          <DetailDrawer id={selectedWiId} onClose={() => select(null)} escActive={active !== false} />
+        )}
       </div>
     </div>
   )

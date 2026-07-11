@@ -136,11 +136,13 @@ describe('Canvas — markdown XSS safety (tether#21)', () => {
   })
 })
 
-describe('Canvas — default is the work graph view (tether#23)', () => {
-  it('renders WorkGraphView (project map) when nothing is selected', () => {
-    // no file selected + no workProject → WorkGraphView shows its hint; the
-    // wi-relationship graph replaced the old "no artifacts yet" empty state.
-    render(<Canvas />)
-    expect(screen.getByText('select a project')).toBeTruthy()
+describe('Canvas — empty state when nothing is selected (tether#26)', () => {
+  it('shows the empty-state hint (the Work map moved to the right tab)', () => {
+    // no file selected → the middle canvas is now just an empty-state hint; the
+    // wi-relationship map moved out of the middle into the right Work tab.
+    const { container } = render(<Canvas />)
+    expect(container.querySelector('.canvas-empty')).toBeTruthy()
+    // the middle no longer mounts the Work map (nor its "select a project" hint)
+    expect(screen.queryByText('select a project')).toBeNull()
   })
 })

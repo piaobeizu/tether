@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render, fireEvent } from '@testing-library/react'
-import ForceGraph from './ForceGraph'
+import ForceGraph, { computePositions } from './ForceGraph'
 import type { FGEdge, FGNode } from './ForceGraph'
 
 const nodes: FGNode[] = [
@@ -171,6 +171,22 @@ describe('ForceGraph', () => {
     expect(svg.getAttribute('viewBox')).toBe(vb0)
   })
 
+  // But a status change that changes the present-column COUNT repacks the whole
+  // geometry, so the viewport MUST re-fit (else the new column is clipped
+  // offscreen) — tether#27 review F1.
+  it('re-fits the viewport when a status change adds a column', () => {
+    const base: FGNode[] = [
+      { id: 'a', label: 'tether#1', status: 'queued' },
+      { id: 'b', label: 'tether#2', status: 'queued' }, // one present column
+    ]
+    const { container, rerender } = render(<ForceGraph nodes={base} edges={[]} />)
+    const svg = container.querySelector('svg.fg-svg') as SVGSVGElement
+    const w0 = vbWidth(svg)
+    // 'b' moves to a new column → two present columns → wider box → re-fit
+    rerender(<ForceGraph nodes={[base[0], { ...base[1], status: 'running' }]} edges={[]} />)
+    expect(vbWidth(svg)).toBeGreaterThan(w0)
+  })
+
   it('gives each card a title tooltip of slug + goal (slug-only when no goal)', () => {
     const tnodes: FGNode[] = [
       { id: 'g', label: 'tether#7', status: 'running', title: 'do the thing' },
@@ -182,5 +198,51 @@ describe('ForceGraph', () => {
     )
     expect(titles).toContain('tether#7 — do the thing')
     expect(titles).toContain('tether#8')
+  })
+})
+
+// Responsive sizing (tether#27): cards shrink to fit the container width so the
+// map stays readable in the narrow right Work tab, capped at the natural size.
+// (jsdom has no ResizeObserver, so the component falls back to cw=0 / natural
+// size — the sizing logic itself is unit-tested here on the pure function.)
+describe('computePositions responsive sizing (tether#27)', () => {
+  const ns: FGNode[] = [
+    { id: 'a', label: 'tether#1', status: 'blocked' },
+    { id: 'b', label: 'tether#2', status: 'running' },
+    { id: 'c', label: 'tether#3', status: 'queued' },
+    { id: 'd', label: 'tether#4', status: 'paused' },
+    { id: 'e', label: 'tether#5', status: 'done' },
+  ]
+
+  it('caps at the natural card size in a wide container', () => {
+    const r = computePositions(ns, 1200)
+    expect(r.cardW).toBe(132) // MAX_CARD_W
+    expect(r.compact).toBe(false)
+  })
+
+  it('shrinks cards + box to fit a narrow container', () => {
+    const wide = computePositions(ns, 1200)
+    const narrow = computePositions(ns, 380)
+    expect(narrow.cardW).toBeLessThan(wide.cardW)
+    expect(narrow.box.w).toBeLessThan(wide.box.w)
+  })
+
+  it('drops to compact cards below the width threshold', () => {
+    const narrow = computePositions(ns, 380) // 5 columns in 380px → tiny cards
+    expect(narrow.compact).toBe(true)
+    expect(narrow.cardH).toBe(22) // CARD_H_COMPACT
+  })
+
+  it('falls back to the natural size when width is unmeasured (cw <= 0)', () => {
+    const r = computePositions(ns, 0)
+    expect(r.cardW).toBe(132)
+    expect(r.compact).toBe(false)
+  })
+
+  it('packs present columns adjacently (box width reflects column count)', () => {
+    const two = computePositions([ns[0], ns[1]], 1200) // blocked + running only
+    const five = computePositions(ns, 1200)
+    expect(two.cols.length).toBe(2)
+    expect(two.box.w).toBeLessThan(five.box.w)
   })
 })

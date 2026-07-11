@@ -1,4 +1,5 @@
-// Canvas — middle-pane artifact viewer (tether#20 Task 10/11).
+// Canvas — middle-pane artifact viewer (tether#20 Task 10/11, tether#21
+// markdown rendering).
 //
 // Reads the shared selection slice from the store (lib/store.ts `select`)
 // and renders one of three modes:
@@ -6,16 +7,19 @@
 //   - file mode: a workspace file's content (from WorkspaceTree)
 //   - empty: neither selected — the original "no artifacts yet" placeholder
 //
-// No markdown renderer exists yet anywhere in web/src (no marked/remark/etc.
-// dependency, no <Markdown> component) — content is rendered as preformatted
-// text per the task's fallback guidance.
-import { useEffect, useState } from 'react'
+// Markdown content (work item `content` and `.md` files) renders via the
+// lazy-loaded <Markdown> component (react-markdown + remark-gfm) so the
+// renderer stays out of the initial bundle. Non-markdown files keep the
+// plain <pre> fallback (no syntax highlighting yet).
+import { lazy, Suspense, useEffect, useState } from 'react'
 import { Icon } from '../../lib/icons'
 import { useStore } from '../../lib/store'
 import { AihubError, fetchFile, fetchItem, fetchSteps } from '../../lib/aihub'
 import type { WorkItemDetail, WorkSteps } from '../../lib/wire.gen'
 import { Dag } from '../work/Dag'
 import type { DagEdge, DagNode } from '../work/Dag'
+
+const Markdown = lazy(() => import('./Markdown'))
 
 function describeError(e: unknown): string {
   if (e instanceof AihubError) {
@@ -25,12 +29,6 @@ function describeError(e: unknown): string {
     return `error (HTTP ${e.status})`
   }
   return e instanceof Error ? e.message : String(e)
-}
-
-/** Preformatted-text fallback used for both markdown and plain file content —
- *  see module doc: no markdown renderer exists in this repo yet. */
-function Prose({ text }: { text: string }) {
-  return <pre className="canvas-pre mono">{text}</pre>
 }
 
 export default function Canvas() {
@@ -104,7 +102,9 @@ function DetailMode({ id }: { id: string }) {
           {item.content && (
             <div className="canvas-section">
               <div className="section-label canvas-section-head">Content</div>
-              <Prose text={item.content} />
+              <Suspense fallback={<pre className="canvas-pre mono">{item.content}</pre>}>
+                <Markdown text={item.content} />
+              </Suspense>
             </div>
           )}
 
@@ -143,20 +143,26 @@ function FileMode({ wsId, path }: { wsId: string; path: string }) {
   }, [wsId, path])
 
   const isMd = path.toLowerCase().endsWith('.md')
-  const filename = path.split('/').pop() || path
 
   return (
     <div className="canvas-view">
       <div className="canvas-head">
-        <span className="mono canvas-slug">{filename}</span>
-        <div className="canvas-file-path mono">{path}</div>
+        {/* Single line: the full relative path IS the title — no separate
+            basename (it just duplicated the path's tail for nested files). */}
+        <span className="mono canvas-slug">{path}</span>
       </div>
       {error && <div className="work-error">{error}</div>}
       {!error && !data && <div className="work-empty">loading…</div>}
       {data && (
         <>
           {data.truncated && <div className="canvas-hint">truncated — showing partial content</div>}
-          {isMd ? <Prose text={data.content} /> : <pre className="canvas-pre mono">{data.content}</pre>}
+          {isMd ? (
+            <Suspense fallback={<pre className="canvas-pre mono">{data.content}</pre>}>
+              <Markdown text={data.content} />
+            </Suspense>
+          ) : (
+            <pre className="canvas-pre mono">{data.content}</pre>
+          )}
         </>
       )}
     </div>

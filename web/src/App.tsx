@@ -7,12 +7,13 @@ import WorkspacePane from './panes/workspace'
 import SkillPane from './panes/skill'
 import ChatPane from './panes/chat'
 import WorkPane from './panes/work'
+import Canvas from './panes/canvas'
 
 // Shell pulls in xterm (~the bulk of the JS bundle); load it only when the
 // Shell tab is first opened so it stays out of the initial download.
 const ShellPane = lazy(() => import('./panes/shell'))
 
-type RightTab = 'chat' | 'skill' | 'shell' | 'work'
+type RightTab = 'work' | 'chat' | 'skill' | 'shell'
 
 const STORAGE_KEY_LEFT  = 'tether_col_left'
 const STORAGE_KEY_RIGHT = 'tether_col_right'
@@ -57,10 +58,10 @@ function ColResizer({ onDelta }: { onDelta: (dx: number) => void }) {
 }
 
 export default function App() {
-  const [rightTab, setRightTab] = useState<RightTab>('chat')
+  const [rightTab, setRightTab] = useState<RightTab>('work')
   // Keep panes mounted after first visit so switching tabs doesn't tear down the
   // PTY (Shell) or refetch (Skills). Chat is always mounted.
-  const [visitedTabs, setVisitedTabs] = useState<Record<RightTab, boolean>>({ chat: true, skill: false, shell: false, work: false })
+  const [visitedTabs, setVisitedTabs] = useState<Record<RightTab, boolean>>({ work: true, chat: true, skill: false, shell: false })
   const selectTab = (t: RightTab) => {
     setRightTab(t)
     setVisitedTabs(v => (v[t] ? v : { ...v, [t]: true }))
@@ -81,6 +82,16 @@ export default function App() {
     setBannerDismissed(false)
     setModalDismissed(false)
   }, [connection.state])
+
+  // T12 click-to-work (tether#20): WorkPane asks the shell to bring Chat to
+  // front before injecting/switching a session — selectTab itself only
+  // depends on stable setState functions, so it's safe to omit from deps.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    const onSelectTab = (e: Event) => selectTab((e as CustomEvent<RightTab>).detail)
+    window.addEventListener('tether:select-tab', onSelectTab)
+    return () => window.removeEventListener('tether:select-tab', onSelectTab)
+  }, [])
 
   const connPillClass =
     connection.state === 'live' ? 'live' :
@@ -216,13 +227,7 @@ export default function App() {
             </div>
           </div>
           <div className="dt-mid-body scroll-thin">
-            <div className="dt-mid-empty">
-              <Icon name="folder-open" size={26} />
-              <div className="serif dt-mid-empty-title">no artifacts yet</div>
-              <div className="dt-mid-empty-sub">
-                Files, diffs, and skill output from this workspace show up here as tether works.
-              </div>
-            </div>
+            <Canvas />
           </div>
         </main>
 
@@ -231,13 +236,13 @@ export default function App() {
         {/* Right: Chat / Skills / Shell tabs */}
         <section className="dt-right" style={{ width: rightW }}>
           <div className="dt-right-tabs">
-            {(['chat', 'skill', 'shell', 'work'] as RightTab[]).map(t => (
+            {(['work', 'chat', 'skill', 'shell'] as RightTab[]).map(t => (
               <button
                 key={t}
                 className={`dt-right-tab${rightTab === t ? ' on' : ''}`}
                 onClick={() => selectTab(t)}
               >
-                {t === 'chat' ? 'Chat' : t === 'skill' ? 'Skills' : t === 'shell' ? 'Shell' : 'Work'}
+                {t === 'work' ? 'Work' : t === 'chat' ? 'Chat' : t === 'skill' ? 'Skills' : 'Shell'}
               </button>
             ))}
           </div>

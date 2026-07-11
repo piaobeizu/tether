@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Icon } from '../../lib/icons'
+import { useStore } from '../../lib/store'
 import { createFileTreeCache, type FileEntry } from './fileTreeCache'
 
 interface WorkspaceTreeProps {
@@ -17,6 +18,13 @@ interface NodeState {
 export default function WorkspaceTree({ workspaceId }: WorkspaceTreeProps) {
   const cache = useMemo(() => createFileTreeCache(workspaceId), [workspaceId])
   const [nodes, setNodes] = useState<Record<string, NodeState>>({})
+  const select = useStore(s => s.select)
+
+  // Clicking a file (not dir) row focuses it in the middle canvas. `path` is
+  // already relative to the workspace root — same shape fetchFile expects.
+  const selectFile = (path: string) => {
+    select({ file: { wsId: workspaceId, path } })
+  }
 
   const expand = (dir: string) => {
     setNodes(prev => ({
@@ -63,7 +71,7 @@ export default function WorkspaceTree({ workspaceId }: WorkspaceTreeProps) {
       {rootNode?.loading && <div className="tree-row" style={{ paddingLeft: 8 }}>loading…</div>}
       {rootNode?.error && <div className="tree-row" style={{ paddingLeft: 8, color: 'var(--danger)' }}>{rootNode.error}</div>}
       {rootNode?.entries && (
-        <TreeChildren dir="" entries={rootNode.entries} depth={0} nodes={nodes} onToggle={toggle} />
+        <TreeChildren dir="" entries={rootNode.entries} depth={0} nodes={nodes} onToggle={toggle} onSelectFile={selectFile} />
       )}
     </div>
   )
@@ -75,9 +83,10 @@ interface TreeChildrenProps {
   depth: number
   nodes: Record<string, NodeState>
   onToggle: (dir: string) => void
+  onSelectFile: (path: string) => void
 }
 
-function TreeChildren({ dir, entries, depth, nodes, onToggle }: TreeChildrenProps) {
+function TreeChildren({ dir, entries, depth, nodes, onToggle, onSelectFile }: TreeChildrenProps) {
   return (
     <>
       {entries.map(entry => {
@@ -90,6 +99,7 @@ function TreeChildren({ dir, entries, depth, nodes, onToggle }: TreeChildrenProp
             depth={depth}
             nodes={nodes}
             onToggle={onToggle}
+            onSelectFile={onSelectFile}
           />
         )
       })}
@@ -103,9 +113,10 @@ interface TreeNodeProps {
   depth: number
   nodes: Record<string, NodeState>
   onToggle: (dir: string) => void
+  onSelectFile: (path: string) => void
 }
 
-function TreeNode({ path, entry, depth, nodes, onToggle }: TreeNodeProps) {
+function TreeNode({ path, entry, depth, nodes, onToggle, onSelectFile }: TreeNodeProps) {
   const node = nodes[path]
   const expanded = entry.isDir && !!node?.expanded
 
@@ -114,7 +125,7 @@ function TreeNode({ path, entry, depth, nodes, onToggle }: TreeNodeProps) {
       <div
         className="tree-row"
         style={{ paddingLeft: 8 }}
-        onClick={() => entry.isDir && onToggle(path)}
+        onClick={() => entry.isDir ? onToggle(path) : onSelectFile(path)}
       >
         {depth > 0 && <span className="ftree-indent" style={{ width: depth * 10 }} aria-hidden="true" />}
         <span className="tree-chevron" aria-hidden="true">
@@ -139,7 +150,7 @@ function TreeNode({ path, entry, depth, nodes, onToggle }: TreeNodeProps) {
         <div className="tree-row" style={{ paddingLeft: 8 + (depth + 1) * 14, color: 'var(--danger)' }}>{node.error}</div>
       )}
       {entry.isDir && expanded && node?.entries && (
-        <TreeChildren dir={path} entries={node.entries} depth={depth + 1} nodes={nodes} onToggle={onToggle} />
+        <TreeChildren dir={path} entries={node.entries} depth={depth + 1} nodes={nodes} onToggle={onToggle} onSelectFile={onSelectFile} />
       )}
     </>
   )

@@ -2,13 +2,22 @@ package workspace
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/piaobeizu/tether/internal/mcp/builtin"
 )
+
+// maxFileReadBytes caps how much of a single file content-read response
+// (Task 6, GET /api/v1/workspaces/{id}/file) returns inline: large files are
+// read up to this limit and reported truncated rather than loaded whole.
+const maxFileReadBytes = 1 << 20 // 1 MiB
 
 // FileEntry describes a single directory entry returned by the files API,
 // annotated with git-dirty state relative to its nearest enclosing git repo.
@@ -147,4 +156,52 @@ func repoRelPath(repoRoot, entryAbs string) string {
 		return entryAbs
 	}
 	return filepath.ToSlash(rel)
+}
+
+// ReadFileContent reads the file at rel (relative to workspace root) and
+// returns its content as a string, truncated to maxFileReadBytes (1 MiB)
+// with truncated=true if the file is larger. rel is resolved via
+// builtin.Registry.SafeJoin, so traversal outside root (via ".." or a
+// symlink) is rejected with an error rather than ever reading outside the
+// workspace. A directory target is also an error (never silently listed).
+func ReadFileContent(root, rel string) (content string, truncated bool, err error) {
+	reg, err := builtin.New(root)
+	if err != nil {
+		return "", false, err
+	}
+	abs, err := reg.SafeJoin(rel)
+	if err != nil {
+		return "", false, err
+	}
+
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", false, err
+	}
+	if info.IsDir() {
+		return "", false, fmt.Errorf("workspace: %s is a directory", rel)
+	}
+
+	f, err := os.Open(abs)
+	if err != nil {
+		return "", false, err
+	}
+	defer f.Close()
+
+	buf := make([]byte, maxFileReadBytes)
+	n, err := io.ReadFull(f, buf)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return "", false, err
+	}
+
+	if n == maxFileReadBytes {
+		// The buffer filled exactly; peek one more byte to tell an exact
+		// 1 MiB file (not truncated) from a larger one (truncated).
+		var extra [1]byte
+		if m, _ := f.Read(extra[:]); m > 0 {
+			truncated = true
+		}
+	}
+
+	return string(buf[:n]), truncated, nil
 }

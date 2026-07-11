@@ -119,7 +119,7 @@ func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *ses
 	// 503 "aihub not configured" itself, in the same auth-gated group as
 	// the workspace/skill APIs above, instead of falling through to the
 	// generic /api/v1/ 501 stub registered below.
-	RegisterWorkAPI(mux, cfg.AihubClient)
+	RegisterWorkAPI(mux, cfg.AihubClient, cfg.WorkspaceRoot)
 
 	// /mcp on the HTTPS main port returns 501 until OAuth 2.1 lands in v0.4.
 	// The real /mcp endpoint is served by MCPLoopback on the loopback HTTP port.

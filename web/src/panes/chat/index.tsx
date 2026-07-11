@@ -251,6 +251,99 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
     setInput('')
   }
 
+  // T12 click-to-work (tether#20) — programmatic send, bypassing the `input`
+  // React state entirely (it's async; setInput() then sendMessage() would
+  // race and send the PREVIOUS value). Mirrors sendMessage's write path.
+  const doInjectAndSend = (text: string) => {
+    if (!writerRef.current) return
+    useStore.getState().addMessage({ id: crypto.randomUUID(), role: 'user', text, ts: Date.now() })
+    useStore.setState({ streaming: true, streamingMsgId: null })
+    const line = JSON.stringify({ text }) + '\n'
+    writerRef.current.write(new TextEncoder().encode(line))
+      .catch(err => console.error('[tether] inject send failed:', err))
+  }
+
+  // Queued text waiting for a live writer — set whenever injectAndSend is
+  // called before the WT connection (and its writer) is ready. Flushed by
+  // the connState effect below, with a bounded retry loop for the narrow
+  // race where connState flips to 'connected' just BEFORE writerRef.current
+  // is assigned in doConnect (see the .then() there).
+  const pendingInjectRef = useRef<string | null>(null)
+  const pendingInjectDeadlineRef = useRef(0)
+
+  const tryFlushPendingInject = () => {
+    const text = pendingInjectRef.current
+    if (text === null) return
+    if (writerRef.current) {
+      pendingInjectRef.current = null
+      doInjectAndSend(text)
+      return
+    }
+    if (Date.now() > pendingInjectDeadlineRef.current) {
+      console.error('[tether] inject-prompt timed out waiting for connection')
+      pendingInjectRef.current = null
+      return
+    }
+    setTimeout(tryFlushPendingInject, 150)
+  }
+
+  useEffect(() => {
+    if (connState === 'connected') tryFlushPendingInject()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connState])
+
+  const injectAndSend = (text: string) => {
+    const trimmed = text.trim()
+    if (!trimmed) return
+    if (writerRef.current && connState === 'connected') {
+      doInjectAndSend(trimmed)
+      return
+    }
+    // Not connected (or writer not yet assigned) — queue it and start
+    // polling; up to ~5s, same budget as the composer disabling itself
+    // while reconnecting.
+    pendingInjectRef.current = trimmed
+    pendingInjectDeadlineRef.current = Date.now() + 5_000
+    tryFlushPendingInject()
+  }
+
+  // Live ref so the once-attached window listener always calls the latest
+  // closure (mirrors manualRetryRef below).
+  const injectAndSendRef = useRef(injectAndSend)
+  injectAndSendRef.current = injectAndSend
+
+  useEffect(() => {
+    const onInject = (e: Event) => injectAndSendRef.current((e as CustomEvent<string>).detail)
+    window.addEventListener('tether:inject-prompt', onInject)
+    return () => window.removeEventListener('tether:inject-prompt', onInject)
+  }, [])
+
+  // T12 click-to-work — switch to an existing session (e.g. a wi already
+  // being driven by another tab/browser visit): persist it as the "last
+  // session", load its history the same way WorkspacePane's session list
+  // does, and reconnect the WT so it resumes that sid.
+  const switchSession = (sid: string) => {
+    if (!sid) return
+    localStorage.setItem('tether_last_sid', sid)
+    useStore.getState().setSessionId(sid)
+    fetch(`/api/v1/sessions/${encodeURIComponent(sid)}/messages`)
+      .then(r => r.ok ? r.json() : [])
+      .then((msgs: HistoryEntry[]) => {
+        if (msgs.length > 0) useStore.getState().loadHistory(msgs.map(historyEntryToMessage))
+      })
+      .catch(() => {})
+    manualRetryRef.current()
+  }
+
+  const switchSessionRef = useRef(switchSession)
+  switchSessionRef.current = switchSession
+
+  useEffect(() => {
+    const onSwitchSession = (e: Event) => switchSessionRef.current((e as CustomEvent<string>).detail)
+    window.addEventListener('tether:switch-session', onSwitchSession)
+    return () => window.removeEventListener('tether:switch-session', onSwitchSession)
+  }, [])
+
   // D-19 §5 / tether#8 T8 — DagBlock's approve button. Sends an "action"
   // ClientFrame on the /wt/control channel, which is not otherwise
   // session-scoped, so the current sessionId travels in the frame itself;

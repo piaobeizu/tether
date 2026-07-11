@@ -16,6 +16,7 @@ import (
 //	POST   /api/v1/workspaces               → add workspace {"name":"...","path":"..."}
 //	DELETE /api/v1/workspaces/{id}          → remove workspace by ID
 //	GET    /api/v1/workspaces/{id}/files    → list files directly under {dir} (default: root)
+//	GET    /api/v1/workspaces/{id}/file     → read one file's content ({"path":..,"content":..,"truncated":..})
 func RegisterAPI(mux *http.ServeMux, reg *Registry) {
 	mux.HandleFunc("/api/v1/workspaces", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -59,6 +60,19 @@ func RegisterAPI(mux *http.ServeMux, reg *Registry) {
 				return
 			}
 			handleFiles(w, r, reg, id)
+			return
+		}
+
+		if id, ok := strings.CutSuffix(rest, "/file"); ok {
+			if id == "" || strings.Contains(id, "/") {
+				http.NotFound(w, r)
+				return
+			}
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			handleFile(w, r, reg, id)
 			return
 		}
 
@@ -109,6 +123,43 @@ func handleFiles(w http.ResponseWriter, r *http.Request, reg *Registry, id strin
 		return
 	}
 	jsonResp(w, entries)
+}
+
+// fileContentResponse is the JSON body for GET /api/v1/workspaces/{id}/file.
+type fileContentResponse struct {
+	Path      string `json:"path"`
+	Content   string `json:"content"`
+	Truncated bool   `json:"truncated"`
+}
+
+// handleFile serves GET /api/v1/workspaces/{id}/file?path=<rel>: it reads
+// one file's content (capped at 1 MiB, see ReadFileContent), mirroring
+// handleFiles' workspace-resolution and error-mapping (tether#20 Task 6).
+// A bad path (traversal, missing, or a directory) never 500s: it maps to
+// 400 (bad path) or 404 (not found).
+func handleFile(w http.ResponseWriter, r *http.Request, reg *Registry, id string) {
+	ws, ok := reg.Get(id)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		http.Error(w, "path is required", http.StatusBadRequest)
+		return
+	}
+
+	content, truncated, err := ReadFileContent(ws.Path, path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			http.NotFound(w, r) // well-formed path, target just doesn't exist
+			return
+		}
+		http.Error(w, "invalid path: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	jsonResp(w, fileContentResponse{Path: path, Content: content, Truncated: truncated})
 }
 
 func jsonResp(w http.ResponseWriter, v any) {

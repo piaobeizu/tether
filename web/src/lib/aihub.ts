@@ -3,7 +3,16 @@
 // SPA (see lib/auth.ts) — plain `fetch`, no explicit credentials needed since
 // these calls never leave the origin.
 
-import type { WorkProject, WorkQueue, WorkItemDetail, WorkEvents, WorkRecent } from './wire.gen'
+import type {
+  WorkProject,
+  WorkQueue,
+  WorkItemDetail,
+  WorkEvents,
+  WorkRecent,
+  WorkGraph,
+  WorkDependencies,
+  WorkSteps,
+} from './wire.gen'
 
 /**
  * Thrown on any non-2xx response from a work/* endpoint. Carries the HTTP
@@ -45,4 +54,29 @@ export function fetchEvents(id: string, cursor?: string): Promise<WorkEvents> {
 /** Terminal (wrapped/cancelled) work items for the done/recent history view. */
 export function fetchRecent(project: string): Promise<WorkRecent> {
   return getJSON<WorkRecent>(`/api/v1/work/recent?project=${encodeURIComponent(project)}`)
+}
+
+/** Curated dependency/parent graph of active work items, for the wi-relationship view. */
+export function fetchGraph(project: string): Promise<WorkGraph> {
+  return getJSON<WorkGraph>(`/api/v1/work/graph?project=${encodeURIComponent(project)}`)
+}
+
+/** Blocking/blockedBy dependency edges for a single work item. */
+export function fetchDeps(id: string): Promise<WorkDependencies> {
+  return getJSON<WorkDependencies>(`/api/v1/work/items/${encodeURIComponent(id)}/dependencies`)
+}
+
+/** Scenario step graph (with progress status) for a single work item. */
+export function fetchSteps(id: string): Promise<WorkSteps> {
+  return getJSON<WorkSteps>(`/api/v1/work/items/${encodeURIComponent(id)}/steps`)
+}
+
+/** One file's content from a workspace, for the file-preview pane. */
+export function fetchFile(
+  wsId: string,
+  path: string,
+): Promise<{ path: string; content: string; truncated: boolean }> {
+  return getJSON<{ path: string; content: string; truncated: boolean }>(
+    `/api/v1/workspaces/${encodeURIComponent(wsId)}/file?path=${encodeURIComponent(path)}`,
+  )
 }

@@ -245,3 +245,31 @@ describe('handleEnvelope fenced — live replace-by-BlockID (tether#8 T8)', () =
     expect(live[1]?.content).toBe('{"v":2}') // last content wins
   })
 })
+
+// tether#20 Task 9 — middle-canvas selection slice: exactly one of
+// selectedWiId/selectedFile is ever set; selecting one clears the other.
+describe('useStore.select (tether#20 canvas selection)', () => {
+  const resetSelection = () => useStore.setState({ selectedWiId: null, selectedFile: null })
+  beforeEach(resetSelection)
+
+  it('selecting a wi id sets selectedWiId and clears selectedFile', () => {
+    useStore.setState({ selectedFile: { wsId: 'ws-1', path: 'a.txt' } })
+    useStore.getState().select({ wiId: 'wi-1' })
+    expect(useStore.getState().selectedWiId).toBe('wi-1')
+    expect(useStore.getState().selectedFile).toBeNull()
+  })
+
+  it('selecting a file sets selectedFile and clears selectedWiId', () => {
+    useStore.setState({ selectedWiId: 'wi-1' })
+    useStore.getState().select({ file: { wsId: 'ws-1', path: 'a.txt' } })
+    expect(useStore.getState().selectedFile).toEqual({ wsId: 'ws-1', path: 'a.txt' })
+    expect(useStore.getState().selectedWiId).toBeNull()
+  })
+
+  it('select(null) clears both', () => {
+    useStore.setState({ selectedWiId: 'wi-1', selectedFile: null })
+    useStore.getState().select(null)
+    expect(useStore.getState().selectedWiId).toBeNull()
+    expect(useStore.getState().selectedFile).toBeNull()
+  })
+})

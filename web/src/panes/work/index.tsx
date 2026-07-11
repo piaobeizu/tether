@@ -1,18 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
-import type { ReactNode } from 'react'
 import { Icon } from '../../lib/icons'
-import { AihubError, fetchEvents, fetchItem, fetchProjects, fetchQueue, fetchRecent } from '../../lib/aihub'
-import type {
-  WorkEvent,
-  WorkItemDetail,
-  WorkPausedItem,
-  WorkProject,
-  WorkQueue,
-  WorkReadyItem,
-  WorkRecentItem,
-  WorkRunningItem,
-  WorkStalledItem,
-} from '../../lib/wire.gen'
+import { useStore } from '../../lib/store'
+import { AihubError, fetchDeps, fetchGraph, fetchProjects } from '../../lib/aihub'
+import type { WorkGraph, WorkGraphNode, WorkProject } from '../../lib/wire.gen'
+import { Dag } from './Dag'
+import type { DagEdge, DagNode } from './Dag'
 
 const POLL_MS = 8000
 
@@ -31,39 +23,8 @@ function describeError(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
 }
 
-function fmtTime(iso: string | undefined): string {
-  if (!iso) return '—'
-  const d = new Date(iso)
-  if (isNaN(d.getTime())) return iso
-  return d.toLocaleTimeString()
-}
-
 function fmtClock(d: Date): string {
   return d.toLocaleTimeString([], { hour12: false })
-}
-
-/** True when every LCRS section is empty (project with zero work items). */
-function isQueueEmpty(q: WorkQueue): boolean {
-  return q.items.length === 0 &&
-    q.needsHumanSession.length === 0 &&
-    q.unclassified.length === 0 &&
-    q.running.length === 0 &&
-    (q.staleRunning?.length ?? 0) === 0 &&
-    q.stalled.length === 0 &&
-    q.paused.length === 0
-}
-
-/** Compact one-line preview of an event payload for the timeline. This is a
- *  dedicated renderer — intentionally not the chat fenced-block renderer,
- *  which is scoped to D-19 structured chat output only. */
-function payloadPreview(payload: unknown): string {
-  if (payload === undefined || payload === null) return ''
-  try {
-    const s = typeof payload === 'string' ? payload : JSON.stringify(payload)
-    return s.length > 140 ? s.slice(0, 140) + '…' : s
-  } catch {
-    return String(payload)
-  }
 }
 
 export default function WorkPane({ active }: Props) {
@@ -71,37 +32,23 @@ export default function WorkPane({ active }: Props) {
   const [projectsError, setProjectsError] = useState<string | null>(null)
   const [project, setProject] = useState<string>('')
 
-  const [queue, setQueue] = useState<WorkQueue | null>(null)
-  const [queueError, setQueueError] = useState<string | null>(null)
-  const [queueLoading, setQueueLoading] = useState(false)
+  const [graph, setGraph] = useState<WorkGraph | null>(null)
+  const [graphError, setGraphError] = useState<string | null>(null)
+  const [graphLoading, setGraphLoading] = useState(false)
   const [lastRefreshed, setLastRefreshed] = useState<Date | null>(null)
 
-  // Done/recent history (terminal wrapped/cancelled items). Loaded alongside
-  // the queue; own epoch guard so a slow fetch can't clobber after a switch.
-  const [recent, setRecent] = useState<WorkRecentItem[] | null>(null)
-  const [recentError, setRecentError] = useState<string | null>(null)
-  const recentEpoch = useRef(0)
+  // Block-edge overlay lazily fetched for the currently-selected node (fetchDeps).
+  // Cleared whenever the graph reloads, since it belongs to the prior fetch.
+  const [blockEdges, setBlockEdges] = useState<DagEdge[]>([])
+  const depsEpoch = useRef(0)
 
-  const [view, setView] = useState<'queue' | 'detail'>('queue')
-  const [selectedId, setSelectedId] = useState<string | null>(null)
-  const [item, setItem] = useState<WorkItemDetail | null>(null)
-  const [itemError, setItemError] = useState<string | null>(null)
+  const selectedWiId = useStore(s => s.selectedWiId)
+  const select = useStore(s => s.select)
 
-  const [events, setEvents] = useState<WorkEvent[]>([])
-  const [eventsCursor, setEventsCursor] = useState<string | undefined>(undefined)
-  const [eventsError, setEventsError] = useState<string | null>(null)
-  const [eventsLoading, setEventsLoading] = useState(false)
-
-  // Monotonic token for queue fetches: any newer load/refresh/project-switch
+  // Monotonic token for graph fetches: any newer load/refresh/project-switch
   // bumps it, so a slower in-flight fetch that resolves later is ignored
-  // instead of clobbering the current project's queue (stale-response guard).
-  const queueEpoch = useRef(0)
-
-  // Live mirror of selectedId so async continuations (loadMoreEvents) can test
-  // the CURRENT selection after their await — a captured closure would still
-  // hold the item that was open when the click fired.
-  const selectedIdRef = useRef<string | null>(selectedId)
-  useEffect(() => { selectedIdRef.current = selectedId }, [selectedId])
+  // instead of clobbering the current project's graph (stale-response guard).
+  const graphEpoch = useRef(0)
 
   // ── Projects: load once on mount ────────────────────────────────────
   useEffect(() => {
@@ -118,51 +65,33 @@ export default function WorkPane({ active }: Props) {
   }, [])
 
   // Manual refresh (button) — also used by the initial per-project load.
-  const loadQueue = async (p: string) => {
+  const loadGraph = async (p: string) => {
     if (!p) return
-    const epoch = ++queueEpoch.current
-    setQueueLoading(true)
+    const epoch = ++graphEpoch.current
+    setGraphLoading(true)
     try {
-      const q = await fetchQueue(p)
-      if (epoch !== queueEpoch.current) return // superseded by a newer load
-      setQueue(q)
-      setQueueError(null)
+      const g = await fetchGraph(p)
+      if (epoch !== graphEpoch.current) return // superseded by a newer load
+      setGraph(g)
+      setGraphError(null)
+      setBlockEdges([])
       setLastRefreshed(new Date())
     } catch (e) {
-      if (epoch !== queueEpoch.current) return
-      setQueueError(describeError(e))
+      if (epoch !== graphEpoch.current) return
+      setGraphError(describeError(e))
     } finally {
-      if (epoch === queueEpoch.current) setQueueLoading(false)
+      if (epoch === graphEpoch.current) setGraphLoading(false)
     }
   }
 
-  // Load the done/recent history for a project (epoch-guarded like loadQueue).
-  const loadRecent = async (p: string) => {
-    if (!p) return
-    const epoch = ++recentEpoch.current
-    try {
-      const r = await fetchRecent(p)
-      if (epoch !== recentEpoch.current) return
-      setRecent(r.items)
-      setRecentError(null)
-    } catch (e) {
-      if (epoch !== recentEpoch.current) return
-      setRecentError(describeError(e))
-    }
-  }
-
-  // ── Queue: (re)load whenever the selected project changes; drop any
-  // open detail view since it may belong to the previous project. ───────
+  // ── Graph: (re)load whenever the selected project changes ────────────
   useEffect(() => {
-    setQueue(null)
-    setQueueError(null)
-    setRecent(null)
-    setRecentError(null)
-    setView('queue')
-    setSelectedId(null)
+    setGraph(null)
+    setGraphError(null)
+    setBlockEdges([])
+    select(null) // don't keep showing the previous project's wi/file in Canvas
     if (!project) return
-    void loadQueue(project)
-    void loadRecent(project)
+    void loadGraph(project)
   }, [project])
 
   // ── Polling: only while this tab is active AND the document is visible.
@@ -175,12 +104,15 @@ export default function WorkPane({ active }: Props) {
 
     const tick = () => {
       if (!alive || document.visibilityState !== 'visible') return
-      fetchQueue(project)
-        .then(q => { if (alive) { setQueue(q); setQueueError(null); setLastRefreshed(new Date()) } })
-        .catch(e => { if (alive) setQueueError(describeError(e)) })
-      fetchRecent(project)
-        .then(r => { if (alive) { setRecent(r.items); setRecentError(null) } })
-        .catch(e => { if (alive) setRecentError(describeError(e)) })
+      const epoch = graphEpoch.current
+      fetchGraph(project)
+        .then(g => {
+          if (!alive || epoch !== graphEpoch.current) return // superseded by a newer load
+          setGraph(g)
+          setGraphError(null)
+          setLastRefreshed(new Date())
+        })
+        .catch(e => { if (alive && epoch === graphEpoch.current) setGraphError(describeError(e)) })
     }
 
     const startTimer = () => {
@@ -210,123 +142,74 @@ export default function WorkPane({ active }: Props) {
     }
   }, [active, project])
 
-  // ── Item detail + timeline ───────────────────────────────────────────
-  const openItem = (id: string) => {
-    setSelectedId(id)
-    setView('detail')
-    setItem(null)
-    setItemError(null)
-    setEvents([])
-    setEventsCursor(undefined)
-    setEventsError(null)
+  // ── Node selection: route to the shared canvas selection + lazily overlay
+  // this node's block edges (fetchDeps), mapped onto the currently-loaded
+  // node set (edges to ids outside it are dropped rather than guessed). ──
+  const onSelectNode = (id: string) => {
+    select({ wiId: id })
+    const epoch = ++depsEpoch.current
+    const nodeIds = new Set((graph?.nodes ?? []).map(n => n.id))
+    fetchDeps(id)
+      .then(deps => {
+        if (epoch !== depsEpoch.current) return
+        const edges: DagEdge[] = []
+        for (const b of deps.blockedBy) {
+          if (nodeIds.has(b.id)) edges.push({ from: b.id, to: id, kind: 'block' })
+        }
+        for (const b of deps.blocking) {
+          if (nodeIds.has(b.id)) edges.push({ from: id, to: b.id, kind: 'block' })
+        }
+        setBlockEdges(edges)
+      })
+      .catch(() => { /* deps overlay is best-effort; leave prior state as-is */ })
   }
 
-  useEffect(() => {
-    if (!selectedId) return
-    let alive = true
+  const dagNodes: DagNode[] = (graph?.nodes ?? []).map(n => ({
+    id: n.id,
+    label: n.slug,
+    status: n.status,
+    sub: n.wiType,
+  }))
+  const parentEdges: DagEdge[] = (graph?.nodes ?? [])
+    .filter((n): n is WorkGraphNode & { parent: string } => !!n.parent)
+    .map(n => ({ from: n.parent, to: n.id, kind: 'parent' as const }))
+  const dagEdges = [...parentEdges, ...blockEdges]
 
-    fetchItem(selectedId)
-      .then(d => { if (alive) setItem(d) })
-      .catch(e => { if (alive) setItemError(describeError(e)) })
+  const isEmpty = graph !== null && graph.nodes.length === 0
 
-    setEventsLoading(true)
-    fetchEvents(selectedId)
-      .then(ev => { if (alive) { setEvents(ev.events); setEventsCursor(ev.nextCursor) } })
-      .catch(e => { if (alive) setEventsError(describeError(e)) })
-      .finally(() => { if (alive) setEventsLoading(false) })
+  // T12 click-to-work (tether#20) — the selected node carries its own
+  // `status`, already fetched as part of the graph (no extra request).
+  const selectedNode = (graph?.nodes ?? []).find(n => n.id === selectedWiId) ?? null
 
-    return () => { alive = false }
-  }, [selectedId])
+  // queued/unclaimed (or an unrecognized/empty status) → not started yet;
+  // anything else (running/paused/done/failed/…) → a session may already
+  // exist for it, so offer to jump into chat instead. v1 heuristic, not
+  // exhaustive over every status the daemon may report — good enough since
+  // "jump to chat" is a harmless action regardless of terminal state.
+  const isUnstarted = !selectedNode?.status || selectedNode.status === 'queued' || selectedNode.status === 'pending'
 
-  const loadMoreEvents = async () => {
-    if (!selectedId || !eventsCursor) return
-    const reqId = selectedId
-    setEventsLoading(true)
-    try {
-      const ev = await fetchEvents(reqId, eventsCursor)
-      if (reqId !== selectedIdRef.current) return // switched items mid-flight; drop
-      setEvents(prev => [...prev, ...ev.events])
-      setEventsCursor(ev.nextCursor)
-      setEventsError(null)
-    } catch (e) {
-      if (reqId !== selectedIdRef.current) return
-      setEventsError(describeError(e))
-    } finally {
-      if (reqId === selectedIdRef.current) setEventsLoading(false)
+  const startWi = () => {
+    if (!selectedNode) return
+    const slug = selectedNode.slug
+    window.dispatchEvent(new CustomEvent('tether:select-tab', { detail: 'chat' }))
+    window.dispatchEvent(new CustomEvent('tether:inject-prompt', { detail: `/pf-work ${slug}` }))
+    // Best-effort mapping so a later "→ 进入 chat" click can jump straight
+    // back to this session — only known for wis started via this browser.
+    localStorage.setItem('tether_wi_sid:' + slug, useStore.getState().sessionId ?? '')
+  }
+
+  const resumeWi = () => {
+    if (!selectedNode) return
+    const slug = selectedNode.slug
+    const sid = localStorage.getItem('tether_wi_sid:' + slug)
+    window.dispatchEvent(new CustomEvent('tether:select-tab', { detail: 'chat' }))
+    if (sid) {
+      window.dispatchEvent(new CustomEvent('tether:switch-session', { detail: sid }))
+    } else {
+      window.dispatchEvent(new CustomEvent('tether:inject-prompt', { detail: `/pf-work ${slug} --resume` }))
     }
   }
 
-  const backToQueue = () => {
-    setView('queue')
-    setSelectedId(null)
-  }
-
-  // ── Detail view ───────────────────────────────────────────────────────
-  if (view === 'detail') {
-    return (
-      <div className="work-pane">
-        <div className="work-detail-head">
-          <button className="icon-btn-sm" onClick={backToQueue} title="Back to queue" aria-label="Back to queue">
-            <Icon name="back" size={14} />
-          </button>
-          <span className="mono work-detail-id">{selectedId}</span>
-        </div>
-        <div className="work-detail-body scroll-thin">
-          {itemError && <div className="work-error">{itemError}</div>}
-          {!itemError && !item && <div className="work-empty">loading…</div>}
-          {item && (
-            <>
-              <div className="work-detail-goal">{item.goal}</div>
-              <div className="work-detail-meta">
-                <span className="work-badge">{item.status}</span>
-                <span className="work-badge">{item.priority}</span>
-                {item.wiType && <span className="work-badge">{item.wiType}</span>}
-              </div>
-              <div className="work-detail-row">
-                <span className="work-detail-k">current step</span>
-                <span className="work-detail-v mono">
-                  {item.currentStep || '—'}{' '}
-                  <span style={{ color: 'var(--ink-tertiary)' }}>({item.currentStepStatus})</span>
-                </span>
-              </div>
-              {item.labels.length > 0 && (
-                <div className="work-labels">
-                  {item.labels.map(l => <span key={l} className="work-label">{l}</span>)}
-                </div>
-              )}
-              {item.content && (
-                <div className="work-detail-content mono">{item.content}</div>
-              )}
-
-              <div className="section-label work-timeline-head">Timeline</div>
-              {eventsError && <div className="work-error">{eventsError}</div>}
-              <div className="work-timeline">
-                {events.map((ev, i) => (
-                  <div key={`${ev.ts}-${i}`} className="work-event-row">
-                    <span className="mono work-event-ts">{fmtTime(ev.ts)}</span>
-                    <span className="work-event-type">{ev.type}</span>
-                    {ev.payload !== undefined && (
-                      <span className="mono work-event-payload">{payloadPreview(ev.payload)}</span>
-                    )}
-                  </div>
-                ))}
-                {events.length === 0 && !eventsLoading && !eventsError && (
-                  <div className="work-empty">no events</div>
-                )}
-              </div>
-              {eventsCursor && (
-                <button className="btn-ghost-sm" disabled={eventsLoading} onClick={() => void loadMoreEvents()}>
-                  {eventsLoading ? 'loading…' : 'load more'}
-                </button>
-              )}
-            </>
-          )}
-        </div>
-      </div>
-    )
-  }
-
-  // ── Queue view ────────────────────────────────────────────────────────
   return (
     <div className="work-pane">
       <div className="work-head">
@@ -339,149 +222,44 @@ export default function WorkPane({ active }: Props) {
           {projects.length === 0 && <option value="">no projects</option>}
           {projects.map(p => <option key={p.name} value={p.name}>{p.name}</option>)}
         </select>
-        <button className="icon-btn-sm" title="Refresh" aria-label="Refresh queue" onClick={() => { void loadQueue(project); void loadRecent(project) }}>
+        <button className="icon-btn-sm" title="Refresh" aria-label="Refresh graph" onClick={() => void loadGraph(project)}>
           <Icon name="bolt" size={13} />
         </button>
       </div>
 
+      {selectedNode && (
+        <div className="work-action-bar">
+          <span className="work-action-bar-slug mono">{selectedNode.slug}</span>
+          <span style={{ flex: 1 }} />
+          {isUnstarted
+            ? <button className="btn-primary-sm" onClick={startWi}>▶ 开始做</button>
+            : <button className="btn-ghost-sm" onClick={resumeWi}>→ 进入 chat</button>}
+        </div>
+      )}
+
       <div className="work-body scroll-thin">
         {projectsError && <div className="work-error">{projectsError}</div>}
         {/* Non-destructive: a transient poll failure surfaces here but never
-            blanks the cached queue rendered below. */}
-        {queueError && <div className="work-error">{queueError}</div>}
-        {queue && (
-          isQueueEmpty(queue) ? (
-            <div className="work-empty">no active work items</div>
-          ) : (
-            <>
-              <ReadySection title="Ready" items={queue.items} onOpen={openItem} />
-              <ReadySection title="Needs human" items={queue.needsHumanSession} onOpen={openItem} />
-              <ReadySection title="Unclassified" items={queue.unclassified} onOpen={openItem} />
-              <RunningSection title="Running" items={queue.running} stale={queue.staleRunning} onOpen={openItem} />
-              <StalledSection items={queue.stalled} onOpen={openItem} />
-              <PausedSection items={queue.paused} onOpen={openItem} />
-            </>
-          )
+            blanks the cached graph rendered below. */}
+        {graphError && <div className="work-error">{graphError}</div>}
+        {graph && isEmpty && <div className="work-empty">no active work items</div>}
+        {graph && !isEmpty && (
+          <div className="work-dag-wrap">
+            <Dag
+              nodes={dagNodes}
+              edges={dagEdges}
+              selectedId={selectedWiId ?? undefined}
+              onSelect={onSelectNode}
+            />
+          </div>
         )}
-        {!queue && !queueError && queueLoading && <div className="work-empty">loading…</div>}
-        {!queue && !queueError && !queueLoading && <div className="work-empty">select a project</div>}
-
-        {/* Done / recent history — independent of the ready queue (a project
-            whose queue is empty can still have completed work). */}
-        {recentError && <div className="work-error">{recentError}</div>}
-        {recent && recent.length > 0 && <RecentSection items={recent} onOpen={openItem} />}
+        {!graph && !graphError && graphLoading && <div className="work-empty">loading…</div>}
+        {!graph && !graphError && !graphLoading && <div className="work-empty">select a project</div>}
       </div>
 
       <div className="work-foot mono">
-        {lastRefreshed ? `last refreshed ${fmtClock(lastRefreshed)}` : queueLoading ? 'loading…' : ''}
+        {lastRefreshed ? `last refreshed ${fmtClock(lastRefreshed)}` : graphLoading ? 'loading…' : ''}
       </div>
-    </div>
-  )
-}
-
-// ── Section renderers ────────────────────────────────────────────────────
-
-function Section({ title, count, children }: { title: string; count: number; children: ReactNode }) {
-  if (count === 0) return null
-  return (
-    <div className="work-section">
-      <div className="section-label work-section-head">{title} <span className="work-section-count">{count}</span></div>
-      {children}
-    </div>
-  )
-}
-
-function ReadySection({ title, items, onOpen }: { title: string; items: WorkReadyItem[]; onOpen: (id: string) => void }) {
-  return (
-    <Section title={title} count={items.length}>
-      {items.map(it => (
-        <div key={it.id} className="work-row" onClick={() => onOpen(it.id)}>
-          <div className="work-row-top">
-            {it.wiType && <span className="work-badge">{it.wiType}</span>}
-            <span className="work-badge">{it.priority}</span>
-          </div>
-          <div className="work-row-goal">{it.goal}</div>
-        </div>
-      ))}
-    </Section>
-  )
-}
-
-function RunningSection(
-  { title, items, stale, onOpen }:
-  { title: string; items: WorkRunningItem[]; stale?: WorkRunningItem[]; onOpen: (id: string) => void }
-) {
-  const total = items.length + (stale?.length ?? 0)
-  return (
-    <Section title={title} count={total}>
-      {items.map(it => (
-        <div key={it.id} className="work-row" onClick={() => onOpen(it.id)}>
-          <div className="work-row-goal">{it.goal}</div>
-          <div className="work-row-sub">{it.ownerDisplay} · {fmtTime(it.lastActiveAt)}</div>
-        </div>
-      ))}
-      {stale?.map(it => (
-        <div key={it.id} className="work-row" onClick={() => onOpen(it.id)}>
-          <div className="work-row-top">
-            <span className="work-badge work-badge-warn">stale</span>
-          </div>
-          <div className="work-row-goal">{it.goal}</div>
-          <div className="work-row-sub">{it.ownerDisplay} · {fmtTime(it.lastActiveAt)}</div>
-        </div>
-      ))}
-    </Section>
-  )
-}
-
-function StalledSection({ items, onOpen }: { items: WorkStalledItem[]; onOpen: (id: string) => void }) {
-  return (
-    <Section title="Stalled" count={items.length}>
-      {items.map(it => (
-        <div key={it.id} className="work-row" onClick={() => onOpen(it.id)}>
-          <div className="work-row-goal">{it.stallReason}</div>
-          <div className="work-row-sub">{it.lastActorDisplay} · since {fmtTime(it.stalledSince)}</div>
-        </div>
-      ))}
-    </Section>
-  )
-}
-
-function PausedSection({ items, onOpen }: { items: WorkPausedItem[]; onOpen: (id: string) => void }) {
-  return (
-    <Section title="Paused" count={items.length}>
-      {items.map(it => (
-        <div key={it.id} className="work-row" onClick={() => onOpen(it.id)}>
-          <div className="work-row-goal">{it.pauseReason || '(no reason given)'}</div>
-          <div className="work-row-sub">{it.lastActorDisplay} · since {fmtTime(it.pausedSince)}</div>
-        </div>
-      ))}
-    </Section>
-  )
-}
-
-// RecentSection renders the done/recent history (terminal wrapped/cancelled
-// items). Collapsible (default open); rows open the same detail/timeline view.
-function RecentSection({ items, onOpen }: { items: WorkRecentItem[]; onOpen: (id: string) => void }) {
-  const [open, setOpen] = useState(true)
-  // aihub returns these in created-order; re-sort newest-closed-first for
-  // display (ISO strings compare lexicographically; missing closedAt sinks).
-  const sorted = [...items].sort((a, b) => (b.closedAt ?? '').localeCompare(a.closedAt ?? ''))
-  return (
-    <div className="work-section">
-      <div className="section-label work-section-head work-recent-head" role="button" onClick={() => setOpen(o => !o)}>
-        <span className="work-recent-caret">{open ? '▾' : '▸'}</span> Done / recent{' '}
-        <span className="work-section-count">{items.length}</span>
-      </div>
-      {open && sorted.map(it => (
-        <div key={it.id} className="work-row" onClick={() => onOpen(it.id)}>
-          <div className="work-row-top">
-            <span className={`work-badge ${it.status === 'cancelled' ? 'work-badge-warn' : 'work-badge-done'}`}>{it.status}</span>
-            {it.wiType && <span className="work-badge">{it.wiType}</span>}
-            <span className="mono work-row-slug">{it.slug}</span>
-          </div>
-          <div className="work-row-goal">{it.goal}</div>
-        </div>
-      ))}
     </div>
   )
 }

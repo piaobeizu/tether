@@ -112,3 +112,56 @@ type WorkRecentItem struct {
 type WorkRecent struct {
 	Items []WorkRecentItem `json:"items"`
 }
+
+// WorkGraphNode is a single work item node in the dependency/parent graph for
+// GET /api/v1/work/graph.
+type WorkGraphNode struct {
+	ID       string  `json:"id"`
+	Slug     string  `json:"slug"`
+	Goal     string  `json:"goal"`
+	Status   string  `json:"status"`
+	Priority string  `json:"priority"`
+	WIType   *string `json:"wiType,omitempty"`
+	Parent   *string `json:"parent,omitempty"`
+}
+
+// WorkGraph is the curated response for GET /api/v1/work/graph.
+type WorkGraph struct {
+	Nodes []WorkGraphNode `json:"nodes"`
+}
+
+// WorkDepEntry is one dependency edge for
+// GET /api/v1/work/items/{id}/dependencies.
+type WorkDepEntry struct {
+	ID      string `json:"id"`
+	Slug    string `json:"slug"`
+	Project string `json:"project"`
+	Kind    string `json:"kind"`
+	Note    string `json:"note"`
+}
+
+// WorkDependencies is the curated response for
+// GET /api/v1/work/items/{id}/dependencies.
+type WorkDependencies struct {
+	Blocking  []WorkDepEntry `json:"blocking"`
+	BlockedBy []WorkDepEntry `json:"blockedBy"`
+}
+
+// WorkStepNode is a single step-graph node for
+// GET /api/v1/work/items/{id}/steps, annotated with its progress status.
+// Status is one of "done", "current", or "pending".
+type WorkStepNode struct {
+	ID     string   `json:"id"`
+	Status string   `json:"status"`
+	Prev   []string `json:"prev,omitempty"`
+}
+
+// WorkSteps is the curated response for GET /api/v1/work/items/{id}/steps.
+// Degraded is true when no scenario graph file could be resolved for the
+// work item (e.g. no matching .repo/<repo>/<wiType>[.<project>].md), in
+// which case Nodes is synthesized best-effort from step-completion events
+// without Prev edges.
+type WorkSteps struct {
+	Nodes    []WorkStepNode `json:"nodes"`
+	Degraded bool           `json:"degraded"`
+}

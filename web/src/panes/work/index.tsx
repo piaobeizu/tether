@@ -51,7 +51,9 @@ export default function WorkPane({ active }: Props) {
 
   const onProjectChange = (p: string) => {
     setWorkProject(p)
-    select(null) // don't carry the previous project's selection into the new map
+    // clear only the wi drawer (its selection belongs to the old project's map);
+    // the middle file is workspace-scoped, unrelated to the Work project (tether#28).
+    select({ wiId: null })
   }
 
   return (
@@ -72,7 +74,7 @@ export default function WorkPane({ active }: Props) {
         {projectsError && <div className="work-error">{projectsError}</div>}
         <WorkGraphView />
         {selectedWiId && (
-          <DetailDrawer id={selectedWiId} onClose={() => select(null)} escActive={active !== false} />
+          <DetailDrawer id={selectedWiId} onClose={() => select({ wiId: null })} escActive={active !== false} />
         )}
       </div>
     </div>

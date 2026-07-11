@@ -246,28 +246,37 @@ describe('handleEnvelope fenced — live replace-by-BlockID (tether#8 T8)', () =
   })
 })
 
-// tether#20 Task 9 — middle-canvas selection slice: exactly one of
-// selectedWiId/selectedFile is ever set; selecting one clears the other.
-describe('useStore.select (tether#20 canvas selection)', () => {
+// tether#28 — Work selection slice: the middle file view (selectedFile) and
+// the right Work wi drawer (selectedWiId) are now INDEPENDENT (they were
+// mutually exclusive through tether#27). select() touches only the field(s)
+// passed, so a file and a wi drawer can be open at once.
+describe('useStore.select (tether#28 independent selection)', () => {
   const resetSelection = () => useStore.setState({ selectedWiId: null, selectedFile: null })
   beforeEach(resetSelection)
 
-  it('selecting a wi id sets selectedWiId and clears selectedFile', () => {
+  it('selecting a wi leaves the file selection intact (coexist)', () => {
     useStore.setState({ selectedFile: { wsId: 'ws-1', path: 'a.txt' } })
     useStore.getState().select({ wiId: 'wi-1' })
     expect(useStore.getState().selectedWiId).toBe('wi-1')
-    expect(useStore.getState().selectedFile).toBeNull()
+    expect(useStore.getState().selectedFile).toEqual({ wsId: 'ws-1', path: 'a.txt' })
   })
 
-  it('selecting a file sets selectedFile and clears selectedWiId', () => {
+  it('selecting a file leaves the wi selection intact (coexist)', () => {
     useStore.setState({ selectedWiId: 'wi-1' })
     useStore.getState().select({ file: { wsId: 'ws-1', path: 'a.txt' } })
     expect(useStore.getState().selectedFile).toEqual({ wsId: 'ws-1', path: 'a.txt' })
-    expect(useStore.getState().selectedWiId).toBeNull()
+    expect(useStore.getState().selectedWiId).toBe('wi-1')
   })
 
-  it('select(null) clears both', () => {
-    useStore.setState({ selectedWiId: 'wi-1', selectedFile: null })
+  it('select({ wiId: null }) clears only the wi (drawer close), leaving the file', () => {
+    useStore.setState({ selectedFile: { wsId: 'ws-1', path: 'a.txt' }, selectedWiId: 'wi-1' })
+    useStore.getState().select({ wiId: null })
+    expect(useStore.getState().selectedWiId).toBeNull()
+    expect(useStore.getState().selectedFile).toEqual({ wsId: 'ws-1', path: 'a.txt' })
+  })
+
+  it('select(null) clears both (project reset)', () => {
+    useStore.setState({ selectedWiId: 'wi-1', selectedFile: { wsId: 'ws-1', path: 'a.txt' } })
     useStore.getState().select(null)
     expect(useStore.getState().selectedWiId).toBeNull()
     expect(useStore.getState().selectedFile).toBeNull()

@@ -1,19 +1,17 @@
-// Canvas — middle-pane view (tether#23).
+// Canvas — middle-pane view.
 //
-// Reads the shared selection slice from the store (lib/store.ts) and renders:
-//   - file mode: a workspace file's content (from the left WorkspaceTree)
-//   - otherwise: the wi relationship knowledge-graph (WorkGraphView) for the
-//     current Work project — the always-present "project map".
+// Reads the shared selection slice from the store (lib/store.ts) and renders a
+// workspace file's content when one is selected (from the left WorkspaceTree),
+// otherwise an empty-state hint. The Work relationship map moved OUT of the
+// middle into the right Work tab in tether#26 (owner found the middle map
+// cluttered) — the middle is now the file / main-work area only.
 //
-// The old wi-detail mode (goal/status/content + step DAG) moved to the right
-// pane (WorkDetail) in the tether#23 panel inversion. Markdown file rendering
-// (tether#21) stays: `.md` files render via the lazy-loaded <Markdown>
-// component (react-markdown + remark-gfm); non-markdown files keep the plain
-// <pre> fallback.
+// Markdown file rendering (tether#21) stays: `.md` files render via the
+// lazy-loaded <Markdown> component (react-markdown + remark-gfm); non-markdown
+// files keep the plain <pre> fallback.
 import { lazy, Suspense, useEffect, useState } from 'react'
 import { useStore } from '../../lib/store'
 import { AihubError, fetchFile } from '../../lib/aihub'
-import WorkGraphView from '../work/WorkGraphView'
 
 const Markdown = lazy(() => import('./Markdown'))
 
@@ -31,7 +29,11 @@ export default function Canvas() {
   const selectedFile = useStore((s) => s.selectedFile)
 
   if (selectedFile) return <FileMode wsId={selectedFile.wsId} path={selectedFile.path} />
-  return <WorkGraphView />
+  return (
+    <div className="canvas-empty">
+      从右侧 <b>Work</b> 点一个 wi 看详情，或从左侧选一个文件
+    </div>
+  )
 }
 
 function FileMode({ wsId, path }: { wsId: string; path: string }) {

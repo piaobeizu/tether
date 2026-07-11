@@ -1,9 +1,9 @@
-// WorkGraphView — middle-canvas container for the wi relationship map
-// (tether#23; cards + deterministic columns as of tether#25). Owns the graph
-// fetch + poll for the current store.workProject and lazy-loads the
-// <ForceGraph> renderer to keep it out of the initial bundle. Clicking a node
-// routes to the shared selection (store.select), which the right-pane Work
-// detail reacts to; the selected node's block edges are lazily overlaid.
+// WorkGraphView — container for the wi relationship map (cards + deterministic
+// columns as of tether#25). Hosted in the right Work tab as of tether#26. Owns
+// the graph fetch + poll for the current store.workProject and lazy-loads the
+// <ForceGraph> renderer to keep it out of the initial bundle. Clicking a card
+// routes to the shared selection (store.select), which opens the DetailDrawer
+// over the map; the selected node's block edges are lazily overlaid.
 import { lazy, Suspense, useEffect, useRef, useState } from 'react'
 import { useStore } from '../../lib/store'
 import { AihubError, fetchDeps, fetchGraph } from '../../lib/aihub'
@@ -188,12 +188,9 @@ export default function WorkGraphView() {
               nodes={fgNodes}
               edges={fgEdges}
               selectedId={selectedWiId ?? undefined}
-              onSelect={(id) => {
-                select({ wiId: id })
-                // bring the right Work tab forward so the detail is visible even
-                // if the user was on Chat/Shell when they clicked (tether#23 F2)
-                window.dispatchEvent(new CustomEvent('tether:select-tab', { detail: 'work' }))
-              }}
+              // the map lives in the Work tab now (tether#26), so selecting a
+              // card just opens the DetailDrawer here — no tab switch needed.
+              onSelect={(id) => select({ wiId: id })}
             />
           </Suspense>
         )}

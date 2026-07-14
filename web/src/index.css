@@ -748,6 +748,8 @@ body {
   font-size: 11px; padding: 3px 6px; border: 1px solid var(--line);
   border-radius: var(--r-2); background: var(--bg-surface); color: var(--ink-secondary);
 }
+/* filter controls are inert while a search spans the whole project (tether#29) */
+.fg-seg:disabled, .fg-type-select:disabled { opacity: .45; cursor: not-allowed; }
 .fg-filter-count { font-size: 10.5px; color: var(--ink-quat); }
 .fg-graph-slot { flex: 1; min-height: 0; }
 
@@ -776,6 +778,28 @@ body {
 .fg-status-failed .fg-card-bar { fill: var(--danger); }
 .fg-status-pending .fg-card-bar { fill: var(--ink-quat); }
 .fg-status-default .fg-card-bar { fill: var(--ink-tertiary); }
+
+/* ── Search / jump overlay (tether#29): find a wi in a large map ─── */
+.fg-search {
+  position: absolute; top: 8px; left: 8px; z-index: 5;
+  display: flex; align-items: center; gap: 6px;
+}
+.fg-search-input {
+  width: 150px; max-width: 42vw;
+  padding: 4px 8px; font-size: 12px;
+  color: var(--ink-primary); background: var(--bg-surface);
+  border: 1px solid var(--line); border-radius: var(--r-2);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .12);
+}
+.fg-search-input:focus { outline: none; border-color: var(--accent); }
+.fg-search-input::placeholder { color: var(--ink-quat); }
+.fg-search-count { font-size: 10.5px; color: var(--ink-tertiary); font-family: var(--font-mono); }
+
+/* highlight matches, dim the rest, ring the active match */
+.fg-node-dim { opacity: .2; transition: opacity .12s; }
+.fg-node-match .fg-card { stroke: var(--accent); stroke-width: 1.5; }
+.fg-node-active .fg-card { stroke: var(--accent-deep); stroke-width: 2.5; }
+.fg-node-active .fg-card-slug { fill: var(--accent-deep); font-weight: 500; }
 
 /* ── Canvas (middle-pane detail/file view, tether#20) ───────────── */
 .canvas-view { display: flex; flex-direction: column; }

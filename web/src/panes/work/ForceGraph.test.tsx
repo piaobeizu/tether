@@ -20,6 +20,9 @@ afterEach(() => {
 function vbWidth(svg: SVGSVGElement) {
   return Number((svg.getAttribute('viewBox') ?? '0 0 0 0').split(/\s+/)[2])
 }
+function vbX(svg: SVGSVGElement) {
+  return Number((svg.getAttribute('viewBox') ?? '0 0 0 0').split(/\s+/)[0])
+}
 function txX(el: Element): number {
   const m = /translate\(([-\d.]+)/.exec(el.getAttribute('transform') ?? '')
   return m ? parseFloat(m[1]) : NaN
@@ -198,6 +201,178 @@ describe('ForceGraph', () => {
     )
     expect(titles).toContain('tether#7 — do the thing')
     expect(titles).toContain('tether#8')
+  })
+})
+
+// Search / jump (tether#29): a floating box finds a wi in a large map by slug or
+// goal substring, highlighting matches, dimming the rest, and centering the
+// viewport on the active match; ↑/↓ walk matches, ↵ opens the drawer, Esc clears.
+describe('ForceGraph search / jump (tether#29)', () => {
+  const input = (c: HTMLElement) => c.querySelector('.fg-search-input') as HTMLInputElement
+  const count = (c: HTMLElement) => c.querySelector('.fg-search-count')?.textContent ?? null
+  const activeSlug = (c: HTMLElement) =>
+    c.querySelector('.fg-node-active .fg-card-slug')?.textContent ?? null
+
+  it('highlights matches, dims the rest, and shows a count', () => {
+    const { container } = render(<ForceGraph nodes={nodes} edges={edges} />)
+    fireEvent.change(input(container), { target: { value: '#2' } })
+    const g = container.querySelectorAll('.fg-node')
+    expect(g[1].classList.contains('fg-node-match')).toBe(true) // 'b' tether#2
+    expect(g[0].classList.contains('fg-node-dim')).toBe(true) // 'a' tether#1
+    expect(g[2].classList.contains('fg-node-dim')).toBe(true) // 'c' tether#3
+    expect(g[1].classList.contains('fg-node-dim')).toBe(false)
+    expect(count(container)).toBe('1/1')
+    expect(activeSlug(container)).toBe('tether#2')
+  })
+
+  it('matches on the goal (title), not just the slug', () => {
+    const gnodes: FGNode[] = [
+      { id: 'g', label: 'tether#7', status: 'running', title: 'fix the parser' },
+      { id: 'h', label: 'tether#8', status: 'running', title: 'add a search box' },
+    ]
+    const { container } = render(<ForceGraph nodes={gnodes} edges={[]} />)
+    fireEvent.change(input(container), { target: { value: 'parser' } })
+    const g = container.querySelectorAll('.fg-node')
+    expect(g[0].classList.contains('fg-node-match')).toBe(true)
+    expect(g[1].classList.contains('fg-node-dim')).toBe(true)
+    expect(count(container)).toBe('1/1')
+  })
+
+  // Matches walk in visual reading order (left-to-right by column): the running
+  // column packs leftmost, so tether#2 is match #1; ↓ wraps forward, ↑ wraps back.
+  it('walks matches with ArrowDown / ArrowUp, wrapping at both ends', () => {
+    const { container } = render(<ForceGraph nodes={nodes} edges={edges} />)
+    fireEvent.change(input(container), { target: { value: '#' } }) // all 3 match
+    expect(count(container)).toBe('1/3')
+    expect(activeSlug(container)).toBe('tether#2') // running col is leftmost
+    fireEvent.keyDown(input(container), { key: 'ArrowDown' })
+    expect(count(container)).toBe('2/3')
+    expect(activeSlug(container)).toBe('tether#3')
+    fireEvent.keyDown(input(container), { key: 'ArrowDown' })
+    expect(activeSlug(container)).toBe('tether#1')
+    fireEvent.keyDown(input(container), { key: 'ArrowDown' }) // forward wrap
+    expect(count(container)).toBe('1/3')
+    expect(activeSlug(container)).toBe('tether#2')
+    fireEvent.keyDown(input(container), { key: 'ArrowUp' }) // backward wrap
+    expect(count(container)).toBe('3/3')
+    expect(activeSlug(container)).toBe('tether#1')
+  })
+
+  it('opens the active match on Enter (onSelect)', () => {
+    const onSelect = vi.fn()
+    const { container } = render(<ForceGraph nodes={nodes} edges={edges} onSelect={onSelect} />)
+    fireEvent.change(input(container), { target: { value: '#3' } })
+    fireEvent.keyDown(input(container), { key: 'Enter' })
+    expect(onSelect).toHaveBeenCalledWith('c')
+  })
+
+  it('clears the search on Escape', () => {
+    const { container } = render(<ForceGraph nodes={nodes} edges={edges} />)
+    fireEvent.change(input(container), { target: { value: '#2' } })
+    expect(container.querySelector('.fg-node-dim')).not.toBeNull()
+    fireEvent.keyDown(input(container), { key: 'Escape' })
+    expect(input(container).value).toBe('')
+    expect(container.querySelector('.fg-node-dim')).toBeNull()
+    expect(container.querySelector('.fg-search-count')).toBeNull()
+  })
+
+  // Nothing matched → the WHOLE map greys out (matches bright, non-matches dim, no
+  // exceptions), so "0 results" reads clearly instead of a full-bright map that
+  // looks like search did nothing (tether#29 live-verify feedback).
+  it('dims the entire map when the query matches nothing', () => {
+    const { container } = render(<ForceGraph nodes={nodes} edges={edges} />)
+    fireEvent.change(input(container), { target: { value: 'zzz' } })
+    const g = container.querySelectorAll('.fg-node')
+    expect(g.length).toBe(3)
+    expect([...g].every((n) => n.classList.contains('fg-node-dim'))).toBe(true)
+    expect(container.querySelector('.fg-node-match')).toBeNull()
+    expect(count(container)).toBe('0')
+  })
+
+  it('centers the viewport on the active match (viewport center ≈ card center)', () => {
+    const { container } = render(<ForceGraph nodes={nodes} edges={edges} />)
+    const svg = container.querySelector('svg.fg-svg') as SVGSVGElement
+    fireEvent.change(input(container), { target: { value: '#2' } }) // active = 'b'
+    const bNode = container.querySelectorAll('.fg-node')[1]
+    const cardW = computePositions(nodes, 0).cardW
+    const cardCenterX = txX(bNode) + cardW / 2
+    const viewCenterX = vbX(svg) + vbWidth(svg) / 2
+    expect(Math.abs(viewCenterX - cardCenterX)).toBeLessThan(1)
+  })
+
+  it('preserves the active match across a poll returning a fresh identical array', () => {
+    const { container, rerender } = render(<ForceGraph nodes={nodes} edges={edges} />)
+    fireEvent.change(input(container), { target: { value: '#' } })
+    fireEvent.keyDown(input(container), { key: 'ArrowDown' }) // active idx 1 → '2/3'
+    expect(count(container)).toBe('2/3')
+    rerender(<ForceGraph nodes={nodes.map((n) => ({ ...n }))} edges={edges.map((e) => ({ ...e }))} />)
+    expect(count(container)).toBe('2/3')
+    expect(activeSlug(container)).toBe('tether#3')
+  })
+
+  // ↑/↓ don't just re-highlight — they re-center the viewport on each match.
+  it('re-centers the viewport when navigating to a different match', () => {
+    const { container } = render(<ForceGraph nodes={nodes} edges={edges} />)
+    const svg = container.querySelector('svg.fg-svg') as SVGSVGElement
+    const cardW = computePositions(nodes, 0).cardW
+    const centerX = () => vbX(svg) + vbWidth(svg) / 2
+    fireEvent.change(input(container), { target: { value: '#' } }) // active = tether#2 (node b)
+    const bCenter = txX(container.querySelectorAll('.fg-node')[1]) + cardW / 2
+    expect(Math.abs(centerX() - bCenter)).toBeLessThan(1)
+    fireEvent.keyDown(input(container), { key: 'ArrowDown' }) // active = tether#3 (node c)
+    const cCenter = txX(container.querySelectorAll('.fg-node')[2]) + cardW / 2
+    expect(cCenter).not.toBe(bCenter) // different column → it actually moved
+    expect(Math.abs(centerX() - cCenter)).toBeLessThan(1)
+  })
+
+  // Esc clears a non-empty search WITHOUT bubbling — else it would also slam an
+  // open detail drawer shut (#26 DetailDrawer's document-level Esc) in one press.
+  it('consumes Escape (stopPropagation) when clearing a non-empty search', () => {
+    const docEsc = vi.fn()
+    const h = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') docEsc()
+    }
+    document.addEventListener('keydown', h)
+    try {
+      const { container } = render(<ForceGraph nodes={nodes} edges={edges} />)
+      fireEvent.change(input(container), { target: { value: '#2' } })
+      fireEvent.keyDown(input(container), { key: 'Escape' })
+      expect(input(container).value).toBe('')
+      expect(docEsc).not.toHaveBeenCalled()
+    } finally {
+      document.removeEventListener('keydown', h)
+    }
+  })
+
+  // But an EMPTY search box lets Esc bubble, so it can still close a drawer.
+  it('lets Escape bubble when the search box is empty', () => {
+    const docEsc = vi.fn()
+    const h = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') docEsc()
+    }
+    document.addEventListener('keydown', h)
+    try {
+      const { container } = render(<ForceGraph nodes={nodes} edges={edges} />)
+      fireEvent.keyDown(input(container), { key: 'Escape' }) // empty query
+      expect(docEsc).toHaveBeenCalled()
+    } finally {
+      document.removeEventListener('keydown', h)
+    }
+  })
+
+  // The container widens the node set while a search is active (tether#29): the
+  // trimmed/lowercased query is reported up via onQueryChange so WorkGraphView can
+  // bypass the active/done filter and let search span the whole project.
+  it('reports the trimmed query to the parent via onQueryChange', () => {
+    const onQueryChange = vi.fn()
+    const { container } = render(
+      <ForceGraph nodes={nodes} edges={edges} onQueryChange={onQueryChange} />,
+    )
+    expect(onQueryChange).toHaveBeenLastCalledWith('') // mount: no active search
+    fireEvent.change(input(container), { target: { value: '  #2  ' } })
+    expect(onQueryChange).toHaveBeenLastCalledWith('#2') // trimmed + lowercased
+    fireEvent.keyDown(input(container), { key: 'Escape' })
+    expect(onQueryChange).toHaveBeenLastCalledWith('')
   })
 })
 

@@ -42,6 +42,10 @@ export default function WorkGraphView() {
   // isn't buried under a long tail of finished work.
   const [mode, setMode] = useState<FilterMode>('active')
   const [typeF, setTypeF] = useState<string>('')
+  // Mirrors the ForceGraph search box (reported via onQueryChange). While a search
+  // is active the map spans the WHOLE project — the mode/type filter is bypassed
+  // so ANY wi is findable, not just the active-filtered subset (tether#29).
+  const [searchQ, setSearchQ] = useState('')
 
   // Monotonic token: a newer load/project-switch supersedes a slower in-flight
   // fetch so it can't clobber the current project's graph (stale-response guard).
@@ -132,7 +136,13 @@ export default function WorkGraphView() {
 
   // Client-side filter of the already-fetched full graph (no backend change).
   const wiTypes = [...new Set(graph.nodes.map((n) => n.wiType).filter((t): t is string => !!t))].sort()
+  const searching = searchQ !== ''
   const shown = graph.nodes.filter((n) => {
+    // An active search spans the whole project: show every wi so the search box
+    // can find (and center) any of them, then dim the non-matches. Without this
+    // the default 'active' filter hides wrapped wi and a search for them finds
+    // nothing (tether#29 live-verify). Cleared search restores the filter.
+    if (searching) return true
     const terminal = isTerminal(n.status)
     const passMode = mode === 'all' ? true : mode === 'done' ? terminal : !terminal
     const passType = !typeF || n.wiType === typeF
@@ -164,6 +174,10 @@ export default function WorkGraphView() {
               key={m}
               type="button"
               className={`fg-seg${mode === m ? ' on' : ''}`}
+              // While searching the whole project is shown, so the mode filter is
+              // inert — disable it to signal the search override (tether#29).
+              disabled={searching}
+              title={searching ? '搜索时显示全部（清空搜索恢复筛选）' : undefined}
               onClick={() => setMode(m)}
             >
               {m}
@@ -171,13 +185,21 @@ export default function WorkGraphView() {
           ))}
         </div>
         {wiTypes.length > 0 && (
-          <select className="fg-type-select" value={typeF} onChange={(e) => setTypeF(e.target.value)}>
+          <select
+            className="fg-type-select"
+            value={typeF}
+            disabled={searching}
+            title={searching ? '搜索时显示全部（清空搜索恢复筛选）' : undefined}
+            onChange={(e) => setTypeF(e.target.value)}
+          >
             <option value="">all types</option>
             {wiTypes.map((t) => <option key={t} value={t}>{t}</option>)}
           </select>
         )}
         <span style={{ flex: 1 }} />
-        <span className="fg-filter-count mono">{shown.length}/{graph.nodes.length}</span>
+        <span className="fg-filter-count mono">
+          {searching ? 'search · all' : `${shown.length}/${graph.nodes.length}`}
+        </span>
       </div>
       <div className="fg-graph-slot">
         {fgNodes.length === 0 ? (
@@ -191,6 +213,9 @@ export default function WorkGraphView() {
               // the map lives in the Work tab now (tether#26), so selecting a
               // card just opens the DetailDrawer here — no tab switch needed.
               onSelect={(id) => select({ wiId: id })}
+              // an active search widens the shown set to the whole project so any
+              // wi is findable, not just the active-filtered subset (tether#29).
+              onQueryChange={setSearchQ}
             />
           </Suspense>
         )}

@@ -49,6 +49,10 @@ export interface ForceGraphProps {
   edges: FGEdge[]
   selectedId?: string
   onSelect?: (id: string) => void
+  /** Reports the trimmed/lowercased search query as it changes, so the container
+   *  can widen the node set while a search is active — search spans the whole
+   *  project, not just the filtered view (tether#29). '' means no active search. */
+  onQueryChange?: (q: string) => void
 }
 
 const MAX_CARD_W = 132 // natural card width (cap in a wide pane)
@@ -244,11 +248,16 @@ function edgePath(s: Pt, t: Pt, cardW: number): string {
   return `M ${sx} ${s.y} Q ${cx} ${cy} ${tx} ${t.y}`
 }
 
-export default function ForceGraph({ nodes, edges, selectedId, onSelect }: ForceGraphProps) {
+export default function ForceGraph({ nodes, edges, selectedId, onSelect, onQueryChange }: ForceGraphProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   // Measured container size (bucketed). {0,0} until the ResizeObserver fires
   // (or forever under jsdom, which has no ResizeObserver) → natural-size fallback.
   const [size, setSize] = useState<{ cw: number; ch: number }>({ cw: 0, ch: 0 })
+  // Search (tether#29): find a wi in a large map. `query` filters nothing out —
+  // it highlights matches and dims the rest; `activeIndex` picks the match the
+  // viewport centers on.
+  const [query, setQuery] = useState('')
+  const [activeIndex, setActiveIndex] = useState(0)
 
   useEffect(() => {
     const el = containerRef.current
@@ -295,6 +304,39 @@ export default function ForceGraph({ nodes, edges, selectedId, onSelect }: Force
   // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on layoutKey (content + width), not the array refs
   const layout = useMemo(() => computePositions(nodes, size.cw), [layoutKey])
 
+  // ── Search matches (tether#29): a wi matches on its slug OR goal (substring,
+  // case-insensitive). Matches are ordered by their laid-out position (left-to-
+  // right, top-to-bottom) so ↑/↓ walk them in visual reading order. `query` is
+  // deliberately NOT part of structureKey/layoutKey — searching never re-fits the
+  // viewport (keeps the #24/#27 pan/zoom stability); centering is a separate
+  // effect keyed on the active id only, so an 8s poll can't jitter the view.
+  const q = query.trim().toLowerCase()
+  const matches = useMemo(() => {
+    if (!q) return [] as string[]
+    return nodes
+      .filter((n) => n.label.toLowerCase().includes(q) || (n.title ?? '').toLowerCase().includes(q))
+      .map((n) => n.id)
+      .sort((a, b) => {
+        const pa = layout.pos.get(a)
+        const pb = layout.pos.get(b)
+        if (!pa || !pb) return 0
+        return pa.x - pb.x || pa.y - pb.y
+      })
+  }, [q, nodes, layout])
+  const matchSet = useMemo(() => new Set(matches), [matches])
+
+  // Reset the active match to the top whenever the match SET changes (mirrors the
+  // structureKey/resetKey in-render reset below). A poll returning the same ids in
+  // the same order keeps matchesKey stable → activeIndex is preserved.
+  const matchesKey = matches.join('|')
+  const [matchReset, setMatchReset] = useState(matchesKey)
+  if (matchReset !== matchesKey) {
+    setMatchReset(matchesKey)
+    setActiveIndex(0)
+  }
+  const activeIdx = matches.length ? Math.min(activeIndex, matches.length - 1) : -1
+  const activeId = activeIdx >= 0 ? matches[activeIdx] : undefined
+
   // Initial viewport = a width-fit window: viewBox width = box width so meet-fit
   // renders at ~1:1 (readable); its height matches the container aspect so tall
   // columns are reached by vertical PAN instead of being shrunk to fit.
@@ -311,6 +353,29 @@ export default function ForceGraph({ nodes, edges, selectedId, onSelect }: Force
     setView(fitView)
   }
   const effectiveView = resetKey === structureKey ? view : fitView
+
+  // Center the viewport on the active search match, keeping the current zoom.
+  // Keyed on the active id AND structureKey — typing/↑↓ recenter (activeId), and a
+  // resize or column-count change (which triggers the fit-reset below via
+  // structureKey) re-centers the active match too, so it isn't snapped back to
+  // fit-the-whole-graph and lost off-screen (tether#29 review WARN). An 8s poll
+  // that keeps the same ids/size does NOT re-fire (both keys stable → no jitter);
+  // when nothing is searched, activeId is undefined and this no-ops.
+  useEffect(() => {
+    if (!activeId) return
+    const p = layout.pos.get(activeId)
+    if (!p) return
+    setView((v) => ({ x: p.x - v.w / 2, y: p.y - v.h / 2, w: v.w, h: v.h }))
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- center on active-id / structure change only; layout+zoom read fresh
+  }, [activeId, structureKey])
+
+  // Report the active query up so the container can widen the node set: an active
+  // search spans the WHOLE project, not just the filtered view (tether#29 live-
+  // verify — the default 'active' filter otherwise hides most wi, so a search for
+  // any wrapped wi found nothing). '' = no active search → filter applies normally.
+  useEffect(() => {
+    onQueryChange?.(q)
+  }, [q, onQueryChange])
 
   const svgRef = useRef<SVGSVGElement>(null)
   const drag = useRef<{ startX: number; startY: number; lastX: number; lastY: number } | null>(null)
@@ -382,6 +447,45 @@ export default function ForceGraph({ nodes, edges, selectedId, onSelect }: Force
 
   return (
     <div className="fg-scroll" ref={containerRef}>
+      <div className="fg-search">
+        <input
+          className="fg-search-input"
+          type="text"
+          value={query}
+          placeholder="find wi…"
+          aria-label="search work items"
+          spellCheck={false}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'ArrowDown') {
+              e.preventDefault()
+              setActiveIndex(matches.length ? (activeIdx + 1) % matches.length : 0)
+            } else if (e.key === 'ArrowUp') {
+              e.preventDefault()
+              setActiveIndex(matches.length ? (activeIdx - 1 + matches.length) % matches.length : 0)
+            } else if (e.key === 'Enter') {
+              e.preventDefault()
+              if (activeId) onSelect?.(activeId)
+            } else if (e.key === 'Escape') {
+              // clear the search on Esc, but only CONSUME the event when there is
+              // a query to clear — an empty box lets Esc bubble so it can still
+              // close an open detail drawer (#26 DetailDrawer's document-level Esc
+              // listener); without stopPropagation, clearing a search would also
+              // slam the drawer shut in one press.
+              if (query) {
+                e.preventDefault()
+                e.stopPropagation()
+                setQuery('')
+              }
+            }
+          }}
+        />
+        {q !== '' && (
+          <span className="fg-search-count">
+            {matches.length ? `${activeIdx + 1}/${matches.length}` : '0'}
+          </span>
+        )}
+      </div>
       <svg
         ref={svgRef}
         className="fg-svg"
@@ -408,10 +512,17 @@ export default function ForceGraph({ nodes, edges, selectedId, onSelect }: Force
             const p = layout.pos.get(n.id)
             if (!p) return null
             const selected = n.id === selectedId
+            const isMatch = matchSet.has(n.id)
+            const isActive = n.id === activeId
+            // dim every non-match while searching — INCLUDING when nothing matches
+            // (the whole map greys out), so "no results" reads clearly instead of a
+            // full-bright map that looks like search did nothing (tether#29 live-
+            // verify). matches bright, non-matches dim — no exceptions.
+            const dim = q !== '' && !isMatch
             return (
               <g
                 key={n.id}
-                className={`fg-node ${statusClass(n.status)} ${selected ? 'fg-node-selected' : ''}`}
+                className={`fg-node ${statusClass(n.status)} ${selected ? 'fg-node-selected' : ''}${isMatch ? ' fg-node-match' : ''}${isActive ? ' fg-node-active' : ''}${dim ? ' fg-node-dim' : ''}`}
                 transform={`translate(${p.x - layout.cardW / 2}, ${p.y - layout.cardH / 2})`}
                 onClick={() => {
                   if (didDrag.current) return

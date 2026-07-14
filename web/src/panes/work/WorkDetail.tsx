@@ -10,6 +10,7 @@ import type { WorkItemDetail, WorkSteps } from '../../lib/wire.gen'
 import { useStore } from '../../lib/store'
 import { Dag } from './Dag'
 import type { DagEdge, DagNode } from './Dag'
+import EventTimeline from './EventTimeline'
 
 const Markdown = lazy(() => import('../canvas/Markdown'))
 
@@ -124,6 +125,11 @@ export default function WorkDetail({ id }: { id: string }) {
                 <Dag nodes={dagNodes} edges={dagEdges} direction="TB" />
               </div>
             )}
+          </div>
+
+          <div className="canvas-section">
+            <div className="section-label canvas-section-head">Activity</div>
+            <EventTimeline id={id} />
           </div>
         </>
       )}

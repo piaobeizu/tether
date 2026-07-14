@@ -1244,3 +1244,61 @@ body {
   color: var(--danger);
 }
 .perm-btn-deny:hover { background: var(--bg-tint); }
+
+/* Work activity timeline — wi detail-drawer Activity section (tether#31) */
+.work-activity-list { display: flex; flex-direction: column; }
+.work-activity-row {
+  display: grid;
+  grid-template-columns: 16px 1fr auto;
+  gap: 8px;
+  align-items: baseline;
+  padding: 5px 0;
+  border-top: 1px solid var(--line);
+}
+.work-activity-row:first-child { border-top: none; }
+.work-activity-icon {
+  color: var(--ink-tertiary);
+  font-size: 11px;
+  text-align: center;
+  line-height: 1.4;
+}
+.work-activity-main { min-width: 0; } /* let the grid track shrink so children can clamp */
+.work-activity-text {
+  color: var(--ink-primary);
+  font-size: 12.5px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.work-activity-text a { color: var(--accent); text-decoration: none; }
+.work-activity-text a:hover { text-decoration: underline; }
+.work-activity-sub {
+  margin-top: 1px;
+  color: var(--ink-tertiary);
+  font-size: 11px;
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.work-activity-time {
+  color: var(--ink-tertiary);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+.work-activity-more {
+  margin-top: 8px;
+  align-self: flex-start;
+  padding: 3px 10px;
+  font-size: 11.5px;
+  color: var(--ink-secondary);
+  background: var(--bg-surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-2);
+  cursor: pointer;
+}
+.work-activity-more:hover:not(:disabled) { border-color: var(--accent); color: var(--ink-primary); }
+.work-activity-more:disabled { opacity: .55; cursor: default; }

@@ -609,6 +609,7 @@ body {
   position: relative; flex-shrink: 0;
   display: flex; align-items: center; justify-content: center;
   padding: 6px 8px; border-bottom: 1px solid var(--line-soft);
+  cursor: ns-resize; touch-action: none; user-select: none; /* drag to resize (tether#30) */
 }
 .work-drawer-handle { width: 32px; height: 4px; border-radius: 2px; background: var(--ink-quat); }
 .work-drawer-grip .icon-btn-sm { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); }

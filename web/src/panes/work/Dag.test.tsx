@@ -80,4 +80,35 @@ describe('Dag', () => {
     fireEvent.wheel(svg, { deltaY: -100, ctrlKey: true }) // zoom in
     expect(parseFloat(svg.getAttribute('width') ?? '0')).toBeGreaterThan(w0)
   })
+
+  // Solid (step/parent) edges carry a direction arrowhead; block edges stay
+  // plain (dashed, no arrow). The <marker> lives in the svg <defs>.
+  it('draws arrowheads on solid edges but not block edges', () => {
+    const { container } = render(<Dag nodes={nodes} edges={edges} />)
+    expect(container.querySelector('marker#rdag-arrow')).toBeTruthy()
+    const solid = container.querySelector('.rdag-edge-solid') // a→b (step)
+    const block = container.querySelector('.rdag-edge-block') // b→c (block)
+    expect(solid?.getAttribute('marker-end')).toContain('#rdag-arrow')
+    expect(block?.getAttribute('marker-end')).toBeFalsy()
+  })
+
+  // LR lays the same chain out horizontally, TB vertically — so for a 3-node
+  // chain the LR viewBox is wider than the TB one (tether#32: wide drawer).
+  it('lays out wider in LR than in TB for the same chain', () => {
+    const chain: DagNode[] = [
+      { id: 'a', label: 'A' },
+      { id: 'b', label: 'B' },
+      { id: 'c', label: 'C' },
+    ]
+    const chainEdges: DagEdge[] = [
+      { from: 'a', to: 'b', kind: 'step' },
+      { from: 'b', to: 'c', kind: 'step' },
+    ]
+    const lr = render(<Dag nodes={chain} edges={chainEdges} direction="LR" />)
+    const lrW = vbWidth(lr.container.querySelector('svg.rdag-svg') as SVGSVGElement)
+    cleanup()
+    const tb = render(<Dag nodes={chain} edges={chainEdges} direction="TB" />)
+    const tbW = vbWidth(tb.container.querySelector('svg.rdag-svg') as SVGSVGElement)
+    expect(lrW).toBeGreaterThan(tbW)
+  })
 })

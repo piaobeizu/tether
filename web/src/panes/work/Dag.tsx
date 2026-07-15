@@ -179,6 +179,23 @@ export function Dag({ nodes, edges, selectedId, onSelect, direction = 'TB' }: Da
         height={h}
         viewBox={`0 0 ${layout.width} ${layout.height}`}
       >
+        <defs>
+          {/* Arrowhead for solid (step/parent) edges — gives the LR pipeline a
+              direction cue. Fill is set via CSS (.rdag-arrow-head) so it tracks
+              the theme. Fixed id is fine: only one Dag renders at a time, and
+              identical same-id markers share the same visual if not. */}
+          <marker
+            id="rdag-arrow"
+            viewBox="0 0 8 8"
+            refX="7"
+            refY="4"
+            markerWidth="6"
+            markerHeight="6"
+            orient="auto"
+          >
+            <path className="rdag-arrow-head" d="M0,0 L8,4 L0,8 z" />
+          </marker>
+        </defs>
         <g className="rdag-edges">
           {layout.edges.map((e) => (
             <path
@@ -186,6 +203,7 @@ export function Dag({ nodes, edges, selectedId, onSelect, direction = 'TB' }: Da
               className={`rdag-edge ${e.kind === 'block' ? 'rdag-edge-block' : 'rdag-edge-solid'}`}
               d={edgePath(e.points)}
               fill="none"
+              markerEnd={e.kind === 'block' ? undefined : 'url(#rdag-arrow)'}
             />
           ))}
         </g>

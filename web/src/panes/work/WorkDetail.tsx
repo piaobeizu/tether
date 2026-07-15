@@ -24,6 +24,23 @@ function describeError(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
 }
 
+// Build scenario-step edges for the DAG. Prefer the real prev-derived edges;
+// when a degraded steps response omits prev (e.g. global-routing#62
+// port_feature returns only touched steps with no prev), synthesize a
+// record-order chain so the graph renders as a connected line instead of
+// unsorted, edgeless nodes. Guard: fall back ONLY when there are no
+// prev-derived edges, so a real DAG is never overwritten by the chain.
+export function buildStepEdges(nodes: { id: string; prev?: string[] }[]): DagEdge[] {
+  const prevEdges = nodes.flatMap((n) =>
+    (n.prev ?? []).map((p) => ({ from: p, to: n.id, kind: 'step' as const })),
+  )
+  if (prevEdges.length > 0) return prevEdges
+  if (nodes.length >= 2) {
+    return nodes.slice(1).map((n, i) => ({ from: nodes[i].id, to: n.id, kind: 'step' as const }))
+  }
+  return []
+}
+
 export default function WorkDetail({ id }: { id: string }) {
   const [item, setItem] = useState<WorkItemDetail | null>(null)
   const [itemError, setItemError] = useState<string | null>(null)
@@ -49,9 +66,7 @@ export default function WorkDetail({ id }: { id: string }) {
   }, [id])
 
   const dagNodes: DagNode[] = (steps?.nodes ?? []).map((n) => ({ id: n.id, label: n.id, status: n.status }))
-  const dagEdges: DagEdge[] = (steps?.nodes ?? []).flatMap((n) =>
-    (n.prev ?? []).map((p) => ({ from: p, to: n.id, kind: 'step' as const })),
-  )
+  const dagEdges: DagEdge[] = buildStepEdges(steps?.nodes ?? [])
 
   // queued/unclaimed → not started (offer ▶开始做); else offer →进入 chat.
   const isUnstarted = !item?.status || item.status === 'queued' || item.status === 'pending'
@@ -115,14 +130,17 @@ export default function WorkDetail({ id }: { id: string }) {
           <div className="canvas-section">
             <div className="section-label canvas-section-head">Scenario steps</div>
             {stepsError && <div className="work-error">{stepsError}</div>}
-            {steps?.degraded && (
+            {steps?.degraded && dagNodes.length > 0 && (
+              <div className="canvas-hint">step order approximate (degraded)</div>
+            )}
+            {steps?.degraded && dagNodes.length === 0 && (
               <div className="canvas-hint">scenario steps unavailable (no scenario clone)</div>
             )}
             {!steps && !stepsError && <div className="work-empty">loading…</div>}
-            {steps && dagNodes.length === 0 && !stepsError && <div className="work-empty">no steps</div>}
+            {steps && !steps.degraded && dagNodes.length === 0 && !stepsError && <div className="work-empty">no steps</div>}
             {steps && dagNodes.length > 0 && (
               <div className="canvas-dag-wrap">
-                <Dag nodes={dagNodes} edges={dagEdges} direction="TB" />
+                <Dag nodes={dagNodes} edges={dagEdges} direction="LR" />
               </div>
             )}
           </div>

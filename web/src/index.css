@@ -703,8 +703,9 @@ body {
 }
 .rdag-svg { display: block; }
 
-.rdag-edge { stroke: var(--ink-quat); stroke-width: 1.5; }
+.rdag-edge { stroke: var(--ink-tertiary); stroke-width: 1.5; }
 .rdag-edge-block { stroke: var(--warn); stroke-dasharray: 4 3; }
+.rdag-arrow-head { fill: var(--ink-tertiary); }
 
 .rdag-node { cursor: pointer; }
 .rdag-node-rect {
@@ -720,10 +721,18 @@ body {
   font-size: 9px; fill: var(--ink-tertiary); font-family: var(--font-mono);
 }
 
-.rdag-status-done .rdag-node-rect { fill: var(--success-tint); }
-.rdag-status-running .rdag-node-rect { fill: var(--info-tint); }
+/* Progress-tracker semantics (tether#32): done fades to grey, the current
+   (running) step pops with an accent ring, pending is faintest (surface +
+   dashed outline, distinct from done's solid grey-brown fill), and failures
+   always stay red — never dimmed. */
+.rdag-status-done .rdag-node-rect { fill: var(--bg-tint); }
+.rdag-status-done .rdag-node-label { fill: var(--ink-tertiary); }
+/* Compound (0,3,0) so the current-step accent ring survives :hover, which is
+   also (0,3,0) and would otherwise recolor the ring grey on hover (review). */
+.rdag-node.rdag-status-running .rdag-node-rect { fill: var(--info-tint); stroke: var(--accent); stroke-width: 2; }
 .rdag-status-failed .rdag-node-rect { fill: var(--danger-tint); }
-.rdag-status-pending .rdag-node-rect { fill: var(--bg-tint); }
+.rdag-status-pending .rdag-node-rect { fill: var(--bg-surface); stroke-dasharray: 3 2; }
+.rdag-status-pending .rdag-node-label { fill: var(--ink-quat); }
 .rdag-status-default .rdag-node-rect { fill: var(--bg-surface); }
 
 /* ── Work relationship map (tether#23; cards + deterministic columns as

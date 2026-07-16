@@ -318,10 +318,16 @@ body {
   display: flex; align-items: center; gap: 6px;
   background: var(--bg-app); border: 1px solid var(--line-soft);
   border-radius: var(--r-2); font-size: 12px;
+  /* grid item: allow it to shrink to the (resized) column instead of being
+     pinned to the input's intrinsic min-width and overflowing (tether#33). */
+  min-width: 0;
 }
 .dt-search input {
   flex: 1; border: 0; background: transparent; outline: none;
   font-family: var(--font-mono); font-size: 12px; color: var(--ink-primary);
+  /* flex item: without this the input won't shrink below its default
+     intrinsic (~size=20) width, so a narrowed sidebar clipped it (tether#33). */
+  min-width: 0;
 }
 .dt-search input::placeholder { color: var(--ink-quat); }
 .dt-tree { padding: 2px 0 8px; overflow: auto; min-height: 0; }
@@ -615,12 +621,31 @@ body {
 .work-drawer-grip .icon-btn-sm { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); }
 .work-drawer-body { flex: 1; min-height: 0; overflow: auto; padding: 8px 12px; }
 
-/* Middle canvas empty state (tether#26): the Work map moved to the right tab. */
-.canvas-empty {
-  display: flex; align-items: center; justify-content: center;
+/* Middle canvas home (tether#33): designed empty state — brand + workspace
+   context + quick actions, replacing the lone faint hint (superseded the
+   tether#26 .canvas-empty one-liner). */
+.canvas-home {
   height: 100%; min-height: 160px; padding: 24px;
-  color: var(--ink-quat); font-size: 12.5px; text-align: center;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 18px; text-align: center;
 }
+.canvas-home-brand { display: flex; align-items: center; gap: 10px; color: var(--accent); }
+.canvas-home-word { font-size: 22px; font-weight: 600; letter-spacing: 0.01em; }
+.canvas-home-ws { font-size: 12.5px; color: var(--ink-secondary); max-width: 480px; }
+.canvas-home-ws-label { color: var(--ink-quat); }
+.canvas-home-path {
+  font-size: 11px; color: var(--ink-quat); margin-top: 3px;
+  max-width: 460px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.canvas-home-actions { display: flex; gap: 10px; margin-top: 4px; flex-wrap: wrap; justify-content: center; }
+.canvas-home-action {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 8px 14px; font-size: 12.5px; color: var(--ink-secondary);
+  background: var(--bg-surface); border: 1px solid var(--line); border-radius: var(--r-2);
+  cursor: pointer; transition: border-color .12s, color .12s;
+}
+.canvas-home-action:hover { border-color: var(--accent); color: var(--ink-primary); }
+.canvas-home-glyph { color: var(--ink-quat); font-size: 12px; }
 .work-foot {
   flex-shrink: 0; padding: 5px 12px;
   font-size: 10.5px; color: var(--ink-quat);

@@ -58,6 +58,13 @@ export default function WorkspacePane() {
     return () => window.removeEventListener('keydown', onKey)
   }, [])
 
+  // The middle-pane home's "打开文件" quick-action focuses the filter (tether#33).
+  useEffect(() => {
+    const onFocusFiles = () => filterRef.current?.focus()
+    window.addEventListener('tether:focus-files', onFocusFiles)
+    return () => window.removeEventListener('tether:focus-files', onFocusFiles)
+  }, [])
+
   const addWorkspace = async () => {
     const path = newPath.trim()
     if (!path) return

@@ -80,3 +80,18 @@ export function fetchFile(
     `/api/v1/workspaces/${encodeURIComponent(wsId)}/file?path=${encodeURIComponent(path)}`,
   )
 }
+
+/** A registered workspace (matches the daemon's GET /api/v1/workspaces shape,
+ *  mirrored from WorkspacePane's local type). */
+export interface Workspace {
+  id: string
+  name: string
+  path: string
+  addedAt?: string
+  activeSid?: string
+}
+
+/** All registered workspaces — used by the middle-pane home to show context. */
+export function fetchWorkspaces(): Promise<Workspace[]> {
+  return getJSON<Workspace[]>('/api/v1/workspaces')
+}

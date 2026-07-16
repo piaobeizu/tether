@@ -1,13 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import Canvas from './index'
 import { useStore } from '../../lib/store'
-import { fetchFile } from '../../lib/aihub'
+import { fetchFile, fetchWorkspaces } from '../../lib/aihub'
 
-// Mock the aihub client so FileMode/DetailMode never hit the network — only
-// fetchFile is exercised by these tests (file-mode markdown/code rendering +
-// header dedup + XSS). fetchItem/fetchSteps are mocked too since Canvas
-// imports them, but no test here selects a work item.
+// Mock the aihub client so FileMode/CanvasHome never hit the network — only
+// fetchFile + fetchWorkspaces are exercised by these tests. fetchItem/fetchSteps
+// are mocked too since Canvas imports them, but no test here selects a work item.
 vi.mock('../../lib/aihub', async () => {
   const actual = await vi.importActual<typeof import('../../lib/aihub')>('../../lib/aihub')
   return {
@@ -15,10 +14,12 @@ vi.mock('../../lib/aihub', async () => {
     fetchItem: vi.fn(),
     fetchSteps: vi.fn(),
     fetchFile: vi.fn(),
+    fetchWorkspaces: vi.fn(),
   }
 })
 
 const mockFetchFile = vi.mocked(fetchFile)
+const mockFetchWorkspaces = vi.mocked(fetchWorkspaces)
 
 // @testing-library/react's auto-cleanup relies on a global `afterEach`, which
 // isn't registered since vitest's `globals` option is off (matches Dag.test.tsx
@@ -136,13 +137,53 @@ describe('Canvas — markdown XSS safety (tether#21)', () => {
   })
 })
 
-describe('Canvas — empty state when nothing is selected (tether#26)', () => {
-  it('shows the empty-state hint (the Work map moved to the right tab)', () => {
-    // no file selected → the middle canvas is now just an empty-state hint; the
-    // wi-relationship map moved out of the middle into the right Work tab.
+describe('Canvas — home when nothing is selected (tether#33)', () => {
+  it('renders the branded home with quick actions (not a lone hint)', () => {
+    mockFetchWorkspaces.mockResolvedValue([])
+    render(<Canvas />)
+    expect(screen.getByText('tether')).toBeTruthy()
+    expect(screen.getByText('对话')).toBeTruthy()
+    expect(screen.getByText('选个 wi')).toBeTruthy()
+    expect(screen.getByText('打开文件')).toBeTruthy()
+  })
+
+  it('shows the primary workspace name + path (and count when multiple)', async () => {
+    mockFetchWorkspaces.mockResolvedValue([
+      { id: 'w1', name: 'tether', path: '/root/code/tether' },
+      { id: 'w2', name: 'aihub', path: '/root/code/aihub' },
+    ])
     const { container } = render(<Canvas />)
-    expect(container.querySelector('.canvas-empty')).toBeTruthy()
-    // the middle no longer mounts the Work map (nor its "select a project" hint)
-    expect(screen.queryByText('select a project')).toBeNull()
+    await screen.findByText('/root/code/tether')
+    const wsText = container.querySelector('.canvas-home-ws')?.textContent ?? ''
+    expect(wsText).toContain('workspace')
+    expect(wsText).toContain('tether')
+    expect(wsText).toContain('+1 more')
+  })
+
+  it('still renders home (brand + actions) when the workspace fetch fails, with no workspace line', async () => {
+    mockFetchWorkspaces.mockRejectedValue(new Error('boom'))
+    const { container } = render(<Canvas />)
+    expect(screen.getByText('tether')).toBeTruthy()
+    expect(screen.getByText('对话')).toBeTruthy()
+    // Flush microtasks + a macrotask so the rejected fetch fully settles; this
+    // would catch a regression where the .catch erroneously set workspace state.
+    await new Promise((r) => setTimeout(r, 0))
+    expect(container.querySelector('.canvas-home-ws')).toBeNull()
+  })
+
+  it('quick actions dispatch the expected window events', () => {
+    mockFetchWorkspaces.mockResolvedValue([])
+    const events: string[] = []
+    const onSelect = (e: Event) => events.push('select-tab:' + (e as CustomEvent).detail)
+    const onFocus = () => events.push('focus-files')
+    window.addEventListener('tether:select-tab', onSelect)
+    window.addEventListener('tether:focus-files', onFocus)
+    render(<Canvas />)
+    fireEvent.click(screen.getByText('对话'))
+    fireEvent.click(screen.getByText('选个 wi'))
+    fireEvent.click(screen.getByText('打开文件'))
+    window.removeEventListener('tether:select-tab', onSelect)
+    window.removeEventListener('tether:focus-files', onFocus)
+    expect(events).toEqual(['select-tab:chat', 'select-tab:work', 'focus-files'])
   })
 })

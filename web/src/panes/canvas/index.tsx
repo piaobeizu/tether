@@ -11,7 +11,8 @@
 // files keep the plain <pre> fallback.
 import { lazy, Suspense, useEffect, useState } from 'react'
 import { useStore } from '../../lib/store'
-import { AihubError, fetchFile } from '../../lib/aihub'
+import { AihubError, fetchFile, fetchWorkspaces, type Workspace } from '../../lib/aihub'
+import { Icon } from '../../lib/icons'
 
 const Markdown = lazy(() => import('./Markdown'))
 
@@ -29,9 +30,58 @@ export default function Canvas() {
   const selectedFile = useStore((s) => s.selectedFile)
 
   if (selectedFile) return <FileMode wsId={selectedFile.wsId} path={selectedFile.path} />
+  return <CanvasHome />
+}
+
+function selectTab(detail: 'chat' | 'work') {
+  window.dispatchEvent(new CustomEvent('tether:select-tab', { detail }))
+}
+
+// CanvasHome — the middle-pane empty state (tether#33). Replaces the old lone
+// faint hint with a centered, branded home: the tether mark, the current
+// workspace's name/path, and three quick-action entries. The Work relationship
+// map stays in the right tab (tether#26); this is a welcoming landing surface,
+// not a data dashboard.
+function CanvasHome() {
+  const [ws, setWs] = useState<Workspace[]>([])
+
+  useEffect(() => {
+    let alive = true
+    fetchWorkspaces()
+      .then((d) => { if (alive) setWs(d) })
+      .catch(() => { /* home still renders without the workspace line */ })
+    return () => { alive = false }
+  }, [])
+
+  const primary = ws[0]
+
   return (
-    <div className="canvas-empty">
-      从右侧 <b>Work</b> 点一个 wi 看详情，或从左侧选一个文件
+    <div className="canvas-home">
+      <div className="canvas-home-brand">
+        <Icon name="tether" size={30} />
+        <span className="canvas-home-word">tether</span>
+      </div>
+      {primary && (
+        <div className="canvas-home-ws">
+          <span className="canvas-home-ws-label">workspace</span> {primary.name}
+          {ws.length > 1 && ` · +${ws.length - 1} more`}
+          <div className="canvas-home-path mono">{primary.path}</div>
+        </div>
+      )}
+      <div className="canvas-home-actions">
+        <button className="canvas-home-action" onClick={() => selectTab('chat')}>
+          <span className="canvas-home-glyph">▶</span> 对话
+        </button>
+        <button className="canvas-home-action" onClick={() => selectTab('work')}>
+          <span className="canvas-home-glyph">◱</span> 选个 wi
+        </button>
+        <button
+          className="canvas-home-action"
+          onClick={() => window.dispatchEvent(new CustomEvent('tether:focus-files'))}
+        >
+          <span className="canvas-home-glyph mono">⌘P</span> 打开文件
+        </button>
+      </div>
     </div>
   )
 }

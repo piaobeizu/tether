@@ -445,7 +445,19 @@ body {
 }
 .msg-ai-name { font-size: 12px; font-weight: 600; }
 .msg-ai-time { font-family: var(--font-mono); font-size: 11px; color: var(--ink-tertiary); }
-.msg-ai-body { font-size: 13.5px; line-height: 1.55; color: var(--ink-primary); padding-left: 25px; white-space: pre-wrap; word-break: break-word; }
+.msg-ai-body { font-size: 13.5px; line-height: 1.55; color: var(--ink-primary); padding-left: 25px; word-break: break-word; }
+/* tether#35: answer body renders markdown via <Markdown> (.md-body). Keep the
+   answer's font size (md-body base is 13px); .md-body owns paragraph flow so the
+   old white-space:pre-wrap (which turned \n\n into oversized blank gaps) is gone. */
+.msg-ai-body .md-body { font-size: 13.5px; line-height: 1.55; }
+/* Streaming cursor: a blinking bar at the tail of the last rendered markdown block
+   (replaces the old inline .tether-cursor <span>, which a block-level tree drops to
+   its own line). :empty covers the pre-first-token window. */
+.msg-ai-body.streaming .md-body > :last-child::after,
+.msg-ai-body.streaming .md-body:empty::after {
+  content: '▋'; display: inline-block; margin-left: 2px;
+  color: var(--ink-tertiary); animation: tether-blink 1s step-start infinite;
+}
 
 /* ── Composer ───────────────────────────────────────────────── */
 .dt-composer {
@@ -517,13 +529,8 @@ body {
 .sb-cell .dot { background: var(--ink-quat); box-shadow: none; }
 .sb-cell .dot.live { background: var(--success); }
 
-/* ── Streaming cursor (inline, in accumulating message) ─────── */
+/* ── Streaming cursor keyframe (used by .msg-ai-body.streaming .md-body::after) ─── */
 @keyframes tether-blink { 0%,100% { opacity: 1 } 50% { opacity: 0 } }
-.tether-cursor {
-  display: inline-block; width: 2px; height: 1em;
-  background: currentColor; vertical-align: text-bottom; margin-left: 1px;
-  animation: tether-blink 1s step-start infinite;
-}
 
 /* ── Thinking dots (waiting for first token, NOT a cursor) ───── */
 @keyframes thinking-bounce {
@@ -549,8 +556,11 @@ body {
 .msg-thinking-live .msg-thinking-text { padding-left: 8px; }
 .msg-thinking-text {
   font-size: 12.5px; line-height: 1.5; color: var(--ink-tertiary);
-  font-style: italic; white-space: pre-wrap; word-break: break-word;
+  word-break: break-word;
 }
+/* tether#35: thinking text renders markdown too. Keep it dim; drop the forced
+   italic (markdown carries its own em/code) and inherit the smaller thinking size. */
+.msg-thinking-text .md-body { color: var(--ink-tertiary); font-style: normal; font-size: 12.5px; line-height: 1.5; }
 /* Collapsed phase: a one-line, clickable "思考 Xs" summary. */
 .msg-thinking-toggle {
   display: inline-flex; align-items: center; gap: 6px;

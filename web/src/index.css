@@ -538,6 +538,30 @@ body {
 .thinking-dots::before { content: '···'; }
 .thinking-dots::after { content: ''; animation: thinking-bounce 1.4s infinite; }
 
+/* ── Extended thinking (tether#34): live stream → collapsed summary ─── */
+.msg-thinking { padding-left: 25px; margin-bottom: 4px; }
+/* Live phase: dim italic streaming text, set off from the answer by a left rule. */
+.msg-thinking-live { border-left: 2px solid var(--line); }
+.msg-thinking-label {
+  font-size: 11px; color: var(--ink-quat); font-style: italic;
+  padding-left: 8px; margin-bottom: 2px;
+}
+.msg-thinking-live .msg-thinking-text { padding-left: 8px; }
+.msg-thinking-text {
+  font-size: 12.5px; line-height: 1.5; color: var(--ink-tertiary);
+  font-style: italic; white-space: pre-wrap; word-break: break-word;
+}
+/* Collapsed phase: a one-line, clickable "思考 Xs" summary. */
+.msg-thinking-toggle {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: none; border: none; padding: 2px 0; cursor: pointer;
+  color: var(--ink-tertiary); font-size: 12px;
+}
+.msg-thinking-toggle:hover { color: var(--ink-secondary); }
+.msg-thinking-chevron { font-size: 11px; width: 10px; text-align: center; color: var(--ink-quat); }
+.msg-thinking-summary { font-family: var(--font-mono); }
+.msg-thinking-done .msg-thinking-text { margin-top: 4px; }
+
 /* ── Mobile drawer ──────────────────────────────────────────── */
 .m-drawer-overlay {
   position: fixed; inset: 0; background: rgba(0,0,0,.35); z-index: 100;

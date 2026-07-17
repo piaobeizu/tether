@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import { useStore, historyEntryToMessage, type HistoryEntry } from '../src/lib/store'
 import type { Envelope } from '../src/lib/wire.gen'
 
-const reset = () => useStore.setState({ messages: [], sessionId: null, streaming: false, streamingMsgId: null, connected: false })
+const reset = () => useStore.setState({ messages: [], sessionId: null, streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, connected: false })
 
 describe('useStore.handleEnvelope', () => {
   beforeEach(reset)

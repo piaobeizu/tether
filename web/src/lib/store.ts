@@ -8,6 +8,13 @@ export interface Message {
   ts: number
   /** Optional D-19 fenced block rendered inline in this message bubble. */
   block?: FencedBlock
+  /** Accumulated extended-thinking text for this assistant turn (tether#34).
+   *  Ephemeral / live-only — the daemon never persists it to history, so it is
+   *  absent after a page reload (spec D3). */
+  thinking?: string
+  /** Wall-clock ms spent thinking before the answer began (tether#34); set when
+   *  the first answer delta arrives. Undefined while thinking is still live. */
+  thinkingMs?: number
 }
 
 /**
@@ -68,7 +75,12 @@ interface AppState {
   connected: boolean
   streaming: boolean
   connection: Connection
-  streamingMsgId: string | null   // id of the in-progress assistant bubble
+  streamingMsgId: string | null   // id of the bubble receiving ANSWER text (drives the cursor)
+  // tether#34 — ONE assistant bubble per turn: thinking + answer text accumulate
+  // into it, so a turn with interleaved thinking blocks (thinking→text→thinking→
+  // text) stays a single bubble instead of fragmenting. Both transient, never persisted.
+  curTurnId: string | null        // the current turn's assistant bubble (null between turns)
+  thinkingStartTs: number | null  // ts of the first thinking delta this turn
 
   // Selection (tether#28): the middle file view (selectedFile) and the right
   // Work wi drawer (selectedWiId) are INDEPENDENT and can be open at once.
@@ -100,6 +112,8 @@ export const useStore = create<AppState>((set) => ({
   connected: false,
   streaming: false,
   streamingMsgId: null,
+  curTurnId: null,
+  thinkingStartTs: null,
   connection: { state: 'connecting', latency: 0, attempt: 0 },
   selectedWiId: null,
   selectedFile: null,
@@ -129,13 +143,17 @@ export const useStore = create<AppState>((set) => ({
       }
       reduced.push(m)
     }
-    return { messages: reduced, streamingMsgId: null, streaming: false }
+    return { messages: reduced, streamingMsgId: null, streaming: false, curTurnId: null, thinkingStartTs: null }
   }),
-  addMessage: (msg) => set((s) => ({ messages: [...s.messages, msg] })),
+  addMessage: (msg) => set((s) => ({
+    messages: [...s.messages, msg],
+    // A new user turn ends the prior assistant turn's accumulation (tether#34).
+    ...(msg.role === 'user' ? { curTurnId: null, thinkingStartTs: null } : {}),
+  })),
   setPendingPermission: (req) => set({ pendingPermission: req }),
   setConnected: (v) => v
     ? set({ connected: true, connection: { state: 'live', latency: 0, attempt: 0 } })
-    : set({ connected: false, streaming: false, streamingMsgId: null, connection: { state: 'dropped', latency: 0, attempt: 0 } }),
+    : set({ connected: false, streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, connection: { state: 'dropped', latency: 0, attempt: 0 } }),
   setConnection: (patch) => set((s) => ({ connection: { ...s.connection, ...patch } })),
 
   handleEnvelope: (env) => {
@@ -152,25 +170,60 @@ export const useStore = create<AppState>((set) => ({
             set({ streaming: true })
             break
           }
+          if (pObj['type'] === 'thinking') {
+            // Extended-thinking delta (tether#34): accumulate into the CURRENT
+            // turn's bubble. If the turn already has a bubble (from earlier
+            // thinking OR answer text — a model may interleave a second thinking
+            // block mid-answer), append to it so the whole turn stays ONE bubble
+            // rather than fragmenting the answer. Only start a new bubble when the
+            // turn has none yet.
+            const delta = typeof pObj['text'] === 'string' ? (pObj['text'] as string) : ''
+            if (!delta) { set({ streaming: true }); break }
+            set((s) => {
+              if (s.curTurnId) {
+                const id = s.curTurnId
+                return {
+                  streaming: true,
+                  messages: s.messages.map(m =>
+                    m.id === id ? { ...m, thinking: (m.thinking ?? '') + delta } : m
+                  ),
+                }
+              }
+              const id = crypto.randomUUID()
+              return {
+                streaming: true,
+                curTurnId: id,
+                thinkingStartTs: Date.now(),
+                messages: [...s.messages, { id, role: 'assistant' as const, text: '', ts: Date.now(), thinking: delta }],
+              }
+            })
+            break
+          }
           break
         }
         if (typeof p !== 'string') break
         set((s) => {
-          if (s.streamingMsgId) {
-            // Append chunk to the current streaming bubble
+          if (s.curTurnId) {
+            // Append answer text to the current turn's bubble. On the FIRST answer
+            // delta after thinking, stamp the thinking duration so the live
+            // "思考中…" block collapses to "思考 Xs" in place (tether#34).
+            const id = s.curTurnId
+            const started = s.thinkingStartTs
             return {
               streaming: true,
-              messages: s.messages.map(m =>
-                m.id === s.streamingMsgId
-                  ? { ...m, text: m.text + p }
-                  : m
-              ),
+              streamingMsgId: id,
+              messages: s.messages.map(m => {
+                if (m.id !== id) return m
+                const firstAnswer = m.text === '' && m.thinking != null && m.thinkingMs == null && started != null
+                return { ...m, text: m.text + p, ...(firstAnswer ? { thinkingMs: Date.now() - started } : {}) }
+              }),
             }
           }
-          // First chunk — create new bubble
+          // First content of the turn is plain answer text (no thinking).
           const id = crypto.randomUUID()
           return {
             streaming: true,
+            curTurnId: id,
             streamingMsgId: id,
             messages: [...s.messages, {
               id,
@@ -183,12 +236,12 @@ export const useStore = create<AppState>((set) => ({
         break
       }
       case 'result':
-        set({ streaming: false, streamingMsgId: null })
+        set({ streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null })
         break
       case 'error':
         // Clear the thinking/streaming indicator on a daemon-surfaced error so
         // the UI doesn't get stuck showing "Claude is thinking…" forever.
-        set({ streaming: false, streamingMsgId: null })
+        set({ streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null })
         break
       case 'fenced': {
         // D-19 fenced block, live-replace-by-BlockID (tether#8 T8, contract §3):
@@ -217,6 +270,7 @@ export const useStore = create<AppState>((set) => ({
           }
           return {
             streamingMsgId: null,
+            curTurnId: null,
             messages: [...s.messages, {
               id: crypto.randomUUID(),
               role: 'assistant' as const,

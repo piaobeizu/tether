@@ -491,6 +491,15 @@ func (r *Registry) broadcast(e *Entry, env wire.Envelope) {
 // passthrough) and never reach here.
 func translateEvent(ev agent.Event) *wire.Envelope {
 	switch ev.Kind {
+	case agent.EventThinking:
+		// Extended-thinking delta (tether#34): a KindMessage with an object
+		// payload (same shape family as tool_use / session_ready) so it flows
+		// through here rather than fanOut's EventText fence-parser passthrough —
+		// thinking is never fence-parsed and never accumulated into history.
+		return &wire.Envelope{Kind: wire.KindMessage, Payload: map[string]any{
+			"type": "thinking",
+			"text": ev.Text,
+		}}
 	case agent.EventToolUse:
 		if ev.ToolUse != nil {
 			return &wire.Envelope{Kind: wire.KindMessage, Payload: map[string]any{

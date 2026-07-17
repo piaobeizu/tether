@@ -11,6 +11,7 @@ import { FormBlock } from '../../fenced-blocks/FormBlock'
 import { CandidatesBlock } from '../../fenced-blocks/CandidatesBlock'
 import { MediaBlock } from '../../fenced-blocks/MediaBlock'
 import { PermissionBlock } from '../../fenced-blocks/PermissionBlock'
+import Markdown from '../canvas/Markdown'
 
 type ConnState = 'connecting' | 'connected' | 'reconnecting' | 'failed'
 
@@ -468,12 +469,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
                 </div>
               )}
               {(m.text || (!m.block && streaming && m.id === streamingMsgId)) && (
-                <div className="msg-ai-body">
-                  {m.text}
-                  {streaming && m.id === streamingMsgId && (
-                    <span className="tether-cursor" aria-label="Claude is responding" />
-                  )}
-                </div>
+                <AnswerBody text={m.text} streaming={streaming && m.id === streamingMsgId} />
               )}
             </div>
           )
@@ -629,6 +625,19 @@ interface ThinkingBlockProps {
   onToggle: () => void
 }
 
+// AnswerBody — assistant answer text rendered as markdown (tether#35). Exported
+// as a pure, prop-controlled component so ChatPane.test.tsx tests it directly
+// without the WebTransport wiring. While streaming it gets a `.streaming` class;
+// index.css paints the blinking cursor via .md-body::after (a block-level markdown
+// tree can't host the old inline <span> cursor at the text tail).
+export function AnswerBody({ text, streaming }: { text: string; streaming: boolean }) {
+  return (
+    <div className={streaming ? 'msg-ai-body streaming' : 'msg-ai-body'} aria-busy={streaming}>
+      <Markdown text={text} />
+    </div>
+  )
+}
+
 // Extended-thinking display (tether#34). While thinking is live it renders
 // expanded ("思考中…"); once it stops being live (answer began, or turn ended)
 // it collapses to a one-line "思考 Xs" summary that clicking re-expands.
@@ -639,7 +648,7 @@ export function ThinkingBlock({ thinking, thinkingMs, live, expanded, onToggle }
     return (
       <div className="msg-thinking msg-thinking-live">
         <div className="msg-thinking-label">思考中…</div>
-        <div className="msg-thinking-text">{thinking}</div>
+        <div className="msg-thinking-text"><Markdown text={thinking} /></div>
       </div>
     )
   }
@@ -650,7 +659,7 @@ export function ThinkingBlock({ thinking, thinkingMs, live, expanded, onToggle }
         <span className="msg-thinking-chevron">{expanded ? '⌄' : '›'}</span>
         <span className="msg-thinking-summary">思考{dur ? ` ${dur}` : ''}</span>
       </button>
-      {expanded && <div className="msg-thinking-text">{thinking}</div>}
+      {expanded && <div className="msg-thinking-text"><Markdown text={thinking} /></div>}
     </div>
   )
 }

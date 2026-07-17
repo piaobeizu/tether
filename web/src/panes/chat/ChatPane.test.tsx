@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { ThinkingBlock, fmtThinkMs } from './index'
+import { AnswerBody, ThinkingBlock, fmtThinkMs } from './index'
 
 // tether#34 — ThinkingBlock is exported and prop-controlled so it tests directly,
 // without mounting ChatPane (which opens a WebTransport connection on mount).
@@ -55,5 +55,33 @@ describe('ThinkingBlock (tether#34)', () => {
     render(<ThinkingBlock thinking="x" thinkingMs={8000} live={false} expanded={false} onToggle={onToggle} />)
     fireEvent.click(screen.getByText('思考 8s'))
     expect(onToggle).toHaveBeenCalledTimes(1)
+  })
+
+  // tether#35 — thinking text renders as markdown in both live and expanded states.
+  it('renders thinking markdown while live', () => {
+    const { container } = render(<ThinkingBlock thinking={'weigh **A** vs B'} live expanded={false} onToggle={() => {}} />)
+    expect(container.querySelector('.msg-thinking-text strong')?.textContent).toBe('A')
+  })
+
+  it('renders thinking markdown when expanded', () => {
+    const { container } = render(<ThinkingBlock thinking={'- step one'} thinkingMs={8000} live={false} expanded onToggle={() => {}} />)
+    expect(container.querySelector('.msg-thinking-text li')?.textContent).toBe('step one')
+  })
+})
+
+describe('AnswerBody (tether#35)', () => {
+  it('renders markdown bold and lists instead of raw markers', () => {
+    const { container } = render(<AnswerBody text={'see **bold** and\n\n- one\n- two'} streaming={false} />)
+    expect(container.querySelector('strong')?.textContent).toBe('bold')
+    expect(container.querySelectorAll('li').length).toBe(2)
+    expect(screen.queryByText('**bold**')).toBeNull() // raw markers must not appear
+  })
+
+  it('adds the streaming class only while streaming (drives the CSS cursor)', () => {
+    const { container, rerender } = render(<AnswerBody text="hi" streaming />)
+    expect(container.querySelector('.msg-ai-body.streaming')).toBeTruthy()
+    rerender(<AnswerBody text="hi" streaming={false} />)
+    expect(container.querySelector('.msg-ai-body.streaming')).toBeNull()
+    expect(container.querySelector('.msg-ai-body')).toBeTruthy()
   })
 })

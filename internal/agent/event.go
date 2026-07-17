@@ -9,6 +9,7 @@ type EventKind string
 const (
 	EventInit       EventKind = "init"       // system/init — carries SessionID
 	EventText       EventKind = "text"       // assistant text chunk
+	EventThinking   EventKind = "thinking"   // extended-thinking delta (tether#34)
 	EventToolUse    EventKind = "tool_use"   // tool_use block extracted from assistant content
 	EventResult     EventKind = "result"     // turn result / stop reason
 	EventRateLimit  EventKind = "rate_limit" // rate_limit_event
@@ -30,9 +31,9 @@ type Event struct {
 // turn open forever: the frontend clears its "thinking…" indicator on both the
 // result and error envelopes (tether#14), and some opencode error paths return
 // before emitting any EventResult, so the error is the only turn-closer. All
-// other kinds (EventText token deltas, tool_use, init, rate_limit) stay
-// best-effort and may be dropped when the buffer is full — intentional
-// backpressure for high-frequency output.
+// other kinds (EventText / EventThinking token deltas, tool_use, init,
+// rate_limit) stay best-effort and may be dropped when the buffer is full —
+// intentional backpressure for high-frequency output.
 func isTerminal(k EventKind) bool {
 	return k == EventResult || k == EventError
 }

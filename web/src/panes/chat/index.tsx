@@ -41,7 +41,7 @@ interface Props {
 }
 
 export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
-  const { messages, sessionId, pendingPermission, streaming, streamingMsgId } = useStore()
+  const { messages, sessionId, pendingPermission, streaming, streamingMsgId, curTurnId } = useStore()
   const [input, setInput] = useState('')
   const [connState, setConnState] = useState<ConnState>('connecting')
   const [connError, setConnError] = useState<string | null>(null)
@@ -55,6 +55,15 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   // Which message ids have their fenced block expanded to the full variant.
   const [expandedBlocks, setExpandedBlocks] = useState<Set<string>>(() => new Set())
   const toggleBlock = (id: string) => setExpandedBlocks(prev => {
+    const next = new Set(prev)
+    if (next.has(id)) next.delete(id); else next.add(id)
+    return next
+  })
+  // Which message ids have their collapsed thinking block expanded (tether#34).
+  // Live thinking (before the answer) always renders expanded; once the answer
+  // starts it collapses to a one-line "思考 Xs" summary that this Set re-opens.
+  const [expandedThinking, setExpandedThinking] = useState<Set<string>>(() => new Set())
+  const toggleThinking = (id: string) => setExpandedThinking(prev => {
     const next = new Set(prev)
     if (next.has(id)) next.delete(id); else next.add(id)
     return next
@@ -438,6 +447,15 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
                 <span className="msg-ai-name">tether</span>
                 <span className="msg-ai-time">{fmtTime(m.ts)}</span>
               </div>
+              {m.thinking && (
+                <ThinkingBlock
+                  thinking={m.thinking}
+                  thinkingMs={m.thinkingMs}
+                  live={m.id === curTurnId && !m.text}
+                  expanded={expandedThinking.has(m.id)}
+                  onToggle={() => toggleThinking(m.id)}
+                />
+              )}
               {m.block && (
                 <div className="msg-ai-block">
                   <FencedBlockView
@@ -465,8 +483,10 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
           <div className="chat-empty mono">message tether to start a session</div>
         )}
 
-        {/* Thinking indicator: animated dots (not a cursor) while waiting for first token */}
-        {streaming && !streamingMsgId && (
+        {/* Thinking indicator: animated dots while waiting for the first token —
+            suppressed once the turn has a bubble (tether#34: thinking block or
+            answer text), since that is itself the "working" signal. */}
+        {streaming && !streamingMsgId && !curTurnId && (
           <div className="msg-ai">
             <div className="msg-ai-header">
               <span className="msg-ai-avatar">
@@ -576,6 +596,62 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
       </div>
 
     </>
+  )
+}
+
+// fmtThinkMs formats a thinking duration for the collapsed summary: whole
+// seconds as "8s", sub-10s with one decimal ("1.2s", "0.5s"), and >=1min as
+// "Xm Ys". Empty string for undefined/negative (no duration to show yet).
+export function fmtThinkMs(ms: number | undefined): string {
+  if (ms == null || ms < 0) return ''
+  if (ms < 60000) {
+    const s = ms / 1000
+    // >= ~10s (incl. 9.95–9.999 that would otherwise render "10.0s") and whole
+    // seconds show without a decimal; otherwise one decimal ("1.2s", "0.5s").
+    const str = s >= 9.95 || Number.isInteger(s) ? String(Math.round(s)) : s.toFixed(1)
+    return `${str}s`
+  }
+  // Round to whole seconds FIRST, then split — avoids "1m 60s" at the boundary.
+  const totalSec = Math.round(ms / 1000)
+  return `${Math.floor(totalSec / 60)}m ${totalSec % 60}s`
+}
+
+interface ThinkingBlockProps {
+  thinking: string
+  thinkingMs?: number
+  /** True while this message is still actively accumulating thinking deltas
+   *  (it is the store's thinkingBufId). Goes false the moment the answer starts
+   *  OR the turn ends (result/error) — either way the block collapses, so a
+   *  thinking-only turn (e.g. thinking → tool_use with no answer text) does not
+   *  get stuck showing "思考中…" forever. */
+  live: boolean
+  expanded: boolean
+  onToggle: () => void
+}
+
+// Extended-thinking display (tether#34). While thinking is live it renders
+// expanded ("思考中…"); once it stops being live (answer began, or turn ended)
+// it collapses to a one-line "思考 Xs" summary that clicking re-expands.
+// Exported and prop-controlled so it unit-tests directly, without the ChatPane
+// WebTransport wiring.
+export function ThinkingBlock({ thinking, thinkingMs, live, expanded, onToggle }: ThinkingBlockProps) {
+  if (live) {
+    return (
+      <div className="msg-thinking msg-thinking-live">
+        <div className="msg-thinking-label">思考中…</div>
+        <div className="msg-thinking-text">{thinking}</div>
+      </div>
+    )
+  }
+  const dur = fmtThinkMs(thinkingMs)
+  return (
+    <div className="msg-thinking msg-thinking-done">
+      <button type="button" className="msg-thinking-toggle" onClick={onToggle} aria-expanded={expanded}>
+        <span className="msg-thinking-chevron">{expanded ? '⌄' : '›'}</span>
+        <span className="msg-thinking-summary">思考{dur ? ` ${dur}` : ''}</span>
+      </button>
+      {expanded && <div className="msg-thinking-text">{thinking}</div>}
+    </div>
   )
 }
 

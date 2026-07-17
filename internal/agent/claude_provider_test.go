@@ -24,6 +24,34 @@ func TestParseLine_StreamEventTextDelta(t *testing.T) {
 	}
 }
 
+// TestParseLine_StreamEventThinkingDelta verifies that extended-thinking
+// deltas (delta.type=="thinking_delta", content in delta.thinking) surface as
+// EventThinking with the thinking text (tether#34) — they used to be dropped.
+func TestParseLine_StreamEventThinkingDelta(t *testing.T) {
+	s := &ccSession{sidReady: make(chan struct{})}
+	line := []byte(`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"The user wants"}}}`)
+	ev := s.parseLine(line)
+	if ev == nil {
+		t.Fatal("expected EventThinking, got nil")
+	}
+	if ev.Kind != EventThinking {
+		t.Errorf("Kind = %q, want %q", ev.Kind, EventThinking)
+	}
+	if ev.Text != "The user wants" {
+		t.Errorf("Text = %q, want %q", ev.Text, "The user wants")
+	}
+}
+
+// TestParseLine_StreamEventThinkingDeltaEmpty — an empty thinking delta (no
+// content) is dropped, mirroring the empty-text_delta guard.
+func TestParseLine_StreamEventThinkingDeltaEmpty(t *testing.T) {
+	s := &ccSession{sidReady: make(chan struct{})}
+	line := []byte(`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}}`)
+	if ev := s.parseLine(line); ev != nil {
+		t.Errorf("expected nil for empty thinking_delta, got %+v", ev)
+	}
+}
+
 // TestParseLine_StreamEventSignatureDelta confirms that thinking-block signature
 // deltas are silently dropped — they're not user-visible content.
 func TestParseLine_StreamEventSignatureDelta(t *testing.T) {

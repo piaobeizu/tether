@@ -411,6 +411,102 @@ collect:
 	}
 }
 
+// TestTranslateEvent_Thinking — (tether#34) EventThinking becomes a KindMessage
+// with an object payload {type:"thinking", text:...} (same shape family as
+// tool_use), so the frontend distinguishes it from plain assistant text.
+func TestTranslateEvent_Thinking(t *testing.T) {
+	env := translateEvent(agent.Event{Kind: agent.EventThinking, Text: "pondering"})
+	if env == nil {
+		t.Fatal("translateEvent(EventThinking) = nil, want a KindMessage envelope")
+	}
+	if env.Kind != wire.KindMessage {
+		t.Errorf("Kind = %q, want %q", env.Kind, wire.KindMessage)
+	}
+	payload, ok := env.Payload.(map[string]any)
+	if !ok {
+		t.Fatalf("Payload = %T, want map[string]any", env.Payload)
+	}
+	if payload["type"] != "thinking" {
+		t.Errorf(`payload["type"] = %v, want "thinking"`, payload["type"])
+	}
+	if payload["text"] != "pondering" {
+		t.Errorf(`payload["text"] = %v, want "pondering"`, payload["text"])
+	}
+}
+
+// TestRegistry_ThinkingBroadcastNotPersisted — (tether#34) an EventThinking
+// delta must be broadcast to subscribers as a KindMessage{type:"thinking"}
+// object payload, must NOT be fence-parsed, and must NOT be accumulated into
+// assistant history (thinking stays ephemeral / live-only, spec D3). The
+// following EventText is the real answer and IS persisted.
+func TestRegistry_ThinkingBroadcastNotPersisted(t *testing.T) {
+	fs := &fakeSession{sid: "sid-think", events: make(chan agent.Event, 8)}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+	reg.History = NewHistoryStore(t.TempDir())
+
+	entry, err := reg.GetOrSpawnEntry(context.Background(), "", "fake")
+	if err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	subCh := make(chan wire.Envelope, 16)
+	entry.Subscribe(subCh)
+
+	fs.events <- agent.Event{Kind: agent.EventInit, SessionID: "sid-think"}
+	fs.events <- agent.Event{Kind: agent.EventThinking, Text: "let me think "}
+	fs.events <- agent.Event{Kind: agent.EventThinking, Text: "about it"}
+	fs.events <- agent.Event{Kind: agent.EventText, Text: "the answer\n"}
+	fs.events <- agent.Event{Kind: agent.EventResult, Text: "stop"}
+	close(fs.events)
+
+	var thinking, answer []string
+	timeout := time.After(2 * time.Second)
+collect:
+	for {
+		select {
+		case env := <-subCh:
+			if env.Kind == wire.KindMessage {
+				switch p := env.Payload.(type) {
+				case map[string]any:
+					if p["type"] == "thinking" {
+						if s, ok := p["text"].(string); ok {
+							thinking = append(thinking, s)
+						}
+					}
+				case string:
+					answer = append(answer, p)
+				}
+			}
+			if env.Kind == wire.KindResult {
+				break collect
+			}
+		case <-timeout:
+			t.Fatal("timed out waiting for envelopes")
+		}
+	}
+
+	if got := strings.Join(thinking, ""); got != "let me think about it" {
+		t.Errorf("thinking = %q, want %q", got, "let me think about it")
+	}
+	if got := strings.Join(answer, ""); got != "the answer\n" {
+		t.Errorf("answer = %q, want %q", got, "the answer\n")
+	}
+
+	// History must contain ONLY the answer — thinking is never persisted (D3).
+	msgs := reg.History.LoadHistory("sid-think")
+	var assistantText string
+	for _, m := range msgs {
+		if m.Role == "assistant" {
+			assistantText += m.Text
+		}
+	}
+	if assistantText != "the answer\n" {
+		t.Errorf("history assistant text = %q, want %q (thinking must not persist)", assistantText, "the answer\n")
+	}
+	if strings.Contains(assistantText, "think") {
+		t.Errorf("thinking leaked into history: %q", assistantText)
+	}
+}
+
 // waitForRegistered polls until sid is registered in reg. GetOrSpawnEntry
 // registers a fresh session under a temp key and re-keys it to the real sid
 // on a separate goroutine once sess.SessionID() resolves (see its doc

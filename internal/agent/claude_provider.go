@@ -222,13 +222,15 @@ type rawContentBlock struct {
 }
 
 // rawPartialMessage is the Anthropic-native SSE event embedded in stream_event
-// lines when --include-partial-messages is on. We only care about the
-// content_block_delta variant with delta.type=="text_delta".
+// lines when --include-partial-messages is on. We care about the
+// content_block_delta variants with delta.type=="text_delta" (assistant text)
+// and "thinking_delta" (extended-thinking tokens, tether#34).
 type rawPartialMessage struct {
 	Type  string `json:"type"` // "content_block_delta", "message_start", etc.
 	Delta struct {
-		Type string `json:"type"` // "text_delta", "input_json_delta", "signature_delta"
-		Text string `json:"text"`
+		Type     string `json:"type"` // "text_delta", "thinking_delta", "input_json_delta", "signature_delta"
+		Text     string `json:"text"`
+		Thinking string `json:"thinking"` // populated when Type=="thinking_delta"
 	} `json:"delta"`
 }
 
@@ -249,14 +251,25 @@ func (s *ccSession) parseLine(line []byte) *Event {
 	}
 
 	// stream_event lines carry token-level deltas (--include-partial-messages).
-	// We forward text_delta as EventText and skip everything else (signature
-	// deltas for thinking blocks; partial JSON for tool_use args is handled
-	// via the final `assistant` event below, which carries the complete input).
+	// We forward text_delta as EventText and thinking_delta as EventThinking
+	// (tether#34). Everything else is skipped: signature deltas for thinking
+	// blocks carry no user-visible content; partial JSON for tool_use args is
+	// handled via the final `assistant` event below, which carries the
+	// complete input.
 	if raw.Type == "stream_event" && raw.Event != nil {
 		if raw.Event.Type == "content_block_delta" &&
 			raw.Event.Delta.Type == "text_delta" &&
 			raw.Event.Delta.Text != "" {
 			return &Event{Kind: EventText, Text: raw.Event.Delta.Text}
+		}
+		// Extended-thinking tokens (tether#34). Forwarded as EventThinking;
+		// registry.fanOut routes it through translateEvent (bypassing the
+		// fence parser), so it is broadcast to the browser but never
+		// accumulated into assistant history — thinking stays ephemeral.
+		if raw.Event.Type == "content_block_delta" &&
+			raw.Event.Delta.Type == "thinking_delta" &&
+			raw.Event.Delta.Thinking != "" {
+			return &Event{Kind: EventThinking, Text: raw.Event.Delta.Thinking}
 		}
 		return nil
 	}

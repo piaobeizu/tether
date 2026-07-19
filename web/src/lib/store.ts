@@ -15,6 +15,10 @@ export interface Message {
   /** Wall-clock ms spent thinking before the answer began (tether#34); set when
    *  the first answer delta arrives. Undefined while thinking is still live. */
   thinkingMs?: number
+  /** Wall-clock ms spent generating the answer (tether#36): first answer delta →
+   *  result. Stamped at result as the turn's "done" signal. Live-only (not
+   *  persisted), so absent after a page reload. */
+  answerMs?: number
 }
 
 /**
@@ -81,6 +85,7 @@ interface AppState {
   // text) stays a single bubble instead of fragmenting. Both transient, never persisted.
   curTurnId: string | null        // the current turn's assistant bubble (null between turns)
   thinkingStartTs: number | null  // ts of the first thinking delta this turn
+  answerStartTs: number | null    // ts of the first answer delta this turn (tether#36)
 
   // Selection (tether#28): the middle file view (selectedFile) and the right
   // Work wi drawer (selectedWiId) are INDEPENDENT and can be open at once.
@@ -114,6 +119,7 @@ export const useStore = create<AppState>((set) => ({
   streamingMsgId: null,
   curTurnId: null,
   thinkingStartTs: null,
+  answerStartTs: null,
   connection: { state: 'connecting', latency: 0, attempt: 0 },
   selectedWiId: null,
   selectedFile: null,
@@ -143,17 +149,17 @@ export const useStore = create<AppState>((set) => ({
       }
       reduced.push(m)
     }
-    return { messages: reduced, streamingMsgId: null, streaming: false, curTurnId: null, thinkingStartTs: null }
+    return { messages: reduced, streamingMsgId: null, streaming: false, curTurnId: null, thinkingStartTs: null, answerStartTs: null }
   }),
   addMessage: (msg) => set((s) => ({
     messages: [...s.messages, msg],
     // A new user turn ends the prior assistant turn's accumulation (tether#34).
-    ...(msg.role === 'user' ? { curTurnId: null, thinkingStartTs: null } : {}),
+    ...(msg.role === 'user' ? { curTurnId: null, thinkingStartTs: null, answerStartTs: null } : {}),
   })),
   setPendingPermission: (req) => set({ pendingPermission: req }),
   setConnected: (v) => v
     ? set({ connected: true, connection: { state: 'live', latency: 0, attempt: 0 } })
-    : set({ connected: false, streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, connection: { state: 'dropped', latency: 0, attempt: 0 } }),
+    : set({ connected: false, streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null, connection: { state: 'dropped', latency: 0, attempt: 0 } }),
   setConnection: (patch) => set((s) => ({ connection: { ...s.connection, ...patch } })),
 
   handleEnvelope: (env) => {
@@ -212,6 +218,8 @@ export const useStore = create<AppState>((set) => ({
             return {
               streaming: true,
               streamingMsgId: id,
+              // First answer delta of the turn starts the answer-duration clock (tether#36).
+              ...(s.answerStartTs == null ? { answerStartTs: Date.now() } : {}),
               messages: s.messages.map(m => {
                 if (m.id !== id) return m
                 const firstAnswer = m.text === '' && m.thinking != null && m.thinkingMs == null && started != null
@@ -225,6 +233,7 @@ export const useStore = create<AppState>((set) => ({
             streaming: true,
             curTurnId: id,
             streamingMsgId: id,
+            answerStartTs: Date.now(), // no-thinking turn: answer starts now (tether#36)
             messages: [...s.messages, {
               id,
               role: 'assistant',
@@ -236,12 +245,21 @@ export const useStore = create<AppState>((set) => ({
         break
       }
       case 'result':
-        set({ streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null })
+        // Stamp the answer-generation duration on the turn's bubble as the
+        // "done" signal (tether#36), then close the turn.
+        set((s) => {
+          const id = s.curTurnId
+          const started = s.answerStartTs
+          const messages = (id && started != null)
+            ? s.messages.map(m => (m.id === id ? { ...m, answerMs: Date.now() - started } : m))
+            : s.messages
+          return { messages, streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null }
+        })
         break
       case 'error':
         // Clear the thinking/streaming indicator on a daemon-surfaced error so
         // the UI doesn't get stuck showing "Claude is thinking…" forever.
-        set({ streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null })
+        set({ streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null })
         break
       case 'fenced': {
         // D-19 fenced block, live-replace-by-BlockID (tether#8 T8, contract §3):
@@ -271,6 +289,13 @@ export const useStore = create<AppState>((set) => ({
           return {
             streamingMsgId: null,
             curTurnId: null,
+            // A fenced block ends the current text/thinking segment: reset both
+            // clocks so the NEXT answer segment times only itself (tether#36 —
+            // otherwise answerStartTs leaks across the card and inflates the badge
+            // or stamps it onto a no-answer bubble). thinkingStartTs self-heals via
+            // the thinking new-bubble path, reset here for a clean boundary.
+            thinkingStartTs: null,
+            answerStartTs: null,
             messages: [...s.messages, {
               id: crypto.randomUUID(),
               role: 'assistant' as const,

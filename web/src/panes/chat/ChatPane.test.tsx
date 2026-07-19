@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { AnswerBody, ThinkingBlock, fmtThinkMs } from './index'
+import { AnswerBody, AnswerMeta, ThinkingBlock, fmtThinkMs } from './index'
 
 // tether#34 — ThinkingBlock is exported and prop-controlled so it tests directly,
 // without mounting ChatPane (which opens a WebTransport connection on mount).
@@ -83,5 +83,24 @@ describe('AnswerBody (tether#35)', () => {
     rerender(<AnswerBody text="hi" streaming={false} />)
     expect(container.querySelector('.msg-ai-body.streaming')).toBeNull()
     expect(container.querySelector('.msg-ai-body')).toBeTruthy()
+  })
+})
+
+describe('AnswerMeta (tether#36)', () => {
+  const ts = 1784290000000
+
+  it('shows the answer-duration badge when answerMs is set', () => {
+    const { container } = render(<AnswerMeta ts={ts} answerMs={2100} />)
+    const dur = container.querySelector('.msg-ai-dur')
+    expect(dur).toBeTruthy()
+    expect(dur?.textContent).toContain('2.1s')
+    expect(container.querySelector('.msg-ai-name')?.textContent).toBe('tether')
+  })
+
+  it('omits the badge when answerMs is undefined (streaming / no answer)', () => {
+    const { container } = render(<AnswerMeta ts={ts} answerMs={undefined} />)
+    expect(container.querySelector('.msg-ai-dur')).toBeNull()
+    expect(container.querySelector('.msg-ai-name')).toBeTruthy()
+    expect(container.querySelector('.msg-ai-time')).toBeTruthy()
   })
 })

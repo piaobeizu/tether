@@ -1,6 +1,15 @@
 import { create } from 'zustand'
 import type { Envelope, FencedBlock } from './wire.gen'
 
+/** A single tool_use content block the daemon already extracts and puts on the
+ *  wire ({name,input}); tether#37 is where the frontend finally KEEPS it instead
+ *  of discarding it (the old tool_use branch only set the streaming flag). */
+export interface ToolCall {
+  id: string
+  name: string
+  input: unknown
+}
+
 export interface Message {
   id: string
   role: 'user' | 'assistant' | 'system'
@@ -19,6 +28,10 @@ export interface Message {
    *  result. Stamped at result as the turn's "done" signal. Live-only (not
    *  persisted), so absent after a page reload. */
   answerMs?: number
+  /** Tool calls (Read/Bash/Edit/…) the agent made during this turn (tether#37),
+   *  in arrival order. Live-only — the daemon never persists tool_use to history,
+   *  so absent after a page reload (same as thinking/answerMs). */
+  tools?: ToolCall[]
 }
 
 /**
@@ -173,7 +186,39 @@ export const useStore = create<AppState>((set) => ({
             break
           }
           if (pObj['type'] === 'tool_use') {
-            set({ streaming: true })
+            // Surface the tool call in the current turn's bubble (tether#37).
+            // The daemon already sent {name,input} (registry.go translateEvent);
+            // earlier this branch threw it away and only kept the streaming flag.
+            // Mirror the thinking-branch accumulation, but do NOT touch
+            // answerStartTs/thinkingStartTs/streamingMsgId — a tool call is
+            // neither the answer nor thinking, so it must not start the answer
+            // clock (tether#36) or claim the streaming cursor.
+            const name = typeof pObj['name'] === 'string' ? (pObj['name'] as string) : ''
+            if (!name) { set({ streaming: true }); break }
+            const tc: ToolCall = {
+              id: typeof pObj['id'] === 'string' ? (pObj['id'] as string) : '',
+              name,
+              input: pObj['input'],
+            }
+            set((s) => {
+              if (s.curTurnId) {
+                const id = s.curTurnId
+                return {
+                  streaming: true,
+                  messages: s.messages.map(m =>
+                    m.id === id ? { ...m, tools: [...(m.tools ?? []), tc] } : m
+                  ),
+                }
+              }
+              // Tool call arrived before any thinking/answer — open the turn's
+              // bubble now (no timing stamps: not thinking, not answer).
+              const id = crypto.randomUUID()
+              return {
+                streaming: true,
+                curTurnId: id,
+                messages: [...s.messages, { id, role: 'assistant' as const, text: '', ts: Date.now(), tools: [tc] }],
+              }
+            })
             break
           }
           if (pObj['type'] === 'thinking') {
@@ -190,6 +235,12 @@ export const useStore = create<AppState>((set) => ({
                 const id = s.curTurnId
                 return {
                   streaming: true,
+                  // If a tool_use opened this bubble before any thinking (tether#37),
+                  // thinkingStartTs is still null — stamp it at the first thinking
+                  // delta so the collapsed "思考 Xs" badge still measures (tether#34
+                  // regression fix). No-op in the common thinking-first path where the
+                  // new-bubble branch below already set it.
+                  ...(s.thinkingStartTs == null ? { thinkingStartTs: Date.now() } : {}),
                   messages: s.messages.map(m =>
                     m.id === id ? { ...m, thinking: (m.thinking ?? '') + delta } : m
                   ),

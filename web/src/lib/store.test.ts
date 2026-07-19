@@ -164,3 +164,86 @@ describe('store answer duration (tether#36)', () => {
     expect(last.answerMs).toBeUndefined()
   })
 })
+
+// tether#37 — tool-call visibility: the daemon already puts {name,input} on the
+// wire (registry.go translateEvent); the store now KEEPS them on the turn's
+// bubble instead of discarding them. These assert accumulation AND that a tool
+// call never pollutes the answer/thinking clocks (would break the #36 badge).
+const toolEnv = (name: string, input?: unknown, id = ''): Envelope =>
+  ({ kind: 'message', payload: { type: 'tool_use', id, name, input } } as unknown as Envelope)
+
+describe('store tool-call visibility (tether#37)', () => {
+  afterEach(reset)
+
+  it('appends tool calls to the current turn bubble after thinking', () => {
+    const h = useStore.getState().handleEnvelope
+    h(thinkingEnv('reading files'))
+    h(toolEnv('Read', { file_path: 'a.ts' }, 't1'))
+    h(toolEnv('Bash', { command: 'go test' }, 't2'))
+    const s = useStore.getState()
+    expect(s.messages).toHaveLength(1)
+    expect(s.messages[0].tools).toHaveLength(2)
+    expect(s.messages[0].tools![0]).toMatchObject({ name: 'Read', id: 't1' })
+    expect(s.messages[0].tools![1].name).toBe('Bash')
+    expect(s.streaming).toBe(true)
+  })
+
+  it('a tool call arriving first opens the bubble WITHOUT starting the answer/thinking clocks', () => {
+    const h = useStore.getState().handleEnvelope
+    h(toolEnv('Read', { file_path: 'a.ts' }))
+    const s = useStore.getState()
+    expect(s.messages).toHaveLength(1)
+    expect(s.messages[0].tools).toHaveLength(1)
+    expect(s.messages[0].text).toBe('')
+    expect(s.curTurnId).toBe(s.messages[0].id)
+    expect(s.answerStartTs).toBeNull()   // tool != answer
+    expect(s.thinkingStartTs).toBeNull() // tool != thinking
+    expect(s.streamingMsgId).toBeNull()  // cursor only follows answer text
+  })
+
+  it('a tools-only turn (tool then result, no answer text) gets NO answer badge', () => {
+    const h = useStore.getState().handleEnvelope
+    h(toolEnv('Read', { file_path: 'a.ts' }))
+    h(resultEnv())
+    const s = useStore.getState()
+    expect(s.messages).toHaveLength(1)
+    expect(s.messages[0].tools).toHaveLength(1)
+    expect(s.messages[0].answerMs).toBeUndefined()
+  })
+
+  it('tool call then answer text: same bubble keeps tools AND gets an answer badge', () => {
+    const h = useStore.getState().handleEnvelope
+    h(toolEnv('Read', { file_path: 'a.ts' }))
+    h(textEnv('done reading'))
+    h(resultEnv())
+    const s = useStore.getState()
+    expect(s.messages).toHaveLength(1)
+    expect(s.messages[0].tools).toHaveLength(1)
+    expect(s.messages[0].text).toBe('done reading')
+    expect(typeof s.messages[0].answerMs).toBe('number')
+  })
+
+  it('a tool_use with no name marks streaming but creates no bubble', () => {
+    const h = useStore.getState().handleEnvelope
+    h(toolEnv(''))
+    const s = useStore.getState()
+    expect(s.messages).toHaveLength(0)
+    expect(s.streaming).toBe(true)
+    expect(s.curTurnId).toBeNull()
+  })
+
+  it('a tool call BEFORE thinking still stamps thinkingMs (review MINOR: #34 badge regression)', () => {
+    // tool_use opens the bubble first, so thinking takes the append path — which
+    // must still start the thinking clock, else the "思考 Xs" badge never measures.
+    const h = useStore.getState().handleEnvelope
+    h(toolEnv('Read', { file_path: 'a.ts' }))
+    h(thinkingEnv('now pondering'))
+    h(textEnv('answer'))
+    const s = useStore.getState()
+    expect(s.messages).toHaveLength(1)
+    expect(s.messages[0].tools).toHaveLength(1)
+    expect(s.messages[0].thinking).toBe('now pondering')
+    expect(typeof s.messages[0].thinkingMs).toBe('number')
+    expect(s.messages[0].thinkingMs).toBeGreaterThanOrEqual(0)
+  })
+})

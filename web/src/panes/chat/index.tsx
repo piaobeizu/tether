@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { TetherWT } from '../../lib/wt'
 import { ControlClient } from '../../lib/control'
-import { useStore, historyEntryToMessage, type HistoryEntry } from '../../lib/store'
+import { useStore, historyEntryToMessage, type HistoryEntry, type ToolCall } from '../../lib/store'
 import { Icon } from '../../lib/icons'
 import type { FencedBlock, ProviderListResponse } from '../../lib/wire.gen'
 import { ClientFrameAction } from '../../lib/wire.gen'
@@ -456,6 +456,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
                   onToggle={() => toggleThinking(m.id)}
                 />
               )}
+              {m.tools && m.tools.length > 0 && <ToolCallList tools={m.tools} />}
               {m.block && (
                 <div className="msg-ai-block">
                   <FencedBlockView
@@ -647,6 +648,80 @@ export function AnswerBody({ text, streaming }: { text: string; streaming: boole
   return (
     <div className={streaming ? 'msg-ai-body streaming' : 'msg-ai-body'} aria-busy={streaming}>
       <Markdown text={text} />
+    </div>
+  )
+}
+
+// tether#37 — tool-call visibility. The daemon already forwards each tool_use as
+// {name,input} (registry.go translateEvent); the store keeps them on the turn's
+// bubble; this renders them as a compact activity log above the answer — one
+// line per call: icon + name + a best-effort one-line arg summary. A turn can
+// fire 10+ tools, so beyond TOOL_FOLD_THRESHOLD they collapse behind a
+// "用了 N 个工具" toggle. No tool result (that needs daemon tool_result parsing —
+// a later slice).
+const TOOL_FOLD_THRESHOLD = 5
+
+// The input field worth showing per known tool; unknown tools show name only.
+const TOOL_ARG_FIELD: Record<string, string> = {
+  Read: 'file_path', Write: 'file_path', Edit: 'file_path', NotebookEdit: 'notebook_path',
+  Bash: 'command', Grep: 'pattern', Glob: 'pattern', Task: 'description',
+  WebFetch: 'url', WebSearch: 'query',
+}
+
+const TOOL_ICON: Record<string, string> = {
+  Read: '📖', Write: '📝', Edit: '✏️', NotebookEdit: '✏️', Bash: '⚡',
+  Grep: '🔍', Glob: '🔍', Task: '🧩', WebFetch: '🌐', WebSearch: '🌐',
+}
+
+// summarizeToolInput derives the one-line arg summary from a tool_use input
+// object. Best-effort + defensive: unknown tools, non-object input, or a missing/
+// non-string field all yield '' (the row then shows the tool name alone).
+// Exported so ChatPane.test.tsx covers it without rendering.
+export function summarizeToolInput(name: string, input: unknown): string {
+  if (!input || typeof input !== 'object') return ''
+  const field = TOOL_ARG_FIELD[name]
+  if (!field) return ''
+  const val = (input as Record<string, unknown>)[field]
+  if (typeof val !== 'string') return ''
+  const s = val.trim().replace(/\s+/g, ' ')
+  return s.length > 60 ? s.slice(0, 60) + '…' : s
+}
+
+// ToolCallList — the per-turn tool activity log. Exported + prop-controlled so
+// ChatPane.test.tsx renders it directly (no WebTransport). Fold state is local
+// (like ThinkingBlock's expand), not in the store.
+export function ToolCallList({ tools }: { tools: ToolCall[] }) {
+  const [open, setOpen] = useState(false)
+  if (tools.length === 0) return null
+  const foldable = tools.length > TOOL_FOLD_THRESHOLD
+  if (foldable && !open) {
+    return (
+      <div className="msg-tools">
+        <button type="button" className="msg-tool-fold" onClick={() => setOpen(true)} aria-expanded={false}>
+          <span className="msg-thinking-chevron">›</span>
+          <span>用了 {tools.length} 个工具</span>
+        </button>
+      </div>
+    )
+  }
+  return (
+    <div className="msg-tools">
+      {foldable && (
+        <button type="button" className="msg-tool-fold" onClick={() => setOpen(false)} aria-expanded={true}>
+          <span className="msg-thinking-chevron">⌄</span>
+          <span>{tools.length} 个工具</span>
+        </button>
+      )}
+      {tools.map((t, i) => {
+        const arg = summarizeToolInput(t.name, t.input)
+        return (
+          <div key={t.id || i} className="msg-tool-row">
+            <span className="msg-tool-icon">{TOOL_ICON[t.name] ?? '🔧'}</span>
+            <span className="msg-tool-name">{t.name}</span>
+            {arg && <span className="msg-tool-arg">{arg}</span>}
+          </div>
+        )
+      })}
     </div>
   )
 }

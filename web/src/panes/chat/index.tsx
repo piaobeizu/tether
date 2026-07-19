@@ -445,8 +445,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
                 <span className="msg-ai-avatar">
                   <Icon name="tether" size={10} style={{ color: 'white' }} />
                 </span>
-                <span className="msg-ai-name">tether</span>
-                <span className="msg-ai-time">{fmtTime(m.ts)}</span>
+                <AnswerMeta ts={m.ts} answerMs={m.answerMs} />
               </div>
               {m.thinking && (
                 <ThinkingBlock
@@ -623,6 +622,20 @@ interface ThinkingBlockProps {
   live: boolean
   expanded: boolean
   onToggle: () => void
+}
+
+// AnswerMeta — assistant bubble header meta (tether#36): name + time, plus an
+// answer-duration badge once the turn completes (answerMs is stamped at result).
+// Exported as a pure component so ChatPane.test.tsx tests the badge directly
+// without mounting ChatPane (WebTransport).
+export function AnswerMeta({ ts, answerMs }: { ts: number; answerMs?: number }) {
+  return (
+    <>
+      <span className="msg-ai-name">tether</span>
+      <span className="msg-ai-time">{fmtTime(ts)}</span>
+      {answerMs != null && <span className="msg-ai-dur">· {fmtThinkMs(answerMs)}</span>}
+    </>
+  )
 }
 
 // AnswerBody — assistant answer text rendered as markdown (tether#35). Exported

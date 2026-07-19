@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { useStore } from './store'
 import type { Envelope } from './wire.gen'
 
@@ -9,9 +9,10 @@ import type { Envelope } from './wire.gen'
 const thinkingEnv = (text: string): Envelope => ({ kind: 'message', payload: { type: 'thinking', text } })
 const textEnv = (text: string): Envelope => ({ kind: 'message', payload: text })
 const resultEnv = (): Envelope => ({ kind: 'result', payload: 'stop' })
+const fencedEnv = (blkKind: string): Envelope => ({ kind: 'fenced', payload: { kind: blkKind } } as unknown as Envelope)
 
 function reset() {
-  useStore.setState({ messages: [], streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null })
+  useStore.setState({ messages: [], streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null })
 }
 
 describe('store thinking accumulation (tether#34)', () => {
@@ -94,5 +95,72 @@ describe('store thinking accumulation (tether#34)', () => {
     expect(s.messages).toHaveLength(0)
     expect(s.streaming).toBe(true)
     expect(s.curTurnId).toBeNull()
+  })
+})
+
+// tether#36 — answer duration badge: answerMs = first answer delta -> result,
+// stamped on the turn's bubble at result (mirrors thinkingMs). Frontend-timed.
+describe('store answer duration (tether#36)', () => {
+  afterEach(reset)
+
+  it('stamps answerMs on the bubble at result (thinking then answer)', () => {
+    const h = useStore.getState().handleEnvelope
+    h(thinkingEnv('ponder'))
+    h(textEnv('the answer'))
+    expect(useStore.getState().messages[0].answerMs).toBeUndefined() // not until result
+    h(resultEnv())
+    const s = useStore.getState()
+    expect(s.messages).toHaveLength(1)
+    expect(typeof s.messages[0].answerMs).toBe('number')
+    expect(s.messages[0].answerMs).toBeGreaterThanOrEqual(0)
+    expect(s.answerStartTs).toBeNull()
+  })
+
+  it('stamps answerMs for a no-thinking answer too', () => {
+    const h = useStore.getState().handleEnvelope
+    h(textEnv('hi'))
+    h(resultEnv())
+    expect(typeof useStore.getState().messages[0].answerMs).toBe('number')
+  })
+
+  it('does NOT stamp answerMs for a thinking-only turn (no answer text)', () => {
+    const h = useStore.getState().handleEnvelope
+    h(thinkingEnv('just thinking'))
+    h(resultEnv())
+    const s = useStore.getState()
+    expect(s.messages).toHaveLength(1)
+    expect(s.messages[0].answerMs).toBeUndefined()
+  })
+
+  it('measures only the final answer segment across an intra-turn fenced block (MAJOR leak regression)', () => {
+    vi.useFakeTimers()
+    try {
+      const h = useStore.getState().handleEnvelope
+      h(textEnv('plan'))            // answer starts (answerStartTs = T0)
+      vi.advanceTimersByTime(5000)  // 5s on card + thinking
+      h(fencedEnv('dag'))           // fenced block resets curTurnId AND answerStartTs
+      h(thinkingEnv('hmm'))         // new thinking bubble (does not set answerStartTs)
+      vi.advanceTimersByTime(1000)
+      h(textEnv('done'))            // final answer segment starts here (answerStartTs = now)
+      vi.advanceTimersByTime(2000)  // 2s answer
+      h(resultEnv())
+      const last = useStore.getState().messages.at(-1)!
+      expect(last.text).toBe('done')
+      expect(last.answerMs).toBe(2000) // only the final segment, NOT 8000 (leaked total)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does NOT stamp answerMs on a thinking-only bubble that follows a fenced block', () => {
+    const h = useStore.getState().handleEnvelope
+    h(textEnv('a'))
+    h(fencedEnv('dag'))
+    h(thinkingEnv('hmm'))  // last bubble has thinking but no answer text
+    h(resultEnv())
+    const last = useStore.getState().messages.at(-1)!
+    expect(last.thinking).toBe('hmm')
+    expect(last.text).toBe('')
+    expect(last.answerMs).toBeUndefined()
   })
 })

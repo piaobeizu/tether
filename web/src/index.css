@@ -445,6 +445,8 @@ body {
 }
 .msg-ai-name { font-size: 12px; font-weight: 600; }
 .msg-ai-time { font-family: var(--font-mono); font-size: 11px; color: var(--ink-tertiary); }
+/* Answer-duration badge (tether#36): shown in the header once the turn completes. */
+.msg-ai-dur { font-family: var(--font-mono); font-size: 11px; color: var(--ink-tertiary); margin-left: 4px; }
 .msg-ai-body { font-size: 13.5px; line-height: 1.55; color: var(--ink-primary); padding-left: 25px; word-break: break-word; }
 /* tether#35: answer body renders markdown via <Markdown> (.md-body). Keep the
    answer's font size (md-body base is 13px); .md-body owns paragraph flow so the

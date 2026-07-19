@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { AnswerBody, AnswerMeta, ThinkingBlock, fmtThinkMs } from './index'
+import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, summarizeToolInput } from './index'
+import type { ToolCall } from '../../lib/store'
 
 // tether#34 — ThinkingBlock is exported and prop-controlled so it tests directly,
 // without mounting ChatPane (which opens a WebTransport connection on mount).
@@ -102,5 +103,66 @@ describe('AnswerMeta (tether#36)', () => {
     expect(container.querySelector('.msg-ai-dur')).toBeNull()
     expect(container.querySelector('.msg-ai-name')).toBeTruthy()
     expect(container.querySelector('.msg-ai-time')).toBeTruthy()
+  })
+})
+
+// tether#37 — tool-call visibility. summarizeToolInput + ToolCallList are exported
+// pure functions/components so they test without mounting ChatPane (WebTransport).
+describe('summarizeToolInput (tether#37)', () => {
+  it('extracts the salient arg per known tool', () => {
+    expect(summarizeToolInput('Read', { file_path: 'a/b.ts' })).toBe('a/b.ts')
+    expect(summarizeToolInput('Bash', { command: 'go test ./...' })).toBe('go test ./...')
+    expect(summarizeToolInput('Grep', { pattern: 'TODO' })).toBe('TODO')
+    expect(summarizeToolInput('Edit', { file_path: 'x.go', old_string: '...' })).toBe('x.go')
+  })
+  it('returns empty for unknown tools, non-object input, or a missing/non-string field', () => {
+    expect(summarizeToolInput('MysteryTool', { file_path: 'a.ts' })).toBe('')
+    expect(summarizeToolInput('Read', null)).toBe('')
+    expect(summarizeToolInput('Read', 'not-an-object')).toBe('')
+    expect(summarizeToolInput('Read', {})).toBe('')
+    expect(summarizeToolInput('Bash', { command: 123 })).toBe('')
+  })
+  it('collapses whitespace and truncates long values to 60 chars + …', () => {
+    const out = summarizeToolInput('Bash', { command: 'x'.repeat(80) })
+    expect(out.endsWith('…')).toBe(true)
+    expect(out.length).toBe(61) // 60 chars + the ellipsis
+    expect(summarizeToolInput('Bash', { command: 'a   b\n c' })).toBe('a b c')
+  })
+})
+
+describe('ToolCallList (tether#37)', () => {
+  const mk = (n: number): ToolCall[] =>
+    Array.from({ length: n }, (_, i) => ({ id: `t${i}`, name: 'Read', input: { file_path: `f${i}.ts` } }))
+
+  it('renders one row per tool with name + arg summary when few (<= threshold)', () => {
+    const { container } = render(<ToolCallList tools={[
+      { id: 't1', name: 'Read', input: { file_path: 'main.go' } },
+      { id: 't2', name: 'Bash', input: { command: 'go build' } },
+    ]} />)
+    expect(container.querySelectorAll('.msg-tool-row').length).toBe(2)
+    expect(screen.getByText('Read')).toBeTruthy()
+    expect(screen.getByText('main.go')).toBeTruthy()
+    expect(screen.getByText('go build')).toBeTruthy()
+    expect(container.querySelector('.msg-tool-fold')).toBeNull() // no fold below threshold
+  })
+
+  it('renders nothing for an empty tool list', () => {
+    const { container } = render(<ToolCallList tools={[]} />)
+    expect(container.querySelector('.msg-tools')).toBeNull()
+  })
+
+  it('folds beyond the threshold into a "用了 N 个工具" summary, hiding rows until expanded', () => {
+    const { container } = render(<ToolCallList tools={mk(8)} />)
+    expect(container.querySelectorAll('.msg-tool-row').length).toBe(0) // collapsed by default
+    const fold = container.querySelector('.msg-tool-fold')!
+    expect(fold.textContent).toContain('用了 8 个工具')
+    fireEvent.click(fold)
+    expect(container.querySelectorAll('.msg-tool-row').length).toBe(8) // expanded
+  })
+
+  it('shows the tool name for an unknown tool (default icon, no arg)', () => {
+    const { container } = render(<ToolCallList tools={[{ id: 'x', name: 'MysteryTool', input: {} }]} />)
+    expect(screen.getByText('MysteryTool')).toBeTruthy()
+    expect(container.querySelector('.msg-tool-arg')).toBeNull()
   })
 })

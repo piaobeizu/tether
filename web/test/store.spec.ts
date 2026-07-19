@@ -41,15 +41,21 @@ describe('useStore.handleEnvelope', () => {
     expect(useStore.getState().messages).toHaveLength(0)
   })
 
-  it('tool_use object payload sets streaming=true but adds no chat message', () => {
+  it('tool_use object payload opens an assistant bubble carrying the tool call (tether#37)', () => {
     const env: Envelope = {
       kind: 'message',
       payload: { type: 'tool_use', id: 'toolu_01abc', name: 'Read', input: { file_path: '/tmp/x' } },
     }
     useStore.getState().handleEnvelope(env)
-    expect(useStore.getState().messages).toHaveLength(0)
+    const { messages, streaming } = useStore.getState()
+    // tether#37: the tool call is now KEPT on the turn's bubble (previously this
+    // branch discarded name/input and added no message — the visibility gap).
+    expect(messages).toHaveLength(1)
+    expect(messages[0]?.role).toBe('assistant')
+    expect(messages[0]?.tools).toHaveLength(1)
+    expect(messages[0]?.tools?.[0]).toMatchObject({ name: 'Read', id: 'toolu_01abc' })
     // streaming stays on: Claude is mid-turn executing a tool.
-    expect(useStore.getState().streaming).toBe(true)
+    expect(streaming).toBe(true)
   })
 
   it('unknown structured payload is ignored without changing state', () => {

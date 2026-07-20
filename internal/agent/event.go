@@ -7,23 +7,25 @@ import "encoding/json"
 type EventKind string
 
 const (
-	EventInit       EventKind = "init"       // system/init — carries SessionID
-	EventText       EventKind = "text"       // assistant text chunk
-	EventThinking   EventKind = "thinking"   // extended-thinking delta (tether#34)
-	EventToolUse    EventKind = "tool_use"   // tool_use block extracted from assistant content
-	EventResult     EventKind = "result"     // turn result / stop reason
-	EventRateLimit  EventKind = "rate_limit" // rate_limit_event
-	EventError      EventKind = "error"      // daemon-side error
+	EventInit       EventKind = "init"        // system/init — carries SessionID
+	EventText       EventKind = "text"        // assistant text chunk
+	EventThinking   EventKind = "thinking"    // extended-thinking delta (tether#34)
+	EventToolUse    EventKind = "tool_use"    // tool_use block extracted from assistant content
+	EventToolResult EventKind = "tool_result" // tool_result block extracted from a user event (tether#38)
+	EventResult     EventKind = "result"      // turn result / stop reason
+	EventRateLimit  EventKind = "rate_limit"  // rate_limit_event
+	EventError      EventKind = "error"       // daemon-side error
 )
 
 // Event is the daemon-internal representation of a cc output event.
 // Translated from stream-json lines by ClaudeCodeProvider.
 type Event struct {
-	Kind      EventKind
-	SessionID string // populated on EventInit; stable for session lifetime
-	Text      string // EventText
-	ToolUse   *ToolUseEvent
-	Err       error // EventError
+	Kind       EventKind
+	SessionID  string // populated on EventInit; stable for session lifetime
+	Text       string // EventText
+	ToolUse    *ToolUseEvent
+	ToolResult *ToolResultEvent
+	Err        error // EventError
 }
 
 // isTerminal reports whether k is a turn-closing event that MUST be delivered
@@ -45,4 +47,14 @@ type ToolUseEvent struct {
 	ID    string
 	Name  string
 	Input json.RawMessage
+}
+
+// ToolResultEvent carries a tool_result content block extracted from a `user`
+// event — the output of a tool cc ran (tether#38). Matched to its ToolUseEvent
+// by ToolUseID. Content is flattened to text (cc sends a string or a
+// [{type,text}] array in the tool_result's content field).
+type ToolResultEvent struct {
+	ToolUseID string
+	Content   string
+	IsError   bool
 }

@@ -8,6 +8,9 @@ export interface ToolCall {
   id: string
   name: string
   input: unknown
+  /** The tool's output, hung under the call (matched by tool_use_id) once the
+   *  daemon forwards the tool_result (tether#38). Absent until then; live-only. */
+  result?: { content: string; isError: boolean }
 }
 
 export interface Message {
@@ -219,6 +222,28 @@ export const useStore = create<AppState>((set) => ({
                 messages: [...s.messages, { id, role: 'assistant' as const, text: '', ts: Date.now(), tools: [tc] }],
               }
             })
+            break
+          }
+          if (pObj['type'] === 'tool_result') {
+            // The output of a tool cc ran (tether#38). The daemon forwards it
+            // keyed by tool_use_id; hang it on the matching ToolCall (from an
+            // earlier tool_use), wherever that bubble is. Match-by-id only — do
+            // NOT open a bubble or touch curTurnId/timing/streamingMsgId (a
+            // result is neither the answer, thinking, nor a new turn segment).
+            const tid = typeof pObj['tool_use_id'] === 'string' ? (pObj['tool_use_id'] as string) : ''
+            if (!tid) { set({ streaming: true }); break }
+            const result = {
+              content: typeof pObj['content'] === 'string' ? (pObj['content'] as string) : '',
+              isError: pObj['is_error'] === true,
+            }
+            set((s) => ({
+              streaming: true,
+              messages: s.messages.map(m =>
+                m.tools?.some(t => t.id === tid)
+                  ? { ...m, tools: m.tools.map(t => (t.id === tid ? { ...t, result } : t)) }
+                  : m
+              ),
+            }))
             break
           }
           if (pObj['type'] === 'thinking') {

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, summarizeToolInput } from './index'
+import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, summarizeToolInput, summarizeToolResult, truncateResult } from './index'
 import type { ToolCall } from '../../lib/store'
 
 // tether#34 — ThinkingBlock is exported and prop-controlled so it tests directly,
@@ -164,5 +164,65 @@ describe('ToolCallList (tether#37)', () => {
     const { container } = render(<ToolCallList tools={[{ id: 'x', name: 'MysteryTool', input: {} }]} />)
     expect(screen.getByText('MysteryTool')).toBeTruthy()
     expect(container.querySelector('.msg-tool-arg')).toBeNull()
+  })
+})
+
+// tether#38 — tool-result inlining: row-tail preview + click-to-expand block.
+describe('summarizeToolResult (tether#38)', () => {
+  it('summarizes per tool kind', () => {
+    expect(summarizeToolResult('Read', { content: 'a\nb\nc', isError: false })).toBe('3 lines')
+    expect(summarizeToolResult('Grep', { content: 'hit1\nhit2', isError: false })).toBe('2 matches')
+    expect(summarizeToolResult('Grep', { content: 'only', isError: false })).toBe('1 match')
+    expect(summarizeToolResult('Bash', { content: '  go version go1.25  \nextra', isError: false })).toBe('go version go1.25')
+  })
+  it('marks errors and empty content', () => {
+    expect(summarizeToolResult('Bash', { content: 'boom', isError: true })).toBe('出错')
+    expect(summarizeToolResult('Read', { content: '', isError: false })).toBe('')
+  })
+})
+
+describe('truncateResult (tether#38)', () => {
+  it('leaves small results unchanged', () => {
+    expect(truncateResult('one\ntwo')).toBe('one\ntwo')
+  })
+  it('clamps by line count with a marker', () => {
+    const out = truncateResult(Array.from({ length: 30 }, (_, i) => `L${i}`).join('\n'))
+    expect(out.split('\n').length).toBe(21) // 20 kept + the marker line
+    expect(out.endsWith('…（已截断）')).toBe(true)
+  })
+  it('clamps by char count with a marker', () => {
+    const out = truncateResult('x'.repeat(3000))
+    expect(out.length).toBeLessThan(3000)
+    expect(out.endsWith('…（已截断）')).toBe(true)
+  })
+})
+
+describe('ToolCallList results (tether#38)', () => {
+  const withResult = (isError = false): ToolCall[] => [
+    { id: 't1', name: 'Read', input: { file_path: 'a.ts' }, result: { content: 'l1\nl2\nl3', isError } },
+  ]
+  it('shows a result preview and expands the full block on click', () => {
+    const { container } = render(<ToolCallList tools={withResult()} />)
+    expect(screen.getByText('3 lines')).toBeTruthy()                // tail preview
+    expect(container.querySelector('.msg-tool-result')).toBeNull()  // collapsed by default
+    fireEvent.click(container.querySelector('.msg-tool-row.clickable')!)
+    expect(container.querySelector('.msg-tool-result')?.textContent).toContain('l1')
+  })
+  it('marks an error result with the err class on preview and block', () => {
+    const { container } = render(<ToolCallList tools={withResult(true)} />)
+    expect(container.querySelector('.msg-tool-preview.err')?.textContent).toBe('出错')
+    fireEvent.click(container.querySelector('.msg-tool-row.clickable')!)
+    expect(container.querySelector('.msg-tool-result.err')).toBeTruthy()
+  })
+  it('a tool without a result is not clickable and shows no preview', () => {
+    const { container } = render(<ToolCallList tools={[{ id: 'x', name: 'Read', input: { file_path: 'a.ts' } }]} />)
+    expect(container.querySelector('.msg-tool-row.clickable')).toBeNull()
+    expect(container.querySelector('.msg-tool-preview')).toBeNull()
+  })
+
+  it('a present-but-empty result is not clickable (review MINOR: no dead click)', () => {
+    const { container } = render(<ToolCallList tools={[{ id: 'e', name: 'Bash', input: { command: 'true' }, result: { content: '', isError: false } }]} />)
+    expect(container.querySelector('.msg-tool-row.clickable')).toBeNull()
+    expect(container.querySelector('.msg-tool-caret')).toBeNull()
   })
 })

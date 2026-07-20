@@ -247,3 +247,53 @@ describe('store tool-call visibility (tether#37)', () => {
     expect(s.messages[0].thinkingMs).toBeGreaterThanOrEqual(0)
   })
 })
+
+// tether#38 — tool-result inlining: the daemon now forwards tool_result keyed by
+// tool_use_id; the store hangs it on the matching ToolCall (from an earlier
+// tool_use). These assert match-by-id + that a result never opens a bubble or
+// touches the turn clocks/cursor.
+const toolResultEnv = (toolUseId: string, content: string, isError = false): Envelope =>
+  ({ kind: 'message', payload: { type: 'tool_result', tool_use_id: toolUseId, content, is_error: isError } } as unknown as Envelope)
+
+describe('store tool-result inlining (tether#38)', () => {
+  afterEach(reset)
+
+  it('hangs the result on the matching ToolCall by tool_use_id', () => {
+    const h = useStore.getState().handleEnvelope
+    h(toolEnv('Read', { file_path: 'a.ts' }, 'tu1'))
+    h(toolEnv('Bash', { command: 'go test' }, 'tu2'))
+    h(toolResultEnv('tu2', 'ok\nPASS'))
+    const s = useStore.getState()
+    expect(s.messages[0].tools).toHaveLength(2)
+    expect(s.messages[0].tools![0].result).toBeUndefined() // tu1 has no result yet
+    expect(s.messages[0].tools![1].result).toEqual({ content: 'ok\nPASS', isError: false })
+  })
+
+  it('carries is_error through', () => {
+    const h = useStore.getState().handleEnvelope
+    h(toolEnv('Bash', { command: 'false' }, 'tu9'))
+    h(toolResultEnv('tu9', 'boom', true))
+    expect(useStore.getState().messages[0].tools![0].result).toEqual({ content: 'boom', isError: true })
+  })
+
+  it('a tool_result with no matching id leaves messages unchanged (no crash)', () => {
+    const h = useStore.getState().handleEnvelope
+    h(toolEnv('Read', { file_path: 'a.ts' }, 'tu1'))
+    h(toolResultEnv('nonexistent', 'orphan result'))
+    const s = useStore.getState()
+    expect(s.messages).toHaveLength(1)
+    expect(s.messages[0].tools![0].result).toBeUndefined()
+    expect(s.streaming).toBe(true)
+  })
+
+  it('a tool_result does NOT open a bubble or touch the turn clocks', () => {
+    const h = useStore.getState().handleEnvelope
+    h(toolResultEnv('tuX', 'x')) // result with no prior tool_use (edge)
+    const s = useStore.getState()
+    expect(s.messages).toHaveLength(0)
+    expect(s.curTurnId).toBeNull()
+    expect(s.answerStartTs).toBeNull()
+    expect(s.thinkingStartTs).toBeNull()
+    expect(s.streamingMsgId).toBeNull()
+  })
+})

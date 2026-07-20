@@ -434,6 +434,37 @@ func TestTranslateEvent_Thinking(t *testing.T) {
 	}
 }
 
+// TestTranslateEvent_ToolResult — (tether#38) a tool_result event becomes a
+// KindMessage{type:"tool_result", tool_use_id, content, is_error} so the
+// frontend can hang the result under its matching tool_use row.
+func TestTranslateEvent_ToolResult(t *testing.T) {
+	env := translateEvent(agent.Event{Kind: agent.EventToolResult, ToolResult: &agent.ToolResultEvent{
+		ToolUseID: "toolu_7", Content: "142 lines", IsError: false,
+	}})
+	if env == nil {
+		t.Fatal("translateEvent(EventToolResult) = nil, want a KindMessage envelope")
+	}
+	if env.Kind != wire.KindMessage {
+		t.Errorf("Kind = %q, want %q", env.Kind, wire.KindMessage)
+	}
+	payload, ok := env.Payload.(map[string]any)
+	if !ok {
+		t.Fatalf("Payload = %T, want map[string]any", env.Payload)
+	}
+	if payload["type"] != "tool_result" {
+		t.Errorf(`payload["type"] = %v, want "tool_result"`, payload["type"])
+	}
+	if payload["tool_use_id"] != "toolu_7" {
+		t.Errorf(`payload["tool_use_id"] = %v, want "toolu_7"`, payload["tool_use_id"])
+	}
+	if payload["content"] != "142 lines" {
+		t.Errorf(`payload["content"] = %v, want "142 lines"`, payload["content"])
+	}
+	if payload["is_error"] != false {
+		t.Errorf(`payload["is_error"] = %v, want false`, payload["is_error"])
+	}
+}
+
 // TestRegistry_ThinkingBroadcastNotPersisted — (tether#34) an EventThinking
 // delta must be broadcast to subscribers as a KindMessage{type:"thinking"}
 // object payload, must NOT be fence-parsed, and must NOT be accumulated into

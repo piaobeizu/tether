@@ -687,38 +687,92 @@ export function summarizeToolInput(name: string, input: unknown): string {
   return s.length > 60 ? s.slice(0, 60) + '…' : s
 }
 
-// ToolCallList — the per-turn tool activity log. Exported + prop-controlled so
-// ChatPane.test.tsx renders it directly (no WebTransport). Fold state is local
-// (like ThinkingBlock's expand), not in the store.
+// summarizeToolResult derives the one-line RESULT preview at the tool row tail
+// (tether#38): Read/Write/Edit → line count, Grep/Glob → match count, errors → a
+// short marker, else the first non-empty output line (truncated). Best-effort +
+// defensive; '' when there's nothing useful to preview. Exported for tests.
+export function summarizeToolResult(name: string, result: { content: string; isError: boolean }): string {
+  if (result.isError) return '出错'
+  const c = result.content ?? ''
+  if (!c) return ''
+  if (name === 'Read' || name === 'Write' || name === 'Edit' || name === 'NotebookEdit') {
+    const n = c.replace(/\n+$/, '').split('\n').length
+    return n === 1 ? '1 line' : `${n} lines`
+  }
+  if (name === 'Grep' || name === 'Glob') {
+    const n = c.split('\n').filter(l => l.trim()).length
+    return n === 1 ? '1 match' : `${n} matches`
+  }
+  const first = c.split('\n').find(l => l.trim()) ?? ''
+  const s = first.trim().replace(/\s+/g, ' ')
+  return s.length > 48 ? s.slice(0, 48) + '…' : s
+}
+
+const RESULT_MAX_LINES = 20
+const RESULT_MAX_CHARS = 2000
+
+// truncateResult clamps the expanded result block so a huge file / long stdout
+// can't flood the chat; a trailing marker signals truncation. Exported for tests.
+export function truncateResult(s: string): string {
+  let out = s
+  let cut = false
+  if (out.length > RESULT_MAX_CHARS) { out = out.slice(0, RESULT_MAX_CHARS); cut = true }
+  const lines = out.split('\n')
+  if (lines.length > RESULT_MAX_LINES) { out = lines.slice(0, RESULT_MAX_LINES).join('\n'); cut = true }
+  return cut ? out + '\n…（已截断）' : out
+}
+
+// ToolCallList — the per-turn tool activity log. Each row shows the call
+// (icon + name + arg, tether#37); once its result arrives (tether#38) the row
+// also shows a one-line result preview at the tail and becomes clickable to
+// expand the full (truncated) result block below it. Exported + prop-controlled
+// so ChatPane.test.tsx renders it directly (no WebTransport). List-fold (>5) and
+// per-tool result-expand are both local state, not in the store.
 export function ToolCallList({ tools }: { tools: ToolCall[] }) {
   const [open, setOpen] = useState(false)
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set())
+  const toggle = (key: string) => setExpanded(prev => {
+    const next = new Set(prev)
+    if (next.has(key)) next.delete(key); else next.add(key)
+    return next
+  })
   if (tools.length === 0) return null
   const foldable = tools.length > TOOL_FOLD_THRESHOLD
-  if (foldable && !open) {
-    return (
-      <div className="msg-tools">
-        <button type="button" className="msg-tool-fold" onClick={() => setOpen(true)} aria-expanded={false}>
-          <span className="msg-thinking-chevron">›</span>
-          <span>用了 {tools.length} 个工具</span>
-        </button>
-      </div>
-    )
-  }
+  const rowsHidden = foldable && !open
   return (
     <div className="msg-tools">
       {foldable && (
-        <button type="button" className="msg-tool-fold" onClick={() => setOpen(false)} aria-expanded={true}>
-          <span className="msg-thinking-chevron">⌄</span>
-          <span>{tools.length} 个工具</span>
+        <button type="button" className="msg-tool-fold" onClick={() => setOpen(o => !o)} aria-expanded={open}>
+          <span className="msg-thinking-chevron">{open ? '⌄' : '›'}</span>
+          <span>{open ? `${tools.length} 个工具` : `用了 ${tools.length} 个工具`}</span>
         </button>
       )}
-      {tools.map((t, i) => {
+      {!rowsHidden && tools.map((t, i) => {
+        const key = t.id || String(i)
         const arg = summarizeToolInput(t.name, t.input)
+        const preview = t.result ? summarizeToolResult(t.name, t.result) : ''
+        const isOpen = expanded.has(key)
+        // Only clickable/expandable when the result has something to show — a
+        // present-but-empty result (e.g. a command with no stdout) would be a
+        // dead click with a blank block otherwise (review MINOR).
+        const hasResult = !!t.result && (t.result.content.length > 0 || t.result.isError)
         return (
-          <div key={t.id || i} className="msg-tool-row">
-            <span className="msg-tool-icon">{TOOL_ICON[t.name] ?? '🔧'}</span>
-            <span className="msg-tool-name">{t.name}</span>
-            {arg && <span className="msg-tool-arg">{arg}</span>}
+          <div key={key}>
+            <div
+              className={hasResult ? 'msg-tool-row clickable' : 'msg-tool-row'}
+              onClick={hasResult ? () => toggle(key) : undefined}
+            >
+              <span className="msg-tool-icon">{TOOL_ICON[t.name] ?? '🔧'}</span>
+              <span className="msg-tool-name">{t.name}</span>
+              {arg && <span className="msg-tool-arg">{arg}</span>}
+              {preview && (
+                <span className={t.result?.isError ? 'msg-tool-preview err' : 'msg-tool-preview'}>{preview}</span>
+              )}
+              {hasResult && <span className="msg-tool-caret">{isOpen ? '⌄' : '▸'}</span>}
+            </div>
+            {hasResult && isOpen && (
+              <pre className={t.result!.isError ? 'msg-tool-result err' : 'msg-tool-result'}>{truncateResult(t.result!.content)}</pre>
+            )}
           </div>
         )
       })}

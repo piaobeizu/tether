@@ -7,12 +7,21 @@ import (
 	"testing"
 )
 
+// first returns the first event parseLine produced, or nil — a shim so the
+// single-event tests read as before now that parseLine returns []Event.
+func first(evs []Event) *Event {
+	if len(evs) == 0 {
+		return nil
+	}
+	return &evs[0]
+}
+
 // TestParseLine_StreamEventTextDelta verifies that --include-partial-messages
 // stream_event lines yield token-level EventText events.
 func TestParseLine_StreamEventTextDelta(t *testing.T) {
 	s := &ccSession{sidReady: make(chan struct{})}
 	line := []byte(`{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"So"}}}`)
-	ev := s.parseLine(line)
+	ev := first(s.parseLine(line))
 	if ev == nil {
 		t.Fatal("expected EventText, got nil")
 	}
@@ -30,7 +39,7 @@ func TestParseLine_StreamEventTextDelta(t *testing.T) {
 func TestParseLine_StreamEventThinkingDelta(t *testing.T) {
 	s := &ccSession{sidReady: make(chan struct{})}
 	line := []byte(`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"The user wants"}}}`)
-	ev := s.parseLine(line)
+	ev := first(s.parseLine(line))
 	if ev == nil {
 		t.Fatal("expected EventThinking, got nil")
 	}
@@ -47,7 +56,7 @@ func TestParseLine_StreamEventThinkingDelta(t *testing.T) {
 func TestParseLine_StreamEventThinkingDeltaEmpty(t *testing.T) {
 	s := &ccSession{sidReady: make(chan struct{})}
 	line := []byte(`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}}`)
-	if ev := s.parseLine(line); ev != nil {
+	if ev := first(s.parseLine(line)); ev != nil {
 		t.Errorf("expected nil for empty thinking_delta, got %+v", ev)
 	}
 }
@@ -57,7 +66,7 @@ func TestParseLine_StreamEventThinkingDeltaEmpty(t *testing.T) {
 func TestParseLine_StreamEventSignatureDelta(t *testing.T) {
 	s := &ccSession{sidReady: make(chan struct{})}
 	line := []byte(`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","text":""}}}`)
-	if ev := s.parseLine(line); ev != nil {
+	if ev := first(s.parseLine(line)); ev != nil {
 		t.Errorf("expected nil for signature_delta, got %+v", ev)
 	}
 }
@@ -68,7 +77,7 @@ func TestParseLine_StreamEventSignatureDelta(t *testing.T) {
 func TestParseLine_AssistantTextSkipped(t *testing.T) {
 	s := &ccSession{sidReady: make(chan struct{})}
 	line := []byte(`{"type":"assistant","message":{"content":[{"type":"text","text":"Soft clouds drift above."}]}}`)
-	if ev := s.parseLine(line); ev != nil {
+	if ev := first(s.parseLine(line)); ev != nil {
 		t.Errorf("expected nil for assistant text block (already streamed), got %+v", ev)
 	}
 }
@@ -79,7 +88,7 @@ func TestParseLine_AssistantTextSkipped(t *testing.T) {
 func TestParseLine_AssistantToolUse(t *testing.T) {
 	s := &ccSession{sidReady: make(chan struct{})}
 	line := []byte(`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_123","name":"Bash","input":{"command":"ls"}}]}}`)
-	ev := s.parseLine(line)
+	ev := first(s.parseLine(line))
 	if ev == nil {
 		t.Fatal("expected EventToolUse, got nil")
 	}
@@ -97,11 +106,105 @@ func TestParseLine_AssistantToolUse(t *testing.T) {
 	}
 }
 
+// TestParseLine_UserToolResult — tool_result blocks on a `user` event surface as
+// EventToolResult with tool_use_id, flattened content, and is_error (tether#38).
+func TestParseLine_UserToolResult(t *testing.T) {
+	s := &ccSession{sidReady: make(chan struct{})}
+	line := []byte(`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_123","content":"file contents","is_error":false}]}}`)
+	ev := first(s.parseLine(line))
+	if ev == nil {
+		t.Fatal("expected EventToolResult, got nil")
+	}
+	if ev.Kind != EventToolResult {
+		t.Errorf("Kind = %q, want %q", ev.Kind, EventToolResult)
+	}
+	if ev.ToolResult == nil {
+		t.Fatal("ToolResult nil")
+	}
+	if ev.ToolResult.ToolUseID != "toolu_123" {
+		t.Errorf("ToolUseID = %q, want toolu_123", ev.ToolResult.ToolUseID)
+	}
+	if ev.ToolResult.Content != "file contents" {
+		t.Errorf("Content = %q, want %q", ev.ToolResult.Content, "file contents")
+	}
+	if ev.ToolResult.IsError {
+		t.Error("IsError = true, want false")
+	}
+}
+
+// TestParseLine_UserToolResult_ArrayContent — cc may send the tool_result content
+// as an array of blocks ([{type:text,text}]); toolResultText flattens to text,
+// and is_error is carried through.
+func TestParseLine_UserToolResult_ArrayContent(t *testing.T) {
+	s := &ccSession{sidReady: make(chan struct{})}
+	line := []byte(`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_9","content":[{"type":"text","text":"line1\n"},{"type":"text","text":"line2"}],"is_error":true}]}}`)
+	ev := first(s.parseLine(line))
+	if ev == nil || ev.Kind != EventToolResult || ev.ToolResult == nil {
+		t.Fatalf("expected EventToolResult, got %+v", ev)
+	}
+	if ev.ToolResult.Content != "line1\nline2" {
+		t.Errorf("Content = %q, want %q", ev.ToolResult.Content, "line1\nline2")
+	}
+	if !ev.ToolResult.IsError {
+		t.Error("IsError = false, want true")
+	}
+}
+
+// TestParseLine_UserToolResultBatch — parallel tool calls come back as MULTIPLE
+// tool_result blocks in ONE user message (the Anthropic API batches them);
+// parseLine must emit an event for EACH, not just the first (tether#38 review
+// MAJOR: returning only the first silently dropped parallel-tool results).
+func TestParseLine_UserToolResultBatch(t *testing.T) {
+	s := &ccSession{sidReady: make(chan struct{})}
+	line := []byte(`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","content":"r1"},{"type":"tool_result","tool_use_id":"tu2","content":"r2","is_error":true}]}}`)
+	evs := s.parseLine(line)
+	if len(evs) != 2 {
+		t.Fatalf("expected 2 EventToolResult, got %d", len(evs))
+	}
+	if evs[0].ToolResult == nil || evs[0].ToolResult.ToolUseID != "tu1" || evs[0].ToolResult.Content != "r1" {
+		t.Errorf("evs[0].ToolResult = %+v, want tu1/r1", evs[0].ToolResult)
+	}
+	if evs[1].ToolResult == nil || evs[1].ToolResult.ToolUseID != "tu2" || !evs[1].ToolResult.IsError {
+		t.Errorf("evs[1].ToolResult = %+v, want tu2/is_error", evs[1].ToolResult)
+	}
+}
+
+// TestParseLine_UserPromptEchoSkipped — a user event that is just the prompt
+// echo (text block, no tool_result) must not be forwarded.
+func TestParseLine_UserPromptEchoSkipped(t *testing.T) {
+	s := &ccSession{sidReady: make(chan struct{})}
+	line := []byte(`{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}`)
+	if ev := first(s.parseLine(line)); ev != nil {
+		t.Errorf("expected nil for user prompt echo, got %+v", ev)
+	}
+}
+
+// TestToolResultText covers the string | array | empty | non-text cases.
+func TestToolResultText(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"string", `"hello"`, "hello"},
+		{"array", `[{"type":"text","text":"a"},{"type":"text","text":"b"}]`, "ab"},
+		{"empty", ``, ""},
+		{"number", `42`, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := toolResultText(json.RawMessage(c.raw)); got != c.want {
+				t.Errorf("toolResultText(%s) = %q, want %q", c.raw, got, c.want)
+			}
+		})
+	}
+}
+
 // TestParseLine_SystemInit confirms session_id capture still works.
 func TestParseLine_SystemInit(t *testing.T) {
 	s := &ccSession{sidReady: make(chan struct{})}
 	line := []byte(`{"type":"system","subtype":"init","session_id":"abc-123"}`)
-	ev := s.parseLine(line)
+	ev := first(s.parseLine(line))
 	if ev == nil || ev.Kind != EventInit {
 		t.Fatalf("expected EventInit, got %+v", ev)
 	}
@@ -114,7 +217,7 @@ func TestParseLine_SystemInit(t *testing.T) {
 func TestParseLine_Result(t *testing.T) {
 	s := &ccSession{sidReady: make(chan struct{})}
 	line := []byte(`{"type":"result","subtype":"success","result":"1, 2, 3"}`)
-	ev := s.parseLine(line)
+	ev := first(s.parseLine(line))
 	if ev == nil || ev.Kind != EventResult {
 		t.Fatalf("expected EventResult, got %+v", ev)
 	}
@@ -130,7 +233,7 @@ func TestParseLine_Result(t *testing.T) {
 func TestParseLine_ControlResponseIgnored(t *testing.T) {
 	s := &ccSession{sidReady: make(chan struct{})}
 	line := []byte(`{"type":"control_response","response":{"subtype":"success","request_id":"tether-interrupt-1"}}`)
-	if ev := s.parseLine(line); ev != nil {
+	if ev := first(s.parseLine(line)); ev != nil {
 		t.Errorf("expected nil for control_response, got %+v", ev)
 	}
 }
@@ -142,7 +245,7 @@ func TestParseLine_ControlResponseIgnored(t *testing.T) {
 func TestParseLine_ControlResponseErrorIgnored(t *testing.T) {
 	s := &ccSession{sidReady: make(chan struct{})}
 	line := []byte(`{"type":"control_response","response":{"subtype":"error","request_id":"tether-interrupt-1","error":"no active turn"}}`)
-	if ev := s.parseLine(line); ev != nil {
+	if ev := first(s.parseLine(line)); ev != nil {
 		t.Errorf("expected nil for control_response error, got %+v", ev)
 	}
 }

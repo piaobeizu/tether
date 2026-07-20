@@ -509,6 +509,17 @@ func translateEvent(ev agent.Event) *wire.Envelope {
 				"input": ev.ToolUse.Input,
 			}}
 		}
+	case agent.EventToolResult:
+		// tether#38: the output of a tool cc ran; the frontend matches it to its
+		// tool_use by tool_use_id and hangs it under the corresponding tool row.
+		if ev.ToolResult != nil {
+			return &wire.Envelope{Kind: wire.KindMessage, Payload: map[string]any{
+				"type":        "tool_result",
+				"tool_use_id": ev.ToolResult.ToolUseID,
+				"content":     ev.ToolResult.Content,
+				"is_error":    ev.ToolResult.IsError,
+			}}
+		}
 	case agent.EventError:
 		return &wire.Envelope{Kind: wire.KindError, Payload: ev.Err.Error()}
 	}

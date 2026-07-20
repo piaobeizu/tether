@@ -62,12 +62,12 @@ func (p *ClaudeCodeProvider) Spawn(ctx context.Context, cfg SpawnConfig) (Sessio
 	enc.SetEscapeHTML(false)
 
 	sess := &ccSession{
-		cmd:       cmd,
-		ctx:       ctx,
-		stdin:     stdin,
-		enc:       enc,
-		events:    make(chan Event, 64),
-		sidReady:  make(chan struct{}),
+		cmd:      cmd,
+		ctx:      ctx,
+		stdin:    stdin,
+		enc:      enc,
+		events:   make(chan Event, 64),
+		sidReady: make(chan struct{}),
 	}
 	go sess.readLoop(bufio.NewScanner(stdout))
 	return sess, nil
@@ -191,11 +191,12 @@ func (s *ccSession) readLoop(scanner *bufio.Scanner) {
 	defer close(s.events)
 
 	for scanner.Scan() {
-		ev := s.parseLine(scanner.Bytes())
-		if ev == nil {
-			continue
+		// A single stream-json line can yield MULTIPLE events — e.g. a `user`
+		// event batching the parallel tool_results for several tool_use blocks
+		// (tether#38). Emit each so none is dropped.
+		for _, ev := range s.parseLine(scanner.Bytes()) {
+			s.emit(ev)
 		}
-		s.emit(*ev)
 	}
 }
 
@@ -219,6 +220,10 @@ type rawContentBlock struct {
 	ID    string          `json:"id,omitempty"`
 	Name  string          `json:"name,omitempty"`
 	Input json.RawMessage `json:"input,omitempty"`
+	// tool_result block fields (tether#38), present on a `user` event's content[].
+	ToolUseID string          `json:"tool_use_id,omitempty"`
+	Content   json.RawMessage `json:"content,omitempty"`
+	IsError   bool            `json:"is_error,omitempty"`
 }
 
 // rawPartialMessage is the Anthropic-native SSE event embedded in stream_event
@@ -234,7 +239,11 @@ type rawPartialMessage struct {
 	} `json:"delta"`
 }
 
-func (s *ccSession) parseLine(line []byte) *Event {
+// parseLine decodes one stream-json line into zero or more events. It returns a
+// slice (not a single *Event) because a `user` / `assistant` message can carry
+// several tool_result / tool_use blocks in one line (parallel tool calls), all
+// of which must surface (tether#38). nil/empty = nothing to forward.
+func (s *ccSession) parseLine(line []byte) []Event {
 	var raw rawStreamEvent
 	if err := json.Unmarshal(line, &raw); err != nil {
 		return nil
@@ -247,7 +256,7 @@ func (s *ccSession) parseLine(line []byte) *Event {
 			s.sid = raw.SessionID
 			close(s.sidReady)
 		})
-		return &Event{Kind: EventInit, SessionID: raw.SessionID}
+		return []Event{{Kind: EventInit, SessionID: raw.SessionID}}
 	}
 
 	// stream_event lines carry token-level deltas (--include-partial-messages).
@@ -260,7 +269,7 @@ func (s *ccSession) parseLine(line []byte) *Event {
 		if raw.Event.Type == "content_block_delta" &&
 			raw.Event.Delta.Type == "text_delta" &&
 			raw.Event.Delta.Text != "" {
-			return &Event{Kind: EventText, Text: raw.Event.Delta.Text}
+			return []Event{{Kind: EventText, Text: raw.Event.Delta.Text}}
 		}
 		// Extended-thinking tokens (tether#34). Forwarded as EventThinking;
 		// registry.fanOut routes it through translateEvent (bypassing the
@@ -269,37 +278,62 @@ func (s *ccSession) parseLine(line []byte) *Event {
 		if raw.Event.Type == "content_block_delta" &&
 			raw.Event.Delta.Type == "thinking_delta" &&
 			raw.Event.Delta.Thinking != "" {
-			return &Event{Kind: EventThinking, Text: raw.Event.Delta.Thinking}
+			return []Event{{Kind: EventThinking, Text: raw.Event.Delta.Thinking}}
 		}
 		return nil
 	}
 
 	// `assistant` events arrive after all deltas have streamed. Text blocks are
 	// redundant (already streamed via stream_event); only tool_use blocks carry
-	// information we haven't emitted yet.
+	// information we haven't emitted yet. An assistant message can hold several
+	// tool_use blocks (parallel tool calls) — emit one event per block.
 	if raw.Type == "assistant" && raw.Message != nil {
+		var evs []Event
 		for _, block := range raw.Message.Content {
 			if block.Type == "tool_use" {
 				// tool_use is a content block, NOT a top-level event (D-05a §3, Risk #4).
-				return &Event{
+				evs = append(evs, Event{
 					Kind: EventToolUse,
 					ToolUse: &ToolUseEvent{
 						ID:    block.ID,
 						Name:  block.Name,
 						Input: block.Input,
 					},
-				}
+				})
 			}
 		}
-		return nil
+		return evs
+	}
+
+	// `user` events carry tool_result blocks — the output of a tool cc ran
+	// (tether#38). tool_result is a content block, not a top-level event; other
+	// user content (e.g. the prompt echo) is not forwarded. The Anthropic
+	// Messages API batches ALL results for a set of parallel tool_use calls into
+	// ONE user message, so emit one event per tool_result block — returning only
+	// the first would silently drop the rest (the common parallel-tools case).
+	if raw.Type == "user" && raw.Message != nil {
+		var evs []Event
+		for _, block := range raw.Message.Content {
+			if block.Type == "tool_result" {
+				evs = append(evs, Event{
+					Kind: EventToolResult,
+					ToolResult: &ToolResultEvent{
+						ToolUseID: block.ToolUseID,
+						Content:   toolResultText(block.Content),
+						IsError:   block.IsError,
+					},
+				})
+			}
+		}
+		return evs
 	}
 
 	if raw.Type == "result" {
-		return &Event{Kind: EventResult, Text: raw.Result}
+		return []Event{{Kind: EventResult, Text: raw.Result}}
 	}
 
 	if raw.Type == "rate_limit_event" {
-		return &Event{Kind: EventRateLimit}
+		return []Event{{Kind: EventRateLimit}}
 	}
 
 	// control_response is cc's reply to a control_request WE sent (currently
@@ -316,12 +350,37 @@ func (s *ccSession) parseLine(line []byte) *Event {
 	return nil
 }
 
+// toolResultText flattens a tool_result block's `content` to plain text. cc
+// sends it either as a JSON string or as an array of content blocks
+// ([{type:"text",text:"…"}]) — handle both; anything else yields "" (tether#38).
+func toolResultText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &blocks); err == nil {
+		var out string
+		for _, b := range blocks {
+			out += b.Text
+		}
+		return out
+	}
+	return ""
+}
+
 // Stub providers for future providers (D-17a §5).
 
 // CursorProvider — stub; see D-17a §5.2.
 type CursorProvider struct{}
 
-func (CursorProvider) Name() string                                { return "cursor" }
+func (CursorProvider) Name() string { return "cursor" }
 func (CursorProvider) Spawn(_ context.Context, _ SpawnConfig) (Session, error) {
 	return nil, fmt.Errorf("cursor provider: not yet implemented")
 }

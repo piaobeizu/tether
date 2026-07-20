@@ -591,6 +591,20 @@ body {
   color: var(--ink-tertiary); font-size: 12px; font-family: var(--font-mono);
 }
 .msg-tool-fold:hover { color: var(--ink-secondary); }
+/* tether#38: tool result — tail preview + click-to-expand block. */
+.msg-tool-row.clickable { cursor: pointer; }
+.msg-tool-preview { margin-left: auto; padding-left: 10px; max-width: 55%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-quat); }
+.msg-tool-preview.err { color: var(--danger); }
+.msg-tool-caret { margin-left: auto; flex-shrink: 0; padding-left: 4px; font-size: 10px; color: var(--ink-quat); }
+.msg-tool-preview + .msg-tool-caret { margin-left: 4px; }
+.msg-tool-result {
+  margin: 2px 0 6px 4px; padding: 4px 0 4px 10px;
+  border-left: 2px solid var(--line);
+  font-family: var(--font-mono); font-size: 11.5px; line-height: 1.45;
+  white-space: pre-wrap; word-break: break-word;
+  color: var(--ink-tertiary); max-height: 280px; overflow: auto;
+}
+.msg-tool-result.err { color: var(--danger); border-left-color: var(--danger); }
 
 /* ── Mobile drawer ──────────────────────────────────────────── */
 .m-drawer-overlay {

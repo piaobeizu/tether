@@ -126,8 +126,24 @@ interface AppState {
   setConnected: (v: boolean) => void
   setConnection: (patch: Partial<Connection>) => void
   handleEnvelope: (env: Envelope) => void
+  /** Finalize the current turn on a manual interrupt/stop (tether#42). */
+  stopTurn: () => void
   select: (sel: { wiId?: string | null; file?: SelectedFile | null } | null) => void
   setWorkProject: (p: string) => void
+}
+
+// finalizeTurn closes the current assistant turn — stamps the answer duration
+// (tether#36) and resets all turn-transient pointers. Shared by the natural
+// 'result' path and the manual interrupt (tether#42 stopTurn): an interrupted
+// cc turn emits NO EventResult, so the frontend finalizes locally. Idempotent —
+// if a late result still arrives, curTurnId is already null and it's a no-op.
+function finalizeTurn(s: AppState): Partial<AppState> {
+  const id = s.curTurnId
+  const started = s.answerStartTs
+  const messages = (id && started != null)
+    ? s.messages.map(m => (m.id === id ? { ...m, answerMs: Date.now() - started } : m))
+    : s.messages
+  return { messages, streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null }
 }
 
 export const useStore = create<AppState>((set) => ({
@@ -181,6 +197,9 @@ export const useStore = create<AppState>((set) => ({
   resolvePermission: (id) => set((s) => ({
     pendingPermissions: s.pendingPermissions.filter((p) => p.id !== id),
   })),
+  // tether#42 — manual interrupt: cc aborts the turn with no EventResult, so
+  // close it locally (same reducer as 'result'). Idempotent.
+  stopTurn: () => set((s) => finalizeTurn(s)),
   setConnected: (v) => v
     ? set({ connected: true, connection: { state: 'live', latency: 0, attempt: 0 } })
     : set({ connected: false, streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null, connection: { state: 'dropped', latency: 0, attempt: 0 } }),
@@ -330,15 +349,9 @@ export const useStore = create<AppState>((set) => ({
       }
       case 'result':
         // Stamp the answer-generation duration on the turn's bubble as the
-        // "done" signal (tether#36), then close the turn.
-        set((s) => {
-          const id = s.curTurnId
-          const started = s.answerStartTs
-          const messages = (id && started != null)
-            ? s.messages.map(m => (m.id === id ? { ...m, answerMs: Date.now() - started } : m))
-            : s.messages
-          return { messages, streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null }
-        })
+        // "done" signal (tether#36), then close the turn. Shared with the
+        // manual interrupt path (stopTurn) via finalizeTurn (tether#42).
+        set((s) => finalizeTurn(s))
         break
       case 'error':
         // Clear the thinking/streaming indicator on a daemon-surfaced error so

@@ -357,3 +357,43 @@ describe('store permission queue (tether#40)', () => {
     expect(useStore.getState().pendingPermissions).toHaveLength(0)
   })
 })
+
+// tether#42 — stopTurn finalizes an interrupted turn locally. cc emits NO
+// EventResult after an interrupt, so the store closes the turn itself (mirrors
+// the 'result' path): stamp answerMs, keep the partial text, reset turn pointers.
+describe('store stopTurn (tether#42)', () => {
+  afterEach(reset)
+
+  it('finalizes the current turn: stops streaming, keeps partial text, stamps answerMs', () => {
+    const h = useStore.getState().handleEnvelope
+    h(textEnv('partial ans'))   // answer started, streaming
+    expect(useStore.getState().streaming).toBe(true)
+    useStore.getState().stopTurn()
+    const s = useStore.getState()
+    expect(s.streaming).toBe(false)
+    expect(s.streamingMsgId).toBeNull()
+    expect(s.curTurnId).toBeNull()
+    expect(s.messages).toHaveLength(1)
+    expect(s.messages[0].text).toBe('partial ans')       // partial answer preserved
+    expect(typeof s.messages[0].answerMs).toBe('number') // stamped like result
+  })
+
+  it('is idempotent — a late result after stopTurn does not double-finalize or crash', () => {
+    const h = useStore.getState().handleEnvelope
+    h(textEnv('x'))
+    useStore.getState().stopTurn()
+    const before = useStore.getState().messages.length
+    h(resultEnv())  // late result: curTurnId already null → no-op
+    const s = useStore.getState()
+    expect(s.messages).toHaveLength(before)
+    expect(s.streaming).toBe(false)
+    expect(s.curTurnId).toBeNull()
+  })
+
+  it('stopTurn with no active turn is a safe no-op', () => {
+    useStore.getState().stopTurn()
+    const s = useStore.getState()
+    expect(s.messages).toHaveLength(0)
+    expect(s.streaming).toBe(false)
+  })
+})

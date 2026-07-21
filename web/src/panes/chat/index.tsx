@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { TetherWT } from '../../lib/wt'
 import { ControlClient } from '../../lib/control'
 import { useStore, historyEntryToMessage, type HistoryEntry, type ToolCall } from '../../lib/store'
+import { CopyButton } from '../../lib/CopyButton'
 import { Icon } from '../../lib/icons'
 import type { FencedBlock, ProviderListResponse } from '../../lib/wire.gen'
 import { ClientFrameAction } from '../../lib/wire.gen'
@@ -389,6 +390,19 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
     })
   }
 
+  // tether#42 — session-level interrupt (stop the streaming turn). Unlike
+  // sendPause (DAG-card scoped, needs blockId), the daemon's "pause" action
+  // routes by SessionID alone (control.go handleActionFrame → InterruptSession
+  // → cc control_request{interrupt}), so no blockId. cc aborts the turn and
+  // stays resumable; it emits no EventResult, so we finalize locally too.
+  const sendStop = () => {
+    const sessionId = useStore.getState().sessionId
+    if (sessionId) {
+      void controlRef.current?.sendAction({ kind: ClientFrameAction, sessionId, action: 'pause' })
+    }
+    useStore.getState().stopTurn()
+  }
+
   const handleInputChange = (v: string) => {
     setInput(v)
     // Only while typing the command token itself (no space yet). Once args begin,
@@ -436,6 +450,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
               <div key={m.id} className="msg-user">
                 <div className="msg-user-bubble">{m.text}</div>
                 <div className="msg-user-time">you · {fmtTime(m.ts)}</div>
+                <CopyButton className="msg-copy" getText={() => m.text} label="Copy message" />
               </div>
             )
           }
@@ -446,6 +461,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
                   <Icon name="tether" size={10} style={{ color: 'white' }} />
                 </span>
                 <AnswerMeta ts={m.ts} answerMs={m.answerMs} />
+                {m.text && <CopyButton className="msg-copy" getText={() => m.text} label="Copy answer" />}
               </div>
               {m.thinking && (
                 <ThinkingBlock
@@ -567,7 +583,11 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
                 if (slashActive && (e.key === 'Tab' || e.key === 'Enter') && !isComposing) {
                   e.preventDefault(); pickSlash(filteredSlash[Math.min(slashIndex, filteredSlash.length - 1)]); return
                 }
-                if (e.key === 'Enter' && !e.shiftKey && !isComposing) { e.preventDefault(); void sendMessage() }
+                // Don't send while a turn is streaming (tether#42 review N1):
+                // the button is a Stop button then, so Enter must not send a new
+                // message (which would reset curTurnId and drop the streaming
+                // turn's answerMs badge). Use the Stop button to interrupt.
+                if (e.key === 'Enter' && !e.shiftKey && !isComposing && !streaming) { e.preventDefault(); void sendMessage() }
                 if (e.key === 'Escape') setSlashOpen(false)
               }}
               placeholder={
@@ -576,15 +596,30 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
                   : streaming ? 'Claude is thinking…' : 'message tether…'
               }
             />
-            <button
-              className="send-btn"
-              disabled={connState !== 'connected'}
-              onClick={() => void sendMessage()}
-              aria-label="Send message"
-              title="Send message"
-            >
-              <Icon name="arrow-up" size={13} />
-            </button>
+            {streaming ? (
+              // tether#42 — while a turn streams, the send button becomes a stop
+              // button (cc/ChatGPT-style) that interrupts the current turn.
+              <button
+                type="button"
+                className="send-btn stop-btn"
+                onClick={() => sendStop()}
+                aria-label="Stop generating"
+                title="Stop generating"
+              >
+                <span className="stop-glyph" aria-hidden="true" />
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="send-btn"
+                disabled={connState !== 'connected'}
+                onClick={() => void sendMessage()}
+                aria-label="Send message"
+                title="Send message"
+              >
+                <Icon name="arrow-up" size={13} />
+              </button>
+            )}
           </div>
           <div className="composer-foot">
             <span className="mono" style={{ fontSize: 10.5, color: 'var(--ink-tertiary)' }}>↵ send · / for commands</span>

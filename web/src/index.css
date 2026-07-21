@@ -486,6 +486,37 @@ body {
   display: flex; align-items: center; justify-content: center; flex-shrink: 0; line-height: 0;
 }
 .send-btn:disabled { background: var(--line); cursor: not-allowed; }
+
+/* tether#42 — stop button: while a turn streams the send button becomes a stop
+   button (filled square glyph). --danger reads on both themes with a white glyph. */
+.send-btn.stop-btn { background: var(--danger); }
+.stop-glyph { width: 9px; height: 9px; background: currentColor; border-radius: 1.5px; }
+
+/* tether#42 — copy buttons (per-message + per-code-block). Subtle, hover-revealed. */
+.copy-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; padding: 0; border: 0; cursor: pointer;
+  background: transparent; color: var(--ink-tertiary); border-radius: var(--r-1);
+  line-height: 0; transition: color .12s, background .12s, opacity .12s;
+}
+.copy-btn:hover { color: var(--ink-secondary); background: var(--bg-tint); }
+.copy-ok { color: var(--success); font-size: 13px; font-weight: 600; line-height: 1; }
+
+/* Message copy: hover-revealed. Assistant sits at the header's right (inline);
+   user floats over the bubble's top-right corner (no reserved flow space). */
+.msg-copy { opacity: 0; }
+.msg-user:hover .msg-copy, .msg-ai:hover .msg-copy { opacity: 1; }
+.msg-ai-header .msg-copy { margin-left: auto; }
+.msg-user { position: relative; }
+.msg-user .msg-copy { position: absolute; top: 2px; right: 2px; }
+
+/* Code-block copy: top-right of each fenced block, on the code background. */
+.md-pre { position: relative; }
+.md-pre .md-code-copy {
+  position: absolute; top: 6px; right: 6px; opacity: 0; z-index: 1;
+  background: var(--bg-code);
+}
+.md-pre:hover .md-code-copy { opacity: 1; }
 .composer-foot {
   display: flex; gap: 12px; padding: 6px 4px 0;
   border-top: 1px dashed var(--line-soft); margin-top: 4px;

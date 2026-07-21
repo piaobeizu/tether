@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, summarizeToolInput, summarizeToolResult, truncateResult } from './index'
-import type { ToolCall } from '../../lib/store'
+import { PermissionQueue, postDecide } from '../../fenced-blocks/PermissionBlock'
+import type { ToolCall, PermissionRequest } from '../../lib/store'
 
 // tether#34 — ThinkingBlock is exported and prop-controlled so it tests directly,
 // without mounting ChatPane (which opens a WebTransport connection on mount).
@@ -224,5 +225,89 @@ describe('ToolCallList results (tether#38)', () => {
     const { container } = render(<ToolCallList tools={[{ id: 'e', name: 'Bash', input: { command: 'true' }, result: { content: '', isError: false } }]} />)
     expect(container.querySelector('.msg-tool-row.clickable')).toBeNull()
     expect(container.querySelector('.msg-tool-caret')).toBeNull()
+  })
+})
+
+// tether#40 — parallel permission requests. PermissionQueue is exported + pure
+// (the parent owns the POST + queue removal via onDecide/onDecideAll), so it
+// tests without mounting ChatPane (which opens a WebTransport connection).
+describe('PermissionQueue (tether#40)', () => {
+  const reqs = (n: number): PermissionRequest[] =>
+    Array.from({ length: n }, (_, i) => ({ id: `r${i}`, toolName: 'Read', input: { file_path: `f${i}.ts` } }))
+
+  it('renders nothing when the queue is empty', () => {
+    const { container } = render(<PermissionQueue requests={[]} onDecide={() => {}} onDecideAll={() => {}} />)
+    expect(container.querySelector('.perm-queue')).toBeNull()
+  })
+
+  it('a single request shows just its block — no count header or bulk buttons (minimal)', () => {
+    const { container } = render(<PermissionQueue requests={reqs(1)} onDecide={() => {}} onDecideAll={() => {}} />)
+    expect(container.querySelectorAll('.perm-block').length).toBe(1)
+    expect(container.querySelector('.perm-queue-head')).toBeNull()
+    expect(screen.getByText('Read')).toBeTruthy()
+  })
+
+  it('two or more requests show a count header + 全部批准/全部拒绝 and one block each', () => {
+    const { container } = render(<PermissionQueue requests={reqs(3)} onDecide={() => {}} onDecideAll={() => {}} />)
+    expect(container.querySelectorAll('.perm-block').length).toBe(3)
+    expect(container.querySelector('.perm-queue-count')?.textContent).toContain('3')
+    expect(screen.getByText('全部批准')).toBeTruthy()
+    expect(screen.getByText('全部拒绝')).toBeTruthy()
+  })
+
+  it('clicking a block Allow calls onDecide(id, true) for that request', () => {
+    const onDecide = vi.fn()
+    render(<PermissionQueue requests={reqs(2)} onDecide={onDecide} onDecideAll={() => {}} />)
+    fireEvent.click(screen.getAllByText('Allow')[1]) // second block's Allow (id 'r1')
+    expect(onDecide).toHaveBeenCalledWith('r1', true)
+  })
+
+  it('clicking a block Deny calls onDecide(id, false)', () => {
+    const onDecide = vi.fn()
+    render(<PermissionQueue requests={reqs(1)} onDecide={onDecide} onDecideAll={() => {}} />)
+    fireEvent.click(screen.getByText('Deny'))
+    expect(onDecide).toHaveBeenCalledWith('r0', false)
+  })
+
+  it('全部批准 / 全部拒绝 call onDecideAll with the right flag', () => {
+    const onDecideAll = vi.fn()
+    render(<PermissionQueue requests={reqs(3)} onDecide={() => {}} onDecideAll={onDecideAll} />)
+    fireEvent.click(screen.getByText('全部批准'))
+    expect(onDecideAll).toHaveBeenCalledWith(true)
+    fireEvent.click(screen.getByText('全部拒绝'))
+    expect(onDecideAll).toHaveBeenCalledWith(false)
+  })
+
+  it('renders the tool name + input for each request', () => {
+    const { container } = render(<PermissionQueue requests={[{ id: 'r0', toolName: 'Bash', input: { command: 'go test' } }]} onDecide={() => {}} onDecideAll={() => {}} />)
+    expect(screen.getByText('Bash')).toBeTruthy()
+    expect(container.querySelector('.perm-input')?.textContent).toContain('go test')
+  })
+})
+
+// tether#40 — postDecide is the by-id decide POST reused by both a single block
+// and the bulk 全部批准/全部拒绝 loop. Assert the endpoint contract (URL + body)
+// so a route/shape drift is caught (review nit: this was the untested seam).
+describe('postDecide (tether#40)', () => {
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  it('POSTs the by-id decide endpoint with allow=true', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 })
+    vi.stubGlobal('fetch', fetchMock)
+    await postDecide('r7', true)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const [url, opts] = fetchMock.mock.calls[0]
+    expect(url).toBe('/api/v1/agent/permission/r7/decide')
+    expect(opts.method).toBe('POST')
+    expect(JSON.parse(opts.body)).toEqual({ allow: true, remember: false })
+  })
+
+  it('carries allow=false for a deny', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 })
+    vi.stubGlobal('fetch', fetchMock)
+    await postDecide('r8', false)
+    const [url, opts] = fetchMock.mock.calls[0]
+    expect(url).toBe('/api/v1/agent/permission/r8/decide')
+    expect(JSON.parse(opts.body)).toEqual({ allow: false, remember: false })
   })
 })

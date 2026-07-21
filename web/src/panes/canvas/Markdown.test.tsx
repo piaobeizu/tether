@@ -41,4 +41,19 @@ describe('Markdown code highlighting (tether#41)', () => {
     expect(container.querySelector('strong')?.textContent).toBe('bold')
     expect(container.querySelectorAll('li').length).toBe(2)
   })
+
+  // tether#42 — each fenced code block is wrapped with a copy button.
+  it('wraps a fenced code block with a copy button, keeping the highlighted code', () => {
+    const { container } = render(<Markdown text={'```go\nfunc main() {}\n```'} />)
+    const wrap = container.querySelector('.md-pre')
+    expect(wrap).toBeTruthy()
+    expect(wrap?.querySelector('pre code.hljs')).toBeTruthy()      // still highlighted (#41)
+    expect(wrap?.querySelector('.copy-btn.md-code-copy')).toBeTruthy() // copy affordance
+  })
+
+  it('does not add a copy wrapper around inline code', () => {
+    const { container } = render(<Markdown text={'use `x = 1` inline'} />)
+    expect(container.querySelector('.md-pre')).toBeNull()
+    expect(container.querySelector('code')?.textContent).toBe('x = 1')
+  })
 })

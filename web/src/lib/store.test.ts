@@ -12,7 +12,7 @@ const resultEnv = (): Envelope => ({ kind: 'result', payload: 'stop' })
 const fencedEnv = (blkKind: string): Envelope => ({ kind: 'fenced', payload: { kind: blkKind } } as unknown as Envelope)
 
 function reset() {
-  useStore.setState({ messages: [], streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null, pendingPermissions: [] })
+  useStore.setState({ messages: [], streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null, stopped: false, pendingPermissions: [] })
 }
 
 describe('store thinking accumulation (tether#34)', () => {
@@ -355,5 +355,77 @@ describe('store permission queue (tether#40)', () => {
     h(permEnv('r1')); h(permEnv('r2'))
     useStore.getState().loadHistory([])
     expect(useStore.getState().pendingPermissions).toHaveLength(0)
+  })
+})
+
+// tether#42 — stopTurn finalizes an interrupted turn locally. cc emits NO
+// EventResult after an interrupt, so the store closes the turn itself (mirrors
+// the 'result' path): stamp answerMs, keep the partial text, reset turn pointers.
+describe('store stopTurn (tether#42)', () => {
+  afterEach(reset)
+
+  it('finalizes the current turn: stops streaming, keeps partial text, stamps answerMs', () => {
+    const h = useStore.getState().handleEnvelope
+    h(textEnv('partial ans'))   // answer started, streaming
+    expect(useStore.getState().streaming).toBe(true)
+    useStore.getState().stopTurn()
+    const s = useStore.getState()
+    expect(s.streaming).toBe(false)
+    expect(s.streamingMsgId).toBeNull()
+    expect(s.curTurnId).toBeNull()
+    expect(s.messages).toHaveLength(1)
+    expect(s.messages[0].text).toBe('partial ans')       // partial answer preserved
+    expect(typeof s.messages[0].answerMs).toBe('number') // stamped like result
+  })
+
+  it('is idempotent — a late result after stopTurn does not double-finalize or crash', () => {
+    const h = useStore.getState().handleEnvelope
+    h(textEnv('x'))
+    useStore.getState().stopTurn()
+    const before = useStore.getState().messages.length
+    h(resultEnv())  // late result: curTurnId already null → no-op
+    const s = useStore.getState()
+    expect(s.messages).toHaveLength(before)
+    expect(s.streaming).toBe(false)
+    expect(s.curTurnId).toBeNull()
+  })
+
+  it('stopTurn with no active turn is a safe no-op', () => {
+    useStore.getState().stopTurn()
+    const s = useStore.getState()
+    expect(s.messages).toHaveLength(0)
+    expect(s.streaming).toBe(false)
+  })
+
+  it('drops late deltas after stop — no new bubble, no resumed streaming (owner: output-after-stop)', () => {
+    const h = useStore.getState().handleEnvelope
+    h(textEnv('partial'))          // streaming turn
+    useStore.getState().stopTurn() // user hits Stop
+    h(textEnv(' more buffered'))   // cc flushes late buffered deltas after the interrupt
+    h(thinkingEnv('late think'))
+    h(toolEnv('Read', { file_path: 'x' }, 'late'))
+    const s = useStore.getState()
+    expect(s.messages).toHaveLength(1)          // NO new bubble spawned
+    expect(s.messages[0].text).toBe('partial')  // late text ignored
+    expect(s.streaming).toBe(false)             // streaming NOT resumed
+  })
+
+  it('a new user turn clears the stopped flag so the next turn streams normally', () => {
+    const h = useStore.getState().handleEnvelope
+    h(textEnv('a'))
+    useStore.getState().stopTurn()
+    useStore.getState().addMessage({ id: 'u1', role: 'user', text: 'again', ts: 1 })
+    h(textEnv('fresh answer'))
+    const s = useStore.getState()
+    expect(s.messages.some(m => m.role === 'assistant' && m.text === 'fresh answer')).toBe(true)
+    expect(s.streaming).toBe(true)
+  })
+
+  it('a terminal result clears the stopped flag', () => {
+    const h = useStore.getState().handleEnvelope
+    h(textEnv('a'))
+    useStore.getState().stopTurn()
+    h(resultEnv())
+    expect(useStore.getState().stopped).toBe(false)
   })
 })

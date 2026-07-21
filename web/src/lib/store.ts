@@ -105,6 +105,10 @@ interface AppState {
   curTurnId: string | null        // the current turn's assistant bubble (null between turns)
   thinkingStartTs: number | null  // ts of the first thinking delta this turn
   answerStartTs: number | null    // ts of the first answer delta this turn (tether#36)
+  // tether#42 — true after a manual stop, until the next user turn; drops the
+  // late buffered deltas cc flushes post-interrupt so they don't spawn a new
+  // bubble / resume streaming ("output another chunk after Stop").
+  stopped: boolean
 
   // Selection (tether#28): the middle file view (selectedFile) and the right
   // Work wi drawer (selectedWiId) are INDEPENDENT and can be open at once.
@@ -126,11 +130,27 @@ interface AppState {
   setConnected: (v: boolean) => void
   setConnection: (patch: Partial<Connection>) => void
   handleEnvelope: (env: Envelope) => void
+  /** Finalize the current turn on a manual interrupt/stop (tether#42). */
+  stopTurn: () => void
   select: (sel: { wiId?: string | null; file?: SelectedFile | null } | null) => void
   setWorkProject: (p: string) => void
 }
 
-export const useStore = create<AppState>((set) => ({
+// finalizeTurn closes the current assistant turn — stamps the answer duration
+// (tether#36) and resets all turn-transient pointers. Shared by the natural
+// 'result' path and the manual interrupt (tether#42 stopTurn): an interrupted
+// cc turn emits NO EventResult, so the frontend finalizes locally. Idempotent —
+// if a late result still arrives, curTurnId is already null and it's a no-op.
+function finalizeTurn(s: AppState): Partial<AppState> {
+  const id = s.curTurnId
+  const started = s.answerStartTs
+  const messages = (id && started != null)
+    ? s.messages.map(m => (m.id === id ? { ...m, answerMs: Date.now() - started } : m))
+    : s.messages
+  return { messages, streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null }
+}
+
+export const useStore = create<AppState>((set, get) => ({
   sessionId: null,
   messages: [],
   pendingPermissions: [],
@@ -140,6 +160,7 @@ export const useStore = create<AppState>((set) => ({
   curTurnId: null,
   thinkingStartTs: null,
   answerStartTs: null,
+  stopped: false,
   connection: { state: 'connecting', latency: 0, attempt: 0 },
   selectedWiId: null,
   selectedFile: null,
@@ -171,19 +192,22 @@ export const useStore = create<AppState>((set) => ({
     }
     // A session reset (page reload / session switch) drops any stale pending
     // permission requests — they belong to the prior session (tether#40).
-    return { messages: reduced, streamingMsgId: null, streaming: false, curTurnId: null, thinkingStartTs: null, answerStartTs: null, pendingPermissions: [] }
+    return { messages: reduced, streamingMsgId: null, streaming: false, curTurnId: null, thinkingStartTs: null, answerStartTs: null, stopped: false, pendingPermissions: [] }
   }),
   addMessage: (msg) => set((s) => ({
     messages: [...s.messages, msg],
     // A new user turn ends the prior assistant turn's accumulation (tether#34).
-    ...(msg.role === 'user' ? { curTurnId: null, thinkingStartTs: null, answerStartTs: null } : {}),
+    ...(msg.role === 'user' ? { curTurnId: null, thinkingStartTs: null, answerStartTs: null, stopped: false } : {}),
   })),
   resolvePermission: (id) => set((s) => ({
     pendingPermissions: s.pendingPermissions.filter((p) => p.id !== id),
   })),
+  // tether#42 — manual interrupt: cc aborts the turn with no EventResult, so
+  // close it locally (same reducer as 'result'). Idempotent.
+  stopTurn: () => set((s) => ({ ...finalizeTurn(s), stopped: true })),
   setConnected: (v) => v
     ? set({ connected: true, connection: { state: 'live', latency: 0, attempt: 0 } })
-    : set({ connected: false, streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null, connection: { state: 'dropped', latency: 0, attempt: 0 } }),
+    : set({ connected: false, streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null, stopped: false, connection: { state: 'dropped', latency: 0, attempt: 0 } }),
   setConnection: (patch) => set((s) => ({ connection: { ...s.connection, ...patch } })),
 
   handleEnvelope: (env) => {
@@ -196,6 +220,12 @@ export const useStore = create<AppState>((set) => ({
             set({ sessionId: pObj['sessionId'] as string })
             break
           }
+          // After a manual stop (tether#42), cc may still flush a few buffered
+          // deltas; drop them so they don't spawn a new bubble or resume
+          // streaming. Cleared by the next user turn (addMessage) or a terminal
+          // result/error. session_ready above is exempt (session-level, not turn
+          // content).
+          if (get().stopped) break
           if (pObj['type'] === 'tool_use') {
             // Surface the tool call in the current turn's bubble (tether#37).
             // The daemon already sent {name,input} (registry.go translateEvent);
@@ -292,6 +322,7 @@ export const useStore = create<AppState>((set) => ({
           break
         }
         if (typeof p !== 'string') break
+        if (get().stopped) break // drop late answer text after a manual stop (tether#42)
         set((s) => {
           if (s.curTurnId) {
             // Append answer text to the current turn's bubble. On the FIRST answer
@@ -330,20 +361,16 @@ export const useStore = create<AppState>((set) => ({
       }
       case 'result':
         // Stamp the answer-generation duration on the turn's bubble as the
-        // "done" signal (tether#36), then close the turn.
-        set((s) => {
-          const id = s.curTurnId
-          const started = s.answerStartTs
-          const messages = (id && started != null)
-            ? s.messages.map(m => (m.id === id ? { ...m, answerMs: Date.now() - started } : m))
-            : s.messages
-          return { messages, streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null }
-        })
+        // "done" signal (tether#36), then close the turn. Shared with the
+        // manual interrupt path (stopTurn) via finalizeTurn (tether#42).
+        // Clear `stopped` too: a terminal result ends the (possibly
+        // interrupted) turn, so later deltas belong to a fresh turn.
+        set((s) => ({ ...finalizeTurn(s), stopped: false }))
         break
       case 'error':
         // Clear the thinking/streaming indicator on a daemon-surfaced error so
         // the UI doesn't get stuck showing "Claude is thinking…" forever.
-        set({ streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null })
+        set({ streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null, stopped: false })
         break
       case 'fenced': {
         // D-19 fenced block, live-replace-by-BlockID (tether#8 T8, contract §3):
@@ -361,6 +388,7 @@ export const useStore = create<AppState>((set) => ({
         // streaming untouched — a card update is not a text boundary.
         const fb = env.payload as FencedBlock | undefined
         if (!fb || typeof fb.kind !== 'string') break
+        if (get().stopped) break // drop late fenced blocks after a manual stop (tether#42)
         set((s) => {
           const idx = fb.blockId
             ? s.messages.findIndex((m) => m.block?.blockId === fb.blockId)

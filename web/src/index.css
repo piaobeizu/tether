@@ -957,6 +957,64 @@ body {
   padding: 10px 12px; overflow: auto; margin: 10px 0;
 }
 .md-body pre code { background: none; padding: 0; }
+
+/* tether#41 — syntax-highlight tokens (rehype-highlight / highlight.js).
+   Colored via tether tokens. --accent / --ink-* flip under [data-theme="dark"],
+   but the saturated --success/--info/--warn/--danger do NOT (only their -tint
+   variants do), so the [data-theme="dark"] block below brightens those specific
+   highlight tokens for legibility on the dark code bg — WITHOUT touching the
+   global tokens (other UI relies on them). Only fenced blocks that declare a
+   language get these classes (detect:false). */
+.md-body .hljs { color: var(--ink-primary); background: none; }
+.md-body .hljs-comment,
+.md-body .hljs-quote { color: var(--ink-tertiary); font-style: italic; }
+.md-body .hljs-keyword,
+.md-body .hljs-selector-tag,
+.md-body .hljs-built_in,
+.md-body .hljs-literal,
+.md-body .hljs-symbol,
+.md-body .hljs-bullet { color: var(--accent); }
+.md-body .hljs-string,
+.md-body .hljs-regexp,
+.md-body .hljs-addition { color: var(--success); }
+.md-body .hljs-number,
+.md-body .hljs-type,
+.md-body .hljs-doctag { color: var(--info); }
+.md-body .hljs-title,
+.md-body .hljs-title.function_,
+.md-body .hljs-title.class_,
+.md-body .hljs-section,
+.md-body .hljs-name { color: var(--info); font-weight: 600; }
+.md-body .hljs-attr,
+.md-body .hljs-attribute,
+.md-body .hljs-property,
+.md-body .hljs-variable,
+.md-body .hljs-template-variable { color: var(--warn); }
+.md-body .hljs-meta { color: var(--ink-tertiary); }
+.md-body .hljs-deletion { color: var(--danger); }
+.md-body .hljs-emphasis { font-style: italic; }
+.md-body .hljs-strong { font-weight: 600; }
+/* Dark-mode brightening (review nit): --success/--info/--warn/--danger keep
+   their light values under [data-theme="dark"] and read <3:1 on --bg-code
+   (#2A2620). Brighten only these highlight tokens here; keyword(--accent) and
+   comment(--ink-tertiary) already flip, so they're left alone. */
+[data-theme="dark"] .md-body .hljs-string,
+[data-theme="dark"] .md-body .hljs-regexp,
+[data-theme="dark"] .md-body .hljs-addition { color: #6FC28E; }
+[data-theme="dark"] .md-body .hljs-number,
+[data-theme="dark"] .md-body .hljs-type,
+[data-theme="dark"] .md-body .hljs-doctag,
+[data-theme="dark"] .md-body .hljs-title,
+[data-theme="dark"] .md-body .hljs-title.function_,
+[data-theme="dark"] .md-body .hljs-title.class_,
+[data-theme="dark"] .md-body .hljs-section,
+[data-theme="dark"] .md-body .hljs-name { color: #6EA8E8; }
+[data-theme="dark"] .md-body .hljs-attr,
+[data-theme="dark"] .md-body .hljs-attribute,
+[data-theme="dark"] .md-body .hljs-property,
+[data-theme="dark"] .md-body .hljs-variable,
+[data-theme="dark"] .md-body .hljs-template-variable { color: #D9A441; }
+[data-theme="dark"] .md-body .hljs-deletion { color: #E0736A; }
 .md-body blockquote {
   margin: 8px 0; padding: 2px 12px;
   border-left: 3px solid var(--line);

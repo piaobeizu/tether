@@ -461,6 +461,24 @@ func (r *Registry) fanOut(e *Entry) {
 			continue
 		}
 
+		// tether#44 — persist thinking + tool activity so a reload reconstructs
+		// the turn's rich content (attached to the turn's assistant history entry
+		// at the next FinalizeAssistant). These were broadcast-only until now.
+		if r.History != nil && sid != "" {
+			switch ev.Kind {
+			case agent.EventThinking:
+				r.History.AccumulateThinking(sid, ev.Text)
+			case agent.EventToolUse:
+				if ev.ToolUse != nil {
+					r.History.RecordToolUse(sid, ev.ToolUse.ID, ev.ToolUse.Name, ev.ToolUse.Input)
+				}
+			case agent.EventToolResult:
+				if ev.ToolResult != nil {
+					r.History.RecordToolResult(sid, ev.ToolResult.ToolUseID, ev.ToolResult.Content, ev.ToolResult.IsError)
+				}
+			}
+		}
+
 		env := translateEvent(ev)
 		if env == nil {
 			continue

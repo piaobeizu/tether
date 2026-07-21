@@ -106,7 +106,14 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
     fetch(`/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`)
       .then(r => r.ok ? r.json() : [])
       .then((msgs: HistoryEntry[]) => {
-        if (msgs.length > 0) {
+        // Don't clobber an in-flight turn (tether#42 fix). On the FIRST send of
+        // a new session, session_ready sets sessionId and fires this effect;
+        // /messages already has the just-persisted user msg, so loadHistory
+        // would run and reset streaming/curTurn — wiping the optimistic
+        // "thinking…" indicator (streaming set in sendMessage) during the gap
+        // before the first token. While a turn is streaming the live stream is
+        // authoritative, so skip the reload.
+        if (msgs.length > 0 && !useStore.getState().streaming) {
           useStore.getState().loadHistory(msgs.map(historyEntryToMessage))
         }
       })

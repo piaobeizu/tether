@@ -12,7 +12,7 @@ const resultEnv = (): Envelope => ({ kind: 'result', payload: 'stop' })
 const fencedEnv = (blkKind: string): Envelope => ({ kind: 'fenced', payload: { kind: blkKind } } as unknown as Envelope)
 
 function reset() {
-  useStore.setState({ messages: [], streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null, pendingPermissions: [] })
+  useStore.setState({ messages: [], streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null, stopped: false, pendingPermissions: [] })
 }
 
 describe('store thinking accumulation (tether#34)', () => {
@@ -395,5 +395,37 @@ describe('store stopTurn (tether#42)', () => {
     const s = useStore.getState()
     expect(s.messages).toHaveLength(0)
     expect(s.streaming).toBe(false)
+  })
+
+  it('drops late deltas after stop — no new bubble, no resumed streaming (owner: output-after-stop)', () => {
+    const h = useStore.getState().handleEnvelope
+    h(textEnv('partial'))          // streaming turn
+    useStore.getState().stopTurn() // user hits Stop
+    h(textEnv(' more buffered'))   // cc flushes late buffered deltas after the interrupt
+    h(thinkingEnv('late think'))
+    h(toolEnv('Read', { file_path: 'x' }, 'late'))
+    const s = useStore.getState()
+    expect(s.messages).toHaveLength(1)          // NO new bubble spawned
+    expect(s.messages[0].text).toBe('partial')  // late text ignored
+    expect(s.streaming).toBe(false)             // streaming NOT resumed
+  })
+
+  it('a new user turn clears the stopped flag so the next turn streams normally', () => {
+    const h = useStore.getState().handleEnvelope
+    h(textEnv('a'))
+    useStore.getState().stopTurn()
+    useStore.getState().addMessage({ id: 'u1', role: 'user', text: 'again', ts: 1 })
+    h(textEnv('fresh answer'))
+    const s = useStore.getState()
+    expect(s.messages.some(m => m.role === 'assistant' && m.text === 'fresh answer')).toBe(true)
+    expect(s.streaming).toBe(true)
+  })
+
+  it('a terminal result clears the stopped flag', () => {
+    const h = useStore.getState().handleEnvelope
+    h(textEnv('a'))
+    useStore.getState().stopTurn()
+    h(resultEnv())
+    expect(useStore.getState().stopped).toBe(false)
   })
 })

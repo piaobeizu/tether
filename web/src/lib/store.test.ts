@@ -12,7 +12,7 @@ const resultEnv = (): Envelope => ({ kind: 'result', payload: 'stop' })
 const fencedEnv = (blkKind: string): Envelope => ({ kind: 'fenced', payload: { kind: blkKind } } as unknown as Envelope)
 
 function reset() {
-  useStore.setState({ messages: [], streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null })
+  useStore.setState({ messages: [], streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null, pendingPermissions: [] })
 }
 
 describe('store thinking accumulation (tether#34)', () => {
@@ -295,5 +295,65 @@ describe('store tool-result inlining (tether#38)', () => {
     expect(s.answerStartTs).toBeNull()
     expect(s.thinkingStartTs).toBeNull()
     expect(s.streamingMsgId).toBeNull()
+  })
+})
+
+// tether#40 — parallel permission requests queue. The daemon sends ONE
+// KindPermission per parallel tool; the store now APPENDS each to a queue
+// (dedup by id) instead of overwriting a single slot, so every request stays
+// approvable (the old single-slot pendingPermission let a later request clobber
+// an earlier one → all-but-one timed out). resolvePermission(id) drops one after
+// it's decided; loadHistory (a session reset) clears the queue, but turn
+// boundaries do NOT — a permission's lifecycle is decide-driven, not turn-driven.
+const permEnv = (id: string, toolName = 'Read', input: unknown = {}): Envelope =>
+  ({ kind: 'permission', payload: { id, toolName, input } } as unknown as Envelope)
+
+describe('store permission queue (tether#40)', () => {
+  afterEach(reset)
+
+  it('appends parallel permission requests instead of overwriting (the bug)', () => {
+    const h = useStore.getState().handleEnvelope
+    h(permEnv('r1', 'Read', { file_path: 'go.mod' }))
+    h(permEnv('r2', 'Read', { file_path: 'README.md' }))
+    h(permEnv('r3', 'Grep', { pattern: 'X' }))
+    const q = useStore.getState().pendingPermissions
+    expect(q).toHaveLength(3)
+    expect(q.map((p) => p.id)).toEqual(['r1', 'r2', 'r3']) // arrival order preserved
+    expect(q[2]).toMatchObject({ toolName: 'Grep' })
+  })
+
+  it('dedups a re-emitted request id (no duplicate block)', () => {
+    const h = useStore.getState().handleEnvelope
+    h(permEnv('r1'))
+    h(permEnv('r1')) // same id again
+    expect(useStore.getState().pendingPermissions).toHaveLength(1)
+  })
+
+  it('resolvePermission removes only that id, leaving the rest', () => {
+    const h = useStore.getState().handleEnvelope
+    h(permEnv('r1')); h(permEnv('r2')); h(permEnv('r3'))
+    useStore.getState().resolvePermission('r2')
+    expect(useStore.getState().pendingPermissions.map((p) => p.id)).toEqual(['r1', 'r3'])
+  })
+
+  it('resolvePermission on an unknown id is a no-op (no crash)', () => {
+    const h = useStore.getState().handleEnvelope
+    h(permEnv('r1'))
+    useStore.getState().resolvePermission('nope')
+    expect(useStore.getState().pendingPermissions).toHaveLength(1)
+  })
+
+  it('a turn boundary (result) does NOT clear pending permissions (decide-driven)', () => {
+    const h = useStore.getState().handleEnvelope
+    h(permEnv('r1'))
+    h(resultEnv())
+    expect(useStore.getState().pendingPermissions).toHaveLength(1)
+  })
+
+  it('loadHistory (session reset) clears the queue', () => {
+    const h = useStore.getState().handleEnvelope
+    h(permEnv('r1')); h(permEnv('r2'))
+    useStore.getState().loadHistory([])
+    expect(useStore.getState().pendingPermissions).toHaveLength(0)
   })
 })

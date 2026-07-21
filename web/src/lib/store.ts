@@ -91,7 +91,10 @@ export interface SelectedFile {
 interface AppState {
   sessionId: string | null
   messages: Message[]
-  pendingPermission: PermissionRequest | null
+  // Pending PreToolUse permission requests (tether#40). A QUEUE, not one slot:
+  // parallel tools each send their own KindPermission, so a single slot let the
+  // later request clobber the earlier one → all-but-one timed out. Live-only.
+  pendingPermissions: PermissionRequest[]
   connected: boolean
   streaming: boolean
   connection: Connection
@@ -118,7 +121,8 @@ interface AppState {
   setSessionId: (id: string) => void
   loadHistory: (msgs: Message[]) => void
   addMessage: (msg: Message) => void
-  setPendingPermission: (req: PermissionRequest | null) => void
+  /** Remove one request from the queue after it's decided (tether#40). */
+  resolvePermission: (id: string) => void
   setConnected: (v: boolean) => void
   setConnection: (patch: Partial<Connection>) => void
   handleEnvelope: (env: Envelope) => void
@@ -129,7 +133,7 @@ interface AppState {
 export const useStore = create<AppState>((set) => ({
   sessionId: null,
   messages: [],
-  pendingPermission: null,
+  pendingPermissions: [],
   connected: false,
   streaming: false,
   streamingMsgId: null,
@@ -165,14 +169,18 @@ export const useStore = create<AppState>((set) => ({
       }
       reduced.push(m)
     }
-    return { messages: reduced, streamingMsgId: null, streaming: false, curTurnId: null, thinkingStartTs: null, answerStartTs: null }
+    // A session reset (page reload / session switch) drops any stale pending
+    // permission requests — they belong to the prior session (tether#40).
+    return { messages: reduced, streamingMsgId: null, streaming: false, curTurnId: null, thinkingStartTs: null, answerStartTs: null, pendingPermissions: [] }
   }),
   addMessage: (msg) => set((s) => ({
     messages: [...s.messages, msg],
     // A new user turn ends the prior assistant turn's accumulation (tether#34).
     ...(msg.role === 'user' ? { curTurnId: null, thinkingStartTs: null, answerStartTs: null } : {}),
   })),
-  setPendingPermission: (req) => set({ pendingPermission: req }),
+  resolvePermission: (id) => set((s) => ({
+    pendingPermissions: s.pendingPermissions.filter((p) => p.id !== id),
+  })),
   setConnected: (v) => v
     ? set({ connected: true, connection: { state: 'live', latency: 0, attempt: 0 } })
     : set({ connected: false, streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null, connection: { state: 'dropped', latency: 0, attempt: 0 } }),
@@ -383,9 +391,18 @@ export const useStore = create<AppState>((set) => ({
         })
         break
       }
-      case 'permission':
-        set({ pendingPermission: env.payload as PermissionRequest })
+      case 'permission': {
+        // Parallel tools each send their own KindPermission (tether#40): APPEND to
+        // the queue instead of overwriting a single slot, so every request stays
+        // approvable. Dedup by id so a re-emitted request doesn't duplicate a block.
+        const req = env.payload as PermissionRequest
+        set((s) => (
+          s.pendingPermissions.some((p) => p.id === req.id)
+            ? {}
+            : { pendingPermissions: [...s.pendingPermissions, req] }
+        ))
         break
+      }
       default:
         break
     }

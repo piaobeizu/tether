@@ -1347,6 +1347,16 @@ body {
 }
 .perm-btn-deny:hover { background: var(--bg-tint); }
 
+/* Parallel permission queue (tether#40) — one block per request, plus a header
+   with the count and 全部批准/全部拒绝 bulk shortcuts once there are 2+. */
+.perm-queue-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; margin-bottom: 8px;
+}
+.perm-queue-count { font-size: 12px; color: var(--warn); }
+.perm-queue-bulk { display: flex; gap: 8px; }
+.perm-queue-bulk .perm-btn { padding: 3px 10px; font-size: 11px; }
+
 /* Work activity timeline — wi detail-drawer Activity section (tether#31) */
 .work-activity-list { display: flex; flex-direction: column; }
 .work-activity-row {

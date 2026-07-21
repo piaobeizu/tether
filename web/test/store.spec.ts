@@ -82,13 +82,16 @@ describe('useStore.handleEnvelope', () => {
     expect(useStore.getState().streaming).toBe(false) // was already false
   })
 
-  it('permission envelope sets pendingPermission', () => {
+  it('permission envelope appends to the pending queue (tether#40)', () => {
+    useStore.setState({ pendingPermissions: [] })
     const env: Envelope = {
       kind: 'permission',
       payload: { id: 'req-1', toolName: 'Bash', input: { command: 'ls' } },
     }
     useStore.getState().handleEnvelope(env)
-    expect(useStore.getState().pendingPermission?.id).toBe('req-1')
+    const q = useStore.getState().pendingPermissions
+    expect(q).toHaveLength(1)
+    expect(q[0].id).toBe('req-1')
   })
 })
 

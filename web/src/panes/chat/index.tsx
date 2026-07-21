@@ -10,7 +10,7 @@ import { DagBlock } from '../../fenced-blocks/DagBlock'
 import { FormBlock } from '../../fenced-blocks/FormBlock'
 import { CandidatesBlock } from '../../fenced-blocks/CandidatesBlock'
 import { MediaBlock } from '../../fenced-blocks/MediaBlock'
-import { PermissionBlock } from '../../fenced-blocks/PermissionBlock'
+import { PermissionQueue, postDecide } from '../../fenced-blocks/PermissionBlock'
 import Markdown from '../canvas/Markdown'
 
 type ConnState = 'connecting' | 'connected' | 'reconnecting' | 'failed'
@@ -42,7 +42,7 @@ interface Props {
 }
 
 export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
-  const { messages, sessionId, pendingPermission, streaming, streamingMsgId, curTurnId } = useStore()
+  const { messages, sessionId, pendingPermissions, resolvePermission, streaming, streamingMsgId, curTurnId } = useStore()
   const [input, setInput] = useState('')
   const [connState, setConnState] = useState<ConnState>('connecting')
   const [connError, setConnError] = useState<string | null>(null)
@@ -139,11 +139,11 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   // Empty-state hint, debounced so it doesn't flash on session resume before
   // history arrives (connState flips to 'connected' before /messages loads).
   useEffect(() => {
-    const empty = messages.length === 0 && connState === 'connected' && !streaming && !pendingPermission
+    const empty = messages.length === 0 && connState === 'connected' && !streaming && pendingPermissions.length === 0
     if (!empty) { setShowEmpty(false); return }
     const t = setTimeout(() => setShowEmpty(true), 500)
     return () => clearTimeout(t)
-  }, [messages.length, connState, streaming, pendingPermission])
+  }, [messages.length, connState, streaming, pendingPermissions.length])
 
   const cancelPendingReconnect = () => {
     if (reconnectTimerRef.current !== null) { clearTimeout(reconnectTimerRef.current); reconnectTimerRef.current = null }
@@ -496,11 +496,17 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
           </div>
         )}
 
-        {pendingPermission && (
-          <PermissionBlock
-            toolName={pendingPermission.toolName}
-            input={pendingPermission.input}
-            requestId={pendingPermission.id}
+        {pendingPermissions.length > 0 && (
+          <PermissionQueue
+            requests={pendingPermissions}
+            onDecide={(id, allow) => { void postDecide(id, allow); resolvePermission(id) }}
+            onDecideAll={(allow) => {
+              // Snapshot ids first (resolvePermission mutates the queue as we go).
+              for (const id of pendingPermissions.map((p) => p.id)) {
+                void postDecide(id, allow)
+                resolvePermission(id)
+              }
+            }}
           />
         )}
       </div>

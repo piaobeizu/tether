@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 )
@@ -193,6 +194,17 @@ func (s *State) isExempt(r *http.Request) bool {
 		p == "/oauth/token",
 		p == "/.well-known/oauth-authorization-server":
 		return true
+	// The PreToolUse permission hook (tether-permission-hook) is a loopback
+	// subprocess of the daemon-spawned cc; it POSTs the tool request here with
+	// NO cookie/ticket (it has no browser session — it routes by session_id in
+	// the body). Exempt it — but ONLY for a loopback caller, so a remote client
+	// on a public (--acme-domain) deployment can't reach it. EXACT-match /request
+	// only: the sibling /decide (approval) stays cookie-gated so only the
+	// authenticated browser can approve. Without this the hook got a 401, decoded
+	// it as {allow:false}, and every tool was silently denied with no
+	// PermissionBlock ever surfacing (tether#39).
+	case p == "/api/v1/permission/request" && isLoopbackAddr(r.RemoteAddr):
+		return true
 	// Static SPA assets are served by the catch-all "/" handler (embed.FS),
 	// never under /api, /wt, or /mcp. Exempt them from the cookie check — but
 	// fail-closed so a client-controlled trailing segment can't masquerade as
@@ -254,6 +266,23 @@ func (s *State) IsExemptForTest(r *http.Request) bool {
 func isAPIorWT(r *http.Request) bool {
 	p := r.URL.Path
 	return strings.HasPrefix(p, "/api/") || strings.HasPrefix(p, "/wt/")
+}
+
+// isLoopbackAddr reports whether addr (an http.Request RemoteAddr, "host:port")
+// is a loopback peer. Malformed/empty addresses are treated as non-loopback
+// (fail-closed), so the permission-request exemption can never widen to a real
+// remote client (tether#39). This assumes the daemon terminates its own
+// QUIC/TCP listeners (the shipped topology, server.go), so RemoteAddr is the
+// real peer address. Do NOT front the daemon with a same-host reverse proxy:
+// that would collapse every RemoteAddr to loopback and open the exemption to
+// remote callers.
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func hasSuffix(s string, suffixes ...string) bool {

@@ -274,6 +274,37 @@ func TestIsExempt_ProdExemptsOnlyRealDistFiles(t *testing.T) {
 	}
 }
 
+// TestIsExempt_PermissionRequestLoopbackOnly pins tether#39: the PreToolUse
+// permission hook POSTs /api/v1/permission/request from loopback with no cookie,
+// so it must be exempt for a loopback caller but NOT for a remote one; and the
+// sibling /decide must never be exempt (only the authenticated browser approves).
+func TestIsExempt_PermissionRequestLoopbackOnly(t *testing.T) {
+	s := auth.NewState("tok", []byte("0123456789abcdef0123456789abcdef"))
+
+	withAddr := func(p, addr string) *http.Request {
+		r := httptest.NewRequest("POST", p, nil)
+		r.RemoteAddr = addr
+		return r
+	}
+
+	// Loopback hook (IPv4 and IPv6) → exempt.
+	if !s.IsExemptForTest(withAddr("/api/v1/permission/request", "127.0.0.1:54321")) {
+		t.Error("loopback /api/v1/permission/request should be exempt (the hook carries no cookie)")
+	}
+	if !s.IsExemptForTest(withAddr("/api/v1/permission/request", "[::1]:54321")) {
+		t.Error("IPv6 loopback ::1 /api/v1/permission/request should be exempt")
+	}
+	// Same path from a remote peer → NOT exempt (falls through to 401).
+	if s.IsExemptForTest(withAddr("/api/v1/permission/request", "203.0.113.7:44444")) {
+		t.Error("remote /api/v1/permission/request must NOT be exempt")
+	}
+	// /decide (approval) must stay cookie-gated even from loopback — only the
+	// authenticated browser may approve a tool.
+	if s.IsExemptForTest(withAddr("/api/v1/permission/abc123/decide", "127.0.0.1:54321")) {
+		t.Error("/decide must never be exempt (approval requires the browser session)")
+	}
+}
+
 // TestMiddleware_APISuffixLookAlikeNotExempt is the end-to-end guard for tether#16:
 // an unauthenticated /api path whose trailing segment ends in ".js" must get 401
 // and must never reach the inner handler.

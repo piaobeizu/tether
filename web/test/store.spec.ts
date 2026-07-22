@@ -150,6 +150,38 @@ describe('historyEntryToMessage / loadHistory (tether#8 T7 block persistence)', 
     expect(messages[1]).toMatchObject({ role: 'assistant', text: 'hi there', ts: 2 })
     expect(messages[1]?.block).toBeUndefined()
   })
+
+  // tether#44 — reload persistence: thinking + tools now come back from history.
+  it('reconstructs thinking + tools from a /messages payload (tether#44)', () => {
+    const payload: HistoryEntry[] = [
+      { role: 'user', text: 'hi', ts: 1 },
+      {
+        role: 'assistant', text: 'done', ts: 2,
+        thinking: 'pondered a while',
+        tools: [
+          { id: 't1', name: 'Read', input: { file_path: 'a.go' } },
+          { id: 't2', name: 'Bash', input: { command: 'go test' }, result: { content: 'PASS', isError: false } },
+        ],
+      },
+    ]
+    useStore.getState().loadHistory(payload.map(historyEntryToMessage))
+    const ai = useStore.getState().messages.find(m => m.role === 'assistant')!
+    expect(ai.thinking).toBe('pondered a while')
+    expect(ai.tools).toHaveLength(2)
+    expect(ai.tools![0]).toMatchObject({ id: 't1', name: 'Read' })
+    expect(ai.tools![0].result).toBeUndefined()
+    expect(ai.tools![1].result).toEqual({ content: 'PASS', isError: false })
+  })
+
+  it('a pre-#44 assistant entry (no thinking/tools) reconstructs without them', () => {
+    useStore.getState().loadHistory([
+      { role: 'assistant', text: 'plain', ts: 1 },
+    ].map(historyEntryToMessage))
+    const ai = useStore.getState().messages.find(m => m.role === 'assistant')!
+    expect(ai.text).toBe('plain')
+    expect(ai.thinking).toBeUndefined()
+    expect(ai.tools).toBeUndefined()
+  })
 })
 
 // tether#8 T8 — live DAG-card updates: a re-emitted 'fenced' envelope with

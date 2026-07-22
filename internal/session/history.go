@@ -32,6 +32,13 @@ import (
 // ceiling for a single response with headroom.
 const MaxAssistantBufBytes = 4 << 20
 
+// tether#44 — caps for the persisted rich-turn accumulators (thinking + tools).
+const (
+	MaxThinkingBufBytes = 4 << 20  // same ceiling as assistant text
+	MaxToolsPerTurn     = 200      // cap tool calls recorded per turn
+	MaxToolResultBytes  = 16 << 10 // cap each persisted tool result (UI truncates display anyway)
+)
+
 // HistoryMessage is one entry stored in the JSONL history file: either a
 // plain text turn (Block nil) or a completed fenced block (D-19, tether#8
 // T7) recorded in stream order alongside surrounding text, so a page
@@ -41,6 +48,26 @@ type HistoryMessage struct {
 	Text  string            `json:"text"`
 	Ts    int64             `json:"ts"` // Unix milliseconds
 	Block *wire.FencedBlock `json:"block,omitempty"`
+	// tether#44 — rich turn content persisted so a reload reconstructs the turn
+	// as it rendered live (previously live-only, lost on refresh). Both optional
+	// (omitempty) for backward compatibility with pre-#44 history lines.
+	Thinking string           `json:"thinking,omitempty"` // extended-thinking text (tether#34)
+	Tools    []ToolCallRecord `json:"tools,omitempty"`    // tool calls + results (tether#37/#38)
+}
+
+// ToolCallRecord mirrors the frontend ToolCall shape (store.ts) so persisted
+// tool activity reconstructs onto the same Message.tools the live path builds.
+type ToolCallRecord struct {
+	ID     string            `json:"id"`
+	Name   string            `json:"name"`
+	Input  json.RawMessage   `json:"input,omitempty"`
+	Result *ToolResultRecord `json:"result,omitempty"`
+}
+
+// ToolResultRecord is a tool's output, hung on its ToolCallRecord by id.
+type ToolResultRecord struct {
+	Content string `json:"content"`
+	IsError bool   `json:"isError"`
 }
 
 // HistoryStore manages per-session message history files.
@@ -53,7 +80,12 @@ type HistoryStore struct {
 type assistantBuf struct {
 	text     string
 	ts       int64
-	overflow bool // true once we've truncated; subsequent chunks are dropped
+	overflow bool // true once text truncated; subsequent chunks are dropped
+	// tether#44 — rich turn content accumulated alongside text and flushed
+	// together by FinalizeAssistant.
+	thinking         string
+	thinkingOverflow bool
+	tools            []ToolCallRecord
 }
 
 // NewHistoryStore creates a store rooted at baseDir.
@@ -108,6 +140,80 @@ func (h *HistoryStore) AccumulateAssistant(sid, chunk string) {
 	buf.text += chunk
 }
 
+// bufLocked returns the pending accumulator for sid, creating it if absent.
+// Caller MUST hold h.mu.
+func (h *HistoryStore) bufLocked(sid string) *assistantBuf {
+	buf, ok := h.pending[sid]
+	if !ok {
+		buf = &assistantBuf{ts: time.Now().UnixMilli()}
+		h.pending[sid] = buf
+	}
+	return buf
+}
+
+// AccumulateThinking buffers extended-thinking text for the current turn
+// (tether#44), flushed to history by FinalizeAssistant. Capped like assistant
+// text; once exceeded, further thinking is dropped until the turn finalizes.
+func (h *HistoryStore) AccumulateThinking(sid, delta string) {
+	if sid == "" || delta == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	buf := h.bufLocked(sid)
+	if buf.thinkingOverflow {
+		return
+	}
+	if len(buf.thinking)+len(delta) > MaxThinkingBufBytes {
+		if remaining := MaxThinkingBufBytes - len(buf.thinking); remaining > 0 {
+			buf.thinking += delta[:remaining]
+		}
+		buf.thinkingOverflow = true
+		slog.Warn("history: thinking truncated", "sid", sid, "limit_bytes", MaxThinkingBufBytes)
+		return
+	}
+	buf.thinking += delta
+}
+
+// RecordToolUse records a tool call for the current turn (tether#44), matched
+// to its result later by id. Capped at MaxToolsPerTurn per turn.
+func (h *HistoryStore) RecordToolUse(sid, id, name string, input json.RawMessage) {
+	if sid == "" || name == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	buf := h.bufLocked(sid)
+	if len(buf.tools) >= MaxToolsPerTurn {
+		return
+	}
+	buf.tools = append(buf.tools, ToolCallRecord{ID: id, Name: name, Input: input})
+}
+
+// RecordToolResult hangs a tool's output on the matching recorded tool_use by
+// id (tether#44), capping the stored content (the UI truncates display anyway).
+// A result with no matching tool_use is dropped (no bubble to hang it on).
+func (h *HistoryStore) RecordToolResult(sid, toolUseID, content string, isError bool) {
+	if sid == "" || toolUseID == "" {
+		return
+	}
+	if len(content) > MaxToolResultBytes {
+		content = content[:MaxToolResultBytes] + "\n[... truncated ...]"
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	buf, ok := h.pending[sid]
+	if !ok {
+		return
+	}
+	for i := range buf.tools {
+		if buf.tools[i].ID == toolUseID {
+			buf.tools[i].Result = &ToolResultRecord{Content: content, IsError: isError}
+			return
+		}
+	}
+}
+
 // FinalizeAssistant flushes accumulated assistant text to disk.
 func (h *HistoryStore) FinalizeAssistant(sid string) {
 	if sid == "" {
@@ -120,13 +226,17 @@ func (h *HistoryStore) FinalizeAssistant(sid string) {
 	}
 	h.mu.Unlock()
 
-	if !ok || buf.text == "" {
+	// tether#44 — flush if the turn has ANY content: text, thinking, or tools
+	// (a thinking-only or tools-only turn must still persist).
+	if !ok || (buf.text == "" && buf.thinking == "" && len(buf.tools) == 0) {
 		return
 	}
 	h.append(sid, HistoryMessage{
-		Role: "assistant",
-		Text: buf.text,
-		Ts:   buf.ts,
+		Role:     "assistant",
+		Text:     buf.text,
+		Ts:       buf.ts,
+		Thinking: buf.thinking,
+		Tools:    buf.tools,
 	})
 }
 

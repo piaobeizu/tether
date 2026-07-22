@@ -47,6 +47,10 @@ export interface HistoryEntry {
   text: string
   ts: number
   block?: FencedBlock
+  // tether#44 — rich turn content the daemon now persists, so a reload
+  // reconstructs the turn as it rendered live (absent on pre-#44 history).
+  thinking?: string
+  tools?: ToolCall[]
 }
 
 /**
@@ -64,6 +68,10 @@ export function historyEntryToMessage(m: HistoryEntry): Message {
     ts: m.ts,
   }
   if (m.block) msg.block = m.block
+  // tether#44 — restore persisted thinking + tool activity so ThinkingBlock /
+  // ToolCallList render the same after a reload as they did live.
+  if (m.thinking) msg.thinking = m.thinking
+  if (m.tools && m.tools.length > 0) msg.tools = m.tools
   return msg
 }
 

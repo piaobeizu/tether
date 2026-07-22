@@ -472,11 +472,19 @@ body {
   border-radius: var(--r-3); padding: 8px 10px 6px; transition: border-color .15s;
 }
 .composer-box:focus-within { border-color: var(--ink-primary); }
-.composer-row { display: flex; align-items: center; gap: 8px; padding: 4px; }
-.composer-prefix { color: var(--accent); font-weight: 600; font-size: 14px; font-family: var(--font-mono); }
+/* tether#46 — composer is a multi-line textarea. Bottom-align the row so the
+   send/Stop button stays anchored to the bottom as the textarea grows; the `/`
+   prefix pins to the top (first line) like a prompt marker. */
+.composer-row { display: flex; align-items: flex-end; gap: 8px; padding: 4px; }
+.composer-prefix { color: var(--accent); font-weight: 600; font-size: 14px; font-family: var(--font-mono); align-self: flex-start; line-height: 20px; }
 .composer-input {
-  flex: 1; font-family: var(--font-mono); font-size: 13px;
+  flex: 1; font-family: var(--font-mono); font-size: 13px; line-height: 20px;
   color: var(--ink-primary); border: 0; outline: none; background: transparent;
+  /* tether#46 — textarea: no manual resize handle, grows via JS (growHeight) up
+     to max-height (8 × 20px line-height), then scrolls internally. border-box so
+     the JS height (from scrollHeight) maps 1:1 without padding drift. */
+  resize: none; padding: 0; margin: 0; box-sizing: border-box; display: block;
+  max-height: 160px; overflow-y: hidden;
 }
 .composer-input::placeholder { color: var(--ink-quat); }
 .composer-input:disabled { color: var(--ink-disabled); }

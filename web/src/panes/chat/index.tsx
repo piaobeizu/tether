@@ -100,6 +100,24 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
     return () => window.removeEventListener('tether:provider-changed', onProviderChange)
   }, [])
 
+  // tether#45 — restore the last session on (re)mount so history loads from
+  // /messages IMMEDIATELY, without waiting for session_ready. session_ready is
+  // sent only after cc emits system/init, which in stream-json input mode needs
+  // a fresh prompt (wt_chat.go) and is unreliable under cc --resume contention
+  // (zombie spawn, mem_ruSB7HHI) — so a plain reload otherwise showed an empty
+  // "new" session. Setting sessionId here fires the history-load effect below,
+  // which fetches /messages over HTTP (independent of cc). A later session_ready
+  // re-confirms the same sid (cc --resume keeps its id) as a no-op; a different
+  // sid re-fires the effect, but its msgs.length>0 guard drops an EMPTY /messages
+  // so it can't wipe restored history (a non-empty payload for that sid replaces,
+  // intentionally). Mirrors switchSession's proven path.
+  useEffect(() => {
+    if (!useStore.getState().sessionId) {
+      const last = localStorage.getItem('tether_last_sid')
+      if (last) useStore.getState().setSessionId(last)
+    }
+  }, [])
+
   // Load chat history when session ID is first established.
   useEffect(() => {
     if (!sessionId) return

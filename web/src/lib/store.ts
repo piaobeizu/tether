@@ -225,7 +225,13 @@ export const useStore = create<AppState>((set, get) => ({
         if (p && typeof p === 'object') {
           const pObj = p as Record<string, unknown>
           if (pObj['type'] === 'session_ready') {
-            set({ sessionId: pObj['sessionId'] as string })
+            // tether#45 — PERSIST the sid (via setSessionId → localStorage), not
+            // just set state. Previously this did a plain set() that bypassed
+            // localStorage, so only the click-to-work paths ever wrote
+            // tether_last_sid; a NORMAL chat session's sid was lost on reload →
+            // doConnect had no ?sid= to resume and ChatPane mount had nothing to
+            // restore → an empty "new" session. Persisting here lets both resume.
+            get().setSessionId(pObj['sessionId'] as string)
             break
           }
           // After a manual stop (tether#42), cc may still flush a few buffered

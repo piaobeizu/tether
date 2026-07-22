@@ -35,6 +35,11 @@ export interface Message {
    *  in arrival order. Live-only — the daemon never persists tool_use to history,
    *  so absent after a page reload (same as thinking/answerMs). */
   tools?: ToolCall[]
+  /** The turn's token usage (tether#48): input/output token counts from cc's
+   *  result event, attached to the turn bubble for the "⇅ in↑/out↓" badge.
+   *  Live-only — the daemon does not persist usage to history, so absent after
+   *  a page reload (same as thinking/answerMs). */
+  usage?: { input: number; output: number }
 }
 
 /**
@@ -305,6 +310,24 @@ export const useStore = create<AppState>((set, get) => ({
                   : m
               ),
             }))
+            break
+          }
+          if (pObj['type'] === 'usage') {
+            // The turn's token usage (tether#48). The daemon emits it right
+            // before the 'result' envelope, so curTurnId still points at the
+            // turn's bubble — attach {input,output} there for the badge. Do NOT
+            // touch streaming/timing/streamingMsgId: usage is a turn-end signal,
+            // not answer/thinking/tool content, and 'result' (arriving next)
+            // owns closing the turn. If curTurnId is null (e.g. a turn that
+            // ended on a fenced block, which resets curTurnId), there's no
+            // bubble to carry the badge — drop it (same as answerMs).
+            const input = typeof pObj['input'] === 'number' ? (pObj['input'] as number) : 0
+            const output = typeof pObj['output'] === 'number' ? (pObj['output'] as number) : 0
+            set((s) => {
+              const id = s.curTurnId
+              if (!id) return {}
+              return { messages: s.messages.map(m => (m.id === id ? { ...m, usage: { input, output } } : m)) }
+            })
             break
           }
           if (pObj['type'] === 'thinking') {

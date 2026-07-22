@@ -673,7 +673,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
                 <span className="msg-ai-avatar">
                   <Icon name="tether" size={10} style={{ color: 'white' }} />
                 </span>
-                <AnswerMeta ts={m.ts} answerMs={m.answerMs} />
+                <AnswerMeta ts={m.ts} answerMs={m.answerMs} usage={m.usage} />
                 {m.text && <CopyButton className="msg-copy" getText={() => m.text} label="Copy answer" />}
               </div>
               {m.thinking && (
@@ -915,6 +915,25 @@ export function fmtThinkMs(ms: number | undefined): string {
   return `${Math.floor(totalSec / 60)}m ${totalSec % 60}s`
 }
 
+// fmtTokens renders a token count compactly for the usage badge (tether#48):
+// under 1k verbatim ("856"), then "k" ("1.2k", "46k"), then "M" ("1.4M").
+// BOTH tiers apply fmtThinkMs's decimal rule (>= ~10 of a unit, or a whole
+// value, drops the decimal — "10.0k"→"10k"). The k-tier stops at 999_500, not
+// 1_000_000: above that, round(n/1000) would hit 1000 and render an ugly
+// "1000k", so those roll into the M-tier ("1.0M") instead. With 1M-context
+// models, near-1M input counts are realistic, so this seam matters. Empty
+// string for undefined/negative.
+export function fmtTokens(n: number | undefined): string {
+  if (n == null || n < 0) return ''
+  if (n < 1000) return String(n)
+  if (n < 999_500) {
+    const k = n / 1000
+    return `${k >= 9.95 || Number.isInteger(k) ? String(Math.round(k)) : k.toFixed(1)}k`
+  }
+  const m = n / 1_000_000
+  return `${m >= 9.95 || Number.isInteger(m) ? String(Math.round(m)) : m.toFixed(1)}M`
+}
+
 interface ThinkingBlockProps {
   thinking: string
   thinkingMs?: number
@@ -932,12 +951,22 @@ interface ThinkingBlockProps {
 // answer-duration badge once the turn completes (answerMs is stamped at result).
 // Exported as a pure component so ChatPane.test.tsx tests the badge directly
 // without mounting ChatPane (WebTransport).
-export function AnswerMeta({ ts, answerMs }: { ts: number; answerMs?: number }) {
+export function AnswerMeta({ ts, answerMs, usage }: {
+  ts: number
+  answerMs?: number
+  /** The turn's token usage (tether#48); renders a "⇅ in↑/out↓" badge when present. */
+  usage?: { input: number; output: number }
+}) {
   return (
     <>
       <span className="msg-ai-name">tether</span>
       <span className="msg-ai-time">{fmtTime(ts)}</span>
       {answerMs != null && <span className="msg-ai-dur">· {fmtThinkMs(answerMs)}</span>}
+      {usage && (
+        <span className="msg-ai-usage" title={`${usage.input} input / ${usage.output} output tokens`}>
+          · ⇅ {fmtTokens(usage.input)}↑/{fmtTokens(usage.output)}↓
+        </span>
+      )}
     </>
   )
 }

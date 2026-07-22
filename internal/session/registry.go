@@ -538,6 +538,19 @@ func translateEvent(ev agent.Event) *wire.Envelope {
 				"is_error":    ev.ToolResult.IsError,
 			}}
 		}
+	case agent.EventUsage:
+		// tether#48: the turn's token usage (from cc's result event), forwarded
+		// as an object-payload KindMessage in the same family as thinking/
+		// tool_use. Emitted just before KindResult, so the frontend attaches it
+		// to the still-open turn bubble. Live-only — NOT accumulated into history
+		// (see the fanOut switch above), so it's absent after a reload.
+		if ev.Usage != nil {
+			return &wire.Envelope{Kind: wire.KindMessage, Payload: map[string]any{
+				"type":   "usage",
+				"input":  ev.Usage.Input,
+				"output": ev.Usage.Output,
+			}}
+		}
 	case agent.EventError:
 		return &wire.Envelope{Kind: wire.KindError, Payload: ev.Err.Error()}
 	}

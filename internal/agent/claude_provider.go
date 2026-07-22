@@ -207,7 +207,17 @@ type rawStreamEvent struct {
 	SessionID string             `json:"session_id,omitempty"`
 	Message   *rawAssistMsg      `json:"message,omitempty"`
 	Result    string             `json:"result,omitempty"`
+	Usage     *rawUsage          `json:"usage,omitempty"` // populated on the `result` event (tether#48)
 	Event     *rawPartialMessage `json:"event,omitempty"` // populated when type=="stream_event"
+}
+
+// rawUsage is cc's per-turn token accounting on the `result` event. cc also
+// reports cache_creation_input_tokens / cache_read_input_tokens and
+// total_cost_usd here, but tether#48 surfaces only the plain input/output
+// counts (owner scope: in/out tokens, no cache detail, no cost).
+type rawUsage struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
 }
 
 type rawAssistMsg struct {
@@ -329,7 +339,17 @@ func (s *ccSession) parseLine(line []byte) []Event {
 	}
 
 	if raw.Type == "result" {
-		return []Event{{Kind: EventResult, Text: raw.Result}}
+		// Surface the turn's token usage (tether#48) BEFORE the result. The
+		// result is the turn-closer (finalizes the frontend turn); emitting usage
+		// first means the frontend still has the open turn bubble to attach it to.
+		var evs []Event
+		if raw.Usage != nil {
+			evs = append(evs, Event{Kind: EventUsage, Usage: &UsageEvent{
+				Input:  raw.Usage.InputTokens,
+				Output: raw.Usage.OutputTokens,
+			}})
+		}
+		return append(evs, Event{Kind: EventResult, Text: raw.Result})
 	}
 
 	if raw.Type == "rate_limit_event" {

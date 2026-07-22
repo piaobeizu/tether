@@ -465,6 +465,36 @@ func TestTranslateEvent_ToolResult(t *testing.T) {
 	}
 }
 
+// TestTranslateEvent_Usage — (tether#48) an EventUsage becomes a
+// KindMessage{type:"usage", input, output} object payload (same family as
+// thinking/tool_use), and a nil Usage produces no envelope (nil) so a
+// malformed event never emits a bogus 0↑/0↓ badge.
+func TestTranslateEvent_Usage(t *testing.T) {
+	env := translateEvent(agent.Event{Kind: agent.EventUsage, Usage: &agent.UsageEvent{Input: 1234, Output: 856}})
+	if env == nil {
+		t.Fatal("translateEvent(EventUsage) = nil, want a KindMessage envelope")
+	}
+	if env.Kind != wire.KindMessage {
+		t.Errorf("Kind = %q, want %q", env.Kind, wire.KindMessage)
+	}
+	payload, ok := env.Payload.(map[string]any)
+	if !ok {
+		t.Fatalf("Payload = %T, want map[string]any", env.Payload)
+	}
+	if payload["type"] != "usage" {
+		t.Errorf(`payload["type"] = %v, want "usage"`, payload["type"])
+	}
+	if payload["input"] != 1234 {
+		t.Errorf(`payload["input"] = %v, want 1234`, payload["input"])
+	}
+	if payload["output"] != 856 {
+		t.Errorf(`payload["output"] = %v, want 856`, payload["output"])
+	}
+	if got := translateEvent(agent.Event{Kind: agent.EventUsage, Usage: nil}); got != nil {
+		t.Errorf("translateEvent(EventUsage{nil}) = %+v, want nil", got)
+	}
+}
+
 // TestRegistry_ThinkingBroadcastNotPersisted — (tether#34) an EventThinking
 // delta must be broadcast to subscribers as a KindMessage{type:"thinking"}
 // object payload, must NOT be fence-parsed, and must NOT be accumulated into
@@ -535,6 +565,69 @@ collect:
 	}
 	if strings.Contains(assistantText, "think") {
 		t.Errorf("thinking leaked into history: %q", assistantText)
+	}
+}
+
+// TestRegistry_UsageBroadcastBeforeResult — (tether#48) an EventUsage must be
+// broadcast to subscribers as a KindMessage{type:"usage"} BEFORE the turn's
+// KindResult (the frontend needs the still-open turn bubble to attach it to),
+// and must NOT be accumulated into assistant history (usage is live-only, like
+// thinking — absent after a reload).
+func TestRegistry_UsageBroadcastBeforeResult(t *testing.T) {
+	fs := &fakeSession{sid: "sid-usage", events: make(chan agent.Event, 8)}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+	reg.History = NewHistoryStore(t.TempDir())
+
+	entry, err := reg.GetOrSpawnEntry(context.Background(), "", "fake")
+	if err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	subCh := make(chan wire.Envelope, 16)
+	entry.Subscribe(subCh)
+
+	// Mirror parseLine's ordering for a result-with-usage line: usage first,
+	// result (turn-closer) second.
+	fs.events <- agent.Event{Kind: agent.EventInit, SessionID: "sid-usage"}
+	fs.events <- agent.Event{Kind: agent.EventText, Text: "the answer\n"}
+	fs.events <- agent.Event{Kind: agent.EventUsage, Usage: &agent.UsageEvent{Input: 1234, Output: 856}}
+	fs.events <- agent.Event{Kind: agent.EventResult, Text: "stop"}
+	close(fs.events)
+
+	var order []wire.EnvelopeKind
+	var usage map[string]any
+	timeout := time.After(2 * time.Second)
+collect:
+	for {
+		select {
+		case env := <-subCh:
+			if env.Kind == wire.KindMessage {
+				if p, ok := env.Payload.(map[string]any); ok && p["type"] == "usage" {
+					usage = p
+					order = append(order, env.Kind)
+				}
+			}
+			if env.Kind == wire.KindResult {
+				order = append(order, env.Kind)
+				break collect
+			}
+		case <-timeout:
+			t.Fatal("timed out waiting for envelopes")
+		}
+	}
+
+	if len(order) != 2 || order[0] != wire.KindMessage || order[1] != wire.KindResult {
+		t.Fatalf("envelope order = %v, want [usage-KindMessage, KindResult]", order)
+	}
+	if usage == nil || usage["input"] != 1234 || usage["output"] != 856 {
+		t.Errorf("usage payload = %+v, want {input:1234, output:856}", usage)
+	}
+
+	// History must contain ONLY the answer — usage is never persisted.
+	msgs := reg.History.LoadHistory("sid-usage")
+	for _, m := range msgs {
+		if m.Role == "assistant" && m.Text != "the answer\n" {
+			t.Errorf("history assistant text = %q, want %q (usage must not persist)", m.Text, "the answer\n")
+		}
 	}
 }
 

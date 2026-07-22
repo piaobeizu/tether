@@ -346,6 +346,50 @@ describe('setActiveWorkspace (tether#47)', () => {
   })
 })
 
+// tether#48 — the turn's token usage attaches to the current turn's bubble for
+// the "⇅ in↑/out↓" badge. The daemon emits it just before 'result', so
+// curTurnId is still set; it must NOT touch streaming/timing, and it must
+// survive the following 'result' (finalizeTurn) that closes the turn.
+describe('usage payload (tether#48)', () => {
+  beforeEach(reset)
+
+  it('attaches {input,output} to the current turn bubble', () => {
+    // An answer delta opens the turn bubble + sets curTurnId.
+    useStore.getState().handleEnvelope({ kind: 'message', payload: 'the answer' })
+    useStore.getState().handleEnvelope({
+      kind: 'message',
+      payload: { type: 'usage', input: 1234, output: 856 },
+    })
+    const msgs = useStore.getState().messages
+    expect(msgs).toHaveLength(1)
+    expect(msgs[0]?.usage).toEqual({ input: 1234, output: 856 })
+  })
+
+  it('is ignored (no crash, no new message) when there is no open turn', () => {
+    // No prior text/thinking → curTurnId is null; usage has no bubble to land on.
+    useStore.getState().handleEnvelope({
+      kind: 'message',
+      payload: { type: 'usage', input: 10, output: 20 },
+    })
+    expect(useStore.getState().messages).toHaveLength(0)
+  })
+
+  it('survives the following result (finalizeTurn keeps usage on the bubble)', () => {
+    useStore.getState().handleEnvelope({ kind: 'message', payload: 'answer' })
+    useStore.getState().handleEnvelope({
+      kind: 'message',
+      payload: { type: 'usage', input: 500, output: 42 },
+    })
+    // 'result' closes the turn (stamps answerMs, clears curTurnId) but must not
+    // wipe the per-message usage.
+    useStore.getState().handleEnvelope({ kind: 'result', payload: 'end_turn' })
+    const msgs = useStore.getState().messages
+    expect(msgs[0]?.usage).toEqual({ input: 500, output: 42 })
+    expect(useStore.getState().curTurnId).toBeNull()
+    expect(useStore.getState().streaming).toBe(false)
+  })
+})
+
 // tether#28 — Work selection slice: the middle file view (selectedFile) and
 // the right Work wi drawer (selectedWiId) are now INDEPENDENT (they were
 // mutually exclusive through tether#27). select() touches only the field(s)

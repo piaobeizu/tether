@@ -287,6 +287,53 @@ describe('handleEnvelope fenced — live replace-by-BlockID (tether#8 T8)', () =
   })
 })
 
+// tether#45 — reload session-restore. Two store-level invariants underpin the
+// fix: (A) session_ready PERSISTS the sid to localStorage (not just sets state),
+// so a normal chat session survives a reload; (C) the session_ready REDUCER is
+// non-destructive — it only (re)sets sessionId, never touches messages. NOTE:
+// (C) locks the reducer, not the whole clobber vector. The remaining clobber
+// path is component-side: setSessionId(newSid) re-fires the history-load effect,
+// whose `msgs.length > 0` guard (chat/index.tsx) drops an EMPTY /messages so it
+// can't wipe restored history (a different sid with a NON-empty payload
+// intentionally replaces). That effect+guard is exercised end-to-end in
+// live_verify (reload → history stays), which is the authoritative behavioral
+// check here (build+test green is not sufficient — tether#8 lesson).
+describe('session_ready persistence + clobber safety (tether#45)', () => {
+  beforeEach(() => {
+    reset()
+    localStorage.clear()
+  })
+
+  it('session_ready persists the sid to localStorage (A)', () => {
+    expect(localStorage.getItem('tether_last_sid')).toBeNull()
+    useStore.getState().handleEnvelope({
+      kind: 'message',
+      payload: { type: 'session_ready', sessionId: 'sess-persist-1' },
+    })
+    // Previously session_ready did a plain set() that bypassed localStorage, so
+    // a normal chat's sid was lost on reload → empty "new" session.
+    expect(localStorage.getItem('tether_last_sid')).toBe('sess-persist-1')
+    expect(useStore.getState().sessionId).toBe('sess-persist-1')
+  })
+
+  it('session_ready does NOT clear already-loaded messages (C clobber guard)', () => {
+    // Simulate a mount-restore that loaded history from /messages…
+    useStore.getState().loadHistory([
+      { id: 'm1', role: 'user', text: 'hi', ts: 1 },
+      { id: 'm2', role: 'assistant', text: 'hello', ts: 2 },
+    ])
+    expect(useStore.getState().messages).toHaveLength(2)
+    // …then a late session_ready arrives (same OR different sid). It must not
+    // wipe the restored history — it only (re)sets sessionId.
+    useStore.getState().handleEnvelope({
+      kind: 'message',
+      payload: { type: 'session_ready', sessionId: 'sess-different' },
+    })
+    expect(useStore.getState().messages).toHaveLength(2)
+    expect(useStore.getState().messages[1]?.text).toBe('hello')
+  })
+})
+
 // tether#28 — Work selection slice: the middle file view (selectedFile) and
 // the right Work wi drawer (selectedWiId) are now INDEPENDENT (they were
 // mutually exclusive through tether#27). select() touches only the field(s)

@@ -17,6 +17,19 @@ type RightTab = 'work' | 'chat' | 'skill' | 'shell'
 
 const STORAGE_KEY_LEFT  = 'tether_col_left'
 const STORAGE_KEY_RIGHT = 'tether_col_right'
+const STORAGE_KEY_TAB   = 'tether_right_tab'
+const RIGHT_TABS: RightTab[] = ['work', 'chat', 'skill', 'shell']
+
+// tether#45 — restore the last-active right tab across reloads. Previously
+// rightTab always initialized to 'work', so a hard-refresh dropped you off Chat
+// (half the reload-restore complaint). Guards a missing/garbage value back to
+// 'work' so a corrupted localStorage can't break the initial render. Exported
+// so it unit-tests without mounting App (which opens a WebTransport connection).
+export function loadRightTab(): RightTab {
+  const saved = localStorage.getItem(STORAGE_KEY_TAB)
+  return saved != null && (RIGHT_TABS as string[]).includes(saved) ? (saved as RightTab) : 'work'
+}
+
 const MIN_LEFT  = 160
 const MAX_LEFT  = 480
 const MIN_RIGHT = 260
@@ -58,12 +71,18 @@ function ColResizer({ onDelta }: { onDelta: (dx: number) => void }) {
 }
 
 export default function App() {
-  const [rightTab, setRightTab] = useState<RightTab>('work')
+  const [rightTab, setRightTab] = useState<RightTab>(loadRightTab)
   // Keep panes mounted after first visit so switching tabs doesn't tear down the
-  // PTY (Shell) or refetch (Skills). Chat is always mounted.
-  const [visitedTabs, setVisitedTabs] = useState<Record<RightTab, boolean>>({ work: true, chat: true, skill: false, shell: false })
+  // PTY (Shell) or refetch (Skills). Chat is always mounted. tether#45: seed the
+  // restored tab as already-visited so a reload onto Skills/Shell renders it
+  // (those panes are gated behind visitedTabs) instead of a blank body.
+  const [visitedTabs, setVisitedTabs] = useState<Record<RightTab, boolean>>(() => {
+    const t = loadRightTab()
+    return { work: true, chat: true, skill: t === 'skill', shell: t === 'shell' }
+  })
   const selectTab = (t: RightTab) => {
     setRightTab(t)
+    localStorage.setItem(STORAGE_KEY_TAB, t) // tether#45 — remember across reloads
     setVisitedTabs(v => (v[t] ? v : { ...v, [t]: true }))
     // xterm measures 0 while display:none; nudge a refit once Shell is visible again.
     if (t === 'shell') requestAnimationFrame(() => window.dispatchEvent(new Event('resize')))

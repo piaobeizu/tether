@@ -334,6 +334,18 @@ describe('session_ready persistence + clobber safety (tether#45)', () => {
   })
 })
 
+// tether#47 — the browsed workspace (id + abspath) published from WorkspacePane
+// so chat's @-mention picker knows which workspace's files to offer.
+describe('setActiveWorkspace (tether#47)', () => {
+  it('sets and clears the active workspace', () => {
+    useStore.setState({ activeWorkspace: null })
+    useStore.getState().setActiveWorkspace({ id: 'ws1', path: '/abs/ws1' })
+    expect(useStore.getState().activeWorkspace).toEqual({ id: 'ws1', path: '/abs/ws1' })
+    useStore.getState().setActiveWorkspace(null)
+    expect(useStore.getState().activeWorkspace).toBeNull()
+  })
+})
+
 // tether#28 — Work selection slice: the middle file view (selectedFile) and
 // the right Work wi drawer (selectedWiId) are now INDEPENDENT (they were
 // mutually exclusive through tether#27). select() touches only the field(s)

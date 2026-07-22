@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, summarizeToolInput, summarizeToolResult, truncateResult, shouldSendOnEnter, growHeight } from './index'
+import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, summarizeToolInput, summarizeToolResult, truncateResult, shouldSendOnEnter, growHeight, parseAtQuery, fuzzyRankFiles } from './index'
 import { PermissionQueue, postDecide } from '../../fenced-blocks/PermissionBlock'
 import type { ToolCall, PermissionRequest } from '../../lib/store'
 
@@ -358,5 +358,57 @@ describe('growHeight (tether#46)', () => {
   it('defaults minLines to 1 when omitted (matches production call site)', () => {
     // production omits minLines; the `?? 1` default must floor at one line.
     expect(growHeight(5, { lineHeightPx: 20, maxLines: 8 })).toEqual({ height: 20, scroll: false })
+  })
+})
+
+// tether#47 — @-file mention. parseAtQuery finds the active @token at the caret;
+// fuzzyRankFiles ranks the workspace file list against the query. Both pure.
+describe('parseAtQuery (tether#47)', () => {
+  it('finds an @token mid-text (preceded by whitespace)', () => {
+    expect(parseAtQuery('see @foo', 8)).toEqual({ atPos: 4, query: 'foo' })
+  })
+  it('finds an @token at the very start', () => {
+    expect(parseAtQuery('@foo', 4)).toEqual({ atPos: 0, query: 'foo' })
+  })
+  it('treats a bare @ as an empty query (show all)', () => {
+    expect(parseAtQuery('@', 1)).toEqual({ atPos: 0, query: '' })
+  })
+  it('keeps path characters (slashes) in the query', () => {
+    expect(parseAtQuery('@src/foo', 8)).toEqual({ atPos: 0, query: 'src/foo' })
+  })
+  it('returns null when a space separates the caret from the @ (token ended)', () => {
+    expect(parseAtQuery('@foo bar', 8)).toBeNull()
+  })
+  it('returns null for an @ preceded by a non-space (e.g. an email)', () => {
+    expect(parseAtQuery('a@b', 3)).toBeNull()
+  })
+  it('returns null when there is no @', () => {
+    expect(parseAtQuery('hello world', 11)).toBeNull()
+  })
+  it('picks the nearest @ to the caret', () => {
+    expect(parseAtQuery('foo @bar @ba', 12)).toEqual({ atPos: 9, query: 'ba' })
+  })
+})
+
+describe('fuzzyRankFiles (tether#47)', () => {
+  const files = ['src/foo.go', 'src/bar.go', 'README.md', 'foo/x.go']
+  it('empty query returns the first `limit` files', () => {
+    expect(fuzzyRankFiles(files, '', 2)).toEqual(['src/foo.go', 'src/bar.go'])
+  })
+  it('filters to subsequence matches (case-insensitive)', () => {
+    const r = fuzzyRankFiles(files, 'FOO', 10)
+    expect(r).toContain('src/foo.go')
+    expect(r).toContain('foo/x.go')
+    expect(r).not.toContain('README.md')
+    expect(r).not.toContain('src/bar.go')
+  })
+  it('ranks a basename match above a directory-only match', () => {
+    expect(fuzzyRankFiles(['a/foo.go', 'foo/x.go'], 'foo', 10)[0]).toBe('a/foo.go')
+  })
+  it('returns [] when nothing matches', () => {
+    expect(fuzzyRankFiles(files, 'zzzq', 10)).toEqual([])
+  })
+  it('honors the limit', () => {
+    expect(fuzzyRankFiles(files, 'o', 1)).toHaveLength(1)
   })
 })

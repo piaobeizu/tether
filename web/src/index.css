@@ -548,6 +548,20 @@ body {
 .slash-row .slash-cmd { color: var(--accent); font-weight: 600; font-family: var(--font-mono); }
 .slash-row .slash-desc { color: var(--ink-secondary); }
 
+/* tether#47 — @-mention file picker: reuses .slash-pop/.slash-row, but the file
+   path spans the full row (no command/description columns) and long paths
+   ellipsize; the list scrolls when there are many matches. */
+.at-pop { max-height: 260px; overflow-y: auto; }
+.at-pop .slash-row { grid-template-columns: 1fr auto; }
+.at-file {
+  color: var(--ink-primary); font-weight: 400; font-family: var(--font-mono);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.at-more {
+  padding: 6px 12px; font-size: 10.5px; color: var(--ink-quat);
+  border-top: 1px solid var(--line-soft);
+}
+
 .reconnect-banner {
   background: var(--warn-tint); border: 1px solid #E7D3A4;
   border-radius: var(--r-2); padding: 6px 10px;

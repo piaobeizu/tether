@@ -130,6 +130,13 @@ interface AppState {
   // render the same project. Empty string = none picked yet.
   workProject: string
 
+  // The workspace the user is currently browsing in the left WorkspacePane
+  // (tether#47). Chat's @-mention picker queries this workspace's files; the
+  // chat session isn't itself bound to a workspace (ActiveSID is unwired and
+  // cc's cwd is decoupled), so following the browsed workspace is the binding.
+  // Carries the abspath so @ can insert @<abspath> (cc reads it regardless of cwd).
+  activeWorkspace: { id: string; path: string } | null
+
   setSessionId: (id: string) => void
   loadHistory: (msgs: Message[]) => void
   addMessage: (msg: Message) => void
@@ -142,6 +149,7 @@ interface AppState {
   stopTurn: () => void
   select: (sel: { wiId?: string | null; file?: SelectedFile | null } | null) => void
   setWorkProject: (p: string) => void
+  setActiveWorkspace: (ws: { id: string; path: string } | null) => void
 }
 
 // finalizeTurn closes the current assistant turn — stamps the answer duration
@@ -173,6 +181,7 @@ export const useStore = create<AppState>((set, get) => ({
   selectedWiId: null,
   selectedFile: null,
   workProject: '',
+  activeWorkspace: null,
 
   setSessionId: (id) => {
     localStorage.setItem('tether_last_sid', id)
@@ -464,4 +473,5 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   setWorkProject: (p) => set({ workProject: p }),
+  setActiveWorkspace: (ws) => set({ activeWorkspace: ws }),
 }))

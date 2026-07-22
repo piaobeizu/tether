@@ -18,6 +18,14 @@ export default function WorkspacePane() {
   const [sessions, setSessions] = useState<string[]>([])
   const [sessionsOpen, setSessionsOpen] = useState(false)
   const currentSid = useStore(s => s.sessionId)
+
+  // tether#47 — publish the browsed workspace (id + abspath) to the store so
+  // chat's @-mention picker knows which workspace's files to offer. Covers all
+  // setActiveId paths (initial default, expand/collapse, delete). Null when none.
+  useEffect(() => {
+    const ws = workspaces.find(w => w.id === activeId)
+    useStore.getState().setActiveWorkspace(ws ? { id: ws.id, path: ws.path } : null)
+  }, [activeId, workspaces])
   const [filter, setFilter] = useState('')
   const filterRef = useRef<HTMLInputElement>(null)
   const [adding, setAdding] = useState(false)

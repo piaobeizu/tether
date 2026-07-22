@@ -46,6 +46,9 @@ function fmtElapsed(start: number) {
 const MAX_COMPOSER_LINES = 8
 const COMPOSER_LINE_PX = 20
 
+// tether#47 — max @-mention file suggestions shown at once.
+const AT_MENU_MAX = 10
+
 // shouldSendOnEnter decides whether an Enter keypress sends the message. It does
 // NOT send when: Shift is held (newline), an IME composition is active, a turn is
 // streaming (the button is Stop — tether#42), or the slash menu is open (which
@@ -69,6 +72,56 @@ export function growHeight(
   return { height: Math.max(min, Math.min(scrollHeight, max)), scroll: scrollHeight > max }
 }
 
+// tether#47 — @-file mention. parseAtQuery locates the @token the caret is
+// currently inside: scanning back from the caret, the token is valid only if an
+// `@` is reached with no whitespace in between AND that `@` sits at the start of
+// text or right after whitespace (so `a@b` — an email — is NOT a mention).
+// Returns the `@` position and the query (text between `@` and the caret; empty
+// right after typing `@`), or null when the caret isn't in a mention token.
+export function parseAtQuery(text: string, caret: number): { atPos: number; query: string } | null {
+  for (let i = caret - 1; i >= 0; i--) {
+    const ch = text[i]
+    if (ch === '@') {
+      if (i === 0 || /\s/.test(text[i - 1])) return { atPos: i, query: text.slice(i + 1, caret) }
+      return null // @ preceded by a non-space → not a mention (e.g. email)
+    }
+    if (/\s/.test(ch)) return null // whitespace before any @ → caret isn't in a mention
+  }
+  return null
+}
+
+// subseqScore returns -1 if q is not a case-insensitive subsequence of s, else a
+// score where SMALLER is a better match: matches within the basename beat
+// directory-only matches, then tighter spans, then earlier starts.
+function subseqScore(s: string, q: string): number {
+  let si = 0, first = -1, last = -1
+  for (let qi = 0; qi < q.length; qi++) {
+    const found = s.indexOf(q[qi], si)
+    if (found < 0) return -1
+    if (first < 0) first = found
+    last = found
+    si = found + 1
+  }
+  const base = s.lastIndexOf('/') + 1
+  const inBasenamePenalty = first >= base ? 0 : 1000
+  return inBasenamePenalty + (last - first) * 10 + first
+}
+
+// fuzzyRankFiles filters `files` to fuzzy (subsequence) matches of `query` and
+// returns the best `limit`, ranked by subseqScore. An empty query returns the
+// first `limit` files unchanged (show-all on a bare `@`). Pure — no DOM/fetch.
+export function fuzzyRankFiles(files: string[], query: string, limit: number): string[] {
+  const q = query.trim().toLowerCase()
+  if (!q) return files.slice(0, limit)
+  const scored: { f: string; score: number }[] = []
+  for (const f of files) {
+    const score = subseqScore(f.toLowerCase(), q)
+    if (score >= 0) scored.push({ f, score })
+  }
+  scored.sort((a, b) => a.score - b.score || a.f.length - b.f.length || (a.f < b.f ? -1 : 1))
+  return scored.slice(0, limit).map(x => x.f)
+}
+
 interface Props {
   onMenuClick?: () => void
 }
@@ -84,6 +137,16 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   const [slashOpen, setSlashOpen] = useState(false)
   const [slashIndex, setSlashIndex] = useState(0)
   const [isComposing, setIsComposing] = useState(false)
+  // tether#47 — @-file mention menu (workspace file fuzzy picker).
+  const [atOpen, setAtOpen] = useState(false)
+  const [atItems, setAtItems] = useState<string[]>([])
+  const [atIndex, setAtIndex] = useState(0)
+  const [atTruncated, setAtTruncated] = useState(false) // workspace file list hit the cap
+  const activeWorkspace = useStore(s => s.activeWorkspace)
+  // Per-workspace file-list cache, keyed by workspace id and holding the fetch
+  // PROMISE (not the resolved array) so concurrent onChange+onSelect calls share
+  // one request; resolves to {files,truncated}. Filtered client-side thereafter.
+  const treeCacheRef = useRef<Map<string, Promise<{ files: string[]; truncated: boolean }>>>(new Map())
   const [showEmpty, setShowEmpty] = useState(false)
   // Which message ids have their fenced block expanded to the full variant.
   const [expandedBlocks, setExpandedBlocks] = useState<Set<string>>(() => new Set())
@@ -337,6 +400,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
     const text = input.trim()
     if (!text || !writerRef.current) return
     setSlashOpen(false)
+    setAtOpen(false) // tether#47 review MINOR-1 — don't leave a stale @ menu after send
     useStore.getState().addMessage({ id: crypto.randomUUID(), role: 'user', text, ts: Date.now() })
     // Light up the "thinking" indicator immediately: `streaming` otherwise
     // only flips true on the first agent event, leaving a blind gap after send
@@ -495,6 +559,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
     // close the menu so Enter sends the message instead of re-picking the command.
     setSlashOpen(v.startsWith('/') && !v.includes(' '))
     setSlashIndex(0)
+    refreshAtMenu() // tether#47 — recompute the @-mention menu from the new value + caret
   }
 
   const filteredSlash = SLASH_CMDS.filter(c => c.cmd.startsWith(input.split(' ')[0]))
@@ -503,6 +568,68 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
     setInput(c.cmd + ' ')
     setSlashOpen(false)
     setSlashIndex(0)
+  }
+
+  // tether#47 — fetch the active workspace's flat file list for the @-mention
+  // picker, memoized by workspace as a PROMISE so onChange+onSelect firing in the
+  // same tick share ONE request (review MINOR-2 in-flight dedup). Resolves to
+  // {files,truncated}; on error resolves empty AND drops the cache so a later @
+  // retries. Successful results stay cached for the session.
+  const ensureTree = (wsId: string): Promise<{ files: string[]; truncated: boolean }> => {
+    const existing = treeCacheRef.current.get(wsId)
+    if (existing) return existing
+    const p = (async () => {
+      try {
+        const r = await fetch(`/api/v1/workspaces/${encodeURIComponent(wsId)}/tree`)
+        if (!r.ok) { treeCacheRef.current.delete(wsId); return { files: [], truncated: false } }
+        const data = (await r.json()) as { files?: string[]; truncated?: boolean }
+        return { files: data.files ?? [], truncated: data.truncated === true }
+      } catch { treeCacheRef.current.delete(wsId); return { files: [], truncated: false } }
+    })()
+    treeCacheRef.current.set(wsId, p)
+    return p
+  }
+
+  // refreshAtMenu recomputes the @ menu from the textarea's live value + caret.
+  // Called on input and on caret moves (onSelect). No active @token / no browsed
+  // workspace → menu closes. First @ in a workspace awaits one fetch; after that
+  // the promise cache resolves synchronously-fast. Re-parses the query when the
+  // fetch resolves so late-arriving files rank against the CURRENT query, not the
+  // one captured when the fetch started (review MINOR-2 stale-query race).
+  const refreshAtMenu = () => {
+    const ta = taRef.current
+    const ws = useStore.getState().activeWorkspace
+    if (!ta || !ws) { setAtOpen(false); return }
+    if (!parseAtQuery(ta.value, ta.selectionStart ?? ta.value.length)) { setAtOpen(false); return }
+    void ensureTree(ws.id).then(({ files, truncated }) => {
+      // Re-read the query NOW (the user may have typed on during the fetch).
+      const t = taRef.current
+      const q = t ? parseAtQuery(t.value, t.selectionStart ?? t.value.length) : null
+      if (!q) { setAtOpen(false); return }
+      const ranked = fuzzyRankFiles(files, q.query, AT_MENU_MAX)
+      setAtItems(ranked); setAtIndex(0); setAtTruncated(truncated); setAtOpen(ranked.length > 0)
+    })
+  }
+
+  // pickAt inserts the chosen file as an absolute @<path> mention, splicing it
+  // over the active @query and restoring the caret after the inserted token.
+  // Absolute so cc resolves it regardless of its (decoupled) cwd (tether#47).
+  const pickAt = (rel: string) => {
+    const ta = taRef.current
+    const ws = useStore.getState().activeWorkspace
+    if (!ta || !ws) return
+    const caret = ta.selectionStart ?? ta.value.length
+    const q = parseAtQuery(ta.value, caret)
+    if (!q) return
+    const token = '@' + ws.path.replace(/\/+$/, '') + '/' + rel + ' '
+    const next = ta.value.slice(0, q.atPos) + token + ta.value.slice(caret)
+    setInput(next)
+    setAtOpen(false)
+    const newCaret = q.atPos + token.length
+    requestAnimationFrame(() => {
+      const t = taRef.current
+      if (t) { t.focus(); t.setSelectionRange(newCaret, newCaret) }
+    })
   }
 
   return (
@@ -636,6 +763,30 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
           </div>
         )}
 
+        {/* tether#47 — @-mention file picker (reuses .slash-pop styling). */}
+        {atOpen && atItems.length > 0 && (
+          <div className="slash-pop at-pop">
+            <div className="slash-head">
+              <span className="mono">@ files{activeWorkspace ? ` · ${activeWorkspace.id.slice(0, 6)}` : ''}</span>
+              <span className="kbd">esc</span>
+            </div>
+            {atItems.map((f, i) => (
+              <div
+                key={f}
+                className={`slash-row${i === atIndex ? ' on' : ''}`}
+                onMouseEnter={() => setAtIndex(i)}
+                onClick={() => pickAt(f)}
+              >
+                <span className="slash-cmd at-file">{f}</span>
+                {i === atIndex && <span className="kbd">↵</span>}
+              </div>
+            ))}
+            {atTruncated && (
+              <div className="at-more mono">workspace has more files — refine your query</div>
+            )}
+          </div>
+        )}
+
         <div className="composer-box">
           {providers.length > 1 && (
             <div style={{ padding: '0 4px 6px', display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -658,10 +809,24 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
               disabled={connState !== 'connected'}
               value={input}
               onChange={e => handleInputChange(e.target.value)}
+              onSelect={refreshAtMenu}
               onCompositionStart={() => setIsComposing(true)}
               onCompositionEnd={() => setIsComposing(false)}
               onKeyDown={e => {
                 const slashActive = slashOpen && filteredSlash.length > 0
+                const atActive = atOpen && atItems.length > 0
+                // tether#47 — @-mention menu owns nav keys while open (checked
+                // before the slash menu; they can't both be active).
+                if (atActive && e.key === 'ArrowDown') {
+                  e.preventDefault(); setAtIndex(i => (i + 1) % atItems.length); return
+                }
+                if (atActive && e.key === 'ArrowUp') {
+                  e.preventDefault(); setAtIndex(i => (i - 1 + atItems.length) % atItems.length); return
+                }
+                if (atActive && (e.key === 'Tab' || e.key === 'Enter') && !isComposing) {
+                  e.preventDefault(); pickAt(atItems[Math.min(atIndex, atItems.length - 1)]); return
+                }
+                if (atActive && e.key === 'Escape') { e.preventDefault(); setAtOpen(false); return }
                 if (slashActive && e.key === 'ArrowDown') {
                   e.preventDefault(); setSlashIndex(i => (i + 1) % filteredSlash.length); return
                 }
@@ -675,8 +840,8 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
                 // textarea handles the newline natively when we don't
                 // preventDefault). shouldSendOnEnter also refuses to send during
                 // IME composition, while streaming (the button is Stop then —
-                // tether#42 review N1), or while the slash menu is open.
-                if (shouldSendOnEnter({ key: e.key, shiftKey: e.shiftKey, isComposing, streaming, slashActive })) {
+                // tether#42 review N1), or while a menu (slash/@) is open.
+                if (shouldSendOnEnter({ key: e.key, shiftKey: e.shiftKey, isComposing, streaming, slashActive: slashActive || atActive })) {
                   e.preventDefault(); void sendMessage()
                 } else if (e.key === 'Enter' && !e.shiftKey && !isComposing && streaming) {
                   // While a turn streams the button is Stop; swallow plain Enter
@@ -685,7 +850,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
                   // Shift+Enter still adds a newline for composing the next msg.
                   e.preventDefault()
                 }
-                if (e.key === 'Escape') setSlashOpen(false)
+                if (e.key === 'Escape') { setSlashOpen(false); setAtOpen(false) }
               }}
               placeholder={
                 connState !== 'connected'

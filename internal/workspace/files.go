@@ -2,8 +2,10 @@ package workspace
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -70,6 +72,63 @@ func listFiles(absDir string) ([]FileEntry, error) {
 	})
 
 	return entries, nil
+}
+
+// skipDirsRecursive are directory names the recursive tree listing never
+// descends into: VCS internals and heavy generated / dependency trees that would
+// otherwise blow up the @-mention file list (tether#47).
+var skipDirsRecursive = map[string]struct{}{
+	".git": {}, "node_modules": {}, "dist": {}, "build": {}, "target": {},
+	"vendor": {}, ".venv": {}, "__pycache__": {}, ".next": {}, ".cache": {},
+}
+
+// errStopWalk is the sentinel returned from the WalkDir callback to stop early
+// once the file cap is hit (WalkDir has no other "stop" signal).
+var errStopWalk = errors.New("stop walk")
+
+// listFilesRecursive walks root and returns a flat, sorted, forward-slash list
+// of FILE paths relative to root (directories omitted) for the @-mention fuzzy
+// picker. It never descends into skipDirsRecursive and stops after `limit`
+// files (truncated=true). root is the trusted workspace root, so no per-path
+// SafeJoin is needed; WalkDir does not follow symlinks, which bounds the walk.
+// Unreadable entries are skipped rather than aborting the whole listing.
+func listFilesRecursive(root string, limit int) (files []string, truncated bool, err error) {
+	if limit <= 0 {
+		limit = 5000
+	}
+	files = []string{}
+	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if d != nil && d.IsDir() {
+				return fs.SkipDir // unreadable dir → skip its subtree
+			}
+			return nil // unreadable file → skip it
+		}
+		if d.IsDir() {
+			if path == root {
+				return nil
+			}
+			if _, skip := skipDirsRecursive[d.Name()]; skip {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if len(files) >= limit {
+			truncated = true
+			return errStopWalk
+		}
+		rel, rerr := filepath.Rel(root, path)
+		if rerr != nil {
+			return nil
+		}
+		files = append(files, filepath.ToSlash(rel))
+		return nil
+	})
+	if walkErr != nil && !errors.Is(walkErr, errStopWalk) {
+		return nil, false, walkErr
+	}
+	sort.Strings(files)
+	return files, truncated, nil
 }
 
 // dirtyPathSet holds repo-root-relative dirty paths (forward-slash separated).

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io/fs"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/piaobeizu/tether/internal/mcp/builtin"
@@ -17,6 +18,7 @@ import (
 //	DELETE /api/v1/workspaces/{id}          → remove workspace by ID
 //	GET    /api/v1/workspaces/{id}/files    → list files directly under {dir} (default: root)
 //	GET    /api/v1/workspaces/{id}/file     → read one file's content ({"path":..,"content":..,"truncated":..})
+//	GET    /api/v1/workspaces/{id}/tree     → flat recursive file list for @-mention ({"files":[..],"truncated":..})
 func RegisterAPI(mux *http.ServeMux, reg *Registry) {
 	mux.HandleFunc("/api/v1/workspaces", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -73,6 +75,19 @@ func RegisterAPI(mux *http.ServeMux, reg *Registry) {
 				return
 			}
 			handleFile(w, r, reg, id)
+			return
+		}
+
+		if id, ok := strings.CutSuffix(rest, "/tree"); ok {
+			if id == "" || strings.Contains(id, "/") {
+				http.NotFound(w, r)
+				return
+			}
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			handleTree(w, r, reg, id)
 			return
 		}
 
@@ -160,6 +175,40 @@ func handleFile(w http.ResponseWriter, r *http.Request, reg *Registry, id string
 		return
 	}
 	jsonResp(w, fileContentResponse{Path: path, Content: content, Truncated: truncated})
+}
+
+// treeResponse is the JSON body for GET /api/v1/workspaces/{id}/tree.
+type treeResponse struct {
+	Files     []string `json:"files"`
+	Truncated bool     `json:"truncated"`
+}
+
+// handleTree serves GET /api/v1/workspaces/{id}/tree?limit=N: a flat, recursive
+// list of file paths (relative, forward-slash) under the workspace root, for the
+// @-mention fuzzy file picker (tether#47). Heavy/VCS dirs are skipped and the
+// list is capped (default 5000, hard max 20000) so a huge repo can't flood the
+// response. The frontend does the fuzzy match client-side over this list.
+func handleTree(w http.ResponseWriter, r *http.Request, reg *Registry, id string) {
+	ws, ok := reg.Get(id)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	limit := 5000
+	if q := r.URL.Query().Get("limit"); q != "" {
+		if n, err := strconv.Atoi(q); err == nil && n > 0 {
+			if n > 20000 {
+				n = 20000
+			}
+			limit = n
+		}
+	}
+	files, truncated, err := listFilesRecursive(ws.Path, limit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	jsonResp(w, treeResponse{Files: files, Truncated: truncated})
 }
 
 func jsonResp(w http.ResponseWriter, v any) {

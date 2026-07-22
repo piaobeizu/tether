@@ -38,6 +38,37 @@ function fmtElapsed(start: number) {
   return `${Math.floor(mins / 60)}h ${mins % 60}m`
 }
 
+// tether#46 — multi-line composer. The composer is a <textarea>: Enter sends,
+// Shift+Enter inserts a newline. shouldSendOnEnter and growHeight are extracted
+// pure so they unit-test without mounting ChatPane (which opens a WebTransport
+// connection). MAX_COMPOSER_LINES / COMPOSER_LINE_PX must match .composer-input
+// line-height + max-height in index.css.
+const MAX_COMPOSER_LINES = 8
+const COMPOSER_LINE_PX = 20
+
+// shouldSendOnEnter decides whether an Enter keypress sends the message. It does
+// NOT send when: Shift is held (newline), an IME composition is active, a turn is
+// streaming (the button is Stop — tether#42), or the slash menu is open (which
+// owns Enter). Any non-Enter key never sends.
+export function shouldSendOnEnter(o: {
+  key: string; shiftKey: boolean; isComposing: boolean; streaming: boolean; slashActive: boolean
+}): boolean {
+  return o.key === 'Enter' && !o.shiftKey && !o.isComposing && !o.streaming && !o.slashActive
+}
+
+// growHeight clamps a textarea's measured scrollHeight to [minLines, maxLines]
+// line-heights and reports whether content overflows (so the caller turns on the
+// internal scrollbar). Pure — the caller measures scrollHeight and applies the
+// result — so it tests without a real DOM.
+export function growHeight(
+  scrollHeight: number,
+  o: { lineHeightPx: number; maxLines: number; minLines?: number },
+): { height: number; scroll: boolean } {
+  const min = (o.minLines ?? 1) * o.lineHeightPx
+  const max = o.maxLines * o.lineHeightPx
+  return { height: Math.max(min, Math.min(scrollHeight, max)), scroll: scrollHeight > max }
+}
+
 interface Props {
   onMenuClick?: () => void
 }
@@ -78,6 +109,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const unmountedRef = useRef(false)
   const chatRef = useRef<HTMLDivElement>(null)
+  const taRef = useRef<HTMLTextAreaElement>(null)
   const [providers, setProviders] = useState<string[]>(['claude-code'])
   const [selectedProvider, setSelectedProvider] = useState(
     () => localStorage.getItem('tether_default_provider') ?? 'claude-code'
@@ -161,6 +193,35 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
       el.scrollTop = el.scrollHeight
     }
   }, [messages.length, lastMsgText, streaming])
+
+  // tether#46 — auto-grow the composer textarea to fit its content, up to
+  // MAX_COMPOSER_LINES then scroll internally. Reset to 'auto' first so the
+  // measured scrollHeight shrinks when text is deleted (and after send clears
+  // `input`, this floors it back to one line). growHeight owns the clamp.
+  const growComposer = () => {
+    const ta = taRef.current
+    if (!ta) return
+    ta.style.height = 'auto'
+    const { height, scroll } = growHeight(ta.scrollHeight, { lineHeightPx: COMPOSER_LINE_PX, maxLines: MAX_COMPOSER_LINES })
+    ta.style.height = `${height}px`
+    ta.style.overflowY = scroll ? 'auto' : 'hidden'
+  }
+  useEffect(() => { growComposer() }, [input]) // eslint-disable-line react-hooks/exhaustive-deps
+  // Recompute on WIDTH changes (right column is user-resizable via ColResizer;
+  // sidebar/drawer toggle; window resize) so a multi-line draft rewrapping taller
+  // doesn't clip under overflow-y:hidden until the next keystroke. Width-guarded
+  // so our own height writes (which ResizeObserver would otherwise echo) can't
+  // feedback-loop. jsdom lacks ResizeObserver → guard keeps tests/SSR safe.
+  useEffect(() => {
+    const ta = taRef.current
+    if (!ta || typeof ResizeObserver === 'undefined') return
+    let lastW = ta.clientWidth
+    const ro = new ResizeObserver(() => {
+      if (ta.clientWidth !== lastW) { lastW = ta.clientWidth; growComposer() }
+    })
+    ro.observe(ta)
+    return () => ro.disconnect()
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Empty-state hint, debounced so it doesn't flash on session resume before
   // history arrives (connState flips to 'connected' before /messages loads).
@@ -590,7 +651,9 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
           )}
           <div className="composer-row">
             <span className="composer-prefix">/</span>
-            <input
+            <textarea
+              ref={taRef}
+              rows={1}
               className="composer-input"
               disabled={connState !== 'connected'}
               value={input}
@@ -608,11 +671,20 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
                 if (slashActive && (e.key === 'Tab' || e.key === 'Enter') && !isComposing) {
                   e.preventDefault(); pickSlash(filteredSlash[Math.min(slashIndex, filteredSlash.length - 1)]); return
                 }
-                // Don't send while a turn is streaming (tether#42 review N1):
-                // the button is a Stop button then, so Enter must not send a new
-                // message (which would reset curTurnId and drop the streaming
-                // turn's answerMs badge). Use the Stop button to interrupt.
-                if (e.key === 'Enter' && !e.shiftKey && !isComposing && !streaming) { e.preventDefault(); void sendMessage() }
+                // tether#46 — Enter sends, Shift+Enter inserts a newline (the
+                // textarea handles the newline natively when we don't
+                // preventDefault). shouldSendOnEnter also refuses to send during
+                // IME composition, while streaming (the button is Stop then —
+                // tether#42 review N1), or while the slash menu is open.
+                if (shouldSendOnEnter({ key: e.key, shiftKey: e.shiftKey, isComposing, streaming, slashActive })) {
+                  e.preventDefault(); void sendMessage()
+                } else if (e.key === 'Enter' && !e.shiftKey && !isComposing && streaming) {
+                  // While a turn streams the button is Stop; swallow plain Enter
+                  // so it neither sends nor inserts a stray newline (parity with
+                  // the old single-line input; tether#46 review MINOR-1).
+                  // Shift+Enter still adds a newline for composing the next msg.
+                  e.preventDefault()
+                }
                 if (e.key === 'Escape') setSlashOpen(false)
               }}
               placeholder={
@@ -647,7 +719,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
             )}
           </div>
           <div className="composer-foot">
-            <span className="mono" style={{ fontSize: 10.5, color: 'var(--ink-tertiary)' }}>↵ send · / for commands</span>
+            <span className="mono" style={{ fontSize: 10.5, color: 'var(--ink-tertiary)' }}>↵ send · ⇧↵ newline · / for commands</span>
             {sessionId && (
               <span className="mono" style={{ fontSize: 10.5, color: 'var(--ink-tertiary)', marginLeft: 'auto' }}>
                 {selectedProvider}

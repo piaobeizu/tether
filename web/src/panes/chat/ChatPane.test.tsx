@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, summarizeToolInput, summarizeToolResult, truncateResult } from './index'
+import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, summarizeToolInput, summarizeToolResult, truncateResult, shouldSendOnEnter, growHeight } from './index'
 import { PermissionQueue, postDecide } from '../../fenced-blocks/PermissionBlock'
 import type { ToolCall, PermissionRequest } from '../../lib/store'
 
@@ -309,5 +309,54 @@ describe('postDecide (tether#40)', () => {
     const [url, opts] = fetchMock.mock.calls[0]
     expect(url).toBe('/api/v1/agent/permission/r8/decide')
     expect(JSON.parse(opts.body)).toEqual({ allow: false, remember: false })
+  })
+})
+
+// tether#46 — multi-line composer. The composer is now a <textarea>: Enter
+// sends, Shift+Enter inserts a newline, and it auto-grows to a cap. Both
+// decisions are extracted as pure functions so they test without mounting
+// ChatPane (which opens a WebTransport connection).
+describe('shouldSendOnEnter (tether#46)', () => {
+  const base = { key: 'Enter', shiftKey: false, isComposing: false, streaming: false, slashActive: false }
+  it('plain Enter sends', () => {
+    expect(shouldSendOnEnter(base)).toBe(true)
+  })
+  it('Shift+Enter does NOT send (inserts a newline instead)', () => {
+    expect(shouldSendOnEnter({ ...base, shiftKey: true })).toBe(false)
+  })
+  it('Enter during IME composition does NOT send', () => {
+    expect(shouldSendOnEnter({ ...base, isComposing: true })).toBe(false)
+  })
+  it('Enter while streaming does NOT send (button is Stop; tether#42)', () => {
+    expect(shouldSendOnEnter({ ...base, streaming: true })).toBe(false)
+  })
+  it('Enter while the slash menu is open does NOT send (menu owns Enter)', () => {
+    expect(shouldSendOnEnter({ ...base, slashActive: true })).toBe(false)
+  })
+  it('a non-Enter key never sends', () => {
+    expect(shouldSendOnEnter({ ...base, key: 'a' })).toBe(false)
+  })
+})
+
+describe('growHeight (tether#46)', () => {
+  const opts = { lineHeightPx: 20, maxLines: 8, minLines: 1 }
+  it('clamps a short content to at least one line', () => {
+    // scrollHeight below one line still floors to minLines*lh.
+    expect(growHeight(10, opts)).toEqual({ height: 20, scroll: false })
+  })
+  it('grows to fit content below the cap (no scroll)', () => {
+    // 4 lines worth of content.
+    expect(growHeight(80, opts)).toEqual({ height: 80, scroll: false })
+  })
+  it('caps at maxLines and switches on scrolling when content overflows', () => {
+    // 12 lines of content, cap is 8 → height clamped to 160, scroll on.
+    expect(growHeight(240, opts)).toEqual({ height: 160, scroll: true })
+  })
+  it('at exactly the cap does not scroll', () => {
+    expect(growHeight(160, opts)).toEqual({ height: 160, scroll: false })
+  })
+  it('defaults minLines to 1 when omitted (matches production call site)', () => {
+    // production omits minLines; the `?? 1` default must floor at one line.
+    expect(growHeight(5, { lineHeightPx: 20, maxLines: 8 })).toEqual({ height: 20, scroll: false })
   })
 })

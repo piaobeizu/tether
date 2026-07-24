@@ -68,6 +68,7 @@ func (p *ClaudeCodeProvider) Spawn(ctx context.Context, cfg SpawnConfig) (Sessio
 		enc:      enc,
 		events:   make(chan Event, 64),
 		sidReady: make(chan struct{}),
+		done:     make(chan struct{}),
 	}
 	go sess.readLoop(bufio.NewScanner(stdout))
 	return sess, nil
@@ -94,11 +95,21 @@ type ccSession struct {
 	sid      string
 	sidReady chan struct{}
 	sidOnce  sync.Once
-	reqSeq   int // control_request id counter (T9 pause/interrupt), guarded by mu
+	done     chan struct{} // closed when readLoop returns (cc process fully exited)
+	reqSeq   int           // control_request id counter (T9 pause/interrupt), guarded by mu
 }
 
+// SessionID blocks until cc emits system/init (which resolves s.sid) OR the
+// session dies first — a cc that exits before ever emitting init (e.g. a failed
+// `--resume`, or a fresh cc that crashes on startup) would otherwise park this
+// caller forever, since sidReady never closes. Selecting on `done` too lets it
+// return "" on premature death so the caller can surface an error / spawn fresh
+// instead of hanging the turn (tether#49).
 func (s *ccSession) SessionID() string {
-	<-s.sidReady
+	select {
+	case <-s.sidReady:
+	case <-s.done:
+	}
 	return s.sid
 }
 
@@ -189,6 +200,10 @@ func (s *ccSession) emit(ev Event) {
 func (s *ccSession) readLoop(scanner *bufio.Scanner) {
 	scanner.Buffer(make([]byte, 1<<20), 100<<20)
 	defer close(s.events)
+	// Unblock any SessionID() waiter when the process exits — critical for a cc
+	// that dies before emitting system/init (tether#49), where sidReady never
+	// closes.
+	defer close(s.done)
 
 	for scanner.Scan() {
 		// A single stream-json line can yield MULTIPLE events — e.g. a `user`

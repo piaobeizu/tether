@@ -68,12 +68,60 @@ func (f *fakeSession) InterruptCalls() int {
 	return f.interruptCalls
 }
 
-// fakeProvider hands back a pre-built fakeSession regardless of SpawnConfig.
-type fakeProvider struct{ sess *fakeSession }
+// fakeProvider hands back a pre-built fakeSession regardless of SpawnConfig,
+// but records the last SpawnConfig it received so tests can assert what the
+// registry asked for (e.g. ResumeSessionID — tether#49).
+type fakeProvider struct {
+	sess    *fakeSession
+	lastCfg agent.SpawnConfig
+	spawns  int
+}
 
 func (p *fakeProvider) Name() string { return "fake" }
-func (p *fakeProvider) Spawn(_ context.Context, _ agent.SpawnConfig) (agent.Session, error) {
+func (p *fakeProvider) Spawn(_ context.Context, cfg agent.SpawnConfig) (agent.Session, error) {
+	p.lastCfg = cfg
+	p.spawns++
 	return p.sess, nil
+}
+
+// TestGetOrSpawnEntry_StaleSidSpawnsFresh — a sid the registry does NOT track
+// (daemon restart / post-disconnect eviction / different workspace-cwd) must
+// spawn a FRESH session, never `cc --resume <sid>`. Resuming a dead sid makes
+// cc exit with "No conversation found" before emitting system/init, which
+// parked SessionID() forever and broke-pipe the first prompt — wedging the turn
+// in "thinking…" (tether#49). Assert the provider got an empty ResumeSessionID.
+func TestGetOrSpawnEntry_StaleSidSpawnsFresh(t *testing.T) {
+	fp := &fakeProvider{sess: &fakeSession{sid: "fresh-sid", events: make(chan agent.Event, 8)}}
+	reg := NewRegistry(fp)
+	if _, err := reg.GetOrSpawnEntry(context.Background(), "stale-dead-sid", "fake"); err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	if fp.lastCfg.ResumeSessionID != "" {
+		t.Errorf("Spawn ResumeSessionID = %q, want \"\" (must not cc --resume a stale sid)", fp.lastCfg.ResumeSessionID)
+	}
+}
+
+// TestGetOrSpawnEntry_LiveSidReused — a sid the registry DOES track returns the
+// existing entry without spawning again (the real reconnect-continuity path,
+// unchanged by tether#49: live reconnect reuses the running cc, never resumes).
+func TestGetOrSpawnEntry_LiveSidReused(t *testing.T) {
+	fp := &fakeProvider{sess: &fakeSession{sid: "live-sid", events: make(chan agent.Event, 8)}}
+	reg := NewRegistry(fp)
+	e1, err := reg.GetOrSpawnEntry(context.Background(), "", "fake")
+	if err != nil {
+		t.Fatalf("first spawn: %v", err)
+	}
+	waitForRegistered(t, reg, "live-sid") // wait for the async re-key tempKey → real sid
+	e2, err := reg.GetOrSpawnEntry(context.Background(), "live-sid", "fake")
+	if err != nil {
+		t.Fatalf("reuse: %v", err)
+	}
+	if e1 != e2 {
+		t.Error("a live sid must reuse the existing entry, not create a new one")
+	}
+	if fp.spawns != 1 {
+		t.Errorf("provider.spawns = %d, want 1 (a live sid must not respawn)", fp.spawns)
+	}
 }
 
 // TestRegistry_FencedBlockSuppressedFromMessageAndHistory drives a session

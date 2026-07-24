@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 // first returns the first event parseLine produced, or nil — a shim so the
@@ -259,6 +260,37 @@ func TestParseLine_ResultNoUsage(t *testing.T) {
 	evs := s.parseLine(line)
 	if len(evs) != 1 || evs[0].Kind != EventResult {
 		t.Fatalf("expected exactly [EventResult], got %+v", evs)
+	}
+}
+
+// TestSessionID_UnblocksOnDeath — a cc that exits before emitting system/init
+// (e.g. a failed `--resume`, tether#49) must NOT park SessionID() forever:
+// readLoop closing `done` unblocks it, returning "" so serveChat surfaces an
+// error / spawns fresh instead of hanging the turn in "thinking…".
+func TestSessionID_UnblocksOnDeath(t *testing.T) {
+	s := &ccSession{sidReady: make(chan struct{}), done: make(chan struct{})}
+	close(s.done) // readLoop returned (process exited) before any system/init
+	got := make(chan string, 1)
+	go func() { got <- s.SessionID() }()
+	select {
+	case sid := <-got:
+		if sid != "" {
+			t.Errorf("SessionID() = %q, want \"\" on death-before-init", sid)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("SessionID() blocked forever after done closed (tether#49 wedge)")
+	}
+}
+
+// TestSessionID_ResolvesOnInit — the normal path: system/init closes sidReady
+// with the sid set, so SessionID() returns the real sid (and death afterwards
+// is irrelevant).
+func TestSessionID_ResolvesOnInit(t *testing.T) {
+	s := &ccSession{sidReady: make(chan struct{}), done: make(chan struct{})}
+	s.sid = "sess-xyz"
+	close(s.sidReady)
+	if got := s.SessionID(); got != "sess-xyz" {
+		t.Errorf("SessionID() = %q, want sess-xyz", got)
 	}
 }
 

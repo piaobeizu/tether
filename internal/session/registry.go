@@ -117,7 +117,24 @@ func (r *Registry) GetOrSpawnEntry(ctx context.Context, sid, providerName string
 	if r.PermEndpoint != "" {
 		extraEnv = append(extraEnv, "TETHER_DAEMON_PERM_ENDPOINT="+r.PermEndpoint)
 	}
-	sess, err := provider.Spawn(ctx, agent.SpawnConfig{ResumeSessionID: sid, Env: extraEnv})
+	// Always spawn a FRESH session — never `cc --resume <sid>` (tether#49).
+	// A sid that IS live returns early above (existing entry reused, cc still
+	// running — the real reconnect-continuity path). In practice the only way
+	// execution reaches here with a non-empty sid is a sid the daemon no longer
+	// tracks (daemon restart, post-disconnect eviction, or a different
+	// workspace/cwd). (A theoretical window exists where a just-init'd sid's
+	// re-key goroutine hasn't inserted r.sessions[sid] yet, but the browser only
+	// learns the sid from session_ready — sent after that same insert — so a
+	// reconnect can't beat it; and even if it did, fresh-vs-resume is no worse.)
+	// Passing such a sid to `cc --resume` makes cc exit with "No conversation
+	// found" BEFORE emitting system/init — which parked SessionID() forever and
+	// broke-pipe the first prompt, wedging the turn in "thinking…" with no
+	// answer. cc's on-disk conversation is project-cwd-scoped and not reliably
+	// resumable across daemon/workspace changes anyway, so we honor the
+	// documented "fall through to a fresh session" intent. (SpawnConfig still
+	// carries ResumeSessionID for a future try-resume-then-fallback; the
+	// registry just no longer triggers the unconditional, wedge-prone resume.)
+	sess, err := provider.Spawn(ctx, agent.SpawnConfig{ResumeSessionID: "", Env: extraEnv})
 	if err != nil {
 		return nil, fmt.Errorf("spawn: %w", err)
 	}
@@ -181,10 +198,12 @@ func (r *Registry) GetOrSpawn(ctx context.Context, sid, providerName string) (ag
 // Eviction is by value: it deletes whatever key maps to e, catching the entry
 // whether it is keyed under its real sid or still under the pending-%p
 // placeholder from GetOrSpawnEntry. The placeholder case matters — a session
-// that dies before emitting system/init parks the re-key goroutine forever in
-// ccSession.SessionID() (sidReady never closes), so this by-value scan is the
-// only path that reclaims that map slot. Setting e.evicted first makes a
-// late-waking re-key goroutine refuse to re-insert the entry (see
+// that dies before emitting system/init: since tether#49, ccSession.SessionID()
+// returns "" on that death (it selects on the process-exit `done` channel, no
+// longer parking forever), so the re-key goroutine wakes, deletes the tempKey,
+// and skips the re-insert (sid == ""). This by-value scan remains the safety
+// net that reclaims the slot regardless of goroutine timing. Setting e.evicted
+// first makes a late-waking re-key goroutine refuse to re-insert the entry (see
 // GetOrSpawnEntry). Deleting during range is safe per the Go spec, and this
 // runs once per session lifetime — not on a hot path.
 //

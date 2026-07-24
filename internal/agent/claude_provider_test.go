@@ -226,6 +226,42 @@ func TestParseLine_Result(t *testing.T) {
 	}
 }
 
+// TestParseLine_ResultWithUsage — a result event carrying a top-level `usage`
+// object yields the turn's token usage as an EventUsage emitted BEFORE the
+// EventResult (tether#48). The frontend needs usage to arrive while the turn
+// bubble is still open, so ordering matters: usage first, result (turn-closer)
+// second. Only input/output are surfaced; cache_* and total_cost_usd are
+// ignored per scope.
+func TestParseLine_ResultWithUsage(t *testing.T) {
+	s := &ccSession{sidReady: make(chan struct{})}
+	line := []byte(`{"type":"result","subtype":"success","result":"done","total_cost_usd":0.0123,"usage":{"input_tokens":1234,"output_tokens":856,"cache_creation_input_tokens":40,"cache_read_input_tokens":9000}}`)
+	evs := s.parseLine(line)
+	if len(evs) != 2 {
+		t.Fatalf("expected [EventUsage, EventResult], got %d events: %+v", len(evs), evs)
+	}
+	if evs[0].Kind != EventUsage {
+		t.Errorf("evs[0].Kind = %q, want %q (usage must precede result)", evs[0].Kind, EventUsage)
+	}
+	if evs[0].Usage == nil || evs[0].Usage.Input != 1234 || evs[0].Usage.Output != 856 {
+		t.Errorf("evs[0].Usage = %+v, want {Input:1234 Output:856}", evs[0].Usage)
+	}
+	if evs[1].Kind != EventResult || evs[1].Text != "done" {
+		t.Errorf("evs[1] = {%q, %q}, want {result, done}", evs[1].Kind, evs[1].Text)
+	}
+}
+
+// TestParseLine_ResultNoUsage — a result event with no `usage` object emits
+// ONLY the EventResult (no empty/zero EventUsage), so turns where cc omits
+// usage don't produce a bogus 0↑/0↓ badge.
+func TestParseLine_ResultNoUsage(t *testing.T) {
+	s := &ccSession{sidReady: make(chan struct{})}
+	line := []byte(`{"type":"result","subtype":"success","result":"done"}`)
+	evs := s.parseLine(line)
+	if len(evs) != 1 || evs[0].Kind != EventResult {
+		t.Fatalf("expected exactly [EventResult], got %+v", evs)
+	}
+}
+
 // TestParseLine_ControlResponseIgnored — cc's reply to an outbound
 // control_request (e.g. the T9 interrupt request written by
 // ccSession.Interrupt) must be silently dropped: no Event, and critically

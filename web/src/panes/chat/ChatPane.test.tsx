@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, summarizeToolInput, summarizeToolResult, truncateResult, shouldSendOnEnter, growHeight, parseAtQuery, fuzzyRankFiles } from './index'
+import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, fmtTokens, summarizeToolInput, summarizeToolResult, truncateResult, shouldSendOnEnter, growHeight, parseAtQuery, fuzzyRankFiles } from './index'
 import { PermissionQueue, postDecide } from '../../fenced-blocks/PermissionBlock'
 import type { ToolCall, PermissionRequest } from '../../lib/store'
 
@@ -104,6 +104,52 @@ describe('AnswerMeta (tether#36)', () => {
     expect(container.querySelector('.msg-ai-dur')).toBeNull()
     expect(container.querySelector('.msg-ai-name')).toBeTruthy()
     expect(container.querySelector('.msg-ai-time')).toBeTruthy()
+  })
+
+  // tether#48 — token-usage badge.
+  it('shows the token-usage badge when usage is set', () => {
+    const { container } = render(<AnswerMeta ts={ts} answerMs={2100} usage={{ input: 1234, output: 856 }} />)
+    const u = container.querySelector('.msg-ai-usage')
+    expect(u).toBeTruthy()
+    expect(u?.textContent).toContain('1.2k↑')
+    expect(u?.textContent).toContain('856↓')
+  })
+
+  it('omits the token-usage badge when usage is undefined (live-only, e.g. after reload)', () => {
+    const { container } = render(<AnswerMeta ts={ts} answerMs={2100} usage={undefined} />)
+    expect(container.querySelector('.msg-ai-usage')).toBeNull()
+    expect(container.querySelector('.msg-ai-dur')).toBeTruthy() // duration still shows
+  })
+})
+
+// tether#48 — fmtTokens compacts a token count for the usage badge.
+describe('fmtTokens (tether#48)', () => {
+  it('renders sub-1k counts verbatim', () => {
+    expect(fmtTokens(0)).toBe('0')
+    expect(fmtTokens(856)).toBe('856')
+    expect(fmtTokens(999)).toBe('999')
+  })
+  it('renders thousands with a "k" suffix (one decimal under ~10k, whole above)', () => {
+    expect(fmtTokens(1000)).toBe('1k')     // lower k boundary
+    expect(fmtTokens(1234)).toBe('1.2k')
+    expect(fmtTokens(9949)).toBe('9.9k')   // just under the 9.95 threshold: decimal kept
+    expect(fmtTokens(9950)).toBe('10k')    // >= 9.95k drops the decimal
+    expect(fmtTokens(45678)).toBe('46k')
+    expect(fmtTokens(45000)).toBe('45k')
+  })
+  it('renders millions with an "M" suffix', () => {
+    expect(fmtTokens(1_400_000)).toBe('1.4M')
+    expect(fmtTokens(2_000_000)).toBe('2M')
+  })
+  it('rolls the k→M seam cleanly instead of rendering "1000k" (tether#48 review M1/M2)', () => {
+    // round(n/1000) would hit 1000 here; must render as M, not "1000k".
+    expect(fmtTokens(999_999)).toBe('1.0M')
+    expect(fmtTokens(1_000_000)).toBe('1M')   // whole M drops the decimal
+    expect(fmtTokens(1_000_001)).toBe('1.0M') // just over: decimal kept, never "1000k"
+  })
+  it('returns empty string for undefined/negative', () => {
+    expect(fmtTokens(undefined)).toBe('')
+    expect(fmtTokens(-1)).toBe('')
   })
 })
 

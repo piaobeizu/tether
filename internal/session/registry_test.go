@@ -124,6 +124,39 @@ func TestGetOrSpawnEntry_LiveSidReused(t *testing.T) {
 	}
 }
 
+// TestGetOrSpawnEntry_PassesRegistryWorkdir — (tether#51) lifecycle.go wires
+// the resolved workspace root onto Registry.Workdir once it's known (Step
+// 3b); GetOrSpawnEntry must forward it into SpawnConfig.Workdir so the agent
+// subprocess's cwd matches the workspace, not the daemon's own.
+func TestGetOrSpawnEntry_PassesRegistryWorkdir(t *testing.T) {
+	fp := &fakeProvider{sess: &fakeSession{sid: "sid-workdir", events: make(chan agent.Event, 4)}}
+	reg := NewRegistry(fp)
+	reg.Workdir = "/some/workspace"
+
+	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	if fp.lastCfg.Workdir != "/some/workspace" {
+		t.Errorf("Spawn Workdir = %q, want %q", fp.lastCfg.Workdir, "/some/workspace")
+	}
+}
+
+// TestGetOrSpawnEntry_UnsetRegistryWorkdirYieldsEmpty — an unset
+// Registry.Workdir must pass through as "" — the empty-Workdir fallback to
+// the process cwd is owned by resolveWorkdir at the provider level (tether#51),
+// not the registry.
+func TestGetOrSpawnEntry_UnsetRegistryWorkdirYieldsEmpty(t *testing.T) {
+	fp := &fakeProvider{sess: &fakeSession{sid: "sid-workdir2", events: make(chan agent.Event, 4)}}
+	reg := NewRegistry(fp)
+
+	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	if fp.lastCfg.Workdir != "" {
+		t.Errorf("Spawn Workdir = %q, want \"\" (registry must not fall back itself)", fp.lastCfg.Workdir)
+	}
+}
+
 // TestRegistry_FencedBlockSuppressedFromMessageAndHistory drives a session
 // through the registry's real fanOut (no direct FenceParser calls) and
 // asserts: (1) a KindFenced envelope carries the extracted block, (2) the

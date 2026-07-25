@@ -40,6 +40,17 @@ session isolation (D-04 `LockUser="default"`) is still v1.0+.
 clients (Cursor, Goose) can connect via OAuth PKCE (v0.3.3) or manual Bearer
 tokens (v0.3.2). Gemini provider is still v1.0+.
 
+**Agent cwd is daemon-global, not per-workspace**
+Every spawned agent (chat provider and the PTY shell pane) runs in the single
+directory resolved from `--workspace-root` (default `~/.tether/workspace`) — see
+`session.Registry.Workdir`. It is *not* the `Path` of whichever
+`internal/workspace` entry the UI is showing, because the chat wire protocol
+carries no workspace selector. Consequences: all registered workspaces share one
+cc project directory (so `--resume` history is pooled), and a daemon launched
+without `--workspace-root` no longer inherits its own launch directory as the
+agent cwd (pre-v0.4 behaviour) — pass `--workspace-root <dir>` to choose it
+explicitly rather than relying on where the daemon was started.
+
 ## UI / PWA
 
 **No offline support**

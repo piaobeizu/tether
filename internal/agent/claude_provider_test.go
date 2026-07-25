@@ -2,7 +2,10 @@ package agent
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -399,4 +402,134 @@ func TestInterrupt_DoesNotSignalProcess(t *testing.T) {
 	if s.cmd != nil {
 		t.Errorf("s.cmd = %+v, want nil — Interrupt must not touch/signal the process", s.cmd)
 	}
+}
+
+// ─── Spawn cwd (tether#51) ──────────────────────────────────────────────────
+//
+// cc's on-disk conversation and file edits are cwd-scoped, so the spawned
+// subprocess MUST run in the workspace directory rather than inheriting the
+// daemon's own startup cwd. These tests spawn a real (fake) subprocess and
+// assert its actual working directory, hermetically — no real `claude`
+// binary required.
+
+// writeFakeCCScript writes a tiny shell script into dir that records its own
+// process cwd (via the `pwd` builtin) to the path named by the OUT_FILE env
+// var, then exits immediately. Standing in for `claude` — Spawn only needs
+// something it can exec.CommandContext and read stdout from; this fake
+// produces no stream-json lines, which readLoop handles fine (EOF, no
+// events, clean exit).
+func writeFakeCCScript(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "fakecc.sh")
+	script := "#!/bin/sh\npwd > \"$OUT_FILE\"\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake cc script: %v", err)
+	}
+	return path
+}
+
+// drainEvents reads sess.Events() until it closes (the fake subprocess has
+// exited), bounded so a bug that hangs Spawn/readLoop fails the test instead
+// of the suite.
+func drainEvents(t *testing.T, sess Session) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case _, ok := <-sess.Events():
+			if !ok {
+				return
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for fake cc subprocess to exit")
+		}
+	}
+}
+
+// readTrimmed reads path and trims trailing whitespace (the trailing newline
+// `pwd` writes).
+func readTrimmed(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// resolvedEqual compares two paths after resolving symlinks on both sides —
+// t.TempDir() on some platforms (and /tmp generally) can be a symlink, so a
+// literal string compare would spuriously fail even when the subprocess ran
+// in the right place.
+func resolvedEqual(t *testing.T, got, want string) {
+	t.Helper()
+	gotResolved, err := filepath.EvalSymlinks(got)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q): %v", got, err)
+	}
+	wantResolved, err := filepath.EvalSymlinks(want)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q): %v", want, err)
+	}
+	if gotResolved != wantResolved {
+		t.Errorf("subprocess cwd = %q, want %q", gotResolved, wantResolved)
+	}
+}
+
+// TestSpawn_SetsCmdDir asserts that a non-empty SpawnConfig.Workdir becomes
+// the spawned subprocess's actual working directory (tether#51) — before
+// this fix, cmd.Dir was never set at all, so cc always inherited the
+// daemon's own cwd regardless of the requested workspace.
+func TestSpawn_SetsCmdDir(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := writeFakeCCScript(t, dir)
+	workdir := t.TempDir()
+	outFile := filepath.Join(dir, "pwd.out")
+
+	p := NewClaudeCodeProvider(scriptPath)
+	sess, err := p.Spawn(context.Background(), SpawnConfig{
+		Workdir: workdir,
+		Env:     []string{"OUT_FILE=" + outFile},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer sess.Close()
+
+	drainEvents(t, sess)
+	resolvedEqual(t, readTrimmed(t, outFile), workdir)
+}
+
+// TestSpawn_EmptyWorkdirFallsBackToProcessCwd asserts that an empty
+// SpawnConfig.Workdir keeps today's behavior — the subprocess inherits the
+// daemon's own cwd (os.Getwd()) — rather than running in some empty/root
+// directory implied by exec's zero-value Dir.
+//
+// This one is a SEMANTICS PIN, not a regression guard: it passes both with and
+// without cmd.Dir set, because setting Dir to the process cwd is observationally
+// identical to leaving it empty. Its job is to fail if someone later changes the
+// fallback (e.g. to "" meaning / or to a hardcoded default), which would silently
+// relocate every agent spawned by an embedder that doesn't set Workdir.
+// TestSpawn_SetsCmdDir is the actual regression guard.
+func TestSpawn_EmptyWorkdirFallsBackToProcessCwd(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := writeFakeCCScript(t, dir)
+	outFile := filepath.Join(dir, "pwd.out")
+
+	p := NewClaudeCodeProvider(scriptPath)
+	sess, err := p.Spawn(context.Background(), SpawnConfig{
+		Env: []string{"OUT_FILE=" + outFile},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer sess.Close()
+
+	drainEvents(t, sess)
+
+	wantWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("os.Getwd: %v", err)
+	}
+	resolvedEqual(t, readTrimmed(t, outFile), wantWd)
 }

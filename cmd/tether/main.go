@@ -56,7 +56,7 @@ func newServerCmd() *cobra.Command {
 	cmd.Flags().StringVar(&cfg.Token, "token", "", "static access token (runtime only, not persisted)")
 	cmd.Flags().IntVar(&cfg.MCPPort, "mcp-port", 8899, "loopback port for /mcp endpoint")
 	cmd.Flags().StringVar(&cfg.MCPConfigPath, "mcp-config", "", "path to config file with [mcp.servers] (default ~/.tether/config.json)")
-	cmd.Flags().StringVar(&cfg.WorkspaceRoot, "workspace-root", "", "workspace root for builtin tools (default ~/.tether/workspace)")
+	cmd.Flags().StringVar(&cfg.WorkspaceRoot, "workspace-root", "", "workspace root for builtin tools AND the cwd of every spawned agent (default ~/.tether/workspace)")
 	cmd.Flags().BoolVar(&cfg.SkipMCPInject, "skip-mcp-inject", false, "skip ~/.claude/settings.json injection (CI/test)")
 	return cmd
 }

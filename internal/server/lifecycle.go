@@ -178,6 +178,15 @@ func Run(cfg *Config) error {
 	// instead of an empty string when --workspace-root wasn't passed
 	// (tether#20 Task 5: the scenario-graph resolver needs a real root).
 	cfg.WorkspaceRoot = wsRoot
+	// The session Registry is built in Step 1, before wsRoot is known, so its
+	// Workdir (the cwd of every agent subprocess — chat provider AND the PTY
+	// shell pane) is wired here instead, same shape as cfg.Registry.PermEndpoint
+	// in Step 3 (tether#51). Only fill it in when unset, so an embedder that
+	// pre-built its own Registry keeps control (cf. the nil-guards on
+	// cfg.Registry / cfg.Registry.History above).
+	if cfg.Registry.Workdir == "" {
+		cfg.Registry.Workdir = wsRoot
+	}
 	mcpCfg, err := loadMCPConfig(cfg.MCPConfigPath)
 	if err != nil {
 		return fmt.Errorf("mcp config: %w", err)

@@ -43,6 +43,10 @@ func (p *ClaudeCodeProvider) Spawn(ctx context.Context, cfg SpawnConfig) (Sessio
 	}
 
 	cmd := exec.CommandContext(ctx, p.ccPath, args...)
+	// cc's on-disk conversation and file edits are cwd-scoped, so the
+	// subprocess must run in the workspace directory, not wherever the
+	// daemon happened to start (tether#51).
+	cmd.Dir = ResolveWorkdir(cfg.Workdir)
 	cmd.Env = buildEnv(cfg.Env)
 	cmd.Stderr = os.Stderr
 

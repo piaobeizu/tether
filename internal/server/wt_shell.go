@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	cryptorand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"github.com/creack/pty"
 	"github.com/quic-go/webtransport-go"
 
+	"github.com/piaobeizu/tether/internal/agent"
 	"github.com/piaobeizu/tether/internal/auth"
 	"github.com/piaobeizu/tether/internal/session"
 	"github.com/piaobeizu/tether/internal/wire"
@@ -69,12 +71,7 @@ func handleWTShell(reg *session.Registry, wts *webtransport.Server, authState *a
 
 		// Spawn claude under PTY. cc internally coordinates jsonl with any
 		// concurrent chat subprocess (D-05a §2 fact 3).
-		ccPath := resolveClaudePath()
-		var args []string
-		if sid != "" {
-			args = append(args, "--resume", sid)
-		}
-		cmd := exec.CommandContext(ctx, ccPath, args...)
+		cmd := buildPTYCommand(ctx, resolveClaudePath(), sid, reg.Workdir)
 		cmd.Env = buildPTYEnv(reg.PermEndpoint)
 
 		ptmx, err := pty.Start(cmd)
@@ -168,6 +165,30 @@ func newShellID() string {
 		panic("server: crypto/rand unavailable: " + err.Error())
 	}
 	return hex.EncodeToString(b)
+}
+
+// buildPTYCommand builds the `claude` invocation for the PTY shell pane.
+//
+// The working directory is load-bearing, not cosmetic: the shell pane is handed
+// the *chat* session's sid (web/src/panes/shell/index.tsx reads it from the
+// store) and resumes it with `--resume <sid>`, but cc stores conversations under
+// ~/.claude/projects/<encoded-cwd>/ — so a shell whose cwd differs from the cwd
+// the chat session was created in gets "No conversation found" and drops the
+// user into a fresh conversation. Both spawn paths therefore resolve their cwd
+// through the same agent.ResolveWorkdir (tether#51); workdir is the daemon's
+// resolved workspace root (session.Registry.Workdir), and "" means "inherit the
+// daemon's cwd", which is the pre-tether#51 behaviour.
+//
+// Extracted as a plain function so this contract is unit-testable without
+// standing up a WebTransport session and a PTY.
+func buildPTYCommand(ctx context.Context, ccPath, sid, workdir string) *exec.Cmd {
+	var args []string
+	if sid != "" {
+		args = append(args, "--resume", sid)
+	}
+	cmd := exec.CommandContext(ctx, ccPath, args...)
+	cmd.Dir = agent.ResolveWorkdir(workdir)
+	return cmd
 }
 
 // buildPTYEnv constructs the env for the PTY shell subprocess.

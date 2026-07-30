@@ -4,7 +4,7 @@ package agent
 //
 // Everything else built on the fake is only as trustworthy as the fake is
 // faithful, so these tests pin the fake against the measured claude 2.1.220
-// probe (team memory mem_t3FrkFIw) rather than against what the fake happens to
+// probe (team memory mem_2ruSlrHR) rather than against what the fake happens to
 // do. They exec it DIRECTLY, not through ClaudeCodeProvider, because the
 // contract is about raw stdout LINES / exit codes / stderr — everything the
 // provider's parser deliberately hides.
@@ -55,12 +55,12 @@ func TestFakeCC_NormalEventOrder(t *testing.T) {
 		t.Fatalf("event order =\n  %v\nwant\n  %v", kinds, want)
 	}
 	if kinds[0] == "system/init" {
-		t.Error("system/init must not be the first line — hook events precede it (mem_t3FrkFIw ⑤)")
+		t.Error("system/init must not be the first line — hook events precede it (mem_2ruSlrHR ⑤)")
 	}
 }
 
 // TestFakeCC_SessionIDAdopted — --session-id <uuid> is adopted verbatim: both
-// system/init and the result echo the caller's uuid (mem_t3FrkFIw ①). This is
+// system/init and the result echo the caller's uuid (mem_2ruSlrHR ①). This is
 // the property that lets tether#50 mint the session id itself instead of
 // learning it from init.
 func TestFakeCC_SessionIDAdopted(t *testing.T) {
@@ -95,7 +95,7 @@ func TestFakeCC_SessionIDAdopted(t *testing.T) {
 }
 
 // TestFakeCC_ResultSuccessCarriesUsage — result/success carries a top-level
-// usage{input_tokens,output_tokens} (mem_t3FrkFIw ⑥). tether#48's token badge
+// usage{input_tokens,output_tokens} (mem_2ruSlrHR ⑥). tether#48's token badge
 // reads exactly this, so a fake that omitted it would make the badge path
 // untestable.
 func TestFakeCC_ResultSuccessCarriesUsage(t *testing.T) {
@@ -126,7 +126,7 @@ func TestFakeCC_ResultSuccessCarriesUsage(t *testing.T) {
 }
 
 // TestFakeCC_ResumeKnownSessionSucceeds — resuming a session this cwd owns
-// exits 0 and does not let the sid drift (mem_t3FrkFIw ②).
+// exits 0 and does not let the sid drift (mem_2ruSlrHR ②).
 func TestFakeCC_ResumeKnownSessionSucceeds(t *testing.T) {
 	h := newFakeCCHarness(t)
 	cwd := t.TempDir()
@@ -153,7 +153,7 @@ func TestFakeCC_ResumeKnownSessionSucceeds(t *testing.T) {
 
 // TestFakeCC_ResumeUnknownSessionFails is the single most important contract in
 // this file — the failure shape tether#49 tripped over and tether#50 has to
-// handle. Measured (mem_t3FrkFIw ③): exit 1; stdout is EXACTLY ONE line, a
+// handle. Measured (mem_2ruSlrHR ③): exit 1; stdout is EXACTLY ONE line, a
 // result/error_during_execution with is_error true, result null, num_turns 0 and
 // the REQUESTED session id; NO system/init anywhere; stderr says
 // "No conversation found with session ID: <uuid>".
@@ -214,7 +214,7 @@ func TestFakeCC_ResumeUnknownSessionFails(t *testing.T) {
 
 // TestFakeCC_ResumeCrossCwdFails — resume is cwd-scoped: a session id that IS
 // known, resumed from a different directory, fails identically to an unknown one
-// (mem_t3FrkFIw ③/④). Without this, a test could "prove" cross-workspace resume
+// (mem_2ruSlrHR ③/④). Without this, a test could "prove" cross-workspace resume
 // works when real cc would refuse.
 func TestFakeCC_ResumeCrossCwdFails(t *testing.T) {
 	h := newFakeCCHarness(t)
@@ -343,15 +343,16 @@ func TestFakeCC_PartialMessagesFlagGatesDeltas(t *testing.T) {
 	}
 }
 
-// TestFakeCC_ZeroTurnSessionNotResumable pins a MODELLED (not measured)
-// decision, and says so: a session that was created but never given a prompt is
-// NOT resumable, because cc writes its transcript per turn and "no turn, no
-// transcript" is both the likelier real behaviour and the stricter one.
+// TestFakeCC_ZeroTurnSessionNotResumable pins behaviour MEASURED against real
+// cc (2.1.220, 2026-07-30 — mem_2ruSlrHR ⑦): a session created but never given
+// a prompt is NOT resumable. Real cc never even reaches init when stdin EOFs
+// first, and writes no session jsonl, so the later --resume fails.
 //
 // It matters because tether#50's mint → pin with --session-id → drop → --resume
-// path runs straight through this branch. Pinning it means the choice cannot
-// drift silently: if someone later moves rememberFakeCCSession back to spawn
-// time, this test fails and forces them to re-probe real cc first.
+// path runs straight through this branch, and because a client that reloads
+// before sending anything hits it in normal use. Pinning it means the choice
+// cannot drift silently: if someone later moves rememberFakeCCSession back to
+// spawn time, this test fails.
 func TestFakeCC_ZeroTurnSessionNotResumable(t *testing.T) {
 	h := newFakeCCHarness(t)
 	cwd := t.TempDir()

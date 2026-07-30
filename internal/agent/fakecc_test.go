@@ -31,7 +31,7 @@ package agent
 //
 // A stub that is merely *plausible* would make every test built on it a
 // self-deception. Every behaviour below is anchored to a real probe of claude
-// 2.1.220 (2026-07-25, team memory mem_t3FrkFIw):
+// 2.1.220 (2026-07-25, team memory mem_2ruSlrHR):
 //
 //	① --session-id <uuid> is ADOPTED — system/init and result both echo the
 //	   uuid the caller supplied, so the caller can mint its own session id.
@@ -110,7 +110,7 @@ const (
 const fakeCCDefaultReply = "clouds drift slowly across a pale morning sky"
 
 // fakeCCNoConversation is the stderr line real cc writes when --resume names a
-// session it cannot find (measured; mem_t3FrkFIw ③). The daemon pipes cc's
+// session it cannot find (measured; mem_2ruSlrHR ③). The daemon pipes cc's
 // stderr straight through today, so this is fidelity for its own sake plus the
 // anchor for anything that later wants to classify a resume failure.
 const fakeCCNoConversation = "No conversation found with session ID: "
@@ -277,7 +277,7 @@ func fakeCCSessionPath(sid string) (string, bool) {
 
 // fakeCCSessionKnown reports whether sid is resumable FROM cwd. The marker
 // file's content is the cwd that created the session, which is how the fake
-// models real cc keying its transcript directory on the cwd (mem_t3FrkFIw ④):
+// models real cc keying its transcript directory on the cwd (mem_2ruSlrHR ④):
 // same uuid + different cwd = not found, exactly like the unknown-uuid case.
 func fakeCCSessionKnown(sid, cwd string) bool {
 	path, ok := fakeCCSessionPath(sid)
@@ -320,16 +320,15 @@ func fakeCCCwd() string {
 // rememberFakeCCSession makes sid resumable from cwd. Callers invoke it when a
 // TURN STARTS, not when the process spawns.
 //
-// NOT MEASURED, and called out because tether#50 sits directly on this branch:
-// the probe never checked whether real cc can --resume a session that was
-// created but never used (spawn with --session-id, send no prompt, respawn with
-// --resume). cc writes its transcript to a per-session jsonl, so "no turn, no
-// transcript, nothing to resume" is the likelier behaviour — and it is also the
-// stricter of the two, so a tether#50 that wrongly assumed zero-turn resume
-// works gets caught here instead of being falsely reassured. If #50 needs the
-// other answer, probe real cc first; do not just move this call earlier.
-// TestFakeCC_ZeroTurnSessionNotResumable pins the modelled behaviour so the
-// choice cannot drift silently.
+// MEASURED against real cc (2.1.220, 2026-07-30 — mem_2ruSlrHR ⑦): a session
+// that was created but never used is NOT resumable. Spawning with --session-id
+// and letting stdin EOF immediately exits 0 after emitting only
+// system/hook_started + system/hook_response — no init, and no session jsonl on
+// disk — so the follow-up --resume fails with the standard "No conversation
+// found" shape. tether#50 sits directly on this branch, and the measurement
+// makes its fallback path ordinary rather than exceptional: a client that
+// connects and reloads without ever sending a prompt has nothing to resume.
+// TestFakeCC_ZeroTurnSessionNotResumable pins the behaviour so it cannot drift.
 func rememberFakeCCSession(sid, cwd string) {
 	path, ok := fakeCCSessionPath(sid)
 	if !ok {
@@ -366,7 +365,7 @@ type fakeCCResultLine struct {
 }
 
 // fakeCCUsage is the top-level per-turn token accounting on result/success
-// (mem_t3FrkFIw ⑥). Real cc also reports cache_* counts; tether ignores them
+// (mem_2ruSlrHR ⑥). Real cc also reports cache_* counts; tether ignores them
 // (rawUsage in claude_provider.go) so the fake does not model them.
 type fakeCCUsage struct {
 	InputTokens  int `json:"input_tokens"`
@@ -439,7 +438,7 @@ func fakeCCChunks(s string) []string {
 }
 
 // emitFakeCCTurn writes one full assistant turn in the measured order
-// (mem_t3FrkFIw ⑤): hook_started → hook_response → init → [stream_event…] →
+// (mem_2ruSlrHR ⑤): hook_started → hook_response → init → [stream_event…] →
 // assistant → result/success. The stream_event block appears only when
 // --include-partial-messages was passed, which is exactly what that flag does
 // in real cc (see ClaudeCodeProvider.Spawn's comment on it).
@@ -518,13 +517,15 @@ func fakeCCMain(argv []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 
 	// Session id resolution: a resumed id wins, then a caller-minted
-	// --session-id (adopted verbatim — mem_t3FrkFIw ①), else the fake mints one.
+	// --session-id (adopted verbatim — mem_2ruSlrHR ①), else the fake mints one.
 	//
-	// NOT MEASURED: what real cc does when BOTH --resume and --session-id are
-	// passed. The probe never tried that combination, and tether never produces
-	// it (Spawn emits at most one of the two), so "resume wins" is this fake's
-	// arbitrary choice, not a cc contract. If tether#50 ever needs to pass both,
-	// re-probe before relying on this ordering.
+	// MEASURED (2.1.220, 2026-07-30 — mem_2ruSlrHR ⑧): real cc REJECTS --resume
+	// and --session-id together, exiting 1 with "--session-id can only be used
+	// with --continue or --resume if --fork-session is also specified." tether
+	// never produces that argv (Spawn emits at most one of the two), so the fake
+	// stays permissive and lets a resumed id win instead of growing a rejection
+	// path no caller exercises. If tether#50 ever needs both it must also pass
+	// --fork-session, and this fake needs the matching branch first.
 	sid := a.resume
 	if sid == "" {
 		sid = a.sessionID

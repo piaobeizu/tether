@@ -681,7 +681,7 @@ func TestSpawn_StreamsFullTurn(t *testing.T) {
 
 // TestSpawn_ResumeUnknownSessionDiesBeforeInit is tether#49's die-before-init
 // case, moved off hand-closed channels and onto a real subprocess that
-// reproduces cc's measured failure shape (mem_t3FrkFIw ③).
+// reproduces cc's measured failure shape (mem_2ruSlrHR ③).
 //
 // TestSessionID_UnblocksOnDeath pins the channel mechanics in isolation; this
 // pins the whole chain that mechanism exists for: a `--resume` of a session this
@@ -746,7 +746,7 @@ func TestSpawn_ResumeUnknownSessionDiesBeforeInit(t *testing.T) {
 
 // TestSpawn_ResumeKnownSessionSucceeds — the other half of the resume contract
 // through the provider: when the session IS resumable from this cwd, cc runs
-// normally and the sid does not drift (mem_t3FrkFIw ②). Together with the test
+// normally and the sid does not drift (mem_2ruSlrHR ②). Together with the test
 // above, this is what makes a try-resume-then-fall-back implementation
 // (tether#50) testable at all: both branches are now reachable on demand.
 func TestSpawn_ResumeKnownSessionSucceeds(t *testing.T) {

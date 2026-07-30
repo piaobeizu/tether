@@ -28,10 +28,7 @@ func NewOpenCodeProvider() *OpenCodeProvider { return &OpenCodeProvider{} }
 func (p *OpenCodeProvider) Name() string { return "opencode" }
 
 func (p *OpenCodeProvider) Spawn(ctx context.Context, cfg SpawnConfig) (Session, error) {
-	workdir := cfg.Workdir
-	if workdir == "" {
-		workdir, _ = os.Getwd()
-	}
+	workdir := ResolveWorkdir(cfg.Workdir)
 
 	sess := &opencodeSession{
 		workdir:   workdir,

@@ -21,6 +21,11 @@ type Registry struct {
 	providers    map[string]agent.AgentProvider
 	PermEndpoint string        // injected into cc subprocess env if non-empty
 	History      *HistoryStore // nil = history disabled
+	// Workdir is the agent subprocess cwd (workspace root); "" = daemon cwd.
+	// Wired by internal/server/lifecycle.go Step 3b once the workspace root
+	// is resolved (tether#51) — Step 1 builds the Registry before wsRoot is
+	// known, so it can't be set at construction time.
+	Workdir string
 }
 
 // Entry is the per-session bundle of agent.Session + subscriber set. Exposed
@@ -134,7 +139,7 @@ func (r *Registry) GetOrSpawnEntry(ctx context.Context, sid, providerName string
 	// documented "fall through to a fresh session" intent. (SpawnConfig still
 	// carries ResumeSessionID for a future try-resume-then-fallback; the
 	// registry just no longer triggers the unconditional, wedge-prone resume.)
-	sess, err := provider.Spawn(ctx, agent.SpawnConfig{ResumeSessionID: "", Env: extraEnv})
+	sess, err := provider.Spawn(ctx, agent.SpawnConfig{ResumeSessionID: "", Env: extraEnv, Workdir: r.Workdir})
 	if err != nil {
 		return nil, fmt.Errorf("spawn: %w", err)
 	}

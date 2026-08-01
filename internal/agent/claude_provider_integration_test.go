@@ -2,6 +2,14 @@
 
 // Run with: go test -tags=integration -run TestClaudeStreaming_E2E ./internal/agent -v
 // Requires `claude` CLI on PATH and a working ANTHROPIC_API_KEY / OAuth session.
+//
+// This is the FIDELITY BACKSTOP, not the everyday guard. Since tether#53 the
+// same chain (argv → subprocess → stream-json → Event) runs by default against
+// the in-repo fake cc — see TestSpawn_StreamsFullTurn in claude_provider_test.go
+// and the fake's own contract tests in fakecc_contract_test.go. Keep this test
+// for what a fake can never do: catch the day real cc's output contract drifts.
+// If it starts failing, re-probe cc and update the fake to match (the fake's
+// behaviour is documented against a measured probe of claude 2.1.220).
 
 package agent
 

@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -270,6 +272,10 @@ func TestParseLine_ResultNoUsage(t *testing.T) {
 // (e.g. a failed `--resume`, tether#49) must NOT park SessionID() forever:
 // readLoop closing `done` unblocks it, returning "" so serveChat surfaces an
 // error / spawns fresh instead of hanging the turn in "thinking…".
+//
+// This pins the channel mechanics in isolation (no subprocess). The same case
+// against a real subprocess reproducing cc's measured failure output is
+// TestSpawn_ResumeUnknownSessionDiesBeforeInit (tether#53).
 func TestSessionID_UnblocksOnDeath(t *testing.T) {
 	s := &ccSession{sidReady: make(chan struct{}), done: make(chan struct{})}
 	close(s.done) // readLoop returned (process exited) before any system/init
@@ -408,25 +414,10 @@ func TestInterrupt_DoesNotSignalProcess(t *testing.T) {
 //
 // cc's on-disk conversation and file edits are cwd-scoped, so the spawned
 // subprocess MUST run in the workspace directory rather than inheriting the
-// daemon's own startup cwd. These tests spawn a real (fake) subprocess and
-// assert its actual working directory, hermetically — no real `claude`
-// binary required.
-
-// writeFakeCCScript writes a tiny shell script into dir that records its own
-// process cwd (via the `pwd` builtin) to the path named by the OUT_FILE env
-// var, then exits immediately. Standing in for `claude` — Spawn only needs
-// something it can exec.CommandContext and read stdout from; this fake
-// produces no stream-json lines, which readLoop handles fine (EOF, no
-// events, clean exit).
-func writeFakeCCScript(t *testing.T, dir string) string {
-	t.Helper()
-	path := filepath.Join(dir, "fakecc.sh")
-	script := "#!/bin/sh\npwd > \"$OUT_FILE\"\n"
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		t.Fatalf("write fake cc script: %v", err)
-	}
-	return path
-}
+// daemon's own startup cwd. These tests spawn a real subprocess — the fake cc
+// from fakecc_test.go — and assert its actual working directory, hermetically:
+// no real `claude` binary and (since tether#53 replaced the old `#!/bin/sh`
+// stand-in) no system shell required either.
 
 // drainEvents reads sess.Events() until it closes (the fake subprocess has
 // exited), bounded so a bug that hangs Spawn/readLoop fails the test instead
@@ -446,15 +437,81 @@ func drainEvents(t *testing.T, sess Session) {
 	}
 }
 
-// readTrimmed reads path and trims trailing whitespace (the trailing newline
-// `pwd` writes).
-func readTrimmed(t *testing.T, path string) string {
+// collectUntilResult reads events until the turn closes (EventResult) or the
+// channel does, bounded so a hang fails this test rather than the suite.
+func collectUntilResult(t *testing.T, sess Session) []Event {
 	t.Helper()
-	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
+	deadline := time.After(10 * time.Second)
+	var evs []Event
+	for {
+		select {
+		case ev, ok := <-sess.Events():
+			if !ok {
+				return evs
+			}
+			evs = append(evs, ev)
+			if ev.Kind == EventResult {
+				return evs
+			}
+		case <-deadline:
+			t.Fatalf("timed out after %d events, never saw EventResult: %v", len(evs), eventKinds(evs))
+		}
 	}
-	return strings.TrimSpace(string(b))
+}
+
+// collectUntilClosed reads every event until Events() closes.
+func collectUntilClosed(t *testing.T, sess Session) []Event {
+	t.Helper()
+	deadline := time.After(10 * time.Second)
+	var evs []Event
+	for {
+		select {
+		case ev, ok := <-sess.Events():
+			if !ok {
+				return evs
+			}
+			evs = append(evs, ev)
+		case <-deadline:
+			t.Fatalf("timed out waiting for Events() to close; got %v", eventKinds(evs))
+		}
+	}
+}
+
+func eventKinds(evs []Event) []EventKind {
+	kinds := make([]EventKind, 0, len(evs))
+	for _, ev := range evs {
+		kinds = append(kinds, ev.Kind)
+	}
+	return kinds
+}
+
+// closeOnce wraps sess.Close so a test can close at a CHOSEN point — necessary
+// whenever it inspects the subprocess's exit status, or reads a writer that
+// os/exec only flushes when cmd.Wait() returns (the withStderr sink) — while
+// still deferring a safety net for the early-t.Fatalf path. Calling Close twice
+// would call cmd.Wait twice and report "Wait was already called"; the sync.Once
+// makes the second call a no-op that replays the first result.
+func closeOnce(sess Session) func() error {
+	var (
+		once sync.Once
+		err  error
+	)
+	return func() error {
+		once.Do(func() { err = sess.Close() })
+		return err
+	}
+}
+
+// closeExpectingCleanExit closes sess and fails the test unless the subprocess
+// exited 0. Worth asserting rather than discarding: if the fake dies badly — a
+// panic, or `go test -race` finding a data race inside it (exit 66) — cmd.Wait's
+// error is the ONLY signal, so a test that throws it away stays green while its
+// subprocess crashed.
+func closeExpectingCleanExit(t *testing.T, sess Session) {
+	t.Helper()
+	if err := sess.Close(); err != nil {
+		t.Errorf("Close() = %v, want nil — the fake cc subprocess must exit 0", err)
+	}
 }
 
 // resolvedEqual compares two paths after resolving symlinks on both sides —
@@ -481,23 +538,26 @@ func resolvedEqual(t *testing.T, got, want string) {
 // this fix, cmd.Dir was never set at all, so cc always inherited the
 // daemon's own cwd regardless of the requested workspace.
 func TestSpawn_SetsCmdDir(t *testing.T) {
-	dir := t.TempDir()
-	scriptPath := writeFakeCCScript(t, dir)
+	h := newFakeCCHarness(t)
+	h.ExitEarly = true // record the invocation and exit; no turn needed here
 	workdir := t.TempDir()
-	outFile := filepath.Join(dir, "pwd.out")
 
-	p := NewClaudeCodeProvider(scriptPath)
+	p := NewClaudeCodeProvider(fakeCCPath(t))
 	sess, err := p.Spawn(context.Background(), SpawnConfig{
 		Workdir: workdir,
-		Env:     []string{"OUT_FILE=" + outFile},
+		Env:     h.Env(),
 	})
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
-	defer sess.Close()
+	defer closeExpectingCleanExit(t, sess)
 
 	drainEvents(t, sess)
-	resolvedEqual(t, readTrimmed(t, outFile), workdir)
+	recs := h.Records(t)
+	if len(recs) != 1 {
+		t.Fatalf("fake cc recorded %d invocations, want 1", len(recs))
+	}
+	resolvedEqual(t, recs[0].Cwd, workdir)
 }
 
 // TestSpawn_EmptyWorkdirFallsBackToProcessCwd asserts that an empty
@@ -512,18 +572,15 @@ func TestSpawn_SetsCmdDir(t *testing.T) {
 // relocate every agent spawned by an embedder that doesn't set Workdir.
 // TestSpawn_SetsCmdDir is the actual regression guard.
 func TestSpawn_EmptyWorkdirFallsBackToProcessCwd(t *testing.T) {
-	dir := t.TempDir()
-	scriptPath := writeFakeCCScript(t, dir)
-	outFile := filepath.Join(dir, "pwd.out")
+	h := newFakeCCHarness(t)
+	h.ExitEarly = true
 
-	p := NewClaudeCodeProvider(scriptPath)
-	sess, err := p.Spawn(context.Background(), SpawnConfig{
-		Env: []string{"OUT_FILE=" + outFile},
-	})
+	p := NewClaudeCodeProvider(fakeCCPath(t))
+	sess, err := p.Spawn(context.Background(), SpawnConfig{Env: h.Env()})
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
-	defer sess.Close()
+	defer closeExpectingCleanExit(t, sess)
 
 	drainEvents(t, sess)
 
@@ -531,5 +588,302 @@ func TestSpawn_EmptyWorkdirFallsBackToProcessCwd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("os.Getwd: %v", err)
 	}
-	resolvedEqual(t, readTrimmed(t, outFile), wantWd)
+	recs := h.Records(t)
+	if len(recs) != 1 {
+		t.Fatalf("fake cc recorded %d invocations, want 1", len(recs))
+	}
+	resolvedEqual(t, recs[0].Cwd, wantWd)
+}
+
+// ─── Spawn against the fake cc: full-turn + failure paths (tether#53) ───────
+//
+// Until now the only end-to-end test of the argv → subprocess → stream-json →
+// Event chain was TestClaudeStreaming_E2E, which needs a real `claude` binary
+// and a live API key and is therefore behind `-tags=integration`. Everything
+// below runs by default against the fake cc, so the chain has a deterministic
+// guard; the real-cc test stays as the fidelity backstop.
+
+// TestSpawn_StreamsFullTurn is the happy path: one prompt in, and the exact
+// event sequence tether depends on comes out — EventInit carrying the session
+// id, several EventText deltas that reassemble into the reply, EventUsage
+// immediately BEFORE the turn-closing EventResult.
+//
+// The sharpest thing it proves is something no unit test could: the fake emits
+// system/hook_started and system/hook_response BEFORE system/init (the measured
+// order), and parseLine still lands on the right events — i.e. nothing in the
+// chain assumes init is the first line it sees.
+func TestSpawn_StreamsFullTurn(t *testing.T) {
+	h := newFakeCCHarness(t)
+	h.Reply = "alpha beta gamma delta epsilon"
+	workdir := t.TempDir()
+	const prompt = "hello there"
+
+	p := NewClaudeCodeProvider(fakeCCPath(t))
+	sess, err := p.Spawn(context.Background(), SpawnConfig{Workdir: workdir, Env: h.Env()})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer closeExpectingCleanExit(t, sess)
+
+	if err := sess.SendPrompt(context.Background(), prompt); err != nil {
+		t.Fatalf("SendPrompt: %v", err)
+	}
+	evs := collectUntilResult(t, sess)
+
+	// One EventText per text_delta the fake streams, derived rather than
+	// hardcoded so a change to the fake's chunking is not a spurious failure
+	// here — the ORDER is what this test is pinning.
+	wantKinds := []EventKind{EventInit}
+	for range fakeCCChunks(h.Reply) {
+		wantKinds = append(wantKinds, EventText)
+	}
+	wantKinds = append(wantKinds, EventUsage, EventResult)
+	if got := eventKinds(evs); !reflect.DeepEqual(got, wantKinds) {
+		t.Fatalf("event kinds = %v, want %v", got, wantKinds)
+	}
+
+	sid := sess.SessionID()
+	if sid == "" {
+		t.Fatal("SessionID() is empty after a successful turn")
+	}
+	if evs[0].SessionID != sid {
+		t.Errorf("EventInit SessionID = %q, want %q", evs[0].SessionID, sid)
+	}
+
+	var assembled string
+	for _, ev := range evs {
+		if ev.Kind == EventText {
+			assembled += ev.Text
+		}
+	}
+	if assembled != h.Reply {
+		t.Errorf("assembled text = %q, want %q", assembled, h.Reply)
+	}
+
+	usage := evs[len(evs)-2]
+	if usage.Usage == nil || usage.Usage.Input != len(prompt) || usage.Usage.Output != len(h.Reply) {
+		t.Errorf("usage = %+v, want {Input:%d Output:%d}", usage.Usage, len(prompt), len(h.Reply))
+	}
+	if result := evs[len(evs)-1]; result.Text != h.Reply {
+		t.Errorf("EventResult Text = %q, want %q", result.Text, h.Reply)
+	}
+
+	// The subprocess really did run where we asked, with the sid it reported.
+	recs := h.Records(t)
+	if len(recs) != 1 {
+		t.Fatalf("fake cc recorded %d invocations, want 1", len(recs))
+	}
+	if recs[0].SessionID != sid {
+		t.Errorf("fake cc used sid %q, provider reported %q", recs[0].SessionID, sid)
+	}
+	resolvedEqual(t, recs[0].Cwd, workdir)
+}
+
+// TestSpawn_ResumeUnknownSessionDiesBeforeInit is tether#49's die-before-init
+// case, moved off hand-closed channels and onto a real subprocess that
+// reproduces cc's measured failure shape (mem_2ruSlrHR ③).
+//
+// TestSessionID_UnblocksOnDeath pins the channel mechanics in isolation; this
+// pins the whole chain that mechanism exists for: a `--resume` of a session this
+// cwd does not own makes cc exit 1 having emitted NO system/init, so
+// SessionID() must return "" (unblocked by readLoop closing `done`) rather than
+// parking the caller forever — the wedge that left a turn stuck in "thinking…".
+//
+// It also pins two facts tether#50's fallback path will build on: the single
+// `result` line has result:null, so parseLine yields an EventResult with EMPTY
+// text (the blank bubble #50 must swallow); and cc's diagnosis is on stderr, not
+// in the event stream — observable here only through the withStderr seam.
+func TestSpawn_ResumeUnknownSessionDiesBeforeInit(t *testing.T) {
+	h := newFakeCCHarness(t) // no session seeded: nothing is resumable
+	var stderr syncBuffer
+
+	p := NewClaudeCodeProvider(fakeCCPath(t), withStderr(&stderr))
+	sess, err := p.Spawn(context.Background(), SpawnConfig{
+		ResumeSessionID: fakeCCTestUUID,
+		Workdir:         t.TempDir(),
+		Env:             h.Env(),
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	closeSess := closeOnce(sess)
+	defer func() { _ = closeSess() }() // safety net if an assertion below fatals
+
+	evs := collectUntilClosed(t, sess)
+
+	if sid := sess.SessionID(); sid != "" {
+		t.Errorf("SessionID() = %q, want \"\" — cc never emitted system/init", sid)
+	}
+	if got := eventKinds(evs); !reflect.DeepEqual(got, []EventKind{EventResult}) {
+		t.Fatalf("event kinds = %v, want exactly [result] (no init, no usage)", got)
+	}
+	if evs[0].Text != "" {
+		t.Errorf("EventResult Text = %q, want \"\" (cc sent result:null)", evs[0].Text)
+	}
+
+	// Close is what calls cmd.Wait(), which both yields the exit status and
+	// finishes os/exec's stderr-copying goroutine — so the sink is only safe to
+	// read after this point.
+	code, ok := exitCodeOf(closeSess())
+	if !ok || code != 1 {
+		t.Errorf("Close() exit status = %d (recognised=%v), want 1", code, ok)
+	}
+	if want := fakeCCNoConversation + fakeCCTestUUID; !strings.Contains(stderr.String(), want) {
+		t.Errorf("stderr = %q, want it to contain %q", stderr.String(), want)
+	}
+
+	recs := h.Records(t)
+	if len(recs) != 1 {
+		t.Fatalf("fake cc recorded %d invocations, want 1", len(recs))
+	}
+	if recs[0].ResumeFlag != fakeCCTestUUID {
+		t.Errorf("fake cc saw --resume %q, want %q", recs[0].ResumeFlag, fakeCCTestUUID)
+	}
+	if !recs[0].ResumeFailed {
+		t.Error("fake cc did not take the resume-failure path")
+	}
+}
+
+// TestSpawn_ResumeKnownSessionSucceeds — the other half of the resume contract
+// through the provider: when the session IS resumable from this cwd, cc runs
+// normally and the sid does not drift (mem_2ruSlrHR ②). Together with the test
+// above, this is what makes a try-resume-then-fall-back implementation
+// (tether#50) testable at all: both branches are now reachable on demand.
+func TestSpawn_ResumeKnownSessionSucceeds(t *testing.T) {
+	h := newFakeCCHarness(t)
+	workdir := t.TempDir()
+	h.SeedSession(t, fakeCCTestUUID, workdir)
+
+	var stderr syncBuffer
+	p := NewClaudeCodeProvider(fakeCCPath(t), withStderr(&stderr))
+	sess, err := p.Spawn(context.Background(), SpawnConfig{
+		ResumeSessionID: fakeCCTestUUID,
+		Workdir:         workdir,
+		Env:             h.Env(),
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	closeSess := closeOnce(sess)
+	defer func() { _ = closeSess() }() // safety net if an assertion below fatals
+
+	if err := sess.SendPrompt(context.Background(), "again"); err != nil {
+		t.Fatalf("SendPrompt: %v", err)
+	}
+	evs := collectUntilResult(t, sess)
+
+	if sid := sess.SessionID(); sid != fakeCCTestUUID {
+		t.Errorf("SessionID() = %q, want the resumed %q (sid must not drift)", sid, fakeCCTestUUID)
+	}
+	if evs[0].Kind != EventInit || evs[0].SessionID != fakeCCTestUUID {
+		t.Errorf("first event = %+v, want EventInit for %q", evs[0], fakeCCTestUUID)
+	}
+	if last := evs[len(evs)-1]; last.Kind != EventResult || last.Text == "" {
+		t.Errorf("last event = %+v, want a non-empty EventResult", last)
+	}
+
+	// Close BEFORE reading the stderr sink, and not from a defer: os/exec copies
+	// a non-*os.File stderr on a goroutine that only finishes inside cmd.Wait(),
+	// which Close is what calls. Asserting the sink while Close was still
+	// deferred made this check unfalsifiable — a mutation that wrote to stderr on
+	// a SUCCESSFUL resume passed it 30/30 (tether#53 review MAJOR).
+	if err := closeSess(); err != nil {
+		t.Errorf("Close() = %v, want nil — a successful resume must exit 0", err)
+	}
+	if s := stderr.String(); s != "" {
+		t.Errorf("stderr = %q, want empty on a successful resume", s)
+	}
+}
+
+// TestSpawn_ArgvContract pins the command line Spawn builds. It was previously
+// untested end to end — the flags only existed as string literals — even though
+// each one is load-bearing: --output-format/--input-format stream-json is the
+// whole protocol, --include-partial-messages is what makes text arrive as
+// deltas instead of one block, and --permission-mode default is what forces
+// PreToolUse hooks to fire regardless of the user's settings.json.
+//
+// It also pins the tether#49 decision that a stale sid must NOT become a
+// `--resume` (the registry passes an empty ResumeSessionID; here we assert Spawn
+// omits the flag when it is empty), and it is the test tether#50 will have to
+// update when it starts minting a --session-id.
+func TestSpawn_ArgvContract(t *testing.T) {
+	h := newFakeCCHarness(t)
+	h.ExitEarly = true
+
+	p := NewClaudeCodeProvider(fakeCCPath(t))
+	sess, err := p.Spawn(context.Background(), SpawnConfig{Workdir: t.TempDir(), Env: h.Env()})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer closeExpectingCleanExit(t, sess)
+	drainEvents(t, sess)
+
+	recs := h.Records(t)
+	if len(recs) != 1 {
+		t.Fatalf("fake cc recorded %d invocations, want 1", len(recs))
+	}
+	want := []string{
+		"--print",
+		"--output-format", "stream-json",
+		"--input-format", "stream-json",
+		"--verbose",
+		"--include-partial-messages",
+		"--permission-mode", "default",
+	}
+	if !reflect.DeepEqual(recs[0].Argv, want) {
+		t.Errorf("argv =\n  %v\nwant\n  %v", recs[0].Argv, want)
+	}
+	if recs[0].ResumeFlag != "" {
+		t.Errorf("--resume %q passed for an empty ResumeSessionID", recs[0].ResumeFlag)
+	}
+	if recs[0].SessionIDFlag != "" {
+		t.Errorf("--session-id %q passed; tether does not mint session ids yet (tether#50)", recs[0].SessionIDFlag)
+	}
+}
+
+// TestSpawn_ResumeSessionIDBecomesResumeFlag — a non-empty
+// SpawnConfig.ResumeSessionID must reach cc as `--resume <sid>`. The registry
+// deliberately never sets it today (tether#49), so this is the guard that the
+// plumbing still works for tether#50, which will.
+func TestSpawn_ResumeSessionIDBecomesResumeFlag(t *testing.T) {
+	h := newFakeCCHarness(t)
+	h.ExitEarly = true
+
+	p := NewClaudeCodeProvider(fakeCCPath(t))
+	sess, err := p.Spawn(context.Background(), SpawnConfig{
+		ResumeSessionID: fakeCCTestUUID,
+		Workdir:         t.TempDir(),
+		Env:             h.Env(),
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer closeExpectingCleanExit(t, sess)
+	drainEvents(t, sess)
+
+	recs := h.Records(t)
+	if len(recs) != 1 {
+		t.Fatalf("fake cc recorded %d invocations, want 1", len(recs))
+	}
+	if recs[0].ResumeFlag != fakeCCTestUUID {
+		t.Errorf("--resume = %q, want %q; full argv %v", recs[0].ResumeFlag, fakeCCTestUUID, recs[0].Argv)
+	}
+}
+
+// TestSpawn_StderrDefaultsToOsStderr — the withStderr seam must not change what
+// production does. A provider built the way the daemon builds it (no options)
+// resolves its sink to os.Stderr, exactly as the hardcoded assignment did before
+// the seam existed; so does a zero-value literal, so a future direct
+// construction can't silently redirect cc's diagnostics to /dev/null.
+func TestSpawn_StderrDefaultsToOsStderr(t *testing.T) {
+	if got := NewClaudeCodeProvider("/nonexistent").stderrSink(); got != os.Stderr {
+		t.Errorf("NewClaudeCodeProvider(...).stderrSink() = %#v, want os.Stderr", got)
+	}
+	if got := (&ClaudeCodeProvider{ccPath: "/nonexistent"}).stderrSink(); got != os.Stderr {
+		t.Errorf("zero-value provider stderrSink() = %#v, want os.Stderr", got)
+	}
+	var sink syncBuffer
+	if got := NewClaudeCodeProvider("/nonexistent", withStderr(&sink)).stderrSink(); got != &sink {
+		t.Errorf("withStderr sink = %#v, want the injected writer", got)
+	}
 }

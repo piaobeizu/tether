@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"sync"
@@ -13,11 +14,47 @@ import (
 // ClaudeCodeProvider implements AgentProvider for `claude` CLI (D-05a §4).
 type ClaudeCodeProvider struct {
 	ccPath string
+	// stderr is where the cc subprocess's stderr goes. nil — the only state
+	// production ever puts it in, since NewClaudeCodeProvider takes no options
+	// at its single call site (internal/server/lifecycle.go) — resolves to
+	// os.Stderr in stderrSink, i.e. byte-for-byte the pre-seam behaviour.
+	// Redirecting it is a test-only affordance (see withStderr).
+	stderr io.Writer
+}
+
+// ccOption configures a ClaudeCodeProvider at construction time. The type is
+// unexported on purpose: the seam exists so this package's tests can observe a
+// spawned process, NOT so an embedder (or an environment variable) can
+// reconfigure the daemon's agent at runtime (tether#53).
+type ccOption func(*ClaudeCodeProvider)
+
+// withStderr routes the cc subprocess's stderr to w instead of the daemon's own
+// os.Stderr, so a test can assert on what cc wrote there — notably the
+// "No conversation found with session ID: <uuid>" line a failed `--resume`
+// produces, which is otherwise unobservable from inside the process.
+func withStderr(w io.Writer) ccOption {
+	return func(p *ClaudeCodeProvider) { p.stderr = w }
 }
 
 // NewClaudeCodeProvider creates a provider using the given cc binary path.
-func NewClaudeCodeProvider(ccPath string) *ClaudeCodeProvider {
-	return &ClaudeCodeProvider{ccPath: ccPath}
+// Options are package-visible only; passing none (what production does) leaves
+// every field at the behaviour that predates the options parameter.
+func NewClaudeCodeProvider(ccPath string, opts ...ccOption) *ClaudeCodeProvider {
+	p := &ClaudeCodeProvider{ccPath: ccPath}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
+}
+
+// stderrSink resolves the subprocess stderr destination. An unset (nil) sink
+// means os.Stderr, so a zero-value ClaudeCodeProvider literal behaves exactly
+// like one built before the seam existed.
+func (p *ClaudeCodeProvider) stderrSink() io.Writer {
+	if p.stderr == nil {
+		return os.Stderr
+	}
+	return p.stderr
 }
 
 func (p *ClaudeCodeProvider) Name() string { return "claude-code" }
@@ -48,7 +85,7 @@ func (p *ClaudeCodeProvider) Spawn(ctx context.Context, cfg SpawnConfig) (Sessio
 	// daemon happened to start (tether#51).
 	cmd.Dir = ResolveWorkdir(cfg.Workdir)
 	cmd.Env = buildEnv(cfg.Env)
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = p.stderrSink()
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

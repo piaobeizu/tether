@@ -429,3 +429,59 @@ describe('store stopTurn (tether#42)', () => {
     expect(useStore.getState().stopped).toBe(false)
   })
 })
+
+// tether#50 — the daemon's "started a new session" notice. Sent right after
+// session_ready when a `cc --resume` failed AND the dead session had history.
+const noticeEnv = (text: string): Envelope => ({ kind: 'message', payload: { type: 'notice', text } })
+
+describe('store session notice (tether#50)', () => {
+  afterEach(reset)
+
+  it('appends the notice as its own system message', () => {
+    const h = useStore.getState().handleEnvelope
+    h(noticeEnv('Started a new session — the previous context could not be restored.'))
+    const s = useStore.getState()
+    expect(s.messages).toHaveLength(1)
+    expect(s.messages[0].role).toBe('system')
+    expect(s.messages[0].text).toBe('Started a new session — the previous context could not be restored.')
+  })
+
+  it('does not claim the turn cursor, so the replayed answer gets its own bubble', () => {
+    // This is the whole reason the notice is an OBJECT payload rather than a
+    // plain string: a string would go through the text-accumulation branch, set
+    // curTurnId, and the daemon's immediately-following replayed answer would
+    // then append INTO the notice's bubble — the notice and the answer fused
+    // into one message.
+    const h = useStore.getState().handleEnvelope
+    h(noticeEnv('context lost'))
+    expect(useStore.getState().curTurnId).toBeNull()
+    expect(useStore.getState().streaming).toBe(false)
+    expect(useStore.getState().streamingMsgId).toBeNull()
+
+    h(textEnv('here is the real answer'))
+    const s = useStore.getState()
+    expect(s.messages).toHaveLength(2)
+    expect(s.messages[0].role).toBe('system')
+    expect(s.messages[0].text).toBe('context lost')
+    expect(s.messages[1].role).toBe('assistant')
+    expect(s.messages[1].text).toBe('here is the real answer')
+  })
+
+  it('ignores a notice with no text', () => {
+    const h = useStore.getState().handleEnvelope
+    h({ kind: 'message', payload: { type: 'notice' } } as unknown as Envelope)
+    expect(useStore.getState().messages).toHaveLength(0)
+  })
+
+  it('is delivered even after a manual stop (session lifecycle, not turn content)', () => {
+    // The `stopped` gate drops late turn deltas so they can't spawn a new
+    // bubble (tether#42). A notice is not turn content — it explains why the
+    // session changed — so it must survive that gate, exactly like
+    // session_ready.
+    const h = useStore.getState().handleEnvelope
+    useStore.setState({ stopped: true })
+    h(noticeEnv('context lost'))
+    expect(useStore.getState().messages).toHaveLength(1)
+    expect(useStore.getState().messages[0].role).toBe('system')
+  })
+})

@@ -851,6 +851,31 @@ func waitForCount(t *testing.T, reg *Registry, n int) {
 	t.Fatalf("registry never reached %d entries; has %d", n, regLen(reg))
 }
 
+// waitForFanOutDone polls until e has been evicted, which happens in fanOut's own
+// deferred evict — i.e. fanOut has RETURNED, and every envelope it was ever going
+// to broadcast has already been broadcast.
+//
+// Distinct from waitForCount, and the distinction matters for negative
+// assertions: spawnEntry's re-key goroutine deletes the pending key as soon as
+// SessionID() resolves, so with a fake whose SessionID() returns immediately,
+// waitForCount(reg, 0) can be satisfied WITHOUT fanOut having processed anything.
+// A "nothing was broadcast" check gated on waitForCount would then pass by
+// scheduling luck rather than by ordering.
+func waitForFanOutDone(t *testing.T, reg *Registry, e *Entry) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		reg.mu.Lock()
+		done := e.evicted
+		reg.mu.Unlock()
+		if done {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("fanOut never returned (entry was never evicted)")
+}
+
 // TestRegistry_EvictsEntryOnSessionEnd — (tether#12) once a session's agent
 // Events() channel closes (subprocess exited, or the client disconnected and
 // cancelled the ctx that bounds the subprocess), fanOut returns and must
@@ -910,5 +935,111 @@ func TestRegistry_EvictedEntryNotResurrectedByRekey(t *testing.T) {
 	}
 	if n := regLen(reg); n != 0 {
 		t.Fatalf("registry holds %d entries, want 0 (re-key must not resurrect)", n)
+	}
+}
+
+// ─── tether#50: the failed-resume empty `result` must never reach the browser ──
+
+// TestFanOut_SuppressesInitlessEmptyResult — a `result` with no preceding
+// system/init and no text is DROPPED.
+//
+// This is the exact wire shape of a failed `cc --resume` (mem_2ruSlrHR ③): cc
+// exits 1 having printed one line,
+// {"type":"result","subtype":"error_during_execution","result":null,…}, and no
+// init at all. parseLine turns that `null` into an EventResult with an empty Text.
+//
+// Forwarding it would close a turn the user never started — the frontend's
+// 'result' branch clears streaming/curTurnId and resets `stopped`, so the
+// thinking indicator for the prompt still in flight blinks out just before the
+// Attachment fallback respawns and answers for real in a fresh bubble.
+func TestFanOut_SuppressesInitlessEmptyResult(t *testing.T) {
+	fs := &fakeSession{sid: "", events: make(chan agent.Event, 4)}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+
+	e, err := reg.GetOrSpawnEntry(context.Background(), "", "fake")
+	if err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	ch := make(chan wire.Envelope, 8)
+	e.Subscribe(ch)
+
+	// The single line a failed resume produces, then EOF.
+	fs.events <- agent.Event{Kind: agent.EventResult, Text: ""}
+	close(fs.events)
+
+	// Gate on fanOut having RETURNED, not on the registry being empty: the re-key
+	// goroutine empties the registry on its own here (this fake's SessionID()
+	// returns immediately), which would make the negative assertion below pass
+	// without fanOut ever having looked at the event.
+	waitForFanOutDone(t, reg, e)
+
+	select {
+	case env := <-ch:
+		t.Fatalf("an init-less empty result reached the browser as %q/%#v; it must be swallowed", env.Kind, env.Payload)
+	default:
+	}
+}
+
+// TestFanOut_ForwardsEmptyResultAfterInit — the positive control for the guard
+// above, and the reason it tests !sawInit rather than just "is the text empty".
+//
+// A real turn always emits system/init first (mem_2ruSlrHR ⑤). Once init has been
+// seen, a result closes the turn even when its text is empty — the frontend needs
+// that KindResult to stop the streaming cursor. A suppression keyed only on
+// "empty text" would eat this one and hang the turn forever.
+func TestFanOut_ForwardsEmptyResultAfterInit(t *testing.T) {
+	fs := &fakeSession{sid: "sid-init-then-empty", events: make(chan agent.Event, 4)}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+
+	e, err := reg.GetOrSpawnEntry(context.Background(), "", "fake")
+	if err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	ch := make(chan wire.Envelope, 8)
+	e.Subscribe(ch)
+
+	fs.events <- agent.Event{Kind: agent.EventInit, SessionID: "sid-init-then-empty"}
+	fs.events <- agent.Event{Kind: agent.EventResult, Text: ""}
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case env := <-ch:
+			if env.Kind == wire.KindResult {
+				return // turn closed, as it must be
+			}
+		case <-deadline:
+			t.Fatal("a post-init empty result was swallowed; the turn would never close")
+		}
+	}
+}
+
+// TestFanOut_ForwardsInitlessResultCarryingText — the other half of the guard's
+// conjunction. An init-less result that DOES carry text has never been observed
+// from cc, but if one ever appears its content is real and must not vanish; the
+// guard is deliberately narrow enough to let it through.
+func TestFanOut_ForwardsInitlessResultCarryingText(t *testing.T) {
+	fs := &fakeSession{sid: "", events: make(chan agent.Event, 4)}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+
+	e, err := reg.GetOrSpawnEntry(context.Background(), "", "fake")
+	if err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	ch := make(chan wire.Envelope, 8)
+	e.Subscribe(ch)
+
+	fs.events <- agent.Event{Kind: agent.EventResult, Text: "something real"}
+
+	select {
+	case env := <-ch:
+		if env.Kind != wire.KindResult {
+			t.Fatalf("envelope kind = %q, want %q", env.Kind, wire.KindResult)
+		}
+		if s, _ := env.Payload.(string); s != "something real" {
+			t.Fatalf("payload = %#v, want \"something real\"", env.Payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("an init-less result WITH text was swallowed; the guard is too broad")
 	}
 }

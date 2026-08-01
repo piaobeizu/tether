@@ -60,6 +60,20 @@ func (p *ClaudeCodeProvider) stderrSink() io.Writer {
 func (p *ClaudeCodeProvider) Name() string { return "claude-code" }
 
 func (p *ClaudeCodeProvider) Spawn(ctx context.Context, cfg SpawnConfig) (Session, error) {
+	// ⑧ (mem_2ruSlrHR, measured on 2.1.220): cc rejects --session-id together
+	// with --resume unless --fork-session is also passed, exiting 1 before it
+	// emits anything. Caught here rather than downstream because that exit looks
+	// EXACTLY like a failed resume (no init, SessionID() == ""), so the caller's
+	// fallback would quietly paper over the bug by spawning a fresh session and
+	// the operator would only see "context was lost, sometimes". Failing the
+	// spawn names the real cause.
+	if cfg.SessionID != "" && cfg.ResumeSessionID != "" {
+		return nil, fmt.Errorf(
+			"spawn cc: SessionID (%s) and ResumeSessionID (%s) are mutually exclusive: "+
+				"--session-id is fresh-spawn-only, reconnect passes --resume alone",
+			cfg.SessionID, cfg.ResumeSessionID)
+	}
+
 	args := []string{
 		"--print",
 		"--output-format", "stream-json",
@@ -75,8 +89,15 @@ func (p *ClaudeCodeProvider) Spawn(ctx context.Context, cfg SpawnConfig) (Sessio
 		// silently skip tether's permission UI.
 		"--permission-mode", "default",
 	}
-	if cfg.ResumeSessionID != "" {
+	// Exactly one of these can be set (guarded above). Reconnect resumes an
+	// existing transcript; a fresh spawn pins the id the daemon minted so the
+	// tether sid, the cc sid and the on-disk transcript name are the same string
+	// from the very first byte — no "listen for init and hope" step (tether#50).
+	switch {
+	case cfg.ResumeSessionID != "":
 		args = append(args, "--resume", cfg.ResumeSessionID)
+	case cfg.SessionID != "":
+		args = append(args, "--session-id", cfg.SessionID)
 	}
 
 	cmd := exec.CommandContext(ctx, p.ccPath, args...)

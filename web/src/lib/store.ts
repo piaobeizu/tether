@@ -248,6 +248,28 @@ export const useStore = create<AppState>((set, get) => ({
             get().setSessionId(pObj['sessionId'] as string)
             break
           }
+          if (pObj['type'] === 'notice') {
+            // tether#50 — a session-level system line, not turn content: the
+            // daemon sends it right after session_ready when a `cc --resume`
+            // failed and it started a fresh session instead, AND the dead
+            // session actually had history to lose.
+            //
+            // Deliberately does NOT touch curTurnId / streamingMsgId /
+            // streaming / the timing stamps — same reasoning as session_ready
+            // above. The daemon replays the buffered prompt onto the new
+            // session immediately after this, so claiming the turn cursor here
+            // would make the real answer accumulate into the NOTICE's bubble.
+            // It is also exempt from the `stopped` gate below for the same
+            // reason session_ready is: it is session lifecycle, not a late
+            // delta from a turn the user stopped.
+            const noticeText = typeof pObj['text'] === 'string' ? (pObj['text'] as string) : ''
+            if (noticeText) {
+              set((s) => ({
+                messages: [...s.messages, { id: crypto.randomUUID(), role: 'system' as const, text: noticeText, ts: Date.now() }],
+              }))
+            }
+            break
+          }
           // After a manual stop (tether#42), cc may still flush a few buffered
           // deltas; drop them so they don't spawn a new bubble or resume
           // streaming. Cleared by the next user turn (addMessage) or a terminal

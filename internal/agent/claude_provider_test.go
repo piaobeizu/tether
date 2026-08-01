@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -802,16 +803,27 @@ func TestSpawn_ResumeKnownSessionSucceeds(t *testing.T) {
 // deltas instead of one block, and --permission-mode default is what forces
 // PreToolUse hooks to fire regardless of the user's settings.json.
 //
-// It also pins the tether#49 decision that a stale sid must NOT become a
-// `--resume` (the registry passes an empty ResumeSessionID; here we assert Spawn
-// omits the flag when it is empty), and it is the test tether#50 will have to
-// update when it starts minting a --session-id.
+// It also pins the tether#50 argv RULE, which is the one thing about this
+// command line that is not free to drift: a fresh spawn pins the daemon's minted
+// id with `--session-id`, a reconnect passes `--resume` alone, and the two flags
+// NEVER appear together (mem_2ruSlrHR ⑧ — real cc exits 1 on that combination).
+// See TestSpawn_ReconnectPassesResumeAlone and
+// TestSpawn_SessionIDWithResumeRejected for the other two thirds of the rule.
+//
+// CHANGED BY tether#50, on purpose: this test previously asserted the OPPOSITE
+// of the last check below — "--session-id %q passed; tether does not mint session
+// ids yet". tether#53 wrote that assertion as a deliberate tripwire so that the
+// slice which started minting ids could not do so silently. This is that slice.
 func TestSpawn_ArgvContract(t *testing.T) {
 	h := newFakeCCHarness(t)
 	h.ExitEarly = true
 
 	p := NewClaudeCodeProvider(fakeCCPath(t))
-	sess, err := p.Spawn(context.Background(), SpawnConfig{Workdir: t.TempDir(), Env: h.Env()})
+	sess, err := p.Spawn(context.Background(), SpawnConfig{
+		SessionID: fakeCCTestUUID,
+		Workdir:   t.TempDir(),
+		Env:       h.Env(),
+	})
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
@@ -829,22 +841,164 @@ func TestSpawn_ArgvContract(t *testing.T) {
 		"--verbose",
 		"--include-partial-messages",
 		"--permission-mode", "default",
+		"--session-id", fakeCCTestUUID,
 	}
 	if !reflect.DeepEqual(recs[0].Argv, want) {
 		t.Errorf("argv =\n  %v\nwant\n  %v", recs[0].Argv, want)
 	}
 	if recs[0].ResumeFlag != "" {
-		t.Errorf("--resume %q passed for an empty ResumeSessionID", recs[0].ResumeFlag)
+		t.Errorf("--resume %q passed on a FRESH spawn; the two flags are mutually exclusive", recs[0].ResumeFlag)
+	}
+	if recs[0].SessionIDFlag != fakeCCTestUUID {
+		t.Errorf("--session-id = %q, want the minted %q; a fresh session must pin its id so it is resumable later (tether#50)",
+			recs[0].SessionIDFlag, fakeCCTestUUID)
+	}
+}
+
+// TestSpawn_ArgvOmitsSessionIDWhenUnset — an unpinned fresh spawn passes NEITHER
+// flag. The daemon always mints (Registry.spawnEntry), so this is the guard that
+// the provider stays a faithful courier rather than inventing an id of its own:
+// a provider that silently minted would make "was this session pinned?"
+// unanswerable from the SpawnConfig alone.
+func TestSpawn_ArgvOmitsSessionIDWhenUnset(t *testing.T) {
+	h := newFakeCCHarness(t)
+	h.ExitEarly = true
+
+	p := NewClaudeCodeProvider(fakeCCPath(t))
+	sess, err := p.Spawn(context.Background(), SpawnConfig{Workdir: t.TempDir(), Env: h.Env()})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer closeExpectingCleanExit(t, sess)
+	drainEvents(t, sess)
+
+	recs := h.Records(t)
+	if len(recs) != 1 {
+		t.Fatalf("fake cc recorded %d invocations, want 1", len(recs))
+	}
+	for _, arg := range recs[0].Argv {
+		if arg == "--session-id" || arg == "--resume" {
+			t.Errorf("argv contains %s for a SpawnConfig that set neither id: %v", arg, recs[0].Argv)
+		}
+	}
+}
+
+// TestSpawn_ReconnectPassesResumeAlone — the reconnect half of the argv rule: a
+// config carrying ONLY ResumeSessionID yields `--resume <sid>` and no
+// `--session-id`. Re-pinning on reconnect is both forbidden (⑧) and pointless
+// (② — a resumed session's id does not drift), and the combination exits 1, so
+// "resume alone" has to be asserted, not assumed.
+func TestSpawn_ReconnectPassesResumeAlone(t *testing.T) {
+	h := newFakeCCHarness(t)
+	h.ExitEarly = true
+
+	p := NewClaudeCodeProvider(fakeCCPath(t))
+	sess, err := p.Spawn(context.Background(), SpawnConfig{
+		ResumeSessionID: fakeCCTestUUID,
+		Workdir:         t.TempDir(),
+		Env:             h.Env(),
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer closeExpectingCleanExit(t, sess)
+	drainEvents(t, sess)
+
+	recs := h.Records(t)
+	if len(recs) != 1 {
+		t.Fatalf("fake cc recorded %d invocations, want 1", len(recs))
+	}
+	if recs[0].ResumeFlag != fakeCCTestUUID {
+		t.Errorf("--resume = %q, want %q", recs[0].ResumeFlag, fakeCCTestUUID)
 	}
 	if recs[0].SessionIDFlag != "" {
-		t.Errorf("--session-id %q passed; tether does not mint session ids yet (tether#50)", recs[0].SessionIDFlag)
+		t.Errorf("--session-id = %q passed alongside --resume; real cc exits 1 on that combination (mem_2ruSlrHR ⑧)",
+			recs[0].SessionIDFlag)
+	}
+}
+
+// TestSpawn_SessionIDWithResumeRejected — setting BOTH ids is refused by Spawn
+// itself, before any process starts.
+//
+// Why this is worth a hard failure rather than a "prefer one" fallback: real cc
+// exits 1 on that argv WITHOUT emitting system/init, which is byte-for-byte how a
+// failed --resume looks. The Attachment fallback would therefore "handle" the bug
+// by quietly starting a fresh session, and the only symptom anyone would ever see
+// is context being lost at random. Failing here names the actual cause.
+func TestSpawn_SessionIDWithResumeRejected(t *testing.T) {
+	h := newFakeCCHarness(t)
+	h.ExitEarly = true
+
+	p := NewClaudeCodeProvider(fakeCCPath(t))
+	sess, err := p.Spawn(context.Background(), SpawnConfig{
+		SessionID:       fakeCCTestUUID,
+		ResumeSessionID: "99999999-8888-4777-8666-555555555555",
+		Workdir:         t.TempDir(),
+		Env:             h.Env(),
+	})
+	if err == nil {
+		_ = sess.Close()
+		t.Fatal("Spawn accepted both SessionID and ResumeSessionID; want an error")
+	}
+	if sess != nil {
+		t.Errorf("Spawn returned a non-nil Session alongside its error: %#v", sess)
+	}
+	for _, want := range []string{"mutually exclusive", fakeCCTestUUID} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+	// No process may have been started: the guard runs before exec.
+	if _, statErr := os.Stat(h.RecordPath); statErr == nil {
+		t.Errorf("fake cc was invoked despite the rejected config: %v", h.Records(t))
+	}
+}
+
+// TestNewSessionID_ShapeAndUniqueness — the minted id must be a syntactically
+// valid v4 uuid (cc validates the --session-id it is handed) and must not repeat,
+// since a collision would point two sessions at one transcript.
+func TestNewSessionID_ShapeAndUniqueness(t *testing.T) {
+	seen := make(map[string]bool, 256)
+	for i := 0; i < 256; i++ {
+		id := NewSessionID()
+		if len(id) != 36 {
+			t.Fatalf("NewSessionID() = %q, want 36 chars", id)
+		}
+		parts := strings.Split(id, "-")
+		wantLens := []int{8, 4, 4, 4, 12}
+		if len(parts) != len(wantLens) {
+			t.Fatalf("NewSessionID() = %q, want 5 dash-separated groups", id)
+		}
+		for j, p := range parts {
+			if len(p) != wantLens[j] {
+				t.Fatalf("NewSessionID() = %q: group %d is %d chars, want %d", id, j, len(p), wantLens[j])
+			}
+			if _, err := hex.DecodeString(p); err != nil {
+				t.Fatalf("NewSessionID() = %q: group %d is not hex: %v", id, j, err)
+			}
+		}
+		if parts[2][0] != '4' {
+			t.Errorf("NewSessionID() = %q: version nibble is %q, want '4'", id, parts[2][0])
+		}
+		if v := parts[3][0]; v != '8' && v != '9' && v != 'a' && v != 'b' {
+			t.Errorf("NewSessionID() = %q: variant nibble is %q, want one of 89ab", id, v)
+		}
+		if seen[id] {
+			t.Fatalf("NewSessionID() repeated %q within 256 calls", id)
+		}
+		seen[id] = true
 	}
 }
 
 // TestSpawn_ResumeSessionIDBecomesResumeFlag — a non-empty
-// SpawnConfig.ResumeSessionID must reach cc as `--resume <sid>`. The registry
-// deliberately never sets it today (tether#49), so this is the guard that the
-// plumbing still works for tether#50, which will.
+// SpawnConfig.ResumeSessionID must reach cc as `--resume <sid>`.
+//
+// Written under tether#49 as a plumbing guard for a field nothing set yet; since
+// tether#50 the registry DOES set it (Registry.Attach, on a reconnect whose sid
+// is no longer live), so this now covers a live path. Kept alongside
+// TestSpawn_ReconnectPassesResumeAlone, which additionally pins the absence of
+// --session-id, because this one is the narrow flag-plumbing assertion and that
+// one is the argv-rule assertion; they fail for different reasons.
 func TestSpawn_ResumeSessionIDBecomesResumeFlag(t *testing.T) {
 	h := newFakeCCHarness(t)
 	h.ExitEarly = true

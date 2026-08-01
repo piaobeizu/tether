@@ -50,30 +50,41 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 	sid := r.URL.Query().Get("sid")
 	providerName := r.URL.Query().Get("provider")
 
-	// If resuming an existing session, verify ownership before spawning.
-	// Only reject if the session EXISTS and is owned by a different client
-	// (#83). If the session doesn't exist (e.g. server restart), silently
-	// ignore the stale sid and fall through to spawn a fresh session below.
+	// If attaching to an existing session, verify ownership first. Only reject
+	// when the session EXISTS and is owned by a different client (#83).
+	//
+	// A sid the registry does NOT track falls through — but since tether#50 that
+	// no longer means "discard it and start over": Attach hands it to
+	// `cc --resume` to recover the conversation's context. Note the consequence
+	// for this gate, which is deliberately unchanged: because only LIVE sessions
+	// are checked, it is inert for exactly the sids that now carry restorable
+	// context. Acceptable under tether's one-human-many-devices model, but it is
+	// no longer the complete barrier its name suggests.
 	if sid != "" && clientID != "" && reg.IsLive(sid) && !reg.IsOwner(sid, clientID) {
 		sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindError, Payload: "session owned by another client; use /wt/events to attach read-only"})
 		return
 	}
 
-	entry, err := reg.GetOrSpawnEntry(ctx, sid, providerName)
+	// Attach, rather than GetOrSpawnEntry: a sid the registry no longer tracks
+	// gets a `cc --resume <sid>` ATTEMPT, so a browser reload or a daemon restart
+	// no longer costs the model its memory of the conversation (tether#50). The
+	// attempt is recoverable — see Attachment.Resolve below.
+	att, err := reg.Attach(ctx, sid, providerName)
 	if err != nil {
 		sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindError, Payload: err.Error()})
 		return
 	}
-	agentSess := entry.Session()
 
-	// Subscribe by entry pointer BEFORE sending the first prompt. The sid is
+	// Subscribe by attachment BEFORE sending the first prompt. The sid is
 	// only published AFTER cc consumes a prompt, so a sid-keyed Subscribe
 	// after the prompt-reader goroutine starts would race with fanOut. By
 	// attaching the channel to the entry directly, every event the agent
-	// emits has a destination from the moment it's emitted.
+	// emits has a destination from the moment it's emitted. Going through the
+	// attachment (not the Entry) additionally re-registers subCh if a failed
+	// resume swaps the Entry underneath us.
 	subCh := make(chan wire.Envelope, 32)
-	entry.Subscribe(subCh)
-	defer entry.Unsubscribe(subCh)
+	att.Subscribe(subCh)
+	defer att.Unsubscribe(subCh)
 
 	// Accept bidi stream BEFORE waiting for SessionID. cc's stream-json
 	// `--input-format` mode does NOT emit system/init until the first user
@@ -100,30 +111,46 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 				continue
 			}
 			slog.Info("chat prompt received", "len", len(msg.Text))
-			if err := agentSess.SendPrompt(ctx, msg.Text); err != nil {
+			// An error here is EXPECTED on the failed-resume path: cc exited
+			// without reading its stdin, so this write hits a broken pipe. The
+			// attachment buffered the prompt and Resolve replays it onto a fresh
+			// session, so this must stay a warning — bailing out here is exactly
+			// the wedge tether#49 removed.
+			if err := att.SendPrompt(ctx, msg.Text); err != nil {
 				slog.Warn("send prompt", "err", err)
 			}
-			// Record user message; sid is resolved after SessionID() returns.
+			// Record the user message under the sid that actually answered it.
+			// WaitSID (not the session's own SessionID) because a fallback
+			// answers under a NEW id: the dead session reports "", and history
+			// silently drops anything recorded against "" — which would lose the
+			// user's own first message from the transcript a reload replays.
 			go func(text string) {
-				sid := agentSess.SessionID()
-				reg.RecordUserMessage(sid, text)
+				reg.RecordUserMessage(att.WaitSID(), text)
 			}(msg.Text)
 		}
 	}()
 
-	// Now wait for cc's system/init (it only arrives AFTER the first prompt
-	// is delivered on cc stdin by the goroutine above).
-	realSID := agentSess.SessionID()
-	slog.Info("serveChat: SessionID resolved", "sid", realSID)
-	if realSID == "" {
-		sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindError, Payload: "agent exited before emitting session id"})
+	// Now confirm the session (cc's system/init only arrives AFTER the first
+	// prompt is delivered on cc stdin by the goroutine above). If this connection
+	// tried to resume and the resume failed, Resolve transparently falls back to
+	// a fresh session and replays the buffered prompt(s) — so the user still gets
+	// an answer to what they just typed.
+	res, err := att.Resolve(ctx)
+	if err != nil {
+		slog.Warn("serveChat: session did not resolve", "err", err)
+		sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindError, Payload: err.Error()})
 		return
 	}
+	realSID := res.SID
+	slog.Info("serveChat: SessionID resolved", "sid", realSID, "recovered", res.Recovered)
 
-	// Claim ownership (CAS — first caller wins).
+	// Claim ownership (CAS — first caller wins). Through the attachment, NOT
+	// reg.SetOwner(realSID, …): the sid-keyed lookup loses a race with the
+	// registry's re-key goroutine and would drop this connection mid-answer — see
+	// Attachment.SetOwner.
 	if clientID != "" {
-		if !reg.SetOwner(realSID, clientID) {
-			sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindError, Payload: "session ownership race; retry"})
+		if !att.SetOwner(clientID) {
+			sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindError, Payload: "session owned by another client; use /wt/events to attach read-only"})
 			return
 		}
 	}
@@ -132,6 +159,27 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 		"type":      "session_ready",
 		"sessionId": realSID,
 	}})
+
+	// Tell the user their context is gone — but ONLY when they actually had some
+	// (see HistoryStore.HasHistory for the gate's reasoning).
+	//
+	// Sent after session_ready by intent, not by guarantee: sendEnvelope opens a
+	// NEW unidirectional stream per envelope and the browser drains streams
+	// concurrently, so send order is not delivery order. Nothing here depends on
+	// the ordering — the store's notice branch ignores env.SessionID — but do not
+	// add anything that does without first making the transport ordered.
+	//
+	// KNOWN LIMIT: the notice is a live-only message, and session_ready triggers
+	// the frontend's history refetch for the new sid, which REPLACES the message
+	// list. Today the notice survives because that refetch is skipped while a turn
+	// is streaming; if it ever resolves in a quiet moment the notice is silently
+	// discarded with no way to bring it back. Tracked separately.
+	if res.Notice {
+		sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindMessage, SessionID: realSID, Payload: map[string]any{
+			"type": "notice",
+			"text": "Started a new session — the previous conversation's context could not be restored.",
+		}})
+	}
 
 	for {
 		select {

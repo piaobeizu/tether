@@ -437,6 +437,14 @@ body {
   font-size: 13.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
 }
 .msg-user-time { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-tertiary); }
+/* Daemon notice line (tether#50) — e.g. "the previous context could not be
+   restored". Centred and muted so it reads as chrome, not as either party's
+   turn; no avatar, no bubble, no timestamp. */
+.msg-system { display: flex; justify-content: center; padding: 2px 0; }
+.msg-system-text {
+  font-family: var(--font-mono); font-size: 11px; color: var(--ink-tertiary);
+  text-align: center; max-width: 86%; line-height: 1.5;
+}
 .msg-ai { display: flex; flex-direction: column; gap: 8px; }
 .msg-ai-header { display: flex; align-items: center; gap: 7px; }
 .msg-ai-avatar {

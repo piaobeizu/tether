@@ -110,6 +110,37 @@ func (r *Registry) GetOrSpawnEntry(ctx context.Context, sid, providerName string
 		}
 	}
 
+	// Spawn a FRESH session — this entry point never `cc --resume`s (tether#49).
+	// A sid that IS live returns early above (existing entry reused, cc still
+	// running — the real reconnect-continuity path). In practice the only way
+	// execution reaches here with a non-empty sid is a sid the daemon no longer
+	// tracks (daemon restart, post-disconnect eviction, or a different
+	// workspace/cwd), and resuming such a sid used to wedge the turn in
+	// "thinking…": cc exits with "No conversation found" BEFORE system/init, and
+	// before tether#49 taught SessionID() to watch the process-exit `done`
+	// channel that parked the caller forever and broke-piped the first prompt.
+	//
+	// tether#50 does NOT change that here. Recovering from a failed resume needs
+	// state this function does not have — a buffer of unconfirmed prompts to
+	// replay — so the try-resume-then-fallback path lives in Attach/Attachment
+	// (attach.go) and is opt-in. Keeping the always-fresh behaviour on this entry
+	// point means a caller that has no recovery story cannot accidentally acquire
+	// a resume it cannot recover from.
+	return r.spawnEntry(ctx, providerName, agent.SpawnConfig{})
+}
+
+// spawnEntry starts a new agent subprocess, wraps it in an Entry, registers the
+// Entry and starts its fanOut loop. cfg is the caller's spawn intent; Env and
+// Workdir are filled in here (they are registry-wide, not per-call), so callers
+// only choose between "pin this freshly minted id" and "resume this existing
+// one".
+//
+// A fresh spawn always pins a minted SessionID (tether#50): cc adopts it and
+// echoes it on init (mem_2ruSlrHR ①), so the daemon knows the session's id — and
+// therefore its on-disk transcript name — before cc has emitted a single byte.
+// Empty-vs-minted is not left to the caller because an unpinned fresh session is
+// exactly the un-resumable state this slice exists to eliminate.
+func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agent.SpawnConfig) (*Entry, error) {
 	if providerName == "" {
 		providerName = "claude-code"
 	}
@@ -118,28 +149,21 @@ func (r *Registry) GetOrSpawnEntry(ctx context.Context, sid, providerName string
 		return nil, fmt.Errorf("unknown provider: %s", providerName)
 	}
 
-	var extraEnv []string
 	if r.PermEndpoint != "" {
-		extraEnv = append(extraEnv, "TETHER_DAEMON_PERM_ENDPOINT="+r.PermEndpoint)
+		// Copy rather than append in place: cfg arrives by value but its Env slice
+		// still shares a backing array with the caller's, so appending into spare
+		// capacity would mutate a slice we do not own. No current caller passes a
+		// non-nil Env, which is exactly why this would be found the hard way.
+		env := make([]string, 0, len(cfg.Env)+1)
+		env = append(env, cfg.Env...)
+		cfg.Env = append(env, "TETHER_DAEMON_PERM_ENDPOINT="+r.PermEndpoint)
 	}
-	// Always spawn a FRESH session — never `cc --resume <sid>` (tether#49).
-	// A sid that IS live returns early above (existing entry reused, cc still
-	// running — the real reconnect-continuity path). In practice the only way
-	// execution reaches here with a non-empty sid is a sid the daemon no longer
-	// tracks (daemon restart, post-disconnect eviction, or a different
-	// workspace/cwd). (A theoretical window exists where a just-init'd sid's
-	// re-key goroutine hasn't inserted r.sessions[sid] yet, but the browser only
-	// learns the sid from session_ready — sent after that same insert — so a
-	// reconnect can't beat it; and even if it did, fresh-vs-resume is no worse.)
-	// Passing such a sid to `cc --resume` makes cc exit with "No conversation
-	// found" BEFORE emitting system/init — which parked SessionID() forever and
-	// broke-pipe the first prompt, wedging the turn in "thinking…" with no
-	// answer. cc's on-disk conversation is project-cwd-scoped and not reliably
-	// resumable across daemon/workspace changes anyway, so we honor the
-	// documented "fall through to a fresh session" intent. (SpawnConfig still
-	// carries ResumeSessionID for a future try-resume-then-fallback; the
-	// registry just no longer triggers the unconditional, wedge-prone resume.)
-	sess, err := provider.Spawn(ctx, agent.SpawnConfig{ResumeSessionID: "", Env: extraEnv, Workdir: r.Workdir})
+	cfg.Workdir = r.Workdir
+	if cfg.ResumeSessionID == "" && cfg.SessionID == "" {
+		cfg.SessionID = agent.NewSessionID()
+	}
+
+	sess, err := provider.Spawn(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("spawn: %w", err)
 	}
@@ -177,9 +201,12 @@ func (r *Registry) GetOrSpawnEntry(ctx context.Context, sid, providerName string
 	return e, nil
 }
 
-// GetOrSpawn is a thin wrapper that hides the Entry behind the Session;
-// retained for /wt/events and any callers that don't need pre-init
-// subscription.
+// GetOrSpawn is a thin wrapper that hides the Entry behind the Session.
+//
+// It currently has NO production caller — /wt/events attaches read-only via
+// Registry.Subscribe, not through here — so this is API surface kept for callers
+// that don't need pre-init subscription, not a path anything exercises. Worth
+// knowing before treating it as a constraint on the two spawn paths.
 func (r *Registry) GetOrSpawn(ctx context.Context, sid, providerName string) (agent.Session, error) {
 	e, err := r.GetOrSpawnEntry(ctx, sid, providerName)
 	if err != nil {
@@ -282,6 +309,11 @@ func (r *Registry) Unsubscribe(sid string, ch chan wire.Envelope) {
 }
 
 // SetOwner records ownerClientID using compare-and-set. Returns true if this call set the owner.
+//
+// Callers that already hold the *Entry should prefer Attachment.SetOwner: the
+// sid lookup here fails for an entry that has not been re-keyed off its
+// `pending-%p` placeholder yet, which is a race the chat path used to lose (see
+// Attachment.SetOwner).
 func (r *Registry) SetOwner(sid, clientID string) bool {
 	r.mu.RLock()
 	e, ok := r.sessions[sid]
@@ -289,6 +321,13 @@ func (r *Registry) SetOwner(sid, clientID string) bool {
 	if !ok {
 		return false
 	}
+	return e.setOwner(clientID)
+}
+
+// setOwner is the compare-and-set itself, independent of how the Entry was
+// found. Returns false only when a DIFFERENT client already owns the session;
+// re-claiming by the same client is idempotent.
+func (e *Entry) setOwner(clientID string) bool {
 	e.subsMu.Lock()
 	defer e.subsMu.Unlock()
 	if e.ownerClientID != "" && e.ownerClientID != clientID {
@@ -442,6 +481,14 @@ func (r *Registry) fanOut(e *Entry) {
 	defer r.evict(e)
 
 	var sid string
+	// sawInit records whether this session ever produced a system/init. It is set
+	// in the same branch as sid and cannot currently diverge from `sid != ""`, so
+	// it carries no extra information today — it is a NAME for the condition the
+	// empty-result suppression below actually depends on. sid doubles as the
+	// history-write gate ("is history addressable"), and a reader of
+	// `!sawInit && ev.Text == ""` should not have to work out that the session
+	// lifecycle is what is being tested there.
+	var sawInit bool
 
 	emitSegments := func(segs []Segment) {
 		for _, seg := range segs {
@@ -467,6 +514,7 @@ func (r *Registry) fanOut(e *Entry) {
 	for ev := range e.sess.Events() {
 		if ev.Kind == agent.EventInit && ev.SessionID != "" {
 			sid = ev.SessionID
+			sawInit = true
 			e.fenceParser.ResetTurn()
 		}
 		slog.Debug("fanOut: agent event", "kind", ev.Kind, "text_preview", truncStr(ev.Text, 60))
@@ -477,6 +525,37 @@ func (r *Registry) fanOut(e *Entry) {
 			continue
 
 		case agent.EventResult:
+			// A `result` that arrives without ANY preceding system/init, carrying
+			// no text, is not a turn ending — it is cc's failed-`--resume`
+			// artifact (mem_2ruSlrHR ③): exit 1, stdout exactly one line
+			// {"type":"result","subtype":"error_during_execution","result":null,…},
+			// no init at all. parseLine turns that `null` into an EventResult with
+			// an empty Text.
+			//
+			// Forwarding it does NOT paint a blank bubble — the frontend's
+			// 'result' branch only calls finalizeTurn and never appends a message.
+			// What it does is close a turn the user never started: it clears
+			// streaming/streamingMsgId/curTurnId and resets `stopped`, so the
+			// thinking indicator the browser is showing for the prompt in flight
+			// blinks out, moments before the Attachment fallback (attach.go)
+			// respawns and answers for real in a new bubble.
+			//
+			// It is dropped here because fanOut is the single place that knows
+			// whether this session ever init'd — the Attachment could suppress it
+			// for the chat path, but only after the envelope had already been
+			// queued into the subscriber channel, and only for that one consumer.
+			//
+			// Both halves of the condition are load-bearing, and each is pinned by
+			// its own test. ⑤ guarantees a real turn emits init before result, so
+			// requiring !sawInit cannot swallow a genuine turn-end (and opencode's
+			// EventResult always carries "stop"); requiring an empty Text keeps a
+			// hypothetical init-less result that DID carry text visible rather than
+			// vanishing. Nothing is buffered in the fence parser at this point
+			// either (no init means no text was ever fed), so skipping the Flush
+			// loses nothing.
+			if !sawInit && ev.Text == "" {
+				continue
+			}
 			emitSegments(e.fenceParser.Flush())
 			if r.History != nil && sid != "" {
 				r.History.FinalizeAssistant(sid)

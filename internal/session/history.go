@@ -290,6 +290,44 @@ func (h *HistoryStore) LoadHistory(sid string) []HistoryMessage {
 	return msgs
 }
 
+// HasHistory reports whether sid has any conversation persisted on disk. It is
+// the gate on tether#50's "started a new session, the old context is gone"
+// notice: the notice is only honest — and only welcome — when there WAS a
+// conversation to lose.
+//
+// The gate exists because a resume can fail for reasons that have nothing to do
+// with the user losing a conversation. Measured on claude 2.1.220
+// (mem_2ruSlrHR ⑦), a cc session with zero completed turns is NOT resumable at
+// all: no transcript is written, so `--resume` fails exactly like an unknown id —
+// minting an id is not the same as having something to come back to. Add the
+// ordinary operational cases (cc pruned the transcript, the workdir moved, the
+// file is corrupt) and "the resume failed" on its own says nothing about whether
+// there was context worth mourning. tether's own history does.
+//
+// Note the pure zero-turn case cannot actually reach here through this daemon:
+// the browser only learns a sid from session_ready, which is sent after cc
+// consumed a prompt, so a session with no turns never hands the client a sid to
+// reconnect with. The gate is defence-in-depth for that one, and load-bearing for
+// the rest.
+//
+// Deliberately a size check rather than LoadHistory: this runs on the reconnect
+// path, where parsing a long-running session's whole transcript just to learn
+// "is it non-empty" would be wasted work. A zero-length file counts as no
+// history, which is also what LoadHistory would conclude.
+func (h *HistoryStore) HasHistory(sid string) bool {
+	if sid == "" {
+		return false
+	}
+	fi, err := os.Stat(h.historyPath(sid))
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn("history: stat failed", "sid", sid, "err", err)
+		}
+		return false
+	}
+	return fi.Size() > 0
+}
+
 // ListSessions returns all session IDs that have history on disk.
 func (h *HistoryStore) ListSessions() []string {
 	entries, err := os.ReadDir(h.baseDir)

@@ -667,6 +667,17 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
               </div>
             )
           }
+          if (m.role === 'system') {
+            // tether#50 — a daemon notice (e.g. "the previous context could not
+            // be restored"). Rendered as its own quiet centred line rather than
+            // an assistant bubble: it did not come from the model, and dressing
+            // it up with the tether avatar would read as the agent saying it.
+            return (
+              <div key={m.id} className="msg-system">
+                <span className="msg-system-text">{m.text}</span>
+              </div>
+            )
+          }
           return (
             <div key={m.id} className="msg-ai">
               <div className="msg-ai-header">

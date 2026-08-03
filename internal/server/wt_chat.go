@@ -43,6 +43,23 @@ func handleWTChat(reg *session.Registry, wts *webtransport.Server, authState *au
 	}
 }
 
+// admitChat decides whether a chat connection carrying sid may attach, or must be
+// turned away as someone else's session (#83). See the caller for the full
+// reasoning about what this gate does and does not cover.
+//
+// It asks Registry.OwnedByOther rather than composing
+// `IsLive(sid) && !IsOwner(sid, clientID)`. The composition additionally rejects a
+// live session NOBODY owns yet — which since tether#54 is a state that lasts until
+// the user types, and which this connection is entitled to join (see
+// Registry.OwnedByOther). A connection with no sid, or with no client id to check
+// against, is always admitted: there is nothing to conflict with.
+func admitChat(reg *session.Registry, sid, clientID string) bool {
+	if sid == "" || clientID == "" {
+		return true
+	}
+	return !reg.OwnedByOther(sid, clientID)
+}
+
 func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Registry, clientID string) {
 	defer wtsess.CloseWithError(0, "")
 	ctx := wtsess.Context()
@@ -56,12 +73,12 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 	// A sid the registry does NOT track falls through — but since tether#50 that
 	// no longer means "discard it and start over": Attach hands it to
 	// `cc --resume` to recover the conversation's context. Note the consequence
-	// for this gate, whose EXPRESSION is unchanged: because only LIVE sessions
+	// for this gate, whose INTENT is unchanged: because only LIVE sessions
 	// are checked, it is inert for exactly the sids that now carry restorable
 	// context. Acceptable under tether's one-human-many-devices model, but it is
 	// no longer the complete barrier its name suggests.
 	//
-	// tether#55 then changed what IsLive MEANS underneath it — a registered
+	// tether#55 then changed what "live" MEANS underneath it — a registered
 	// session whose agent has exited now answers false — so the set of sids that
 	// bypass this gate grew to include those. Deliberate, and not a loosening in
 	// substance: such a session is unreachable by ANY client (its cc is gone),
@@ -69,7 +86,18 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 	// gate. Reading it the other way round is what the bug was — the gate
 	// consulted the owner recorded on a corpse and so rejected the owner's own
 	// reconnect from a second device.
-	if sid != "" && clientID != "" && reg.IsLive(sid) && !reg.IsOwner(sid, clientID) {
+	//
+	// The decision itself is admitChat, so that it is testable without standing up
+	// a WebTransport session — a review of tether#54 found this gate wrong, and a
+	// gate whose only home is the middle of a WT handler cannot be pinned.
+	//
+	// KNOWN COVERAGE GAP, unchanged by that extraction: nothing pins that this call
+	// site still MAKES the call. serveChat takes a concrete *webtransport.Session,
+	// so reaching it from a test needs a real QUIC connection, and no such harness
+	// exists here. Deleting these three lines leaves the suite green — as it did
+	// before the extraction, when the whole gate lived inline. What changed is that
+	// the decision is now pinned; the wiring is covered only by live_verify.
+	if !admitChat(reg, sid, clientID) {
 		sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindError, Payload: "session owned by another client; use /wt/events to attach read-only"})
 		return
 	}
@@ -153,10 +181,12 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 	realSID := res.SID
 	slog.Info("serveChat: SessionID resolved", "sid", realSID, "recovered", res.Recovered)
 
-	// Claim ownership (CAS — first caller wins). Through the attachment, NOT
-	// reg.SetOwner(realSID, …): the sid-keyed lookup loses a race with the
-	// registry's re-key goroutine and would drop this connection mid-answer — see
-	// Attachment.SetOwner.
+	// Claim ownership (CAS — first caller wins). Through the attachment, which
+	// holds the *Entry, rather than by looking realSID up in the registry: a
+	// lookup here is at best redundant and, for a provider that mints its own
+	// session id, still able to miss a session that is right there — which this
+	// function would read as a fatal ownership race and answer by dropping the
+	// connection mid-answer. See Attachment.SetOwner.
 	if clientID != "" {
 		if !att.SetOwner(clientID) {
 			sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindError, Payload: "session owned by another client; use /wt/events to attach read-only"})

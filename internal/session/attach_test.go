@@ -173,6 +173,7 @@ func TestAttach_LiveSidReusesWithoutSpawning(t *testing.T) {
 	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
 		t.Fatalf("seed spawn: %v", err)
 	}
+	fp.sess.announceInit()
 	waitForRegistered(t, reg, "live-sid")
 	spawnsBefore := fp.spawns
 
@@ -281,6 +282,7 @@ func TestAttach_RegisteredButDeadSessionIsNotReused(t *testing.T) {
 	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
 		t.Fatalf("seed spawn: %v", err)
 	}
+	corpse.announceInit()
 	waitForRegistered(t, reg, "corpse-sid")
 	corpseEntry := registeredEntry(reg, "corpse-sid")
 	if corpseEntry == nil {
@@ -343,6 +345,7 @@ func TestAttach_LiveSessionStillReusedAfterLivenessCheck(t *testing.T) {
 	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
 		t.Fatalf("seed spawn: %v", err)
 	}
+	live.announceInit()
 	waitForRegistered(t, reg, "healthy-sid")
 	seeded := registeredEntry(reg, "healthy-sid")
 
@@ -723,16 +726,24 @@ func TestWaitSID_UnblocksWhenResolveFails(t *testing.T) {
 // TestSetOwner_WorksBeforeTheEntryIsRekeyed is a regression guard for a race an
 // adversarial review measured at 500/500 in a tight harness.
 //
-// spawnEntry registers each entry under a `pending-%p` placeholder and re-keys it
-// to its real sid from a goroutine parked in SessionID(). Resolve waits on that
-// SAME wakeup, so it routinely returns before the re-key has taken the lock. A
-// sid-keyed reg.SetOwner(res.SID, …) therefore finds nothing and returns false —
+// spawnEntry USED TO register each entry under a `pending-%p` placeholder and
+// re-key it to its real sid from a goroutine parked in SessionID(). Resolve waits
+// on that SAME wakeup, so it routinely returned before the re-key had taken the
+// lock; a sid-keyed ownership lookup therefore found nothing and answered false —
 // which serveChat treats as a fatal ownership race, sending an error envelope and
 // dropping the connection while the user's first answer is in flight.
 //
-// Attachment.SetOwner resolves against the Entry it already holds, so there is no
-// lookup to lose. The assertion is deliberately "0 losses out of many": one loss
-// is a user-visible dropped connection.
+// tether#54 removed the placeholder, so for cc the lookup would no longer lose.
+// This test stays, and stays worth having, because it pins the reason ownership is
+// resolved through the *Entry regardless. The fake here mints its own id (like
+// opencode), and it emits NO init — so at the moment Resolve returns, the entry is
+// still registered under the id the registry pinned, NOT under the res.SID this
+// call is about. A sid-keyed lookup would miss it, exactly as it would in the
+// production window between opencode publishing its sid and fanOut adopting it.
+// SetOwner must not care.
+//
+// The assertion is deliberately "0 losses out of many": one loss is a user-visible
+// dropped connection.
 func TestSetOwner_WorksBeforeTheEntryIsRekeyed(t *testing.T) {
 	const n = 300
 	losses := 0
@@ -744,7 +755,8 @@ func TestSetOwner_WorksBeforeTheEntryIsRekeyed(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Attach: %v", err)
 		}
-		// Release Resolve and the re-key goroutine simultaneously.
+		// Release Resolve. (Under the old code this also released the re-key
+		// goroutine, which is what made the two collide every single time.)
 		close(ready)
 		if _, err := att.Resolve(context.Background()); err != nil {
 			t.Fatalf("Resolve: %v", err)

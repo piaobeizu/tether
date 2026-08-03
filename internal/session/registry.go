@@ -89,6 +89,62 @@ func (r *Registry) GetLock(sid string) *SessionLock {
 	return l
 }
 
+// liveEntry looks sid up and returns its Entry ONLY if the agent behind it is
+// still alive. It is the single answer to "may this registered session be
+// reused?", shared by every caller that used to ask the weaker question — is sid
+// a key in r.sessions.
+//
+// # Registered is not alive (tether#55)
+//
+// An Entry outlives its agent. fanOut removes it in a deferred evict that runs
+// only after the agent's Events() channel has closed AND drained, so between "cc
+// exited" and "the map forgot it" the entry is still there, still answering
+// SessionID() with the id it cached at init, still reporting an owner. Every
+// signal a reconnect used to consult says healthy. Reusing it hands the client a
+// corpse: Resolve confirms the session, session_ready goes out, and each prompt
+// after that dies in a broken pipe that only reaches a slog.Warn — "thinking…"
+// forever, the exact failure tether#49 set out to end, reached through the one
+// door tether#50 left open.
+//
+// Alive() is asked rather than anything process-shaped on purpose; see
+// agent.Session.Alive for why a `kill(pid, 0)` probe would call every corpse
+// alive, and why it cannot block.
+//
+// # It also un-registers what it finds dead
+//
+// Dropping the corpse here is not tidying, it is what keeps the answer stable:
+// otherwise the very next lookup of the same sid — from this same reconnect, or
+// a concurrent one — re-finds it and has to re-derive that it is dead, and the
+// dead sid keeps reading as live to IsLive/Subscribe/DeliverAction in between.
+// Attachment.resolve already does exactly this on the failed-resume path for the
+// same reason. evict is idempotent and by-value, so the entry's own teardown
+// doing it again is a no-op, and it cannot take out the replacement session that
+// re-keys under this sid moments later.
+//
+// A dead entry is left UNREAPED (no Session().Close()), which leaks the zombie
+// tether#56 is about — deliberately, because it leaks that zombie identically
+// today and reaping is that slice's job, not a behaviour to smuggle in here.
+func (r *Registry) liveEntry(sid string) (*Entry, bool) {
+	if sid == "" {
+		return nil, false
+	}
+	r.mu.RLock()
+	e, ok := r.sessions[sid]
+	r.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	// Deliberately outside r.mu: Alive() is documented non-blocking, but holding
+	// the registry-wide lock across a call into an agent implementation is how a
+	// future non-conforming one would take the whole daemon down with it.
+	if !e.sess.Alive() {
+		slog.Info("dropping a registered session whose agent has exited", "sid", sid)
+		r.evict(e)
+		return nil, false
+	}
+	return e, true
+}
+
 // GetOrSpawnEntry returns the *Entry for the given sid, or spawns a new
 // agent process and registers a fresh Entry. If sid is empty, a new
 // process is spawned and re-keyed once its system/init provides the real
@@ -101,24 +157,26 @@ func (r *Registry) GetLock(sid string) *SessionLock {
 // events produced in between would otherwise be fanned out to zero
 // subscribers.
 func (r *Registry) GetOrSpawnEntry(ctx context.Context, sid, providerName string) (*Entry, error) {
-	if sid != "" {
-		r.mu.RLock()
-		e, ok := r.sessions[sid]
-		r.mu.RUnlock()
-		if ok {
-			return e, nil
-		}
+	if e, ok := r.liveEntry(sid); ok {
+		return e, nil
 	}
 
 	// Spawn a FRESH session — this entry point never `cc --resume`s (tether#49).
-	// A sid that IS live returns early above (existing entry reused, cc still
-	// running — the real reconnect-continuity path). In practice the only way
-	// execution reaches here with a non-empty sid is a sid the daemon no longer
-	// tracks (daemon restart, post-disconnect eviction, or a different
-	// workspace/cwd), and resuming such a sid used to wedge the turn in
-	// "thinking…": cc exits with "No conversation found" BEFORE system/init, and
-	// before tether#49 taught SessionID() to watch the process-exit `done`
-	// channel that parked the caller forever and broke-piped the first prompt.
+	// A sid that IS live and whose agent is still running returns early above
+	// (the real reconnect-continuity path). Two different states reach here with
+	// a non-empty sid, and only the first is the tether#49 story:
+	//
+	//   - a sid the daemon no longer tracks (daemon restart, post-disconnect
+	//     eviction, a different workspace/cwd). Resuming one of these used to
+	//     wedge the turn in "thinking…": cc exits with "No conversation found"
+	//     BEFORE system/init, which parked the caller forever in SessionID() and
+	//     broke-piped the first prompt, until tether#49 taught SessionID() to
+	//     watch the process-exit `done` channel.
+	//   - a sid it DOES track whose agent has already exited, dropped by
+	//     liveEntry (tether#55). This one usually HAS a transcript on disk, so a
+	//     `--resume` of it would most likely succeed — which is why Attach sends
+	//     it down the resume path and only this always-fresh entry point does
+	//     not.
 	//
 	// tether#50 does NOT change that here. Recovering from a failed resume needs
 	// state this function does not have — a buffer of unconfirmed prompts to
@@ -337,11 +395,26 @@ func (e *Entry) setOwner(clientID string) bool {
 	return true
 }
 
-// IsLive returns true if the session exists and is actively tracked.
+// IsLive returns true if the session exists AND its agent has not exited.
+//
+// NOT a pure predicate: like every liveEntry caller it UNREGISTERS a session it
+// finds dead (see liveEntry for why the answer has to be made stable rather than
+// merely reported). Benign for the polling caller in tests — evicting an already
+// dead entry is idempotent and cannot touch a live one — but worth knowing before
+// calling this in a loop and expecting it to observe without disturbing.
+//
+// It goes through liveEntry (not a bare map lookup) so it cannot disagree with
+// the reuse decision Attach makes microseconds later on the same sid. Its one
+// production caller is serveChat's ownership gate, and a corpse answering "live"
+// there is its own small failure: the gate consults the owner recorded on the
+// dead entry, so reconnecting a sid whose agent has exited from a SECOND device
+// was rejected outright ("session owned by another client") instead of recovering
+// the conversation. Under tether's one-human-many-devices model a dead sid is
+// nobody's to own — and it already behaves that way for a sid the registry has
+// finished forgetting, so this makes the two agree rather than loosening the gate
+// (see serveChat's note on the gate being inert for restorable sids).
 func (r *Registry) IsLive(sid string) bool {
-	r.mu.RLock()
-	_, ok := r.sessions[sid]
-	r.mu.RUnlock()
+	_, ok := r.liveEntry(sid)
 	return ok
 }
 

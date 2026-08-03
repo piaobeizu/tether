@@ -102,12 +102,14 @@ type Resolution struct {
 //
 // Three cases, in order of preference:
 //
-//   - sid names a LIVE session → reuse it. cc is still running and still holds
-//     the context in memory; nothing to resume. (Unchanged since tether#49 —
-//     this is the reconnect path that always worked.)
-//   - sid is non-empty but not live (daemon restarted, entry evicted after a
-//     disconnect) → ATTEMPT `--resume <sid>`. This is what tether#50 adds; before
-//     it, this case spawned a fresh session and cc silently forgot everything.
+//   - sid names a session that is registered AND whose agent is still alive →
+//     reuse it. cc is still running and still holds the context in memory;
+//     nothing to resume. "Still alive" is checked rather than assumed from the
+//     registration, which is the tether#55 fix.
+//   - sid is non-empty but not live — daemon restarted, entry evicted after a
+//     disconnect, or registered-but-dead → ATTEMPT `--resume <sid>`. This is what
+//     tether#50 adds; before it, this case spawned a fresh session and cc
+//     silently forgot everything.
 //   - sid is empty → fresh session under a newly minted id.
 //
 // KNOWN LIMITS, both rooted in the same thing — an entry is registered under the
@@ -120,6 +122,11 @@ type Resolution struct {
 //     both run `cc --resume <sid>` on one transcript. This is reachable from a
 //     SINGLE browser: the sid lives in localStorage, which is shared across tabs
 //     of the origin, so two tabs reconnecting after a daemon restart is enough.
+//     Since tether#55 a REGISTERED-but-dead sid reaches the same window (both
+//     attaches judge it dead and both resume), which is a new route into this
+//     limit but not a new limit: an evicted dead sid always behaved this way, and
+//     the alternative — keeping the corpse so the second attach "finds" it —
+//     is the bug tether#55 fixes.
 //     Both then re-key to the same map key, so one Entry silently displaces the
 //     other in r.sessions and the displaced cc keeps running unreachable
 //     (Registry.evict is by-value and only reclaims the pointer it is given).
@@ -142,21 +149,45 @@ func (r *Registry) Attach(ctx context.Context, sid, providerName string) (*Attac
 		resolved: make(chan struct{}),
 	}
 
-	if sid != "" {
-		r.mu.RLock()
-		e, ok := r.sessions[sid]
-		r.mu.RUnlock()
-		if ok {
-			// NOTE: reuse is NOT fallback-eligible (resuming stays false) and does
-			// not re-check that the session is still producing. An entry lingers in
-			// r.sessions between its cc exiting and fanOut's deferred evict running;
-			// an attach landing in that window reuses a corpse whose SessionID() still
-			// returns the cached sid, so Resolve reports success and every later prompt
-			// fails into a slog.Warn — "thinking…" with no answer. Narrow, and the
-			// residual case this slice does not cover; tracked separately.
-			a.entry = e
-			return a, nil
-		}
+	// liveEntry, not a bare r.sessions lookup: an entry that is still registered
+	// is not necessarily an agent that is still running, and adopting a corpse
+	// here leaves the turn in "thinking…" forever (tether#55 — see
+	// Registry.liveEntry for the mechanism). A sid whose agent has exited now
+	// falls through to the `--resume` case below, which is both the right answer
+	// and the recoverable one: the transcript is on disk, so resuming usually
+	// restores the context the corpse was holding in memory, and if it does not,
+	// this attach is fallback-eligible and Resolve replays onto a fresh session.
+	//
+	// HOW BIG THIS IS, stated plainly because the comment it replaces was not:
+	// the window where an entry is registered but its agent has gone is bounded —
+	// it opens when the agent's stream closes and shuts when fanOut's deferred
+	// evict has drained at most a channel-buffer of events. It is a race a
+	// reconnect can lose, not a state the daemon sits in. Closing it is worth
+	// doing because the cost of losing it is unbounded (the turn never returns)
+	// and the check is free, NOT because it is the only road to a hung turn.
+	//
+	// STILL NOT COVERED — all three of these produce the same "thinking…" and
+	// none of them is this gate's business, because the gate is a decision taken
+	// once, not a subscription:
+	//
+	//  1. An agent that dies AFTER being adopted here, e.g. mid-turn. Reuse stays
+	//     non-fallback-eligible (resuming stays false) on purpose: such a session
+	//     wants recovering by resuming ITS transcript, whereas the fallback
+	//     machinery spawns fresh. Expressing that needs a third attachment state
+	//     neither this slice nor tether#50 has. Note serveChat only slog.Warns a
+	//     SendPrompt error, so nothing downstream converts it into recovery
+	//     either.
+	//  2. An agent that is running but WEDGED — cc alive, stdin accepted,
+	//     nothing ever emitted (the stale-spawn pitfall). Alive() reports true
+	//     and should: no non-blocking check can tell "thinking" from "stuck".
+	//  3. opencode specifically: if its `serve` child dies outside Interrupt()/
+	//     Close(), nothing calls closeEvents, so the session's stream never ends
+	//     and Alive() keeps saying true forever. That is a gap in
+	//     opencodeSession's own lifecycle, tracked separately — reporting it here
+	//     would mean this gate second-guessing the provider.
+	if e, ok := r.liveEntry(sid); ok {
+		a.entry = e
+		return a, nil
 	}
 
 	cfg := agent.SpawnConfig{ResumeSessionID: sid}

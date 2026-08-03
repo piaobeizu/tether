@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,6 +28,11 @@ type fakeSession struct {
 	// parked in SessionID(). Nil (the default) returns the sid immediately,
 	// preserving every other test's behavior.
 	sidReady chan struct{}
+	// dead, when set, makes Alive() report false while SessionID() keeps handing
+	// back the cached sid — the registered-corpse state tether#55 is about. It is
+	// an atomic because a test flips it from one goroutine while the registry
+	// reads it from another (and -race would otherwise flag the reuse tests).
+	dead atomic.Bool
 
 	mu             sync.Mutex
 	prompts        []string
@@ -39,6 +45,19 @@ func (f *fakeSession) SessionID() string {
 	}
 	return f.sid
 }
+
+// Alive defaults to TRUE for the zero value, so every pre-tether#55 test that
+// builds a fakeSession keeps describing a healthy session. (A double that
+// defaulted to dead would silently gut the existing suite rather than fail it.)
+//
+// Deliberately NOT derived from `close(f.events)`, even though the real
+// ccSession's liveness and its stream close are two halves of one event: tests
+// here close a fake's events channel to make fanOut return and evict, so
+// coupling the two would make "evicted ⟹ Alive() false" true by construction
+// and turn the registered-but-dead tests into tautologies. Keeping the flag
+// independent is what lets a test hold an entry REGISTERED while its session
+// reports dead — the state the fix is about, which cannot otherwise be staged.
+func (f *fakeSession) Alive() bool { return !f.dead.Load() }
 func (f *fakeSession) SendPrompt(_ context.Context, text string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -121,6 +140,71 @@ func TestGetOrSpawnEntry_LiveSidReused(t *testing.T) {
 	}
 	if fp.spawns != 1 {
 		t.Errorf("provider.spawns = %d, want 1 (a live sid must not respawn)", fp.spawns)
+	}
+}
+
+// TestGetOrSpawnEntry_RegisteredButDeadSpawnsFresh — tether#55 on the entry point
+// that never resumes. A registered sid whose agent has exited must NOT be handed
+// back: this path's contract is always-fresh (tether#49), so the corpse is
+// dropped and a brand-new session spawned, with ResumeSessionID still empty.
+//
+// Reusing it here is the same wedge as on the Attach path but with no recovery at
+// all — GetOrSpawnEntry has no prompt buffer to replay, which is exactly why it
+// must not adopt a session it cannot verify.
+func TestGetOrSpawnEntry_RegisteredButDeadSpawnsFresh(t *testing.T) {
+	corpse := &fakeSession{sid: "dead-sid", events: make(chan agent.Event, 8)}
+	fp := &fakeProvider{sess: corpse}
+	reg := NewRegistry(fp)
+
+	e1, err := reg.GetOrSpawnEntry(context.Background(), "", "fake")
+	if err != nil {
+		t.Fatalf("seed spawn: %v", err)
+	}
+	waitForRegistered(t, reg, "dead-sid")
+	corpse.dead.Store(true)
+
+	e2, err := reg.GetOrSpawnEntry(context.Background(), "dead-sid", "fake")
+	if err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	if e2 == e1 {
+		t.Error("returned the dead entry; a registered sid whose agent exited must not be reused")
+	}
+	if fp.spawns != 2 {
+		t.Errorf("provider.spawns = %d, want 2 (seed + the replacement)", fp.spawns)
+	}
+	if fp.lastCfg.ResumeSessionID != "" {
+		t.Errorf("ResumeSessionID = %q, want \"\": this entry point never resumes (tether#49)",
+			fp.lastCfg.ResumeSessionID)
+	}
+	if fp.lastCfg.SessionID == "" {
+		t.Error("SessionID not pinned on the replacement spawn; a fresh session must mint one")
+	}
+}
+
+// TestIsLive_FalseOnceTheAgentExits — IsLive answers the question its name asks.
+// serveChat's ownership gate is its one production caller, and a corpse reporting
+// "live" there consults the owner recorded on the dead entry: a second device
+// reconnecting to a sid whose agent had exited was rejected outright instead of
+// recovering the conversation.
+func TestIsLive_FalseOnceTheAgentExits(t *testing.T) {
+	fs := &fakeSession{sid: "islive-sid", events: make(chan agent.Event, 4)}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+
+	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	waitForRegistered(t, reg, "islive-sid") // this itself asserts IsLive is true
+	if !reg.IsLive("islive-sid") {
+		t.Fatal("IsLive = false for a healthy registered session")
+	}
+
+	fs.dead.Store(true)
+	if reg.IsLive("islive-sid") {
+		t.Error("IsLive = true for a registered session whose agent has exited")
+	}
+	if reg.IsLive("never-existed") {
+		t.Error("IsLive = true for a sid that was never registered")
 	}
 }
 

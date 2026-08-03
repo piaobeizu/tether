@@ -113,6 +113,52 @@ type Session interface {
 	// SessionID returns the cc-managed JSONL session ID (available after
 	// the first system/init event; blocks if not yet received).
 	SessionID() string
+	// Alive reports whether this session can still do anything: produce another
+	// event, or accept another prompt. It MUST NOT BLOCK — see below.
+	//
+	// # Why the interface needs this at all
+	//
+	// SessionID() is not a liveness signal even though it looks like one. It
+	// caches the id the first system/init carried and keeps returning it for the
+	// rest of the process's life AND after its death, so a caller holding a
+	// Session whose agent has exited sees a perfectly healthy-looking non-empty
+	// id (tether#55). Every later SendPrompt then fails into a broken pipe the
+	// browser never hears about — the "thinking…" that never returns, which is
+	// the tether#49 symptom arriving down a different road.
+	//
+	// # Semantics
+	//
+	// false is TERMINAL and monotonic: this session will never emit another
+	// event and will never accept another prompt, so a caller holding it must
+	// replace it rather than retry. true means "not known to be dead" — it is
+	// deliberately NOT a promise that the next SendPrompt succeeds, because no
+	// non-blocking answer can be (the agent may be exiting as the call returns).
+	// Callers must still handle SendPrompt errors; Alive exists to stop them
+	// ADOPTING a session that is already known-dead, not to make error handling
+	// unnecessary. Worth knowing that today's chat path does NOT yet convert such
+	// an error into recovery — internal/server/wt_chat.go logs it and moves on —
+	// so a session that dies AFTER it was adopted still loses its turn. Closing
+	// that needs the third attachment state described in
+	// session.Registry.Attach, not a stronger promise from this method.
+	//
+	// # Must not block
+	//
+	// Alive is called on the reconnect path while deciding whether to reuse a
+	// registered session, i.e. exactly where a hang is the bug being fixed. An
+	// implementation that waited on the agent for an answer would convert
+	// "reuses a corpse and hangs" into "hangs before it even decides", so
+	// implementations answer from state they already hold (a closed channel, an
+	// atomic flag) and never do I/O, never take a lock that I/O is held across,
+	// and never signal the agent.
+	//
+	// Note for implementers: this is the transport's view, not the OS's. Do NOT
+	// implement it as a process-liveness probe. `kill(pid, 0)` succeeds for a
+	// zombie, and tether leaves one behind for every session it does not
+	// explicitly reap (tether#56), so a signal probe would call every corpse
+	// alive. It would also be wrong in the other direction for OpenCodeProvider,
+	// whose serve child is deliberately killed and relaunched around Interrupt()
+	// while the SESSION stays perfectly usable.
+	Alive() bool
 	// SendPrompt sends a user prompt as a stream-json message.
 	SendPrompt(ctx context.Context, text string) error
 	// Events returns the channel of daemon-internal events (read-only).

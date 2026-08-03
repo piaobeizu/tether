@@ -1041,3 +1041,95 @@ func TestSpawn_StderrDefaultsToOsStderr(t *testing.T) {
 		t.Errorf("withStderr sink = %#v, want the injected writer", got)
 	}
 }
+
+// ─── Alive: liveness that does not lie and does not block (tether#55) ────────
+
+// TestCCSession_AliveTrueWhileRunning_FalseOnceExited is the primitive the
+// tether#55 fix rests on: a real subprocess, driven through the provider, whose
+// Alive() tracks the process rather than the cached session id.
+//
+// Both halves are deterministic on purpose. After EventResult the fake is back
+// blocked reading stdin — tether holds it open across turns — so "still running"
+// is a fact here, not a hope. And the second half reads Events() to CLOSE before
+// asserting death, which is what makes the assertion meaningful for the registry:
+// Registry.fanOut evicts a session in a defer that runs only after that same
+// close, so if Alive() were not already false at this point the fix would have
+// nothing to see in the window it exists for.
+//
+// What this does NOT pin is readLoop's defer ORDER (`done` before `events`).
+// Swapping those two leaves this green — the closes are adjacent, so an observer
+// essentially never lands between them. The order is a hand-checked invariant
+// noted on ccSession.Alive; do not read a pass here as protecting it.
+func TestCCSession_AliveTrueWhileRunning_FalseOnceExited(t *testing.T) {
+	h := newFakeCCHarness(t)
+	p := NewClaudeCodeProvider(fakeCCPath(t))
+	sess, err := p.Spawn(context.Background(), SpawnConfig{
+		SessionID: fakeCCTestUUID,
+		Workdir:   t.TempDir(),
+		Env:       h.Env(),
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	closeSess := closeOnce(sess)
+	defer func() { _ = closeSess() }()
+
+	if err := sess.SendPrompt(context.Background(), "hello"); err != nil {
+		t.Fatalf("SendPrompt: %v", err)
+	}
+	collectUntilResult(t, sess)
+
+	if !sess.Alive() {
+		t.Error("Alive() = false for a cc that just finished a turn and is reading stdin again")
+	}
+	if sid := sess.SessionID(); sid != fakeCCTestUUID {
+		t.Fatalf("SessionID() = %q, want %q", sid, fakeCCTestUUID)
+	}
+
+	_ = closeSess() // stdin.Close() + Wait(): the fake sees EOF and exits
+	collectUntilClosed(t, sess)
+
+	if sess.Alive() {
+		t.Error("Alive() = true after the subprocess exited and Events() closed")
+	}
+	// The point of the whole slice: the id survives the process, so it is not a
+	// liveness signal. If this ever starts returning "" the fix has a second,
+	// cheaper discriminator — and this test should be revisited, not deleted.
+	if sid := sess.SessionID(); sid != fakeCCTestUUID {
+		t.Errorf("SessionID() = %q after death, want the cached %q — "+
+			"the premise of tether#55 is that the id outlives the process", sid, fakeCCTestUUID)
+	}
+}
+
+// TestCCSession_AliveDoesNotBlock — Alive() must answer from state it already
+// holds. It is consulted on the reconnect path whose failure mode is a hang, so
+// an implementation that waited on the agent (e.g. `<-s.done` without a default,
+// the shape SessionID() legitimately uses) would turn "reuses a corpse" into
+// "hangs before deciding". Asserted against a session that is deliberately never
+// going to resolve: the fake has emitted nothing because no prompt was sent, so
+// anything that waits for the agent waits forever.
+func TestCCSession_AliveDoesNotBlock(t *testing.T) {
+	h := newFakeCCHarness(t)
+	p := NewClaudeCodeProvider(fakeCCPath(t))
+	sess, err := p.Spawn(context.Background(), SpawnConfig{
+		SessionID: fakeCCTestUUID,
+		Workdir:   t.TempDir(),
+		Env:       h.Env(),
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer func() { _ = closeOnce(sess)() }()
+
+	answered := make(chan bool, 1)
+	go func() { answered <- sess.Alive() }()
+
+	select {
+	case alive := <-answered:
+		if !alive {
+			t.Error("Alive() = false for a freshly spawned cc that has not been prompted yet")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Alive() blocked on a session that has not emitted system/init — it must never wait on the agent")
+	}
+}

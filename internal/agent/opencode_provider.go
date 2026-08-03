@@ -161,6 +161,15 @@ type opencodeSession struct {
 	events   chan Event
 	eventsMu sync.RWMutex // guards closed
 	closed   bool
+	// dead mirrors `closed` for Alive(), which must answer without taking
+	// eventsMu. Not redundant state for its own sake: emit() holds eventsMu.RLock
+	// while a TERMINAL event blocks on a full events buffer, and Go's RWMutex
+	// makes a waiting writer (closeEvents) park every subsequent reader behind
+	// it — so an Alive() that read `closed` under RLock could be held up by the
+	// consumer's drain rate, which is precisely the blocking a liveness probe is
+	// not allowed to do (tether#55). Written only by closeEvents, which is
+	// once-guarded, so the flag and the channel close cannot disagree.
+	dead atomic.Bool
 
 	// lifeMu serializes serve-lifecycle transitions — the SendPrompt() resume
 	// swap, Interrupt(), and Close() — against each other. SendPrompt runs on
@@ -229,8 +238,25 @@ func (s *opencodeSession) closeEvents() {
 		return
 	}
 	s.closed = true
+	// These two statements are ordered, and the order is an invariant no test
+	// pins: a consumer ranging over Events() observes the close without holding
+	// eventsMu, so if the store came second there would be a window where the
+	// stream is visibly over and Alive() still says true — the exact
+	// registered-but-dead illusion tether#55 removes. Reversing them keeps the
+	// suite green (measured), so KEEP THESE ADJACENT AND IN THIS ORDER; what the
+	// tests do pin is that the store happens at all.
+	s.dead.Store(true)
 	close(s.events)
 }
+
+// Alive reports whether this session's event stream is still open. See
+// agent.Session.Alive for the contract; the note there about NOT probing the OS
+// matters most here, because Interrupt() deliberately kills the `opencode serve`
+// child and marks the session dormant while SendPrompt is still able to relaunch
+// it and continue the same conversation — a dormant session has no process and is
+// entirely alive. The stream close (Close(), or the Spawn ctx-done teardown) is
+// the only event that ends a session, which is why the flag lives in closeEvents.
+func (s *opencodeSession) Alive() bool { return !s.dead.Load() }
 
 // unblockSID closes s.sidCh exactly once. Use to either publish a real sid
 // (after also setting s.sid under s.mu) or release waiters when opencode

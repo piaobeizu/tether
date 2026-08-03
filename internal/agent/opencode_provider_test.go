@@ -107,6 +107,37 @@ func TestOpenCodeCloseEvents_Idempotent(t *testing.T) {
 	s.emit(Event{Kind: EventText, Text: "late"})
 }
 
+// TestOpenCodeAlive_TracksStreamNotProcess — Alive() must follow the SESSION's
+// event stream, not any `opencode serve` child (tether#55).
+//
+// The dormant case is the one that would bite a process-shaped implementation:
+// Interrupt() kills the serve on purpose and SendPrompt relaunches it against
+// the same on-disk conversation, so a session with NO running child is entirely
+// usable and must keep reporting alive. Only closeEvents — Close(), or the
+// Spawn ctx-done teardown — ends a session.
+func TestOpenCodeAlive_TracksStreamNotProcess(t *testing.T) {
+	s := newTestOCSession()
+	if !s.Alive() {
+		t.Fatal("Alive() = false for a fresh session")
+	}
+
+	s.mu.Lock()
+	s.dormant = true // hibernated by Interrupt(): no serve child, still usable
+	s.mu.Unlock()
+	if !s.Alive() {
+		t.Error("Alive() = false for a dormant session — SendPrompt would have relaunched it")
+	}
+
+	s.closeEvents()
+	if s.Alive() {
+		t.Error("Alive() = true after closeEvents ended the session's stream")
+	}
+	s.closeEvents() // once-guarded; must not flip the answer back or panic
+	if s.Alive() {
+		t.Error("Alive() = true after a second closeEvents")
+	}
+}
+
 // TestOpenCodeInterrupt_Integration exercises the real spawn -> prompt ->
 // interrupt -> resume flow against an installed `opencode` binary. It is gated
 // behind TETHER_OPENCODE_IT (and skipped if opencode is absent) because it

@@ -175,6 +175,40 @@ func (s *ccSession) SessionID() string {
 	return s.sid
 }
 
+// Alive reports whether the cc subprocess is still reading its stdin, by polling
+// the same `done` channel SessionID() selects on (tether#49). No new state: done
+// is closed by readLoop's own defer, i.e. when readLoop has stopped scanning cc's
+// stdout — normally because the pipe EOF'd (the process is gone and the stdin
+// this session writes prompts to has no reader), and also on a scanner error such
+// as a line past the 100MB cap, which is equally terminal for this session
+// because nothing restarts readLoop.
+//
+// The poll cannot block: a select with a default over an already-created channel
+// touches no lock, no syscall and no I/O, so it answers in the caller's own
+// goroutine no matter what state cc is in — the property tether#55 needs, since
+// this runs on the reconnect path whose failure mode is a hang.
+//
+// One consequence worth stating rather than discovering: done closes when
+// readLoop NOTICES the exit, not at the instant of exit, so there is a
+// scheduler-wakeup-sized window in which a dead cc still reports Alive. That
+// window is inherent to any non-blocking answer and is not the window tether#55
+// is about — the reported one is between done closing (readLoop returned) and
+// Registry.fanOut's deferred evict draining the buffered events, which this
+// closes completely because done closes BEFORE events (defer order in readLoop:
+// close(events) is registered first, so it runs last). That defer order is a
+// hand-checked invariant, NOT one the tests pin — swapping the two defers leaves
+// the suite green, because the two closes are adjacent enough that an observer
+// almost never lands between them. Keep them in that order anyway: it is what
+// makes "Events() closed ⟹ Alive() already false" true for fanOut.
+func (s *ccSession) Alive() bool {
+	select {
+	case <-s.done:
+		return false
+	default:
+		return true
+	}
+}
+
 func (s *ccSession) SendPrompt(_ context.Context, text string) error {
 	msg := map[string]any{
 		"type": "user",

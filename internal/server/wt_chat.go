@@ -56,10 +56,19 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 	// A sid the registry does NOT track falls through — but since tether#50 that
 	// no longer means "discard it and start over": Attach hands it to
 	// `cc --resume` to recover the conversation's context. Note the consequence
-	// for this gate, which is deliberately unchanged: because only LIVE sessions
+	// for this gate, whose EXPRESSION is unchanged: because only LIVE sessions
 	// are checked, it is inert for exactly the sids that now carry restorable
 	// context. Acceptable under tether's one-human-many-devices model, but it is
 	// no longer the complete barrier its name suggests.
+	//
+	// tether#55 then changed what IsLive MEANS underneath it — a registered
+	// session whose agent has exited now answers false — so the set of sids that
+	// bypass this gate grew to include those. Deliberate, and not a loosening in
+	// substance: such a session is unreachable by ANY client (its cc is gone),
+	// and the identical sid a moment later, after eviction, already bypassed the
+	// gate. Reading it the other way round is what the bug was — the gate
+	// consulted the owner recorded on a corpse and so rejected the owner's own
+	// reconnect from a second device.
 	if sid != "" && clientID != "" && reg.IsLive(sid) && !reg.IsOwner(sid, clientID) {
 		sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindError, Payload: "session owned by another client; use /wt/events to attach read-only"})
 		return

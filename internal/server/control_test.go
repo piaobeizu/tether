@@ -76,6 +76,11 @@ type fakeActionSession struct {
 }
 
 func (f *fakeActionSession) SessionID() string { return f.sid }
+
+// Alive is unconditionally true: every test using this double is about routing a
+// control frame to a session that IS running. The registered-but-dead case
+// tether#55 added lives in internal/session, next to the reuse decision.
+func (f *fakeActionSession) Alive() bool { return true }
 func (f *fakeActionSession) SendPrompt(_ context.Context, text string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

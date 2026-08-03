@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 // failure mode rather than a silently-succeeding write.
 type deadSession struct {
 	events chan agent.Event
+	dead   atomic.Bool
 	mu     sync.Mutex
 	sends  int
 	closes int
@@ -37,10 +39,15 @@ func newDeadSession() *deadSession {
 // stream, exactly as ccSession.readLoop does when the process EOFs.
 func (d *deadSession) die() {
 	d.events <- agent.Event{Kind: agent.EventResult, Text: ""}
+	d.dead.Store(true)
 	close(d.events)
 }
 
 func (d *deadSession) SessionID() string { return "" }
+
+// Alive follows die(), matching ccSession: the process-exit signal lands before
+// the event stream close is observable downstream.
+func (d *deadSession) Alive() bool { return !d.dead.Load() }
 func (d *deadSession) SendPrompt(_ context.Context, _ string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -185,6 +192,175 @@ func TestAttach_LiveSidReusesWithoutSpawning(t *testing.T) {
 	}
 	if res.Recovered {
 		t.Error("Recovered = true for a live-session reuse; nothing was lost")
+	}
+}
+
+// ─── Attach: registered is not alive (tether#55) ─────────────────────────────
+
+// corpseThenLiveProvider hands back a session that will be left for dead first
+// and a healthy one second. It is not deadThenLiveProvider: that one models a cc
+// that never emitted init (SessionID() == ""), which is tether#50's failed
+// resume. tether#55 is the OPPOSITE shape — a session that DID init, so its sid
+// is cached and non-empty forever, and only Alive() can tell it is gone.
+type corpseThenLiveProvider struct {
+	corpse *fakeSession
+	live   *fakeSession
+
+	mu     sync.Mutex
+	cfgs   []agent.SpawnConfig
+	spawns int
+}
+
+func (p *corpseThenLiveProvider) Name() string { return "fake" }
+
+func (p *corpseThenLiveProvider) Spawn(_ context.Context, cfg agent.SpawnConfig) (agent.Session, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.cfgs = append(p.cfgs, cfg)
+	p.spawns++
+	if p.spawns == 1 {
+		return p.corpse, nil
+	}
+	return p.live, nil
+}
+
+func (p *corpseThenLiveProvider) Configs() []agent.SpawnConfig {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]agent.SpawnConfig(nil), p.cfgs...)
+}
+
+func (p *corpseThenLiveProvider) Spawns() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.spawns
+}
+
+// registeredEntry returns the Entry currently registered under sid, or nil.
+func registeredEntry(reg *Registry, sid string) *Entry {
+	reg.mu.RLock()
+	defer reg.mu.RUnlock()
+	return reg.sessions[sid]
+}
+
+// stillRegistered reports whether target is reachable from r.sessions under ANY
+// key — the by-value question Registry.evict answers, so a test can tell
+// "unregistered" from "re-keyed".
+func stillRegistered(reg *Registry, target *Entry) bool {
+	reg.mu.RLock()
+	defer reg.mu.RUnlock()
+	for _, e := range reg.sessions {
+		if e == target {
+			return true
+		}
+	}
+	return false
+}
+
+// TestAttach_RegisteredButDeadSessionIsNotReused is tether#55.
+//
+// The reuse branch used to ask only "is sid a key in r.sessions". An entry stays
+// in that map from the moment its cc exits until fanOut's deferred evict has
+// drained the event stream, and inside that window every signal reads healthy:
+// SessionID() hands back the id it cached at init, so Resolve confirms the
+// session, session_ready goes out, ownership is claimed — and then every prompt
+// dies in a broken pipe that never reaches the browser. "Thinking…" forever.
+//
+// The assertions below are the whole user-visible chain, in order: the corpse is
+// not adopted, the reconnect becomes a `--resume` of the same transcript (so the
+// conversation's context is recovered rather than dropped), the prompt lands on a
+// session that can answer it, and the corpse is unregistered rather than left to
+// catch the next reconnect too.
+func TestAttach_RegisteredButDeadSessionIsNotReused(t *testing.T) {
+	corpse := &fakeSession{sid: "corpse-sid", events: make(chan agent.Event, 8)}
+	live := &fakeSession{sid: "corpse-sid", events: make(chan agent.Event, 8)}
+	cp := &corpseThenLiveProvider{corpse: corpse, live: live}
+	reg := NewRegistry(cp)
+
+	// Seed a normal session, then let its agent exit while the entry lingers.
+	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
+		t.Fatalf("seed spawn: %v", err)
+	}
+	waitForRegistered(t, reg, "corpse-sid")
+	corpseEntry := registeredEntry(reg, "corpse-sid")
+	if corpseEntry == nil {
+		t.Fatal("seed session not registered under its sid")
+	}
+	corpse.dead.Store(true)
+
+	att, err := reg.Attach(context.Background(), "corpse-sid", "fake")
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	if got := cp.Spawns(); got != 2 {
+		t.Fatalf("spawns = %d, want 2: a registered-but-dead sid must NOT be reused", got)
+	}
+	if cfgs := cp.Configs(); cfgs[1].ResumeSessionID != "corpse-sid" {
+		t.Errorf("second spawn ResumeSessionID = %q, want %q — the transcript is on disk, "+
+			"so the dead session's context should be resumed, not discarded",
+			cfgs[1].ResumeSessionID, "corpse-sid")
+	}
+
+	// The property the user actually feels: the prompt reaches something alive.
+	if err := att.SendPrompt(context.Background(), "who am I?"); err != nil {
+		t.Fatalf("SendPrompt: %v", err)
+	}
+	if got := corpse.Prompts(); len(got) != 0 {
+		t.Errorf("corpse received %v; a dead session must never be prompted", got)
+	}
+	if got := live.Prompts(); len(got) != 1 || got[0] != "who am I?" {
+		t.Errorf("live session prompts = %v, want [\"who am I?\"]", got)
+	}
+
+	res, err := att.Resolve(context.Background())
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if res.SID != "corpse-sid" {
+		t.Errorf("Resolution.SID = %q, want \"corpse-sid\" (a successful resume does not drift the id)", res.SID)
+	}
+	if res.Recovered {
+		t.Error("Recovered = true, want false: the resume SUCCEEDED, no context was lost")
+	}
+
+	if stillRegistered(reg, corpseEntry) {
+		t.Error("the dead entry is still in r.sessions; the next reconnect would find it too")
+	}
+}
+
+// TestAttach_LiveSessionStillReusedAfterLivenessCheck — the other side of the
+// tether#55 gate, and the regression that would matter most if it broke: a
+// HEALTHY registered session must still be reused, with no second spawn. Calling
+// a live session dead would respawn cc on every reconnect and point a second
+// process at a transcript the first one owns — which is worse than the bug being
+// fixed, and is what tether#49's always-fresh behaviour cost before tether#50.
+func TestAttach_LiveSessionStillReusedAfterLivenessCheck(t *testing.T) {
+	live := &fakeSession{sid: "healthy-sid", events: make(chan agent.Event, 8)}
+	cp := &corpseThenLiveProvider{corpse: live, live: live}
+	reg := NewRegistry(cp)
+
+	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
+		t.Fatalf("seed spawn: %v", err)
+	}
+	waitForRegistered(t, reg, "healthy-sid")
+	seeded := registeredEntry(reg, "healthy-sid")
+
+	att, err := reg.Attach(context.Background(), "healthy-sid", "fake")
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	if got := cp.Spawns(); got != 1 {
+		t.Errorf("spawns = %d, want 1: a live sid must be reused, never respawned", got)
+	}
+	att.mu.Lock()
+	bound := att.entry
+	att.mu.Unlock()
+	if bound != seeded {
+		t.Error("Attach bound a different Entry for a live sid; the reuse path must return the existing one")
+	}
+	if !stillRegistered(reg, seeded) {
+		t.Error("the live entry was evicted; only a dead one may be dropped")
 	}
 }
 

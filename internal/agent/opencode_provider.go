@@ -47,7 +47,9 @@ func (p *OpenCodeProvider) Spawn(ctx context.Context, cfg SpawnConfig) (Session,
 	// the event stream. Each per-serve sseLoop deliberately does NOT own these
 	// (a hibernated/relaunched serve must not tear down the session's event
 	// stream), so this single session-scoped goroutine covers the ctx-cancel
-	// teardown paths that don't go through Close().
+	// teardown paths that don't go through Close(). A serve that dies without
+	// being asked to is the remaining path, and belongs to watchServeExit — it
+	// is per-incarnation, so it cannot be folded in here.
 	go func() {
 		<-ctx.Done()
 		sess.unblockSID()
@@ -81,41 +83,162 @@ func (s *opencodeSession) startServe(ctx context.Context) error {
 		return fmt.Errorf("opencode serve: %w", err)
 	}
 
+	// Per-serve SSE loop cancel. Its own cancel lets Interrupt()/Close() stop
+	// just this incarnation without spinning on a dead port after the serve is
+	// killed; the next relaunch starts a fresh loop bound to the new port. It is
+	// created up here, before the loop it stops, only so the exit watcher below
+	// can hold it — an unexpected death has to stop the loop too.
+	sseCtx, sseCancel := context.WithCancel(ctx)
+
+	// armed/live hand this incarnation over to the exit watcher; see
+	// watchServeExit for what each one means and why they are per-incarnation
+	// rather than session-scoped.
+	armed := new(atomic.Bool)
+	live := make(chan struct{})
+
 	// One goroutine owns serve.Wait() for this incarnation; waitReady checks
 	// exitDone non-blocking, Close()/Interrupt() read it blocking. Catches the
 	// TOCTOU port-grab window between net.Listen() and opencode binding — if the
 	// port was stolen, opencode exits ~immediately and we surface a clear error.
 	exitDone := make(chan struct{})
-	go func() {
-		werr := serve.Wait()
-		s.mu.Lock()
-		s.serveExitErr = werr
-		s.mu.Unlock()
-		close(exitDone)
-	}()
+	go s.watchServeExit(serve, exitDone, live, armed, sseCancel)
+	// EVERY return below this point must release the watcher, which parks on
+	// `live` holding this incarnation's teardown decision. Deferred rather than
+	// written out per-path so a future early return cannot leak the goroutine.
+	defer close(live)
 
 	s.mu.Lock()
 	s.baseURL = baseURL
 	s.serve = serve
 	s.serveExitDone = exitDone
+	s.serveArmed = armed
+	s.sseCancel = sseCancel
 	s.mu.Unlock()
 
 	if err := s.waitReady(ctx, baseURL, exitDone, 10*time.Second); err != nil {
+		// Leave `armed` false. A serve that never came up is startServe's OWN
+		// failure and is reported by this error return — which SendPrompt's
+		// relaunch path turns into an EventError. Letting the watcher end the
+		// session here instead would close the event stream first and swallow
+		// that error, hanging the consumer's turn: the exact symptom this file
+		// exists to prevent. The session stays alive and dormant, so the next
+		// prompt retries the relaunch.
+		//
+		// The fields published above are deliberately left pointing at this dead
+		// incarnation. Every one of them is a no-op against a reaped process
+		// (Kill returns ErrProcessDone, exitDone is closed, sseCancel and armed are
+		// already spent), and `dormant` stays true, so the next SendPrompt runs
+		// startServe again and replaces the lot.
+		sseCancel()
 		_ = serve.Process.Kill()
 		<-exitDone
 		return fmt.Errorf("opencode serve not ready: %w", err)
 	}
 
-	// Per-serve SSE loop. Its own cancel lets Interrupt()/Close() stop just this
-	// incarnation without spinning on a dead port after the serve is killed; the
-	// next relaunch starts a fresh loop bound to the new port.
-	sseCtx, sseCancel := context.WithCancel(ctx)
-	s.mu.Lock()
-	s.sseCancel = sseCancel
-	s.mu.Unlock()
 	go s.sseLoop(sseCtx, baseURL)
 
+	// This incarnation is live: from here on nobody is checking on it except the
+	// watcher, so arm it. The store lands before the deferred close(live), which
+	// is what makes the handoff race-free — a serve that died between waitReady's
+	// last successful health poll and this line is still torn down, because the
+	// watcher cannot read `armed` until startServe has finished deciding.
+	armed.Store(true)
 	return nil
+}
+
+// watchServeExit owns serve.Wait() for ONE serve incarnation and decides whether
+// that incarnation's exit ends the SESSION.
+//
+// # Why the distinction is the entire point
+//
+// A session outlives any single serve: Interrupt() kills one deliberately and
+// SendPrompt relaunches another against the same on-disk conversation, so "no
+// serve process" is a perfectly alive session. Before tether#58 this goroutine
+// therefore did nothing but record the exit — which left a serve that died on
+// its OWN (crash, OOM, an outside kill, a port stolen after startup) with nobody
+// to call closeEvents. The consequences ran the whole way down: the event stream
+// never ended, so Registry.fanOut never returned, so its deferred evict never
+// ran and the Entry sat in the registry forever; `dead` was never stored, so
+// Alive() answered true forever and tether#55's reuse gate adopted the corpse;
+// every later prompt then attached to a dead port and serveChat only logged it,
+// producing a "thinking…" that never returns. That is strictly worse than the
+// bounded registered-but-dead window tether#55 closed, because nothing ever
+// ended it.
+//
+// # Why not the `dormant` flag
+//
+// `dormant` can be made to work — it is set under mu before Interrupt() kills,
+// and lifeMu serialises the killers against the relaunch, so reading it BEFORE
+// close(exitDone) would be sound. It was not chosen because it makes the safety
+// argument non-local: you have to hold the lifeMu serialisation, the
+// set-before-kill ordering, and the read-before-close ordering in your head at
+// once, and two of its edges are already slightly wrong in ways that only happen
+// to be harmless — it stays true for the whole of a relaunch (SendPrompt clears
+// it only after startServe returns), and Close() never sets it, so a Close would
+// take the crash branch and duplicate its own teardown (benign, since closeEvents
+// is once-guarded). Per-incarnation state answers the per-incarnation question
+// directly instead:
+//
+//   - live is closed by startServe once it has finished with this incarnation.
+//     Waiting on it is what makes the verdict race-free: until startServe
+//     returns, IT owns the failure and reports one by returning an error, so the
+//     watcher must not act. This cannot deadlock — exitDone is already closed
+//     before we park here, and exitDone is the only thing startServe waits for.
+//   - armed is set by startServe only for an incarnation that went live, and
+//     cleared by Interrupt()/Close() before they kill.
+//
+// So `armed` still true here means "no CALLER asked for this exit" — deliberately
+// not "nobody did". The Spawn ctx-cancel path also kills the child, because serve
+// is built with exec.CommandContext, and nothing disarms on the way; that exit
+// takes the branch below. It is the right outcome by luck rather than by design:
+// the teardown is exactly what the ctx-done goroutine in Spawn does anyway, and
+// every step of it is idempotent. Worth knowing before treating the branch below
+// as proof that a crash occurred.
+func (s *opencodeSession) watchServeExit(serve *exec.Cmd, exitDone chan struct{}, live <-chan struct{}, armed *atomic.Bool, sseCancel context.CancelFunc) {
+	werr := serve.Wait()
+	s.mu.Lock()
+	s.serveExitErr = werr
+	s.mu.Unlock()
+	// Closed before the verdict, never after, so that no killer waiting on
+	// exitDone can be held up behind the teardown below.
+	close(exitDone)
+
+	<-live
+	if !armed.Load() {
+		// Asked for: an Interrupt() hibernation, a Close(), or a startup failure
+		// startServe is reporting itself. Not the session's end.
+		return
+	}
+
+	// Unexpected death — end the session.
+	// 1. Stop this incarnation's SSE loop. Its ctx derives from the session's, so
+	//    without this it reconnects to a dead port every 500ms forever.
+	sseCancel()
+	// 2. Release SessionID() waiters: a crash before session.created would
+	//    otherwise park them until the whole session ctx is cancelled.
+	s.unblockSID()
+	// 3. Finalize the in-flight turn BEFORE closing the stream, because closing it
+	//    is the point after which nothing can be said: emit drops every event once
+	//    `closed` is set, terminal ones included (the `if s.closed` return precedes
+	//    the isTerminal branch). Nothing downstream would cover for us — evict only
+	//    deletes registry keys and does not close subscriber channels, so without
+	//    this a mid-turn crash leaves the browser on "thinking…" until its
+	//    transport dies. That is the symptom this whole file is about, and honest
+	//    liveness alone does not cure it: Alive() is only consulted on the NEXT
+	//    attach, so it saves the next turn, not this one.
+	//
+	//    Blocking here is safe, and for the same reason emit's terminal branch is
+	//    safe in general: fanOut is still ranging over Events() at this instant
+	//    precisely because we have not closed it yet, so the send makes progress.
+	//    We also hold no lock — closeEvents takes eventsMu after emit released it.
+	msg := "opencode serve exited unexpectedly"
+	if werr != nil {
+		msg += ": " + werr.Error()
+	}
+	s.emit(Event{Kind: EventError, Err: errors.New(msg)})
+	// 4. End the stream. This is what turns Alive() false and lets fanOut's
+	//    deferred evict drop the registry entry.
+	s.closeEvents()
 }
 
 // waitReady polls /global/health until the serve subprocess is responsive,
@@ -181,14 +304,20 @@ type opencodeSession struct {
 	lifeMu sync.Mutex
 
 	// mu guards every field below: the serve incarnation (baseURL/serve/
-	// serveExitErr/serveExitDone/sseCancel) is replaced across
+	// serveExitErr/serveExitDone/serveArmed/sseCancel) is replaced across
 	// Interrupt()+SendPrompt() restarts, and dormant/curRunCancel/sid are
 	// touched from both the caller and the run goroutine.
-	mu            sync.RWMutex
-	sid           string
-	baseURL       string
-	serve         *exec.Cmd
-	serveExitErr  error
+	mu           sync.RWMutex
+	sid          string
+	baseURL      string
+	serve        *exec.Cmd
+	serveExitErr error
+	// serveArmed is the CURRENT incarnation's exit-watcher arming flag — mu
+	// guards the pointer (which incarnation), the atomic guards the value (who
+	// won the race between our kill and its death). Interrupt()/Close() clear it
+	// before killing so a deliberate exit is not mistaken for a crash; see
+	// watchServeExit.
+	serveArmed    *atomic.Bool
 	serveExitDone chan struct{}
 	sseCancel     context.CancelFunc
 	dormant       bool
@@ -254,8 +383,12 @@ func (s *opencodeSession) closeEvents() {
 // matters most here, because Interrupt() deliberately kills the `opencode serve`
 // child and marks the session dormant while SendPrompt is still able to relaunch
 // it and continue the same conversation — a dormant session has no process and is
-// entirely alive. The stream close (Close(), or the Spawn ctx-done teardown) is
-// the only event that ends a session, which is why the flag lives in closeEvents.
+// entirely alive. The stream close is the only event that ends a session, which
+// is why the flag lives in closeEvents. Three things reach it: Close(), the Spawn
+// ctx-done teardown, and — since tether#58 — watchServeExit noticing a serve that
+// died without being asked to. That third one is still not a process probe: it is
+// the session's own lifecycle learning that this incarnation will never produce
+// another event, which is precisely what a dormant serve has not done.
 func (s *opencodeSession) Alive() bool { return !s.dead.Load() }
 
 // unblockSID closes s.sidCh exactly once. Use to either publish a real sid
@@ -416,9 +549,24 @@ func (s *opencodeSession) Interrupt() error {
 	sseCancel := s.sseCancel
 	serve := s.serve
 	exitDone := s.serveExitDone
+	armed := s.serveArmed
 	s.dormant = true
 	s.mu.Unlock()
 
+	// 0. Disarm this incarnation's exit watcher FIRST, before anything that can
+	//    take time. Hibernating is not the session's end — it stays alive and
+	//    relaunchable — so the watcher must not tear it down (watchServeExit).
+	//    Ordering is what makes it sound, and doing it here rather than just
+	//    before the kill is what keeps the window tight: for as long as this flag
+	//    is still set, a serve dying on its own is read as a crash and would end a
+	//    session the caller only wanted to hibernate. Nothing below is a
+	//    precondition for it (sseCancel cancels a CHILD of the serve's ctx, so it
+	//    cannot stop the serve), so there is no reason to wait. The residue —
+	//    "the serve died before Interrupt was even called" — is unavoidable, and
+	//    is correctly classified as a crash either way.
+	if armed != nil {
+		armed.Store(false)
+	}
 	// 1. Cancel the in-flight `opencode run` client so its goroutine winds down
 	//    without surfacing a spurious exit error and emits EventResult.
 	if runCancel != nil {
@@ -429,7 +577,9 @@ func (s *opencodeSession) Interrupt() error {
 	if sseCancel != nil {
 		sseCancel()
 	}
-	// 3. Kill the serve — it owns generation, so this actually stops it.
+	// 3. Kill the serve — it owns generation, so this actually stops it. The exit
+	//    watcher was disarmed in step 0, so this exit hibernates the session
+	//    rather than ending it.
 	if serve != nil && serve.Process != nil {
 		_ = serve.Process.Kill()
 		if exitDone != nil {
@@ -448,6 +598,7 @@ func (s *opencodeSession) Close() error {
 	sseCancel := s.sseCancel
 	serve := s.serve
 	exitDone := s.serveExitDone
+	armed := s.serveArmed
 	s.mu.Unlock()
 
 	// Cancel any in-flight `opencode run` client too: killing the serve alone
@@ -458,6 +609,14 @@ func (s *opencodeSession) Close() error {
 	}
 	if sseCancel != nil {
 		sseCancel()
+	}
+	// Disarm before killing: this exit is asked for, and Close() ends the session
+	// itself below. Placement is don't-care here, unlike in Interrupt() — leaving
+	// it armed entirely would only duplicate a teardown we are about to do, and
+	// every step of that is idempotent. Disarming anyway keeps one meaning for the
+	// flag: exactly one party ends an incarnation.
+	if armed != nil {
+		armed.Store(false)
 	}
 	if serve != nil && serve.Process != nil {
 		_ = serve.Process.Kill()
@@ -477,7 +636,11 @@ func (s *opencodeSession) Close() error {
 // incarnation, bound to baseURL and stopped via ctx (see startServe). It does
 // NOT close the session's event stream on exit — the session outlives any
 // single serve incarnation (Interrupt() kills one, SendPrompt relaunches
-// another); closeEvents is owned by Close() / the Spawn ctx-done goroutine.
+// another); closeEvents is owned by Close(), the Spawn ctx-done goroutine, and
+// watchServeExit. Note the loop cannot detect its own serve's death for us
+// anyway: a dead port fails the request, which is indistinguishable from a
+// restart in progress, so it retries — which is why the exit watcher, not this
+// loop, is what ends the session (tether#58).
 func (s *opencodeSession) sseLoop(ctx context.Context, baseURL string) {
 	client := &http.Client{}
 	url := baseURL + "/global/event"

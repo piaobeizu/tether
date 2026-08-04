@@ -80,6 +80,73 @@ export function historyEntryToMessage(m: HistoryEntry): Message {
   return msg
 }
 
+/**
+ * A daemon session-lifecycle notice (tether#50) — e.g. "the previous
+ * conversation's context could not be restored".
+ *
+ * tether#57 — this lives in its OWN store slice rather than inside `messages`,
+ * and that separation is the whole fix. `messages` is server truth: the
+ * `[sessionId]` effect refetches GET /messages and `loadHistory` REPLACES the
+ * array wholesale. A notice is locally-originated, never persisted by the
+ * daemon, and unrecoverable once dropped — so while it shared that array, the
+ * refetch that `session_ready` itself triggers could silently wipe the one line
+ * explaining why the user's context is gone. Two lists with two owners cannot
+ * clobber each other; they are recombined only at render time by
+ * `mergeTranscript` below. (Before #57 the notice survived purely by accident,
+ * because that refetch is skipped while a turn is streaming.)
+ */
+export interface Notice {
+  id: string
+  text: string
+  ts: number
+}
+
+/**
+ * mergeTranscript recombines the two independently-owned lists into the single
+ * ordered transcript the chat pane renders — a pure projection, computed at
+ * render time, owning no state of its own.
+ *
+ * Notices are projected into the `role: 'system'` Message shape so the existing
+ * `.msg-system` render branch (tether#50) handles them unchanged.
+ *
+ * WHY interleave chronologically instead of pinning notices to the top? Because
+ * in the common case the history refetch is skipped (it is guarded on
+ * `!streaming`), so the list the user is looking at still holds the OLD
+ * session's conversation plus their just-sent prompt — and "we started a new
+ * session" belongs AFTER those, not above them. Head-of-list is only the right
+ * answer in the post-refetch state, where every message does belong to the new
+ * session. Chronological placement is right in both.
+ *
+ * Ordering: each notice is INSERTED before the first message whose ts is at or
+ * after the notice's (ties put the notice first) — messages are never reordered
+ * relative to one another. That distinction matters because `messages` is not
+ * guaranteed ts-monotonic: live bubbles are stamped with the BROWSER clock while
+ * refetched history carries the DAEMON's, so a naive sort of the union could
+ * reshuffle the user's actual conversation.
+ *
+ * Be honest about the limit of that: because the two clocks are different (tether
+ * is routinely driven from a phone against a remote daemon), skew is not bounded,
+ * and a badly skewed clock can land a notice anywhere in the list, including
+ * either end. What it can never do is reorder the messages themselves — the
+ * transcript stays intact, only the banner's position degrades.
+ *
+ * The common case (no notices) returns the SAME array reference, so it is inert
+ * for memoisation and re-render identity.
+ */
+export function mergeTranscript(messages: Message[], notices: Notice[]): Message[] {
+  if (notices.length === 0) return messages
+  const pending = [...notices].sort((a, b) => a.ts - b.ts)
+  const asMessage = (n: Notice): Message => ({ id: n.id, role: 'system', text: n.text, ts: n.ts })
+  const out: Message[] = []
+  let i = 0
+  for (const m of messages) {
+    while (i < pending.length && pending[i].ts <= m.ts) { out.push(asMessage(pending[i])); i++ }
+    out.push(m)
+  }
+  while (i < pending.length) { out.push(asMessage(pending[i])); i++ }
+  return out
+}
+
 export interface PermissionRequest {
   id: string
   toolName: string
@@ -104,6 +171,10 @@ export interface SelectedFile {
 interface AppState {
   sessionId: string | null
   messages: Message[]
+  // Daemon session-lifecycle notices (tether#50), kept OUT of `messages` so the
+  // history refetch cannot wipe them (tether#57 — see the Notice doc comment).
+  // Live-only, page-lifetime: the daemon never persists them.
+  notices: Notice[]
   // Pending PreToolUse permission requests (tether#40). A QUEUE, not one slot:
   // parallel tools each send their own KindPermission, so a single slot let the
   // later request clobber the earlier one → all-but-one timed out. Live-only.
@@ -144,6 +215,11 @@ interface AppState {
 
   setSessionId: (id: string) => void
   loadHistory: (msgs: Message[]) => void
+  /** Drop the notice list when the USER deliberately opens a different session
+   *  (tether#57). Not wired to setSessionId: the resume-fallback path also
+   *  changes the sid, and clearing there would discard the very notice that
+   *  explains the change. */
+  clearNotices: () => void
   addMessage: (msg: Message) => void
   /** Remove one request from the queue after it's decided (tether#40). */
   resolvePermission: (id: string) => void
@@ -174,6 +250,7 @@ function finalizeTurn(s: AppState): Partial<AppState> {
 export const useStore = create<AppState>((set, get) => ({
   sessionId: null,
   messages: [],
+  notices: [],
   pendingPermissions: [],
   connected: false,
   streaming: false,
@@ -214,8 +291,17 @@ export const useStore = create<AppState>((set, get) => ({
     }
     // A session reset (page reload / session switch) drops any stale pending
     // permission requests — they belong to the prior session (tether#40).
+    //
+    // tether#57 — note what is NOT in this return: `notices`. This reducer is
+    // the server-truth replace, and it does not own the notice list, so it
+    // cannot drop it. Do not add `notices` here to "reset" it; use clearNotices
+    // at the deliberate session-switch call sites instead.
     return { messages: reduced, streamingMsgId: null, streaming: false, curTurnId: null, thinkingStartTs: null, answerStartTs: null, stopped: false, pendingPermissions: [] }
   }),
+  // No-op when there is nothing to clear: ChatPane subscribes without a selector,
+  // so an unconditional set() would re-render it (and invalidate the transcript
+  // memo) on every session switch whether or not a notice existed.
+  clearNotices: () => set((s) => (s.notices.length === 0 ? {} : { notices: [] })),
   addMessage: (msg) => set((s) => ({
     messages: [...s.messages, msg],
     // A new user turn ends the prior assistant turn's accumulation (tether#34).
@@ -262,11 +348,26 @@ export const useStore = create<AppState>((set, get) => ({
             // It is also exempt from the `stopped` gate below for the same
             // reason session_ready is: it is session lifecycle, not a late
             // delta from a turn the user stopped.
+            //
+            // tether#57 — lands in `notices`, NOT `messages`. session_ready (which
+            // the daemon SENDS just before this one) sets the new sid, which fires
+            // ChatPane's history refetch, and that refetch's loadHistory replaces
+            // `messages` wholesale. Appending here put the notice directly in the
+            // path of that replace; it survived only while the refetch happened to
+            // be skipped mid-stream. Keeping it in a list loadHistory does not own
+            // removes the race rather than re-timing it. Still ignores
+            // env.SessionID (send order is not delivery order — see wt_chat.go).
             const noticeText = typeof pObj['text'] === 'string' ? (pObj['text'] as string) : ''
             if (noticeText) {
-              set((s) => ({
-                messages: [...s.messages, { id: crypto.randomUUID(), role: 'system' as const, text: noticeText, ts: Date.now() }],
-              }))
+              // Nothing prunes this list except a deliberate session switch or a
+              // page reload (before #57 a quiet refetch pruned it — that WAS the
+              // bug, but it also capped the pile). The text is a compile-time
+              // constant in wt_chat.go, so a long-lived tab that falls back
+              // several times would otherwise stack identical lines: collapse a
+              // repeat of the line already showing.
+              set((s) => (s.notices[s.notices.length - 1]?.text === noticeText ? {} : ({
+                notices: [...s.notices, { id: crypto.randomUUID(), text: noticeText, ts: Date.now() }],
+              })))
             }
             break
           }

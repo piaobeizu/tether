@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { useStore } from './store'
+import { useStore, mergeTranscript, type Message, type Notice } from './store'
 import type { Envelope } from './wire.gen'
 
 // tether#34 — extended-thinking accumulation in the chat store. These drive
@@ -12,7 +12,7 @@ const resultEnv = (): Envelope => ({ kind: 'result', payload: 'stop' })
 const fencedEnv = (blkKind: string): Envelope => ({ kind: 'fenced', payload: { kind: blkKind } } as unknown as Envelope)
 
 function reset() {
-  useStore.setState({ messages: [], streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null, stopped: false, pendingPermissions: [] })
+  useStore.setState({ messages: [], notices: [], streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null, stopped: false, pendingPermissions: [] })
 }
 
 describe('store thinking accumulation (tether#34)', () => {
@@ -434,16 +434,26 @@ describe('store stopTurn (tether#42)', () => {
 // session_ready when a `cc --resume` failed AND the dead session had history.
 const noticeEnv = (text: string): Envelope => ({ kind: 'message', payload: { type: 'notice', text } })
 
+/** What ChatPane actually renders: the two lists recombined (tether#57). */
+const rendered = () => {
+  const s = useStore.getState()
+  return mergeTranscript(s.messages, s.notices)
+}
+
 describe('store session notice (tether#50)', () => {
   afterEach(reset)
 
-  it('appends the notice as its own system message', () => {
+  it('records the notice as a system line in the rendered transcript', () => {
     const h = useStore.getState().handleEnvelope
     h(noticeEnv('Started a new session — the previous context could not be restored.'))
-    const s = useStore.getState()
-    expect(s.messages).toHaveLength(1)
-    expect(s.messages[0].role).toBe('system')
-    expect(s.messages[0].text).toBe('Started a new session — the previous context could not be restored.')
+    // tether#57 — it is kept OUT of `messages` (server truth) …
+    expect(useStore.getState().messages).toHaveLength(0)
+    expect(useStore.getState().notices).toHaveLength(1)
+    // … but is still what the pane renders.
+    const t = rendered()
+    expect(t).toHaveLength(1)
+    expect(t[0].role).toBe('system')
+    expect(t[0].text).toBe('Started a new session — the previous context could not be restored.')
   })
 
   it('does not claim the turn cursor, so the replayed answer gets its own bubble', () => {
@@ -459,18 +469,19 @@ describe('store session notice (tether#50)', () => {
     expect(useStore.getState().streamingMsgId).toBeNull()
 
     h(textEnv('here is the real answer'))
-    const s = useStore.getState()
-    expect(s.messages).toHaveLength(2)
-    expect(s.messages[0].role).toBe('system')
-    expect(s.messages[0].text).toBe('context lost')
-    expect(s.messages[1].role).toBe('assistant')
-    expect(s.messages[1].text).toBe('here is the real answer')
+    const t = rendered()
+    expect(t).toHaveLength(2)
+    expect(t[0].role).toBe('system')
+    expect(t[0].text).toBe('context lost')
+    expect(t[1].role).toBe('assistant')
+    expect(t[1].text).toBe('here is the real answer')
   })
 
   it('ignores a notice with no text', () => {
     const h = useStore.getState().handleEnvelope
     h({ kind: 'message', payload: { type: 'notice' } } as unknown as Envelope)
-    expect(useStore.getState().messages).toHaveLength(0)
+    expect(useStore.getState().notices).toHaveLength(0)
+    expect(rendered()).toHaveLength(0)
   })
 
   it('is delivered even after a manual stop (session lifecycle, not turn content)', () => {
@@ -481,7 +492,137 @@ describe('store session notice (tether#50)', () => {
     const h = useStore.getState().handleEnvelope
     useStore.setState({ stopped: true })
     h(noticeEnv('context lost'))
-    expect(useStore.getState().messages).toHaveLength(1)
-    expect(useStore.getState().messages[0].role).toBe('system')
+    const t = rendered()
+    expect(t).toHaveLength(1)
+    expect(t[0].role).toBe('system')
+  })
+})
+
+// tether#57 — the notice must survive the history refetch that session_ready
+// itself sets off. Chain: session_ready(newSid) → setSessionId → ChatPane's
+// [sessionId] effect → GET /messages → loadHistory, which REPLACES `messages`.
+// While the notice lived in that array the refetch could silently eat it, and
+// the daemon never persists the notice, so there was no way to get it back.
+describe('session notice survives the history refetch (tether#57)', () => {
+  afterEach(reset)
+
+  const histMsg = (role: Message['role'], text: string, ts: number): Message =>
+    ({ id: `h-${role}-${ts}`, role, text, ts })
+
+  it('is still rendered after loadHistory replaces the whole message list', () => {
+    const h = useStore.getState().handleEnvelope
+    h(noticeEnv('context lost'))
+    // The refetch for the NEW sid resolves in a quiet moment and replaces
+    // everything with server truth (the replayed prompt + its answer). A realistic
+    // ±1s window around the notice, not absurd 1970/2286 sentinels that would make
+    // the ordering assertion below true by construction.
+    useStore.getState().loadHistory([
+      histMsg('user', 'what did we decide?', Date.now() - 1_000),
+      histMsg('assistant', 'starting fresh', Date.now() + 1_000),
+    ])
+    expect(useStore.getState().messages).toHaveLength(2)
+    const t = rendered()
+    // THE point of tether#57: the notice outlived the wholesale replace.
+    expect(t.filter(m => m.role === 'system').map(m => m.text)).toEqual(['context lost'])
+    // Secondary: with clocks agreeing it lands between the prompt and the answer.
+    // (Under real cross-machine skew the position can degrade — see mergeTranscript.)
+    expect(t.map(m => m.role)).toEqual(['user', 'system', 'assistant'])
+  })
+
+  // The two edits most likely to silently restore the bug with a green suite:
+  // "tidying up" a session reset by clearing notices in setSessionId (which the
+  // resume-fallback path itself calls) or in the disconnect reducer.
+  it('setSessionId does NOT clear notices — the fallback path changes the sid too', () => {
+    useStore.getState().handleEnvelope(noticeEnv('context lost'))
+    useStore.getState().setSessionId('a-brand-new-sid')
+    expect(useStore.getState().notices).toHaveLength(1)
+    expect(rendered().some(m => m.role === 'system')).toBe(true)
+  })
+
+  it('a disconnect does NOT clear notices', () => {
+    useStore.getState().handleEnvelope(noticeEnv('context lost'))
+    useStore.getState().setConnected(false)
+    expect(useStore.getState().notices).toHaveLength(1)
+  })
+
+  it('collapses a repeat of the notice already showing (constant text, no pile-up)', () => {
+    const h = useStore.getState().handleEnvelope
+    h(noticeEnv('context lost'))
+    h(noticeEnv('context lost'))
+    expect(useStore.getState().notices).toHaveLength(1)
+  })
+
+  it('survives repeated refetches (loadHistory can never own the notice list)', () => {
+    const h = useStore.getState().handleEnvelope
+    h(noticeEnv('context lost'))
+    useStore.getState().loadHistory([histMsg('user', 'a', 1)])
+    useStore.getState().loadHistory([histMsg('user', 'a', 1), histMsg('assistant', 'b', 2)])
+    expect(useStore.getState().notices).toHaveLength(1)
+    expect(rendered().some(m => m.role === 'system' && m.text === 'context lost')).toBe(true)
+  })
+
+  it('clearNotices retires it on a deliberate session switch', () => {
+    const h = useStore.getState().handleEnvelope
+    h(noticeEnv('context lost'))
+    expect(rendered()).toHaveLength(1)
+    useStore.getState().clearNotices()
+    expect(useStore.getState().notices).toHaveLength(0)
+    expect(rendered()).toHaveLength(0)
+  })
+})
+
+describe('mergeTranscript (tether#57)', () => {
+  const msg = (id: string, ts: number): Message => ({ id, role: 'user', text: id, ts })
+  const notice = (id: string, ts: number): Notice => ({ id, text: id, ts })
+
+  it('returns the SAME array reference when there are no notices', () => {
+    const msgs = [msg('a', 1), msg('b', 2)]
+    expect(mergeTranscript(msgs, [])).toBe(msgs)
+  })
+
+  it('inserts a notice before the first message at or after its ts', () => {
+    const out = mergeTranscript([msg('a', 10), msg('b', 30)], [notice('n', 20)])
+    expect(out.map(m => m.id)).toEqual(['a', 'n', 'b'])
+  })
+
+  it('on an exact ts tie the notice goes FIRST (Date.now() is only ms-granular)', () => {
+    expect(mergeTranscript([msg('a', 10)], [notice('n', 10)]).map(m => m.id)).toEqual(['n', 'a'])
+  })
+
+  it('appends a notice newer than every message', () => {
+    const out = mergeTranscript([msg('a', 10)], [notice('n', 99)])
+    expect(out.map(m => m.id)).toEqual(['a', 'n'])
+  })
+
+  it('renders a notice with no messages at all', () => {
+    expect(mergeTranscript([], [notice('n', 5)]).map(m => m.id)).toEqual(['n'])
+  })
+
+  it('keeps multiple notices in ts order', () => {
+    const out = mergeTranscript([msg('a', 10)], [notice('n2', 40), notice('n1', 20)])
+    expect(out.map(m => m.id)).toEqual(['a', 'n1', 'n2'])
+  })
+
+  it('never reorders messages among themselves, even with non-monotonic ts', () => {
+    // `messages` mixes browser-stamped live bubbles with daemon-stamped history,
+    // so it is NOT guaranteed ts-sorted. A naive sort of the union would
+    // reshuffle the user's real conversation; insertion must not.
+    const msgs = [msg('a', 100), msg('b', 5), msg('c', 200)]
+    const out = mergeTranscript(msgs, [notice('n', 50)])
+    expect(out.filter(m => m.id !== 'n').map(m => m.id)).toEqual(['a', 'b', 'c'])
+    expect(out.map(m => m.id)).toEqual(['n', 'a', 'b', 'c'])
+  })
+
+  it('projects a notice into the system-role Message shape the renderer expects', () => {
+    const [only] = mergeTranscript([], [{ id: 'n1', text: 'context lost', ts: 7 }])
+    expect(only).toEqual({ id: 'n1', role: 'system', text: 'context lost', ts: 7 })
+  })
+
+  it('does not mutate either input list', () => {
+    const msgs = [msg('a', 10)]
+    const nots = [notice('n2', 40), notice('n1', 20)]
+    mergeTranscript(msgs, nots)
+    expect(msgs.map(m => m.id)).toEqual(['a'])
+    expect(nots.map(n => n.id)).toEqual(['n2', 'n1'])
   })
 })

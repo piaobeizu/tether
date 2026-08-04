@@ -153,11 +153,12 @@ type Session interface {
 	//
 	// Note for implementers: this is the transport's view, not the OS's. Do NOT
 	// implement it as a process-liveness probe. `kill(pid, 0)` succeeds for a
-	// zombie, and tether leaves one behind for every session it does not
-	// explicitly reap (tether#56), so a signal probe would call every corpse
-	// alive. It would also be wrong in the other direction for OpenCodeProvider,
-	// whose serve child is deliberately killed and relaunched around Interrupt()
-	// while the SESSION stays perfectly usable.
+	// zombie, and an exited agent IS one until something reaps it — since
+	// tether#56 that is Registry.teardown, but it runs after the event stream
+	// closes, so the window is real and a signal probe inside it would call a
+	// corpse alive. It would also be wrong in the other direction for
+	// OpenCodeProvider, whose serve child is deliberately killed and relaunched
+	// around Interrupt() while the SESSION stays perfectly usable.
 	Alive() bool
 	// SendPrompt sends a user prompt as a stream-json message.
 	SendPrompt(ctx context.Context, text string) error
@@ -165,6 +166,27 @@ type Session interface {
 	Events() <-chan Event
 	// Interrupt sends a SIGINT to the subprocess.
 	Interrupt() error
-	// Close shuts down the session cleanly.
+	// Close ends the session and releases the OS resources behind it. For a
+	// process-backed agent that means REAPING the child — leaving it unreaped
+	// costs the daemon a zombie, a parked exec watchdog goroutine and a pipe fd
+	// per session, for as long as the daemon runs (tether#56).
+	//
+	// Every session is closed exactly once by Registry.teardown, from fanOut's
+	// defer, i.e. after this session's Events() channel has closed AND drained.
+	// Some are closed EARLIER as well (Attachment.resolve reaps a failed resume
+	// as soon as it knows the resume failed), so implementations MUST be
+	// idempotent: the second call has to return the same answer, not an error
+	// about the first one.
+	//
+	// It is NOT required to be non-blocking, and neither implementation is:
+	// waiting for a child process is the point. What that costs is worth stating,
+	// because idempotency is usually achieved with a once-guard and a once-guard
+	// makes concurrent callers RENDEZVOUS — the second caller blocks for as long
+	// as the first one does. ccSession is exactly that shape, so a Close that
+	// waits on a child which is not exiting stalls both the fanOut goroutine that
+	// entered first and any Attachment.resolve reap that arrives behind it. That
+	// is bounded in practice by the connection context killing the child, and it
+	// is strictly better than the leak it replaced, but it means a caller on a
+	// latency-sensitive path should not treat Close as cheap.
 	Close() error
 }

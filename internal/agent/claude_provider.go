@@ -159,6 +159,9 @@ type ccSession struct {
 	sidOnce  sync.Once
 	done     chan struct{} // closed when readLoop returns (cc process fully exited)
 	reqSeq   int           // control_request id counter (T9 pause/interrupt), guarded by mu
+	// closeOnce/closeErr make Close idempotent — see Close for why it has to be.
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // SessionID blocks until cc emits system/init (which resolves s.sid) OR the
@@ -265,9 +268,51 @@ func (s *ccSession) Interrupt() error {
 	return s.enc.Encode(req)
 }
 
+// Close reaps the cc subprocess. It closes the stdin this session writes prompts
+// to and then waits for the process, which is what releases the three things a
+// session otherwise leaves behind for the whole life of the daemon (tether#56):
+// the `[claude] <defunct>` zombie, the stdin fd, and the goroutine
+// exec.CommandContext starts to watch ctx — that one parks on an internal
+// unbuffered channel whose only receiver is inside Wait, so with no cmd.WaitDelay
+// set (tether sets none) it is Wait, and nothing else, that lets it finish. Note
+// that a ctx cancellation does NOT release it on its own; it merely moves it from
+// one park to the next.
+//
+// # Only safe once every read of cc's stdout has finished
+//
+// os/exec documents cmd.Wait as incorrect to call while a read from StdoutPipe
+// is still in flight — Wait closes that pipe, out from under whoever is reading
+// it. readLoop is the sole reader, so each caller has to establish that readLoop
+// has stopped scanning BEFORE calling this. The two production callers do, by
+// different routes, and both spell the argument out at the call site:
+//
+//   - Registry.teardown (internal/session/registry.go), from fanOut's defer:
+//     Events() has closed and drained, and close(s.events) is readLoop's LAST
+//     deferred statement.
+//   - Attachment.resolve (internal/session/attach.go), on the failed-resume
+//     path: SessionID() returned "" only because `done` closed, and
+//     close(s.done) is likewise a readLoop defer.
+//
+// A third caller owes the same argument. "The process looks dead" is NOT it:
+// readLoop can still be draining bytes the pipe buffered before the process
+// exited, which is exactly the window the os/exec warning is about.
+//
+// # Idempotent on purpose
+//
+// The two callers above are not mutually exclusive — a failed resume reaps
+// eagerly from the serveChat goroutine while that same entry's fanOut is
+// independently unwinding toward its teardown defer — and cmd.Wait is not
+// re-entrant: a second call answers "exec: Wait was already called" and cannot
+// re-report the exit status. Guarding it here rather than asking every caller to
+// coordinate keeps the reap at exactly one per session and gives every caller
+// the same answer, instead of handing the loser an error about bookkeeping it
+// did not do.
 func (s *ccSession) Close() error {
-	_ = s.stdin.Close()
-	return s.cmd.Wait()
+	s.closeOnce.Do(func() {
+		_ = s.stdin.Close()
+		s.closeErr = s.cmd.Wait()
+	})
+	return s.closeErr
 }
 
 // emit sends ev to s.events. Terminal events (isTerminal) block until delivered

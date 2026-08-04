@@ -357,9 +357,16 @@ func (a *Attachment) resolve(ctx context.Context) (Resolution, error) {
 	// documented os/exec race — so this is only safe because of WHY we are here:
 	// SessionID() returned "" only because ccSession's `done` channel closed, and
 	// `done` is closed by readLoop's own defer, so readLoop has already returned
-	// and every read from that pipe is finished. Skipping it leaks a zombie plus
-	// an exec watchdog goroutine per failed resume, and a failed resume is an
-	// ordinary reload event rather than a rare one.
+	// and every read from that pipe is finished.
+	//
+	// Since tether#56 this entry's own fanOut reaps it too, from Registry.teardown,
+	// so the reap is no longer at risk of being skipped — but it is still done HERE
+	// rather than left to that defer. The fresh spawn happens on the next line, and
+	// bounding "how long can two cc processes for one attachment overlap" to this
+	// call rather than to whenever another goroutine gets scheduled is worth one
+	// idempotent call. agent.Session.Close is required to be idempotent precisely
+	// so these two can coexist (see the interface doc); whichever arrives second
+	// gets the same answer instead of "Wait was already called".
 	if err := e.Session().Close(); err != nil {
 		slog.Debug("reaped the failed-resume subprocess", "requested_sid", a.reqSID, "err", err)
 	}

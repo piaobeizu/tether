@@ -145,9 +145,13 @@ func (r *Registry) GetLock(sid string) *SessionLock {
 // doing it again is a no-op, and it cannot take out the replacement session that
 // re-keys under this sid moments later.
 //
-// A dead entry is left UNREAPED (no Session().Close()), which leaks the zombie
-// tether#56 is about — deliberately, because it leaks that zombie identically
-// today and reaping is that slice's job, not a behaviour to smuggle in here.
+// The agent behind a dead entry is NOT reaped here, and that is not an omission:
+// this function knows the session is over, but not that readLoop has stopped
+// reading its stdout, which is the precondition Session().Close() needs (see
+// teardown). Reaping stays with the entry's own fanOut, which is by now unwinding
+// toward its teardown defer and will get there whether or not this ran.
+// Un-registering early only stops the corpse from being handed to the next
+// reconnect.
 func (r *Registry) liveEntry(sid string) (*Entry, bool) {
 	if sid == "" {
 		return nil, false
@@ -408,9 +412,12 @@ func (r *Registry) GetOrSpawn(ctx context.Context, sid, providerName string) (ag
 	return e.sess, nil
 }
 
-// evict removes e from the sessions map after its session has terminated —
-// called from fanOut's defer, i.e. once the agent's Events() channel has
-// closed. serveChat binds the agent subprocess to the client-connection
+// evict removes e from the sessions map after its session has terminated. On the
+// ordinary path it is reached through teardown (which fanOut defers), i.e. once
+// the agent's Events() channel has closed — un-registering is only HALF of ending
+// a session, and teardown is where the other half, reaping the agent, lives and
+// where the argument for its safety is written down. serveChat binds the agent
+// subprocess to the client-connection
 // context (exec.CommandContext with wtsess.Context()), and both providers
 // close Events() when that context is cancelled — cc via readLoop's
 // `defer close(events)` after the SIGKILL'd subprocess EOFs, opencode via its
@@ -424,8 +431,9 @@ func (r *Registry) GetOrSpawn(ctx context.Context, sid, providerName string) (ag
 // e.regKey. Since tether#54 an entry is registered under its sid from before its
 // process existed and only Registry.rekey ever moves it, so the two agree — the
 // by-value scan is kept because it is what makes this idempotent and
-// order-independent for its three callers (fanOut's defer, liveEntry dropping a
-// corpse, Attachment.resolve dropping a failed resume), and because it cannot
+// order-independent for its three callers (teardown, from fanOut's defer;
+// liveEntry dropping a corpse; Attachment.resolve dropping a failed resume), and
+// because it cannot
 // take out a DIFFERENT entry that has since been registered under the same key.
 // Deleting during range is safe per the Go spec, and this runs once per session
 // lifetime — not on a hot path.
@@ -441,6 +449,103 @@ func (r *Registry) evict(e *Entry) {
 		if v == e {
 			delete(r.sessions, k)
 		}
+	}
+}
+
+// teardown ends a session for good: it un-registers the entry, then reaps the
+// agent behind it. Called from fanOut's defer and nowhere else — so once per
+// session, on the session's own goroutine, after Events() has closed AND drained.
+//
+// # Why the reap lives here
+//
+// agent.Session.Close is the only thing in the daemon that waits on the CC
+// subprocess (other cmd.Wait calls exist — the PTY shell, the workspace MCP tool,
+// opencode's own serve reaper — but none of them can reap a cc), and until
+// tether#56 its only production caller was Attachment.resolve, on the
+// failed-resume path. Every session that ended the ORDINARY way — the
+// overwhelming majority — therefore left behind a `[claude] <defunct>` zombie, a
+// goroutine parked in exec.CommandContext's ctx watchdog, and an unclosed stdin
+// fd, all held until the daemon itself exited. Measured on a live daemon at one of
+// each per chat session.
+//
+// # Why not in evict, the other obvious candidate
+//
+// Two independent reasons, either one sufficient:
+//
+//   - evict runs under r.mu, and cmd.Wait blocks until the child is reaped.
+//     Holding the registry-wide lock across a wait on a child process is how one
+//     agent that is slow to die stops every OTHER session from being looked up —
+//     the same objection liveEntry states for calling Alive() under the lock.
+//   - evict has three callers and is deliberately idempotent, and only this one
+//     can prove the os/exec precondition below. liveEntry and Attachment.resolve
+//     evict a session they know is DEAD; dead is not the same as "nothing is
+//     reading its stdout any more".
+//
+// # The os/exec precondition, spelled out
+//
+// cmd.Wait must not run while anything is still reading the process's stdout: it
+// closes the pipe under the reader, which os/exec documents as incorrect and
+// which costs at minimum the last line. Nothing is, and here is the chain:
+//
+//	the `range e.sess.Events()` in fanOut returned
+//	  ⟹ that channel is closed
+//	  ⟹ ccSession.readLoop ran its `defer close(s.events)`
+//	  ⟹ readLoop's `for scanner.Scan()` loop is over
+//	  ⟹ every read of that process's stdout has completed.
+//
+// That chain is INDEPENDENT of the order readLoop's two defers run in: both of
+// them run after the scan loop, and the scan loop ending is the whole of what Wait
+// cares about. So this is not a second thing balanced on that hand-checked
+// invariant — worth saying, because the invariant is real and nearby, and a reader
+// who assumed this depended on it would also assume swapping the defers had to be
+// re-argued here. What the order IS load-bearing for is Alive() ("Events() closed
+// ⟹ Alive() already false", claude_provider.go); leave it alone for that reason,
+// not for this one.
+//
+// The order does buy one thing here, though: because `events` closes LAST, this is
+// the LATER of the two available signals, which makes it a strictly stronger
+// precondition than the one Attachment.resolve argues from (`done`). Both are
+// sound; the difference is only how much slack each leaves.
+//
+// What neither argument is, and what a third call site must not be: "the process
+// exited, so Wait must be safe". readLoop can still be draining bytes the pipe
+// buffered before the process died, and that is precisely the window os/exec warns
+// about.
+//
+// # What it means for the other provider
+//
+// For OpenCodeProvider this call is a confirmation rather than a reap: its Close
+// kills the `opencode serve` child and then waits on the goroutine that already
+// owns that child's cmd.Wait, and its events channel is closed only by
+// closeEvents — which either Close itself or the Spawn ctx-done teardown has
+// already run by the time we get here. Arriving second is therefore free, but NOT
+// because Close is once-guarded: it is not. It is idempotent by construction —
+// killing an already-reaped process returns ErrProcessDone, which it discards;
+// receiving from the already-closed serve-exit channel returns immediately; and
+// closeEvents is itself the once-guard. Worth spelling out, because a maintainer
+// who reads "idempotent" here and goes looking for a sync.Once in
+// opencode_provider.go will not find one and may conclude this call is unsafe.
+//
+// Note also the case that never reaches here at all: Interrupt() kills the serve
+// WITHOUT closing Events(), because a hibernated opencode session is still alive
+// and the next SendPrompt relaunches it — so a dormant session is not torn down
+// by mistake.
+func (r *Registry) teardown(e *Entry) {
+	r.mu.RLock()
+	sid := e.regKey
+	r.mu.RUnlock()
+
+	// Evict FIRST. It is what stops the dead sid from reading as live to the next
+	// reconnect, and it must not queue behind a Wait on a child that is slow to
+	// die. The reap has no such urgency — nothing observes it but the OS.
+	r.evict(e)
+
+	// A non-nil error here is the normal case, not an alarm: the overwhelmingly
+	// common teardown is a client disconnect, which cancels the Spawn ctx, which
+	// SIGKILLs cc, so Wait reports "signal: killed". Debug, and logged only so an
+	// operator chasing a stuck session can see the reap happened at all.
+	if err := e.sess.Close(); err != nil {
+		slog.Debug("reaped the agent behind an ended session", "sid", sid, "err", err)
 	}
 }
 
@@ -714,9 +819,12 @@ func truncStr(s string, n int) string {
 func (r *Registry) fanOut(e *Entry) {
 	// When the range below returns, the agent's Events() channel has closed —
 	// the session has ended (subprocess exited, or the client disconnected and
-	// cancelled the Spawn context that bounds the subprocess). Evict the entry
-	// so long-running daemons don't leak dead sessions in r.sessions (tether#12).
-	defer r.evict(e)
+	// cancelled the Spawn context that bounds the subprocess). Un-register the
+	// entry so long-running daemons don't leak dead sessions in r.sessions
+	// (tether#12), and reap the agent so they don't leak its process either
+	// (tether#56). Both live in teardown, which is also where the argument for
+	// why the reap is SAFE at this exact point is written down.
+	defer r.teardown(e)
 
 	var sid string
 	// sawInit records whether this session ever produced a system/init. It is set

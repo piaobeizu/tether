@@ -65,6 +65,34 @@ func (r *Registry) Get(id string) (Workspace, bool) {
 	return Workspace{}, false
 }
 
+// Path resolves a workspace ID to its absolute path, reporting whether the ID is
+// registered at all.
+//
+// It exists so that a caller which must turn a CLIENT-SUPPLIED workspace id into
+// a directory (tether#52 — the `?ws=` parameter on /wt/chat) can do so without
+// depending on this package: session.WorkspaceLookup is exactly this one method,
+// so internal/session declares the interface and *Registry satisfies it, and no
+// new import edge is created in either direction.
+//
+// The (string, bool) shape rather than (string, error) is deliberate: there is
+// exactly one way to fail — the id is not in the registry — and the CALLER is
+// where that has to become an error, because only the caller knows what refusing
+// costs. Handing back "" with no second return would let a caller spend an
+// unchecked empty string as "use the default directory", which for the /wt/chat
+// route means an unknown id silently selecting the daemon's own workspace root
+// instead of being rejected. That is the failure mode this signature makes
+// unavailable.
+func (r *Registry) Path(id string) (string, bool) {
+	if id == "" {
+		return "", false
+	}
+	w, ok := r.Get(id)
+	if !ok {
+		return "", false
+	}
+	return w.Path, true
+}
+
 // Add registers a new workspace (deduplicated by path).
 func (r *Registry) Add(name, path string) (Workspace, error) {
 	abs, err := filepath.Abs(path)

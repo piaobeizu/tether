@@ -40,16 +40,70 @@ session isolation (D-04 `LockUser="default"`) is still v1.0+.
 clients (Cursor, Goose) can connect via OAuth PKCE (v0.3.3) or manual Bearer
 tokens (v0.3.2). Gemini provider is still v1.0+.
 
-**Agent cwd is daemon-global, not per-workspace**
-Every spawned agent (chat provider and the PTY shell pane) runs in the single
-directory resolved from `--workspace-root` (default `~/.tether/workspace`) — see
-`session.Registry.Workdir`. It is *not* the `Path` of whichever
-`internal/workspace` entry the UI is showing, because the chat wire protocol
-carries no workspace selector. Consequences: all registered workspaces share one
-cc project directory (so `--resume` history is pooled), and a daemon launched
-without `--workspace-root` no longer inherits its own launch directory as the
-agent cwd (pre-v0.4 behaviour) — pass `--workspace-root <dir>` to choose it
-explicitly rather than relying on where the daemon was started.
+~~**Agent cwd is daemon-global, not per-workspace**~~
+*(Resolved in tether#52.)* A chat connection selects a registered workspace with
+`?ws=<id>` on `/wt/chat`; the agent runs in that workspace's `Path`, and the PTY
+shell pane follows the chat session it resumes
+(`session.Registry.WorkdirForSession`). The daemon resolves the **id** through
+`~/.tether/workspaces.json` and refuses one it does not know — a client never
+supplies a path. A connection that selects no workspace still runs in the
+resolved `--workspace-root` (default `~/.tether/workspace`), which remains the
+MCP builtin-tools sandbox root as well.
+
+Residuals:
+
+- **A session's workspace is fixed for its lifetime.** cc keys its transcript on
+  cwd, so a session created in workspace A cannot be resumed in B. Browsing to a
+  different workspace therefore does *not* move a live session — open a new
+  session to work elsewhere. The binding is recorded at
+  `~/.tether/sessions/<sid>/workspace.json` and honoured on reconnect; a session
+  presented under a *different* workspace is answered with a new session there,
+  reported like a failed resume (`Recovered`/notice), never resumed in the wrong
+  directory.
+- **The tether MCP builtin tools do NOT follow the session's workspace.**
+  `workspace_read_file` / `workspace_list_files` / `workspace_run_shell`
+  (`internal/mcp/builtin`) are rooted at `--workspace-root` for the daemon's whole
+  life, because that server is a single instance injected into
+  `~/.claude/settings.json`. Before this change agent cwd and that root were the
+  same directory; now a workspace-selected session has cc's own Read/Write/Bash
+  in `/srv/project-a` while the tether builtins still operate in
+  `~/.tether/workspace`, so a relative path means two different things inside one
+  session. Per-session builtin roots are a separate slice.
+- **A session the daemon has no binding for lands in `--workspace-root`, and
+  stays there.** The browser sends `ws` only when it has no sid, so a
+  `tether_last_sid` with no recorded workspace (any session created before this
+  change, a wiped `~/.tether/sessions`, a sid carried from another machine)
+  reconnects into the default directory and its fresh replacement is recorded
+  there. Start a new session to move it.
+- **A workspace whose directory no longer exists fails the connection, and the
+  browser retries it.** No path is ever checked to exist (`workspace.Registry.Add`
+  only makes it absolute), so a deleted/renamed/unmounted workspace makes
+  `provider.Spawn` fail on `chdir`. Likewise a `ws` id the daemon does not know is
+  refused — correctly — but the refusal reaches the browser as a closed
+  connection, which the chat pane treats as a transport failure and retries with
+  the same URL up to its reconnect cap, ending in a "UDP/QUIC may be blocked"
+  message that is the wrong diagnosis. Making a workspace error terminal and
+  legible on the client needs a distinguishable error on the wire; not done here.
+- **The first session on a fresh browser profile.** The chat pane defers its first
+  connect until the workspace list settles (2 s cap) and then uses the selected
+  workspace; if the list is empty or unreachable, that session runs in
+  `--workspace-root`.
+- **Removing a workspace does not end its sessions.** `Remove` deletes a list
+  entry and touches no files; existing sessions keep their recorded directory, so
+  they stay resumable. Revocation is not implemented.
+- **No UI shows which workspace a session belongs to.** The workspace pane
+  highlights what you are *browsing*, which after a workspace switch is not
+  necessarily where chat is running. The shell pane follows the chat session's
+  workspace, but only once chat *has* a session — a shell opened before that
+  starts in `--workspace-root`.
+- **`POST /api/v1/workspaces` accepts any absolute path**, with no existence or
+  confinement check. "The client sends an id, never a path" is true of the chat
+  handshake, but an authenticated client can still choose any directory in two
+  requests. That endpoint predates this change; what changed is that the workspace
+  list now decides where the agent *executes*, not just what the file browser
+  shows.
+- `Workspace.ActiveSID` remains unwired — it is a workspace→sid pointer, and the
+  binding above is the sid→workspace direction the daemon actually needs.
 
 ## UI / PWA
 

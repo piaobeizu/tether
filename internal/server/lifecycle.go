@@ -102,12 +102,20 @@ func Run(cfg *Config) error {
 		return err
 	}
 
-	// Step 2a: wire up session history store.
-	if cfg.Registry.History == nil {
+	// Step 2a: wire up session history store + the per-session workspace bindings
+	// that share its directory (tether#52). The bindings are what let a reconnect
+	// carrying only a sid land back in that session's own workspace — including
+	// after a daemon restart, which is the whole reason they are on disk.
+	if cfg.Registry.History == nil || cfg.Registry.Bindings == nil {
 		home, err := os.UserHomeDir()
 		if err == nil {
-			histDir := filepath.Join(home, ".tether", "sessions")
-			cfg.Registry.History = session.NewHistoryStore(histDir)
+			sessDir := filepath.Join(home, ".tether", "sessions")
+			if cfg.Registry.History == nil {
+				cfg.Registry.History = session.NewHistoryStore(sessDir)
+			}
+			if cfg.Registry.Bindings == nil {
+				cfg.Registry.Bindings = session.NewBindingStore(sessDir)
+			}
 		}
 	}
 	binDir, err := tetherBinDir()
@@ -123,6 +131,16 @@ func Run(cfg *Config) error {
 		} else {
 			cfg.WsRegistry = wsReg
 		}
+	}
+	// Let the session registry resolve a chat connection's `?ws=` id against the
+	// user's workspace list (tether#52). Guarded on non-nil rather than assigned
+	// unconditionally: a nil *workspace.Registry stored in the interface would be a
+	// NON-nil interface holding a nil pointer, so the "no registry, refuse the
+	// request" branch in resolveWorkspace would be skipped in favour of a nil-
+	// receiver call. Leaving the field nil when the registry failed to load is what
+	// makes that failure refuse workspace requests instead of panicking on one.
+	if cfg.WsRegistry != nil {
+		cfg.Registry.Workspaces = cfg.WsRegistry
 	}
 	if cfg.SkillRegistry == nil {
 		skReg, err := skill.NewRegistry()

@@ -626,3 +626,70 @@ describe('mergeTranscript (tether#57)', () => {
     expect(nots.map(n => n.id)).toEqual(['n2', 'n1'])
   })
 })
+
+// tether#52 — workspacesLoaded gates ChatPane's first connect (see
+// panes/chat/index.tsx's mount effect and shouldDeferFirstConnect). It starts
+// false so a cold load defers a sid-less first connect until WorkspacePane's
+// GET /api/v1/workspaces settles (or the 2s fallback fires).
+describe('store workspacesLoaded (tether#52)', () => {
+  afterEach(() => useStore.setState({ workspacesLoaded: false }))
+
+  it('starts false', () => {
+    expect(useStore.getState().workspacesLoaded).toBe(false)
+  })
+
+  it('setWorkspacesLoaded(true) flips it, and is idempotent', () => {
+    useStore.getState().setWorkspacesLoaded(true)
+    expect(useStore.getState().workspacesLoaded).toBe(true)
+    useStore.getState().setWorkspacesLoaded(true)
+    expect(useStore.getState().workspacesLoaded).toBe(true)
+  })
+
+  it('setWorkspacesLoaded(false) can flip it back', () => {
+    useStore.getState().setWorkspacesLoaded(true)
+    useStore.getState().setWorkspacesLoaded(false)
+    expect(useStore.getState().workspacesLoaded).toBe(false)
+  })
+})
+
+// tether#52 — the ordering invariant behind settleWorkspaces, and the one test
+// that would have caught the bug this slice shipped and then fixed.
+//
+// zustand notifies subscribers SYNCHRONOUSLY from inside `set`, and ChatPane's
+// gate subscription calls doConnect right there — which reads `activeWorkspace`
+// through getState() and bakes it into the connect URL. A brand-new session's cwd
+// is pinned at spawn and can never be moved afterwards. So the workspace must
+// ALREADY be published in the very notification that reports the gate open;
+// publishing it one update (or one React commit) later means every fresh session
+// connects with no `ws` and lands in the daemon's default directory forever.
+//
+// Asserting on the FIRST notification is what makes this falsifiable: splitting
+// settleWorkspaces into two `set` calls keeps every other assertion in this file
+// green and turns this one red.
+describe('store settleWorkspaces ordering (tether#52)', () => {
+  afterEach(() => useStore.setState({ workspacesLoaded: false, activeWorkspace: null }))
+
+  it('publishes the workspace in the SAME notification that opens the gate', () => {
+    const seen: Array<{ loaded: boolean; ws: string | null }> = []
+    const unsub = useStore.subscribe(s => {
+      seen.push({ loaded: s.workspacesLoaded, ws: s.activeWorkspace?.id ?? null })
+    })
+    useStore.getState().settleWorkspaces({ id: 'ws-a', path: '/srv/project-a' })
+    unsub()
+
+    expect(seen.length).toBe(1) // one update, not two
+    expect(seen[0]).toEqual({ loaded: true, ws: 'ws-a' })
+  })
+
+  it('an empty workspace list still opens the gate, with no selection', () => {
+    const seen: Array<{ loaded: boolean; ws: string | null }> = []
+    const unsub = useStore.subscribe(s => {
+      seen.push({ loaded: s.workspacesLoaded, ws: s.activeWorkspace?.id ?? null })
+    })
+    useStore.getState().settleWorkspaces(null)
+    unsub()
+
+    // Chat must still connect (falling back to --workspace-root), not hang.
+    expect(seen[0]).toEqual({ loaded: true, ws: null })
+  })
+})

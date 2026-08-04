@@ -25,6 +25,48 @@ import (
 	"github.com/piaobeizu/tether/internal/wire"
 )
 
+// ValidSessionID reports whether sid may be used as a path segment under
+// ~/.tether/sessions — the one guard shared by everything in the daemon that
+// turns a session id into a file path.
+//
+// It accepts only the alphabet real cc / opencode session ids use (UUID hex +
+// dashes, or `ses_` / `t-` prefixes with [A-Za-z0-9]) and bounds the length.
+// Anything else — `..`, slashes, control characters, URL-encoded escapes — is
+// rejected, so no caller can escape the sessions directory.
+//
+// # Why it lives here and is exported
+//
+// A sid arrives from the client on two routes (`/wt/chat?sid=` and
+// `/api/v1/sessions/<sid>/messages`) and is joined into a path by two types in
+// this package (HistoryStore, BindingStore). This function was originally a
+// private copy in internal/server for the HTTP route only; tether#52 needed the
+// same check for BindingStore and briefly grew a SECOND, weaker `validSID` in
+// this package — two same-named guards with different contracts in adjacent
+// packages, which is how one of them ends up being the one that matters. It is a
+// single definition here instead, and internal/server delegates to it.
+//
+// An allowlist rather than a `..`-blocklist: a blocklist stops traversal but
+// still admits unbounded-length names and arbitrary control characters, which
+// turn into ENAMETOOLONG and junk directories rather than into an escape — a
+// weaker guarantee for no benefit, since every real id is already in this
+// alphabet.
+func ValidSessionID(sid string) bool {
+	if len(sid) < 8 || len(sid) > 128 {
+		return false
+	}
+	for _, c := range sid {
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+		case c == '-' || c == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // MaxAssistantBufBytes caps the in-memory accumulator per session so that a
 // single very long streaming response can't grow unbounded. When exceeded,
 // the buffer is truncated with a marker and accumulation stops until the
@@ -315,7 +357,13 @@ func (h *HistoryStore) LoadHistory(sid string) []HistoryMessage {
 // "is it non-empty" would be wasted work. A zero-length file counts as no
 // history, which is also what LoadHistory would conclude.
 func (h *HistoryStore) HasHistory(sid string) bool {
-	if sid == "" {
+	// ValidSessionID, not just a non-empty check: this is the one HistoryStore
+	// entry point reached with a RAW client-supplied sid — Attachment.resolve asks
+	// it about a.reqSID straight off `/wt/chat?sid=` — so without the guard a
+	// `..`-shaped sid turns this into a stat oracle for any file named
+	// history.jsonl outside the sessions directory. A rejected sid simply has no
+	// history, which suppresses the notice and nothing else.
+	if !ValidSessionID(sid) {
 		return false
 	}
 	fi, err := os.Stat(h.historyPath(sid))
@@ -328,7 +376,17 @@ func (h *HistoryStore) HasHistory(sid string) bool {
 	return fi.Size() > 0
 }
 
-// ListSessions returns all session IDs that have history on disk.
+// ListSessions returns all session IDs that have history on disk. It backs
+// GET /api/v1/sessions, i.e. the session list the workspace pane renders.
+//
+// "have history" is checked, not inferred from the directory existing, and that
+// distinction became load-bearing in tether#52: BindingStore shares this
+// baseDir and creates <baseDir>/<sid>/ at SPAWN time to record the session's
+// workspace — before any message exists. Enumerating directories would therefore
+// list every session that ever connected and closed without saying anything, each
+// rendering as a clickable entry whose transcript is empty. Filtering on the
+// transcript keeps this function's answer the one its name promises, and keeps the
+// two stores' shared directory an implementation detail rather than an API change.
 func (h *HistoryStore) ListSessions() []string {
 	entries, err := os.ReadDir(h.baseDir)
 	if err != nil {
@@ -339,7 +397,7 @@ func (h *HistoryStore) ListSessions() []string {
 	}
 	var sids []string
 	for _, e := range entries {
-		if e.IsDir() {
+		if e.IsDir() && h.HasHistory(e.Name()) {
 			sids = append(sids, e.Name())
 		}
 	}

@@ -47,9 +47,29 @@ export default function WorkspacePane() {
       const data = await res.json() as Workspace[]
       setWorkspaces(data)
       setError(null)
-      if (data.length > 0 && !activeId) setActiveId(data[0].id)
+      const first = data.length > 0 && !activeId ? data[0] : null
+      if (first) setActiveId(first.id)
+      // tether#52 — release ChatPane's first-connect gate, and publish the
+      // selection IN THE SAME store update (store.ts settleWorkspaces).
+      //
+      // The selection is computed here rather than left to the
+      // [activeId, workspaces] effect below, and that is the fix for a real bug:
+      // the effect runs one React commit LATER, while zustand notifies ChatPane's
+      // gate listener synchronously, so releasing the gate from here and
+      // publishing from there meant every fresh session connected before the
+      // workspace was known — with no `ws`, into --workspace-root, permanently.
+      // The effect still owns every LATER change (expand/collapse, delete) and
+      // re-publishes the same value idempotently.
+      const sel = first ?? data.find(w => w.id === activeId) ?? null
+      useStore.getState().settleWorkspaces(sel ? { id: sel.id, path: sel.path } : null)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
+      // Release the gate but publish NO selection: a failed fetch must not leave
+      // chat waiting forever for a list that will never arrive (ChatPane's 2s
+      // fallback timer is the other half of that guarantee), and must not wipe a
+      // selection an earlier successful load already published — load() also runs
+      // after add/remove.
+      useStore.getState().setWorkspacesLoaded(true)
     }
   }
 

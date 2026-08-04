@@ -95,7 +95,11 @@ export default function App() {
   // changes so a fresh failure/reconnect re-surfaces the affordance.
   const [bannerDismissed, setBannerDismissed] = useState(false)
   const [modalDismissed, setModalDismissed] = useState(false)
-  const { connection, sessionId } = useStore()
+  // tether#63 — `fatal` is read here for one reason: to stay OUT of the way.
+  // Everything below that explains a dead connection does so in the language of
+  // an exhausted reconnect ladder, which is the wrong story when the daemon
+  // named a cause. See showBanner / showCatchupFailed.
+  const { connection, sessionId, fatal } = useStore()
 
   useEffect(() => {
     setBannerDismissed(false)
@@ -120,19 +124,37 @@ export default function App() {
     connection.state === 'live' ? 'daemon · live' :
     connection.state === 'reconnecting' ? `reconnecting · attempt ${connection.attempt}` :
     connection.state === 'connecting' ? 'connecting…' :
+    // tether#63 — "dropped" reads as "it fell over"; a refusal is the daemon
+    // declining on purpose, and the pane's card has the reason.
+    fatal !== null ? 'refused' :
     'dropped'
 
   // Ask ChatPane (owner of the WT connection) to retry immediately.
   const retryConnection = () => window.dispatchEvent(new CustomEvent('tether:retry-connection'))
 
+  // tether#63 — `fatal === null` on the dropped branch. "daemon unreachable ·
+  // check connection" is a diagnosis, and it is the wrong one for a daemon that
+  // answered promptly with a reason; there is also nothing for the user to check.
   const showBanner = !bannerDismissed && (
     connection.state === 'reconnecting' ||
-    (connection.state === 'dropped' && sessionId !== null))
+    (connection.state === 'dropped' && sessionId !== null && fatal === null))
 
   // Catch-up-failed = a resumable session that the daemon could not re-attach
   // after exhausting reconnect attempts (ChatPane sets state → 'dropped').
+  //
+  // tether#63 — NOT when a terminal refusal is what dropped us. This modal is a
+  // fixed-position, full-viewport overlay (index.css .dt-catchup-overlay,
+  // z-index 300) and it renders a specific claim — "the daemon dropped after the
+  // reconnect attempts were exhausted", "at reconnect (attempt N)". Both are
+  // false for a refusal: the ladder stopped on purpose after ONE attempt because
+  // the daemon said retrying was pointless. Left ungated it would cover
+  // ChatPane's failed-card with a worse explanation of the same event, which is
+  // the whole bug this slice exists to fix, reintroduced one layer up. `fatal`
+  // rather than a new ConnState because it is already the single flag meaning
+  // "we know why this connection ended", and a fifth ConnState would have to be
+  // handled correctly by every reader of connection.state to buy the same thing.
   const showCatchupFailed = !modalDismissed &&
-    connection.state === 'dropped' && sessionId !== null
+    connection.state === 'dropped' && sessionId !== null && fatal === null
 
   // WT transport is actively re-establishing.
   const showWtPill = connection.state === 'reconnecting'

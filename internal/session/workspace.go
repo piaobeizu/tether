@@ -34,6 +34,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+
+	"github.com/piaobeizu/tether/internal/wire"
 )
 
 // WorkspaceLookup answers "what absolute path does this workspace id name?".
@@ -262,11 +264,11 @@ func (r *Registry) resolveWorkspace(sid, wsID string) (workspaceDecision, error)
 		// deleted workspace when the truth is that the registry failed to load at
 		// startup (lifecycle.go Step 2b logs a warning and leaves this field nil).
 		if r.Workspaces == nil {
-			return workspaceDecision{}, fmt.Errorf("workspace %q requested but this daemon has no workspace registry", wsID)
+			return workspaceDecision{}, refuse(wire.ErrCodeNoWorkspaceRegistry, "workspace %q requested but this daemon has no workspace registry", wsID)
 		}
 		path, ok := r.Workspaces.Path(wsID)
 		if !ok {
-			return workspaceDecision{}, fmt.Errorf("unknown workspace %q", wsID)
+			return workspaceDecision{}, refuse(wire.ErrCodeUnknownWorkspace, "unknown workspace %q", wsID)
 		}
 		req = WorkspaceBinding{WorkspaceID: wsID, Path: path}
 	}

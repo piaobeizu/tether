@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, fmtTokens, summarizeToolInput, summarizeToolResult, truncateResult, shouldSendOnEnter, growHeight, parseAtQuery, fuzzyRankFiles, shouldDeferFirstConnect } from './index'
+import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, fmtTokens, summarizeToolInput, summarizeToolResult, truncateResult, shouldSendOnEnter, growHeight, parseAtQuery, fuzzyRankFiles, shouldDeferFirstConnect, shouldReconnectAfterClose, shouldRefundAttemptBudget, FATAL_CODE_MESSAGES } from './index'
 import { PermissionQueue, postDecide } from '../../fenced-blocks/PermissionBlock'
+import {
+  ErrCodeUnknownWorkspace, ErrCodeNoWorkspaceRegistry, ErrCodeUnknownProvider, ErrCodeSessionOwned,
+  ErrCodeSpawnFailed, ErrCodeConnectionClosed, ErrCodeSessionUnconfirmed, ErrCodeAgent,
+} from '../../lib/wire.gen'
 import type { ToolCall, PermissionRequest } from '../../lib/store'
 
 // tether#34 — ThinkingBlock is exported and prop-controlled so it tests directly,
@@ -479,5 +483,80 @@ describe('shouldDeferFirstConnect (tether#52)', () => {
   it('never defers when a last sid is remembered, regardless of workspacesLoaded', () => {
     expect(shouldDeferFirstConnect({ hasLastSid: true, workspacesLoaded: false })).toBe(false)
     expect(shouldDeferFirstConnect({ hasLastSid: true, workspacesLoaded: true })).toBe(false)
+  })
+})
+
+// tether#63 — shouldReconnectAfterClose decides whether ChatPane's onClose
+// schedules the reconnect ladder. Two independent stop conditions (unmounted,
+// a terminal wire.ErrorPayload recorded as store.fatal); the ladder retries
+// only when NEITHER holds. This is the fix for the silent-reconnect-loop bug:
+// before it, a terminal refusal (e.g. unknown_workspace) still retried once a
+// second forever, because the WebTransport handshake itself had succeeded —
+// the refusal only arrives after (wt_chat.go sends it post-Upgrade).
+describe('shouldReconnectAfterClose (tether#63)', () => {
+  it('reconnects when neither unmounted nor fatal (the ordinary transient-drop case)', () => {
+    expect(shouldReconnectAfterClose({ unmounted: false, fatal: false })).toBe(true)
+  })
+
+  it('does not reconnect once unmounted — nothing is left to hand the socket to', () => {
+    expect(shouldReconnectAfterClose({ unmounted: true, fatal: false })).toBe(false)
+  })
+
+  // THE regression this slice fixes: a terminal refusal must stop the ladder
+  // even though the pane is still mounted and would otherwise retry forever.
+  it('does not reconnect when fatal, even though still mounted', () => {
+    expect(shouldReconnectAfterClose({ unmounted: false, fatal: true })).toBe(false)
+  })
+
+  it('does not reconnect when both unmounted and fatal', () => {
+    expect(shouldReconnectAfterClose({ unmounted: true, fatal: true })).toBe(false)
+  })
+})
+
+// tether#63 — shouldRefundAttemptBudget is the structural half of the same fix:
+// RECONNECT_MAX_ATTEMPTS was not a bound at all, because the budget was refunded
+// on a WebTransport handshake and a refused connection completes a perfect
+// handshake before dying. Measured on an unpatched build: 27 reconnects in 30s.
+// Refunding only for a connection that lasted long enough to have been usable
+// keeps the ladder bounded even when the refusal's REASON does not arrive (an
+// older daemon, or a link slow enough to lose the envelope inside the daemon's
+// 300ms drain grace) — in which case the pre-existing 5-attempt ladder ends it.
+describe('shouldRefundAttemptBudget (tether#63)', () => {
+  it('refunds for a connection that lasted long enough to be usable', () => {
+    expect(shouldRefundAttemptBudget(2_000)).toBe(true)
+    expect(shouldRefundAttemptBudget(60_000)).toBe(true)
+  })
+
+  // A refusal is torn down in well under a second — the daemon's own drain
+  // grace is 300ms — so this is the case that must NOT hand its successor a
+  // fresh budget.
+  it('does not refund for a connection that died almost immediately', () => {
+    expect(shouldRefundAttemptBudget(0)).toBe(false)
+    expect(shouldRefundAttemptBudget(300)).toBe(false)
+    expect(shouldRefundAttemptBudget(1_999)).toBe(false)
+  })
+})
+
+// tether#63 — FATAL_CODE_MESSAGES is PRESENTATION (the ladder's decision is the
+// single `terminal` bit, never these strings), but a terminal code with no entry
+// renders the generic fallback and quietly loses the specific explanation this
+// slice exists to give. Tying the map to the generated wire constants means a
+// renamed code fails here instead of silently degrading in the UI.
+describe('FATAL_CODE_MESSAGES (tether#63)', () => {
+  it('has a sentence for every code the daemon classifies as terminal', () => {
+    for (const code of [
+      ErrCodeUnknownWorkspace,
+      ErrCodeNoWorkspaceRegistry,
+      ErrCodeUnknownProvider,
+      ErrCodeSessionOwned,
+    ]) {
+      expect(FATAL_CODE_MESSAGES[code], `no sentence for ${code}`).toBeTruthy()
+    }
+  })
+
+  it('has no entry for a retryable code — those never reach the card', () => {
+    for (const code of [ErrCodeSpawnFailed, ErrCodeConnectionClosed, ErrCodeSessionUnconfirmed, ErrCodeAgent]) {
+      expect(FATAL_CODE_MESSAGES[code]).toBeUndefined()
+    }
   })
 })

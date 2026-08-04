@@ -2,11 +2,14 @@ package server
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/quic-go/webtransport-go"
 
@@ -110,8 +113,14 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 	// exists here. Deleting these three lines leaves the suite green — as it did
 	// before the extraction, when the whole gate lived inline. What changed is that
 	// the decision is now pinned; the wiring is covered only by live_verify.
+	// tether#63: this refusal had the SAME silent-reconnect-loop failure the
+	// unknown-workspace one did — it arrives after wts.Upgrade has already
+	// succeeded, so the browser's reconnect ladder (web/src/panes/chat/index.tsx)
+	// saw a successful handshake, reset its attempt counter, and retried
+	// forever against a session it will never be allowed to join. Classified
+	// as ErrCodeSessionOwned, terminal, so the ladder stops instead.
 	if !admitChat(reg, sid, clientID) {
-		sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindError, Payload: "session owned by another client; use /wt/events to attach read-only"})
+		refuse(ctx, wtsess, wire.NewErrorEnvelope(wire.ErrCodeSessionOwned, "session owned by another client; use /wt/events to attach read-only"))
 		return
 	}
 
@@ -128,7 +137,7 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 	att, err := reg.Attach(ctx, sid, providerName, wsID)
 	if err != nil {
 		slog.Warn("serveChat: attach refused", "sid", sid, "ws", wsID, "err", err)
-		sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindError, Payload: err.Error()})
+		refuse(ctx, wtsess, errorEnvelope(err))
 		return
 	}
 
@@ -195,7 +204,7 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 	res, err := att.Resolve(ctx)
 	if err != nil {
 		slog.Warn("serveChat: session did not resolve", "err", err)
-		sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindError, Payload: err.Error()})
+		refuse(ctx, wtsess, errorEnvelope(err))
 		return
 	}
 	realSID := res.SID
@@ -209,7 +218,7 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 	// connection mid-answer. See Attachment.SetOwner.
 	if clientID != "" {
 		if !att.SetOwner(clientID) {
-			sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindError, Payload: "session owned by another client; use /wt/events to attach read-only"})
+			refuse(ctx, wtsess, wire.NewErrorEnvelope(wire.ErrCodeSessionOwned, "session owned by another client; use /wt/events to attach read-only"))
 			return
 		}
 	}
@@ -266,6 +275,90 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 			sendEnvelope(wtsess, env)
 		}
 	}
+}
+
+// refusalDrainGrace is how long a refused chat connection is held open after
+// its error envelope has been written, before serveChat's deferred
+// CloseWithError destroys the session.
+//
+// MEASURED, not guessed (tether#63 live-verify, Chrome 1xx headless against
+// this daemon over localhost):
+//
+//   - With no grace, the envelope arrived 0 times out of 10. sendEnvelope
+//     writes it on a FRESH unidirectional stream and returns immediately, so
+//     the session was destroyed in the same tick; the browser saw the stream
+//     die as "WebTransportError: Connection lost" and never read a byte. That
+//     is why tether#52's refusal looked silent from the UI — not because the
+//     frontend discarded the message, but because the message never arrived.
+//   - With this grace, 6 out of 6, observed ~1ms after the handshake. The wait
+//     is therefore about two orders of magnitude larger than the delivery it
+//     protects, which is the margin a non-local link needs.
+//
+// A close code and reason on CloseWithError are NOT an alternative: the same
+// runs showed Chrome rejecting `WebTransport.closed` with "Connection lost"
+// rather than resolving it with the code/reason, for both 0/"" and a custom
+// 4001/"...", so nothing the daemon puts there is readable by the browser.
+//
+// The cost is one sleeping goroutine per refused connection for 300ms. That is
+// strictly less than the connection it is already holding, and a caller who
+// wants to spend the daemon's goroutines can open sessions that are NOT refused
+// far more cheaply — so this is not a new amplifier.
+const refusalDrainGrace = 300 * time.Millisecond
+
+// refuse sends a classified refusal to the browser and then holds the session
+// open just long enough for it to be delivered (see refusalDrainGrace).
+//
+// Every refusal on this route goes through here rather than calling
+// sendEnvelope directly, so that "a refusal the daemon decided is a refusal the
+// browser is told about" is a property of the one function they all share
+// instead of something each site is trusted to remember. It is a convention,
+// not something the type system enforces — wire.Envelope's fields are exported
+// and internal/server/wt_shell.go still builds a KindError by hand for the
+// shell pane's lock_held (a different channel, with extra fields and no
+// frontend consumer). What IS structural is that no refusal on the CHAT route
+// can be written without going through here or being obviously different from
+// its four neighbours.
+//
+// The wait ends early if the client has already gone: ctx is the WebTransport
+// session's, so on the ErrCodeConnectionClosed path — where the refusal exists
+// only because the browser hung up — there is nobody left to deliver to and the
+// grace would be 300ms spent on nothing.
+//
+// The browser's half of the contract is web/src/panes/chat/index.tsx
+// (shouldReconnectAfterClose).
+func refuse(ctx context.Context, wtsess *webtransport.Session, env wire.Envelope) {
+	sendEnvelope(wtsess, env)
+	select {
+	case <-ctx.Done():
+	case <-time.After(refusalDrainGrace):
+	}
+}
+
+// errorEnvelope converts err into a classified wire.KindError envelope.
+//
+// A session.Refusal (from Registry.Attach / Attachment.Resolve — see
+// resolveWorkspace, spawnEntry, and resolve's doc comments for what each code
+// means) carries the code the daemon already decided; errors.As unwraps to
+// find one even if err is wrapped further up the call stack. Anything else —
+// an error type this function does not specifically recognize — becomes an
+// UNCLASSIFIED envelope: ErrorCode("") has no entry in wire's terminalCodes
+// table, so ErrorCode.Terminal() answers false for it. That default is
+// deliberate, not an oversight: it means a failure mode nobody has
+// classified yet degrades to "the browser reconnects and hopes", the
+// pre-tether#63 behaviour, rather than bricking a connection on a code this
+// function was never taught to recognize.
+// The MESSAGE is always err.Error(), never ref.Error(): errors.As finds the
+// INNERMOST Refusal, so taking its text would discard every layer wrapped
+// around it on the way up. Attachment.resolve does exactly that wrapping —
+// "resume %s failed and fresh spawn failed: %w" — and a browser told only
+// "spawn: ..." has lost the half that says which recovery was being attempted.
+// The code comes from the Refusal, the words come from the whole error.
+func errorEnvelope(err error) wire.Envelope {
+	var ref *session.Refusal
+	if errors.As(err, &ref) {
+		return wire.NewErrorEnvelope(ref.Code, err.Error())
+	}
+	return wire.NewErrorEnvelope(wire.ErrorCode(""), err.Error())
 }
 
 func sendEnvelope(wtsess *webtransport.Session, env wire.Envelope) {

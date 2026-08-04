@@ -99,6 +99,91 @@ export function shouldDeferFirstConnect(o: { hasLastSid: boolean; workspacesLoad
   return !o.hasLastSid && !o.workspacesLoaded
 }
 
+// tether#63 — decides whether a dropped WebTransport connection's onClose
+// should schedule the reconnect ladder. Extracted pure (mirrors
+// shouldDeferFirstConnect above) so this is unit-testable without mounting
+// the pane. Two independent reasons say no:
+//   - unmounted: the pane is gone: nothing is left to hand a reconnected
+//     socket to, and the cleanup effect has already cancelled any pending
+//     timer (pre-existing behaviour, unchanged by tether#63).
+//   - fatal: the daemon's LAST word on this connection was a terminal
+//     wire.ErrorPayload (session.Refusal with Terminal=true — see
+//     wire/errors.go) — e.g. an unknown workspace or a session owned by
+//     another tab. The WebTransport handshake itself succeeded (a refusal is
+//     sent AFTER wts.Upgrade in wt_chat.go), so retrying reopens the same
+//     handshake only to be refused again, once a second, forever — the exact
+//     silent-loop bug this slice exists to fix. Both false only when NEITHER
+//     condition holds: a live pane whose most recent envelope carried no
+//     terminal refusal is the one case an ordinary transient drop should
+//     still be retried.
+export function shouldReconnectAfterClose(o: { unmounted: boolean; fatal: boolean }): boolean {
+  return !o.unmounted && !o.fatal
+}
+
+// tether#63 — MIN_USABLE_CONN_MS is how long a connection must stay open before
+// it counts as an attempt that WORKED and refunds the reconnect budget.
+//
+// This is the structural half of the fix, and the reason RECONNECT_MAX_ATTEMPTS
+// above was decorative rather than a bound. `wt.connect()` resolving means the
+// WebTransport HANDSHAKE succeeded — nothing more. A daemon-side refusal is
+// sent AFTER wts.Upgrade has already returned (wt_chat.go), so a refused
+// connection completes a perfect handshake and then dies. Refunding the budget
+// on that made every cycle attempt #1 again, and the ladder retried once a
+// second for as long as the page stayed open. Measured on an unpatched build:
+// 27 reconnects in a 30-second window, with no upper bound in sight.
+//
+// The classification (a terminal wire.ErrorPayload) is what stops such a
+// connection on the FIRST attempt, and it is the mechanism that normally runs.
+// This threshold is what keeps the loop bounded when that reason does not
+// arrive — an older daemon, or a link slow enough to lose the envelope inside
+// refusalDrainGrace. It has to be a duration rather than something sharper
+// because at close time a refusal and a genuine early drop are the same event;
+// what separates them is that a refused session is torn down in well under a
+// second (the daemon's own grace is 300ms) while a usable one lives for as long
+// as the user is there. 2s sits an order of magnitude above the former and
+// orders of magnitude below the latter.
+//
+// WHO ELSE PAYS, stated rather than left to be discovered: every RETRYABLE
+// refusal is also sub-2s by construction (the daemon's grace is the only thing
+// holding the session open), so spawn_failed / connection_closed /
+// session_unconfirmed now consume budget too. Those used to retry indefinitely;
+// they now get five attempts across ~31s and then a Retry button. That is a
+// real reduction, and it is the one Attachment.resolve's concurrent-attach note
+// leans on — but five spaced retries is a fair allowance for a spawn that keeps
+// dying, and "the daemon cannot start an agent" is a state a human should be
+// told about rather than one the browser should hammer at forever.
+//
+// Being wrong in the conservative direction costs a user on a link that cannot
+// hold two seconds five quick retries and then a Retry button — which is the
+// honest report for a link that cannot hold two seconds.
+//
+// Kept comfortably above internal/server/wt_chat.go's refusalDrainGrace. That
+// relationship is load-bearing and nothing enforces it across the two
+// languages; if the grace ever grows towards a second, this must grow with it.
+const MIN_USABLE_CONN_MS = 2_000
+
+export function shouldRefundAttemptBudget(uptimeMs: number): boolean {
+  return uptimeMs >= MIN_USABLE_CONN_MS
+}
+
+// tether#63 — code→sentence map for the failed-connection card. Only the
+// four codes wire.ErrorCode currently classifies Terminal=true (errors.go's
+// terminalCodes) need an entry; any other code (including one this frontend
+// build predates — see wire.ErrorCode.Terminal's "unclassified defaults
+// false" doc comment, which is about retryability, not this map) falls back
+// to FATAL_GENERIC_MESSAGE below rather than rendering `undefined`.
+export const FATAL_CODE_MESSAGES: Record<string, string> = {
+  unknown_workspace: 'This workspace no longer exists on the daemon.',
+  no_workspace_registry: "The daemon's workspace registry failed to load.",
+  unknown_provider: 'The requested agent provider is not available on this daemon.',
+  // NOT "another tab": clientID is per browser profile (persisted in
+  // localStorage by AuthPage) and every tab shares it, so admitChat admits
+  // them all. Reaching this means a different DEVICE holds the session — see
+  // wire.ErrCodeSessionOwned's doc comment.
+  session_owned_by_other: 'This session is open on another device.',
+}
+const FATAL_GENERIC_MESSAGE = 'This connection was refused and cannot be retried automatically.'
+
 // tether#47 — @-file mention. parseAtQuery locates the @token the caret is
 // currently inside: scanning back from the caret, the token is valid only if an
 // `@` is reached with no whitespace in between AND that `@` sits at the start of
@@ -154,7 +239,7 @@ interface Props {
 }
 
 export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
-  const { messages, notices, sessionId, pendingPermissions, resolvePermission, streaming, streamingMsgId, curTurnId } = useStore()
+  const { messages, notices, sessionId, pendingPermissions, resolvePermission, streaming, streamingMsgId, curTurnId, fatal } = useStore()
   // tether#57 — what the pane actually renders: server-truth `messages` and
   // locally-originated `notices` recombined here, at render time. They are kept
   // apart in the store precisely so the history refetch that session_ready
@@ -200,6 +285,10 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   const wtRef = useRef<TetherWT | null>(null)
   const controlRef = useRef<ControlClient | null>(null)
   const attemptRef = useRef(0)
+  // tether#63 — when the current connection's handshake completed, or 0 when
+  // none is open. Read once in onClose to decide whether that connection lasted
+  // long enough to refund the attempt budget (shouldRefundAttemptBudget).
+  const connectedAtRef = useRef(0)
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const unmountedRef = useRef(false)
@@ -341,6 +430,12 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
 
   const scheduleReconnect = () => {
     if (unmountedRef.current) return
+    // tether#63 — clear any timer/countdown already pending before arming new
+    // ones. Since a close can now be reported by either the `closed` handler or
+    // connect()'s own chain (wt.ts), two calls in quick succession are possible,
+    // and the second used to overwrite countdownRef without clearing the first
+    // interval — a leaked setInterval double-decrementing the countdown.
+    cancelPendingReconnect()
     attemptRef.current += 1
     useStore.getState().setConnection({ state: 'reconnecting', attempt: attemptRef.current })
     if (attemptRef.current > RECONNECT_MAX_ATTEMPTS) {
@@ -368,6 +463,11 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
     setConnState('connecting')
     setConnError(null)
     useStore.getState().setConnection({ state: 'connecting' })
+    // tether#63 — a fresh attempt deserves a fresh chance: whatever refused
+    // the PREVIOUS connection (e.g. a since-closed other tab holding the
+    // session) may no longer apply, and this is a deliberate new handshake,
+    // not the reconnect ladder retrying the same one automatically.
+    useStore.getState().clearFatal()
 
     const old = wtRef.current
     wtRef.current = null
@@ -397,13 +497,42 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
         useStore.getState().setConnected(false)
         controlRef.current?.stop()
         controlRef.current = null
-        if (!unmountedRef.current) scheduleReconnect()
+        // tether#63 — refund the attempt budget only for a connection that
+        // lasted long enough to have been usable, THEN decide about retrying.
+        // Order matters: refunding after the decision would let a refused
+        // connection hand its successor a full budget.
+        const upMs = connectedAtRef.current === 0 ? 0 : Date.now() - connectedAtRef.current
+        connectedAtRef.current = 0
+        if (shouldRefundAttemptBudget(upMs)) attemptRef.current = 0
+        // A terminal refusal recorded by handleEnvelope's 'error' case (see
+        // store.ts) means retrying THIS connection is pointless.
+        // shouldReconnectAfterClose is the one place that decision is made, so
+        // it can be pinned by a unit test without mounting the pane.
+        const isFatal = useStore.getState().fatal !== null
+        if (!shouldReconnectAfterClose({ unmounted: unmountedRef.current, fatal: isFatal })) {
+          if (isFatal) {
+            // Stop the ladder outright rather than let scheduleReconnect fire
+            // once more and immediately refuse again — same daemon, same
+            // workspace/session, same answer. 'dropped' (not 'reconnecting')
+            // reflects that nothing is scheduled to retry.
+            cancelPendingReconnect()
+            setConnState('failed')
+            useStore.getState().setConnection({ state: 'dropped' })
+          }
+          return
+        }
+        scheduleReconnect()
       },
     })
     wtRef.current = wt
 
     wt.connect().then(async () => {
-      attemptRef.current = 0
+      // tether#63 — the attempt budget is NOT refunded here. See
+      // shouldRefundAttemptBudget: a handshake is not evidence that the
+      // connection is usable, and refunding on one is what made the bounded
+      // ladder unbounded. connectedAtRef starts the clock the close handler
+      // measures against.
+      connectedAtRef.current = Date.now()
       useStore.getState().setConnected(true)
       setConnState('connected')
       const stream = await wt.openBidiStream()
@@ -419,7 +548,24 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
       const msg = err instanceof Error ? err.message : String(err)
       console.error('[tether] chat connect failed:', msg)
       setConnError(msg)
-      if (!unmountedRef.current) scheduleReconnect()
+      // tether#63 — the same terminal check as onClose, because this chain can
+      // report the death first: before the daemon held refused sessions open
+      // (refusalDrainGrace), `openBidiStream()` threw here in the same tick the
+      // refusal killed the session, and that — not onClose — is what drove the
+      // endless loop. Gating only onClose would have left this path retrying a
+      // refusal the daemon has already explained.
+      const isFatal = useStore.getState().fatal !== null
+      if (!shouldReconnectAfterClose({ unmounted: unmountedRef.current, fatal: isFatal })) {
+        // Only an unmounted pane gets no bookkeeping — there is no UI left to
+        // put a state on, and the cleanup effect already cancelled the timer.
+        if (isFatal && !unmountedRef.current) {
+          cancelPendingReconnect()
+          setConnState('failed')
+          useStore.getState().setConnection({ state: 'dropped' })
+        }
+        return
+      }
+      scheduleReconnect()
     })
   }
 
@@ -727,9 +873,25 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
 
         {connState === 'failed' && (
           <div className="failed-card">
-            <div style={{ color: 'var(--danger)', fontWeight: 600, marginBottom: 4 }}>WebTransport connection failed</div>
-            {connError && <div style={{ color: 'var(--ink-tertiary)', fontSize: 11, marginBottom: 6, wordBreak: 'break-all' }}>{connError}</div>}
-            <div style={{ color: 'var(--ink-tertiary)', fontSize: 11, marginBottom: 8 }}>UDP/QUIC may be blocked — see K.8.1 in README.</div>
+            {fatal ? (
+              // tether#63 — the daemon told us WHY, and it was terminal: lead
+              // with the code→sentence translation (falling back to a generic
+              // sentence for a code this frontend build doesn't recognize —
+              // see FATAL_CODE_MESSAGES' doc comment), then the daemon's own
+              // message text for anyone who wants the raw detail.
+              <>
+                <div style={{ color: 'var(--danger)', fontWeight: 600, marginBottom: 4 }}>
+                  {FATAL_CODE_MESSAGES[fatal.code] ?? FATAL_GENERIC_MESSAGE}
+                </div>
+                <div style={{ color: 'var(--ink-tertiary)', fontSize: 11, marginBottom: 8, wordBreak: 'break-all' }}>{fatal.message}</div>
+              </>
+            ) : (
+              <>
+                <div style={{ color: 'var(--danger)', fontWeight: 600, marginBottom: 4 }}>WebTransport connection failed</div>
+                {connError && <div style={{ color: 'var(--ink-tertiary)', fontSize: 11, marginBottom: 6, wordBreak: 'break-all' }}>{connError}</div>}
+                <div style={{ color: 'var(--ink-tertiary)', fontSize: 11, marginBottom: 8 }}>UDP/QUIC may be blocked — see K.8.1 in README.</div>
+              </>
+            )}
             <button onClick={manualRetry} className="btn-ghost-sm">Retry</button>
           </div>
         )}

@@ -7,10 +7,23 @@ import { describe, expect, it } from 'vitest'
 import type {
   Envelope,
   EnvelopeKind,
+  ErrorCode,
+  ErrorPayload,
   FencedBlock,
   FencedBlockKind,
   HashHex64,
   SessionID,
+} from '../src/lib/wire.gen'
+import {
+  ErrCodeAgent,
+  ErrCodeConnectionClosed,
+  ErrCodeNoWorkspaceRegistry,
+  ErrCodeSessionOwned,
+  ErrCodeSessionUnconfirmed,
+  ErrCodeSpawnFailed,
+  ErrCodeUnknownProvider,
+  ErrCodeUnknownWorkspace,
+  KindError,
 } from '../src/lib/wire.gen'
 
 const testURL = typeof process !== 'undefined' ? process.env['TETHER_TEST_URL'] : undefined
@@ -110,5 +123,64 @@ describe('contract-6: tool_use input shape', () => {
     expect(tool.type).toBe('tool_use')
     expect(tool.name).toBe('Bash')
     expect(tool.input).toBeDefined()
+  })
+})
+
+// ─── Contract 7: KindError payload carries {code, message, terminal} (tether#63) ──
+// Before this contract, a KindError envelope's payload was a bare string with
+// no disposition — the browser could not tell a permanent refusal from a
+// transient drop without pattern-matching text. This pins the shape tygo
+// generates from internal/wire/errors.go so a future Go-side change to
+// ErrorPayload's json tags is caught here, in the one place both sides of the
+// wire boundary are checked against each other.
+describe('contract-7: ErrorPayload shape', () => {
+  it('KindError is the string "error"', () => {
+    expect(KindError).toBe('error')
+  })
+
+  it('ErrorPayload round-trips through JSON with its three lower_snake_case keys', () => {
+    const payload: ErrorPayload = { code: ErrCodeUnknownWorkspace, message: 'unknown workspace "foo"', terminal: true }
+    const json = JSON.stringify(payload)
+    const parsed = JSON.parse(json) as Record<string, unknown>
+    expect(Object.keys(parsed).sort()).toEqual(['code', 'message', 'terminal'])
+    expect(parsed['code']).toBe('unknown_workspace')
+    expect(parsed['message']).toBe('unknown workspace "foo"')
+    expect(parsed['terminal']).toBe(true)
+  })
+
+  it('an Envelope of kind error carries an ErrorPayload', () => {
+    const env: Envelope = {
+      kind: KindError,
+      payload: { code: ErrCodeSessionOwned, message: 'session owned by another client', terminal: true } as ErrorPayload,
+    }
+    expect(env.kind).toBe('error')
+    const p = env.payload as ErrorPayload
+    expect(p.terminal).toBe(true)
+  })
+
+  // Pins the exact 8 wire-visible codes and their string values — a change to
+  // any of these strings is a wire-format change, not a refactor, and must be
+  // deliberate on both the Go and TypeScript sides.
+  it('exposes exactly the 8 ErrorCode constants with their wire string values', () => {
+    const codes: Record<string, ErrorCode> = {
+      ErrCodeUnknownWorkspace,
+      ErrCodeNoWorkspaceRegistry,
+      ErrCodeUnknownProvider,
+      ErrCodeSessionOwned,
+      ErrCodeSpawnFailed,
+      ErrCodeConnectionClosed,
+      ErrCodeSessionUnconfirmed,
+      ErrCodeAgent,
+    }
+    expect(codes).toEqual({
+      ErrCodeUnknownWorkspace: 'unknown_workspace',
+      ErrCodeNoWorkspaceRegistry: 'no_workspace_registry',
+      ErrCodeUnknownProvider: 'unknown_provider',
+      ErrCodeSessionOwned: 'session_owned_by_other',
+      ErrCodeSpawnFailed: 'spawn_failed',
+      ErrCodeConnectionClosed: 'connection_closed',
+      ErrCodeSessionUnconfirmed: 'session_unconfirmed',
+      ErrCodeAgent: 'agent_error',
+    })
   })
 })

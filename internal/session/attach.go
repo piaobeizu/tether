@@ -411,14 +411,23 @@ func (a *Attachment) resolve(ctx context.Context) (Resolution, error) {
 	// would make it worthless. There is also nothing worth recovering for a client
 	// that has gone away.
 	if ctx.Err() != nil {
-		return Resolution{}, fmt.Errorf("connection closed before the session confirmed: %w", ctx.Err())
+		return Resolution{}, refuse(wire.ErrCodeConnectionClosed, "connection closed before the session confirmed: %w", ctx.Err())
 	}
 
 	if !resuming {
 		// A FRESH session died before init. There is nothing to fall back to —
 		// respawning would just repeat whatever killed it (a missing/broken cc
 		// binary, a bad workdir) and could spin. Surface it, exactly as before.
-		return Resolution{}, fmt.Errorf("agent exited before emitting session id")
+		//
+		// tether#63: classified ErrCodeSessionUnconfirmed, and it MUST stay
+		// retryable — see this function's own doc comment and Attach's: an
+		// ordinary browser reconnect for the same sid takes the `--resume`
+		// path next time, which is precisely how a transient spawn failure
+		// (a bad binary path, a momentary resource limit) recovers without
+		// the user doing anything. Marking this terminal would turn that
+		// recoverable hiccup into a dead end the ladder refuses to retry out
+		// of.
+		return Resolution{}, refuse(wire.ErrCodeSessionUnconfirmed, "agent exited before emitting session id")
 	}
 
 	// The resume failed. Decide about the notice BEFORE spawning, while reqSID is
@@ -491,13 +500,23 @@ func (a *Attachment) resolve(ctx context.Context) (Resolution, error) {
 	// than paid for by holding a mutex across I/O.
 	for _, text := range pending {
 		if err := fresh.Session().SendPrompt(ctx, text); err != nil {
-			return Resolution{}, fmt.Errorf("replay prompt onto fresh session: %w", err)
+			// tether#63 — the fallback session exists but would not take the
+			// user's words. Retryable, and classified rather than left to
+			// default so that the enumeration in wire/errors.go is the whole
+			// list and not merely most of it: the next reconnect re-resumes,
+			// and a pipe that broke once is exactly the kind of failure a
+			// second attempt clears.
+			return Resolution{}, refuse(wire.ErrCodeSpawnFailed, "replay prompt onto fresh session: %w", err)
 		}
 	}
 
 	sid := fresh.Session().SessionID()
 	if sid == "" {
-		return Resolution{}, fmt.Errorf("fresh session after failed resume %s exited before emitting session id", a.reqSID)
+		// tether#63 — the twin of the `!resuming` branch above, and retryable
+		// for the same reason stated there. Same code deliberately: from the
+		// browser's side these are one situation ("the agent never confirmed a
+		// session"), and the messages already say which of the two it was.
+		return Resolution{}, refuse(wire.ErrCodeSessionUnconfirmed, "fresh session after failed resume %s exited before emitting session id", a.reqSID)
 	}
 	return Resolution{SID: sid, Recovered: true, Notice: notice}, nil
 }

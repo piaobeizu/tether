@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -540,11 +541,27 @@ func TestResolve_FreshSessionDeathIsNotRetried(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
-	if _, err := att.Resolve(context.Background()); err == nil {
+	_, resolveErr := att.Resolve(context.Background())
+	if resolveErr == nil {
 		t.Fatal("Resolve returned nil error for a fresh session that never emitted init")
 	}
 	if got := dp.Spawns(); got != 1 {
 		t.Errorf("spawns = %d, want 1: a fresh death must not be retried", got)
+	}
+
+	// tether#63: classified ErrCodeSessionUnconfirmed, and it MUST be
+	// retryable (see resolve's doc comment on this branch) — an ordinary
+	// browser reconnect for the same sid is what lets a transient spawn
+	// failure recover on the next attempt.
+	var ref *Refusal
+	if !errors.As(resolveErr, &ref) {
+		t.Fatalf("error %v (%T) is not a *Refusal", resolveErr, resolveErr)
+	}
+	if ref.Code != wire.ErrCodeSessionUnconfirmed {
+		t.Errorf("code = %q, want %q", ref.Code, wire.ErrCodeSessionUnconfirmed)
+	}
+	if ref.Code.Terminal() {
+		t.Error("ErrCodeSessionUnconfirmed must be retryable, not terminal")
 	}
 }
 
@@ -897,13 +914,27 @@ func TestResolve_CancelledConnectionIsNotReportedAsAFailedResume(t *testing.T) {
 	}
 	cancel()
 
-	if _, err := att.Resolve(ctx); err == nil {
+	_, resolveErr := att.Resolve(ctx)
+	if resolveErr == nil {
 		t.Fatal("Resolve succeeded for a cancelled connection")
-	} else if !strings.Contains(err.Error(), "connection closed") {
-		t.Errorf("error = %q, want it to name the closed connection rather than a resume failure", err)
+	} else if !strings.Contains(resolveErr.Error(), "connection closed") {
+		t.Errorf("error = %q, want it to name the closed connection rather than a resume failure", resolveErr)
 	}
 	if got := dp.Spawns(); got != 1 {
 		t.Errorf("spawns = %d, want 1: no fallback should be started for a client that has gone away", got)
+	}
+
+	// tether#63: classified ErrCodeConnectionClosed, retryable — the daemon
+	// did nothing wrong here, and reconnecting is the entire remedy.
+	var ref *Refusal
+	if !errors.As(resolveErr, &ref) {
+		t.Fatalf("error %v (%T) is not a *Refusal", resolveErr, resolveErr)
+	}
+	if ref.Code != wire.ErrCodeConnectionClosed {
+		t.Errorf("code = %q, want %q", ref.Code, wire.ErrCodeConnectionClosed)
+	}
+	if ref.Code.Terminal() {
+		t.Error("ErrCodeConnectionClosed must be retryable, not terminal")
 	}
 }
 

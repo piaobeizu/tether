@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { useStore, mergeTranscript, type Message, type Notice } from './store'
+import { useStore, mergeTranscript, parseErrorPayload, type Message, type Notice } from './store'
 import type { Envelope } from './wire.gen'
 
 // tether#34 — extended-thinking accumulation in the chat store. These drive
@@ -691,5 +691,92 @@ describe('store settleWorkspaces ordering (tether#52)', () => {
 
     // Chat must still connect (falling back to --workspace-root), not hang.
     expect(seen[0]).toEqual({ loaded: true, ws: null })
+  })
+})
+
+// tether#63 — parseErrorPayload defensively narrows a KindError envelope's
+// payload to wire.ErrorPayload's shape. Pure, so it tests without a store.
+describe('parseErrorPayload (tether#63)', () => {
+  it('parses a well-formed ErrorPayload', () => {
+    expect(parseErrorPayload({ code: 'unknown_workspace', message: 'nope', terminal: true }))
+      .toEqual({ code: 'unknown_workspace', message: 'nope', terminal: true })
+  })
+
+  it('returns null for the pre-tether#63 bare-string payload a stale daemon might still send', () => {
+    expect(parseErrorPayload('some plain error string')).toBeNull()
+  })
+
+  it('returns null for null/undefined', () => {
+    expect(parseErrorPayload(null)).toBeNull()
+    expect(parseErrorPayload(undefined)).toBeNull()
+  })
+
+  it('returns null when a required field is missing or the wrong type', () => {
+    expect(parseErrorPayload({ code: 'x', message: 'y' })).toBeNull() // no terminal
+    expect(parseErrorPayload({ code: 'x', message: 'y', terminal: 'true' })).toBeNull() // terminal not boolean
+    expect(parseErrorPayload({ code: 1, message: 'y', terminal: false })).toBeNull() // code not string
+  })
+})
+
+// tether#63 — the 'error' envelope handler records a TERMINAL wire.ErrorPayload
+// into store.fatal, which is what tells ChatPane's onClose to stop the
+// reconnect ladder (shouldReconnectAfterClose in panes/chat/index.tsx) instead
+// of retrying a refusal that can never succeed on the same connection.
+const errorEnv = (payload: unknown): Envelope => ({ kind: 'error', payload } as unknown as Envelope)
+
+describe('store fatal refusal handling (tether#63)', () => {
+  afterEach(() => useStore.setState({ fatal: null, streaming: false, streamingMsgId: null, curTurnId: null }))
+
+  it('sets fatal from a terminal error payload', () => {
+    const h = useStore.getState().handleEnvelope
+    h(errorEnv({ code: 'unknown_workspace', message: 'unknown workspace "foo"', terminal: true }))
+    expect(useStore.getState().fatal).toEqual({ code: 'unknown_workspace', message: 'unknown workspace "foo"' })
+  })
+
+  it('does NOT set fatal for a retryable (non-terminal) error payload', () => {
+    const h = useStore.getState().handleEnvelope
+    h(errorEnv({ code: 'connection_closed', message: 'connection closed', terminal: false }))
+    expect(useStore.getState().fatal).toBeNull()
+  })
+
+  it('leaves a previously-set fatal untouched when a later error is non-terminal', () => {
+    const h = useStore.getState().handleEnvelope
+    h(errorEnv({ code: 'unknown_workspace', message: 'first', terminal: true }))
+    h(errorEnv({ code: 'connection_closed', message: 'second', terminal: false }))
+    expect(useStore.getState().fatal).toEqual({ code: 'unknown_workspace', message: 'first' })
+  })
+
+  it('an unparsable payload (pre-tether#63 bare string) does not set fatal and does not crash', () => {
+    const h = useStore.getState().handleEnvelope
+    h(errorEnv('legacy plain-string error'))
+    expect(useStore.getState().fatal).toBeNull()
+  })
+
+  it('still clears the thinking/streaming indicator on a terminal error (pre-existing behaviour)', () => {
+    const h = useStore.getState().handleEnvelope
+    useStore.setState({ streaming: true, streamingMsgId: 'm1', curTurnId: 'm1' })
+    h(errorEnv({ code: 'session_owned_by_other', message: 'owned', terminal: true }))
+    const s = useStore.getState()
+    expect(s.streaming).toBe(false)
+    expect(s.streamingMsgId).toBeNull()
+    expect(s.curTurnId).toBeNull()
+  })
+
+  it('clearFatal resets fatal to null and is idempotent', () => {
+    useStore.setState({ fatal: { code: 'unknown_workspace', message: 'x' } })
+    useStore.getState().clearFatal()
+    expect(useStore.getState().fatal).toBeNull()
+    useStore.getState().clearFatal() // no-op, no throw
+    expect(useStore.getState().fatal).toBeNull()
+  })
+
+  // loadHistory is the server-truth replace triggered by session_ready's history
+  // refetch — it must NOT clear fatal, mirroring the existing notices guarantee
+  // (tether#57): a terminal refusal explaining why the connection is dead is not
+  // something a history reload should be able to silently wipe.
+  it('loadHistory does NOT clear a pending fatal refusal', () => {
+    useStore.setState({ fatal: { code: 'unknown_workspace', message: 'x' } })
+    useStore.getState().loadHistory([])
+    expect(useStore.getState().fatal).toEqual({ code: 'unknown_workspace', message: 'x' })
   })
 })

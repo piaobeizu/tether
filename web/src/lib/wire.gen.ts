@@ -86,10 +86,16 @@ export const ErrCodeNoWorkspaceRegistry: ErrorCode = "no_workspace_registry";
 export const ErrCodeUnknownProvider: ErrorCode = "unknown_provider";
 /**
  * ErrCodeSessionOwned means this sid is already claimed by a different
- * client (tether#54's OwnedByOther / Entry.setOwner). Terminal for THIS
- * connection: the fix is opening /wt/events read-only or using a different
- * tab, not retrying the same chat connection, which will be refused again
- * for as long as the other client holds the session.
+ * client (tether#54's OwnedByOther / Entry.setOwner).
+ * "Client" here is a DEVICE, not a tab: clientID comes from the login cookie
+ * (internal/auth/middleware.go) and the SPA persists one per browser profile
+ * in localStorage, so every tab of one browser shares it and admitChat lets
+ * them all in. This refusal is therefore reached from a SECOND DEVICE, and
+ * opening another tab is not a workaround for it.
+ * Terminal for this connection: Entry.ownerClientID has one writer and is
+ * never reset, so the other device closing its tab does not release the
+ * session — retrying the same chat connection is refused for as long as the
+ * entry lives. /wt/events attaches read-only instead.
  */
 export const ErrCodeSessionOwned: ErrorCode = "session_owned_by_other";
 /**

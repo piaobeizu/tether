@@ -220,6 +220,13 @@ export default function WorkspacePane() {
                   className={`tree-row${sid === currentSid ? ' active' : ''}`}
                   style={{ paddingLeft: 12, fontSize: 11 }}
                   onClick={() => {
+                    // tether#57 — notices outlive loadHistory by design now, so a
+                    // deliberate session switch has to retire them explicitly (they
+                    // describe the session being left). Cleared synchronously at the
+                    // START of the switch, matching ChatPane's switchSession: doing it
+                    // after the fetch resolves would both leave it undone when the
+                    // session has no history and wipe a notice that arrived meanwhile.
+                    useStore.getState().clearNotices()
                     fetch(`/api/v1/sessions/${encodeURIComponent(sid)}/messages`)
                       .then(r => r.ok ? r.json() : [])
                       .then((msgs: HistoryEntry[]) => {

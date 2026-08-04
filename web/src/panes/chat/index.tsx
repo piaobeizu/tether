@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { TetherWT } from '../../lib/wt'
 import { ControlClient } from '../../lib/control'
-import { useStore, historyEntryToMessage, type HistoryEntry, type ToolCall } from '../../lib/store'
+import { useStore, historyEntryToMessage, mergeTranscript, type HistoryEntry, type ToolCall } from '../../lib/store'
 import { CopyButton } from '../../lib/CopyButton'
 import { Icon } from '../../lib/icons'
 import type { FencedBlock, ProviderListResponse } from '../../lib/wire.gen'
@@ -127,7 +127,12 @@ interface Props {
 }
 
 export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
-  const { messages, sessionId, pendingPermissions, resolvePermission, streaming, streamingMsgId, curTurnId } = useStore()
+  const { messages, notices, sessionId, pendingPermissions, resolvePermission, streaming, streamingMsgId, curTurnId } = useStore()
+  // tether#57 — what the pane actually renders: server-truth `messages` and
+  // locally-originated `notices` recombined here, at render time. They are kept
+  // apart in the store precisely so the history refetch that session_ready
+  // triggers cannot replace a notice out of existence.
+  const transcript = useMemo(() => mergeTranscript(messages, notices), [messages, notices])
   const [input, setInput] = useState('')
   const [connState, setConnState] = useState<ConnState>('connecting')
   const [connError, setConnError] = useState<string | null>(null)
@@ -246,7 +251,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   }, [sessionStart])
 
   // Scroll to bottom on new messages AND when streaming text accumulates
-  const lastMsgText = messages.length > 0 ? messages[messages.length - 1].text : ''
+  const lastMsgText = transcript.length > 0 ? transcript[transcript.length - 1].text : ''
   useEffect(() => {
     const el = chatRef.current
     if (!el) return
@@ -255,7 +260,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
     if (streaming || nearBottom) {
       el.scrollTop = el.scrollHeight
     }
-  }, [messages.length, lastMsgText, streaming])
+  }, [transcript.length, lastMsgText, streaming])
 
   // tether#46 — auto-grow the composer textarea to fit its content, up to
   // MAX_COMPOSER_LINES then scroll internally. Reset to 'auto' first so the
@@ -289,11 +294,11 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   // Empty-state hint, debounced so it doesn't flash on session resume before
   // history arrives (connState flips to 'connected' before /messages loads).
   useEffect(() => {
-    const empty = messages.length === 0 && connState === 'connected' && !streaming && pendingPermissions.length === 0
+    const empty = transcript.length === 0 && connState === 'connected' && !streaming && pendingPermissions.length === 0
     if (!empty) { setShowEmpty(false); return }
     const t = setTimeout(() => setShowEmpty(true), 500)
     return () => clearTimeout(t)
-  }, [messages.length, connState, streaming, pendingPermissions.length])
+  }, [transcript.length, connState, streaming, pendingPermissions.length])
 
   const cancelPendingReconnect = () => {
     if (reconnectTimerRef.current !== null) { clearTimeout(reconnectTimerRef.current); reconnectTimerRef.current = null }
@@ -486,6 +491,11 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   const switchSession = (sid: string) => {
     if (!sid) return
     localStorage.setItem('tether_last_sid', sid)
+    // tether#57 — a notice describes the session you are LEAVING, so a
+    // deliberate switch retires it. Before #57 loadHistory's replace did this
+    // implicitly (the notice lived in `messages`); now that notices survive
+    // that replace by design, this call site has to say so explicitly.
+    useStore.getState().clearNotices()
     useStore.getState().setSessionId(sid)
     fetch(`/api/v1/sessions/${encodeURIComponent(sid)}/messages`)
       .then(r => r.ok ? r.json() : [])
@@ -657,7 +667,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
           </div>
         )}
 
-        {messages.map((m) => {
+        {transcript.map((m) => {
           if (m.role === 'user') {
             return (
               <div key={m.id} className="msg-user">

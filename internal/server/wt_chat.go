@@ -208,11 +208,15 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 	// the ordering — the store's notice branch ignores env.SessionID — but do not
 	// add anything that does without first making the transport ordered.
 	//
-	// KNOWN LIMIT: the notice is a live-only message, and session_ready triggers
-	// the frontend's history refetch for the new sid, which REPLACES the message
-	// list. Today the notice survives because that refetch is skipped while a turn
-	// is streaming; if it ever resolves in a quiet moment the notice is silently
-	// discarded with no way to bring it back. Tracked separately.
+	// The notice is live-only — it is never written to history, so if the frontend
+	// drops it there is no way to get it back. session_ready (sent just above) is
+	// what triggers the frontend's history refetch for the new sid, and that
+	// refetch REPLACES the message list; until tether#57 the notice sat in that
+	// same list and survived only because the refetch happens to be skipped while
+	// a turn is streaming. The frontend now keeps notices in a separate slice the
+	// refetch does not own (web/src/lib/store.ts, mergeTranscript), so the two can
+	// no longer clobber each other. Keep it that way: a notice added to the
+	// server-truth message list is a notice the next refetch can silently eat.
 	if res.Notice {
 		sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindMessage, SessionID: realSID, Payload: map[string]any{
 			"type": "notice",

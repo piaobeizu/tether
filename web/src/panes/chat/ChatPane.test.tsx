@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, fmtTokens, summarizeToolInput, summarizeToolResult, truncateResult, shouldSendOnEnter, growHeight, parseAtQuery, fuzzyRankFiles } from './index'
+import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, fmtTokens, summarizeToolInput, summarizeToolResult, truncateResult, shouldSendOnEnter, growHeight, parseAtQuery, fuzzyRankFiles, shouldDeferFirstConnect } from './index'
 import { PermissionQueue, postDecide } from '../../fenced-blocks/PermissionBlock'
 import type { ToolCall, PermissionRequest } from '../../lib/store'
 
@@ -456,5 +456,28 @@ describe('fuzzyRankFiles (tether#47)', () => {
   })
   it('honors the limit', () => {
     expect(fuzzyRankFiles(files, 'o', 1)).toHaveLength(1)
+  })
+})
+
+// tether#52 — shouldDeferFirstConnect decides whether ChatPane's mount effect
+// waits for WorkspacePane's workspace list before opening the WebTransport
+// connection. Only the sid-less (brand-new-session) path defers — see
+// index.tsx's mount effect comment for why a remembered sid must never wait.
+describe('shouldDeferFirstConnect (tether#52)', () => {
+  it('defers when there is no remembered sid and workspaces have not loaded yet', () => {
+    expect(shouldDeferFirstConnect({ hasLastSid: false, workspacesLoaded: false })).toBe(true)
+  })
+
+  it('does not defer once workspaces have loaded, even with no sid', () => {
+    expect(shouldDeferFirstConnect({ hasLastSid: false, workspacesLoaded: true })).toBe(false)
+  })
+
+  // THE load-bearing negative: a remembered sid means the daemon already knows
+  // that session's workspace (chatUrl.ts) — waiting on workspacesLoaded here
+  // would add latency to the overwhelmingly common reconnect for no behavioral
+  // effect, so a sid present must short-circuit to "don't defer" regardless.
+  it('never defers when a last sid is remembered, regardless of workspacesLoaded', () => {
+    expect(shouldDeferFirstConnect({ hasLastSid: true, workspacesLoaded: false })).toBe(false)
+    expect(shouldDeferFirstConnect({ hasLastSid: true, workspacesLoaded: true })).toBe(false)
   })
 })

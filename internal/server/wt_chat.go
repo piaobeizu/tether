@@ -66,6 +66,19 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 
 	sid := r.URL.Query().Get("sid")
 	providerName := r.URL.Query().Get("provider")
+	// tether#52 — which registered workspace the agent should run IN, as an opaque
+	// id from ~/.tether/workspaces.json. A query parameter, like sid and provider
+	// above, because that is where this route's per-connection parameters already
+	// live; internal/wire carries the server→browser envelope schema and has no
+	// part in the handshake, so nothing here is generated and wire.gen.ts does not
+	// move.
+	//
+	// It is an ID and not a path on purpose, and Registry.Attach is where that is
+	// enforced: the agent's cwd decides which files it can read and write, so a
+	// request that could name a directory would be choosing that for itself. An
+	// unregistered id is refused below rather than falling back to
+	// --workspace-root — a silent fallback would turn "rejected" into "redirected".
+	wsID := r.URL.Query().Get("ws")
 
 	// If attaching to an existing session, verify ownership first. Only reject
 	// when the session EXISTS and is owned by a different client (#83).
@@ -106,8 +119,15 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 	// gets a `cc --resume <sid>` ATTEMPT, so a browser reload or a daemon restart
 	// no longer costs the model its memory of the conversation (tether#50). The
 	// attempt is recoverable — see Attachment.Resolve below.
-	att, err := reg.Attach(ctx, sid, providerName)
+	//
+	// An error here is now also how an unusable workspace request ends (tether#52):
+	// Attach validates wsID BEFORE spawning, so a forged or stale id closes the
+	// connection with an error envelope and no subprocess anywhere. Note this is
+	// reached only after admitChat above, so workspace selection cannot be used to
+	// reach a session admission would have refused.
+	att, err := reg.Attach(ctx, sid, providerName, wsID)
 	if err != nil {
+		slog.Warn("serveChat: attach refused", "sid", sid, "ws", wsID, "err", err)
 		sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindError, Payload: err.Error()})
 		return
 	}
@@ -218,9 +238,19 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 	// no longer clobber each other. Keep it that way: a notice added to the
 	// server-truth message list is a notice the next refetch can silently eat.
 	if res.Notice {
+		// Two different truths, so two different sentences (tether#52). A failed
+		// resume means the conversation is GONE. A rebind means it is intact and still
+		// resumable — just not from this workspace, because cc keys a transcript on the
+		// directory it was created in. Telling someone their context "could not be
+		// restored" when it is sitting safely in another workspace is a lie, and a
+		// notice a user has caught lying is one they stop reading.
+		text := "Started a new session — the previous conversation's context could not be restored."
+		if res.Rebound {
+			text = "Started a new session in this workspace — the previous conversation belongs to a different workspace and stays there."
+		}
 		sendEnvelope(wtsess, wire.Envelope{Kind: wire.KindMessage, SessionID: realSID, Payload: map[string]any{
 			"type": "notice",
-			"text": "Started a new session — the previous conversation's context could not be restored.",
+			"text": text,
 		}})
 	}
 

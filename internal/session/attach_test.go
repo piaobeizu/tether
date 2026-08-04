@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -160,7 +161,7 @@ func TestAttach_NoSidMintsFreshSessionID(t *testing.T) {
 	fp := &fakeProvider{sess: &fakeSession{sid: "minted-sid", events: make(chan agent.Event, 8)}}
 	reg := NewRegistry(fp)
 
-	if _, err := reg.Attach(context.Background(), "", "fake"); err != nil {
+	if _, err := reg.Attach(context.Background(), "", "fake", ""); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
 	if fp.lastCfg.ResumeSessionID != "" {
@@ -183,7 +184,7 @@ func TestAttach_DeadSidAttemptsResume(t *testing.T) {
 	fp := &fakeProvider{sess: &fakeSession{sid: "dead-sid", events: make(chan agent.Event, 8)}}
 	reg := NewRegistry(fp)
 
-	if _, err := reg.Attach(context.Background(), "dead-sid", "fake"); err != nil {
+	if _, err := reg.Attach(context.Background(), "dead-sid", "fake", ""); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
 	if fp.lastCfg.ResumeSessionID != "dead-sid" {
@@ -209,7 +210,7 @@ func TestAttach_LiveSidReusesWithoutSpawning(t *testing.T) {
 	waitForRegistered(t, reg, "live-sid")
 	spawnsBefore := fp.spawns
 
-	att, err := reg.Attach(context.Background(), "live-sid", "fake")
+	att, err := reg.Attach(context.Background(), "live-sid", "fake", "")
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -322,7 +323,7 @@ func TestAttach_RegisteredButDeadSessionIsNotReused(t *testing.T) {
 	}
 	corpse.dead.Store(true)
 
-	att, err := reg.Attach(context.Background(), "corpse-sid", "fake")
+	att, err := reg.Attach(context.Background(), "corpse-sid", "fake", "")
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -381,7 +382,7 @@ func TestAttach_LiveSessionStillReusedAfterLivenessCheck(t *testing.T) {
 	waitForRegistered(t, reg, "healthy-sid")
 	seeded := registeredEntry(reg, "healthy-sid")
 
-	att, err := reg.Attach(context.Background(), "healthy-sid", "fake")
+	att, err := reg.Attach(context.Background(), "healthy-sid", "fake", "")
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -416,7 +417,7 @@ func TestResolve_FailedResumeFallsBackAndReplays(t *testing.T) {
 	dp := &deadThenLiveProvider{dead: dead, live: live}
 	reg := NewRegistry(dp)
 
-	att, err := reg.Attach(context.Background(), "gone-sid", "fake")
+	att, err := reg.Attach(context.Background(), "gone-sid", "fake", "")
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -475,7 +476,7 @@ func TestResolve_ReplaysEveryBufferedPrompt(t *testing.T) {
 	dp := &deadThenLiveProvider{dead: dead, live: live}
 	reg := NewRegistry(dp)
 
-	att, err := reg.Attach(context.Background(), "gone-sid", "fake")
+	att, err := reg.Attach(context.Background(), "gone-sid", "fake", "")
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -507,7 +508,7 @@ func TestResolve_PromptsAfterSettlingAreNotReplayed(t *testing.T) {
 	fp := &fakeProvider{sess: live}
 	reg := NewRegistry(fp)
 
-	att, err := reg.Attach(context.Background(), "", "fake")
+	att, err := reg.Attach(context.Background(), "", "fake", "")
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -535,7 +536,7 @@ func TestResolve_FreshSessionDeathIsNotRetried(t *testing.T) {
 	dp := &deadOnlyProvider{dead: newDeadSession()}
 	reg := NewRegistry(dp)
 
-	att, err := reg.Attach(context.Background(), "", "fake")
+	att, err := reg.Attach(context.Background(), "", "fake", "")
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -586,7 +587,7 @@ func TestResolve_SubscriberSurvivesFallback(t *testing.T) {
 	dp := &deadThenLiveProvider{dead: dead, live: live}
 	reg := NewRegistry(dp)
 
-	att, err := reg.Attach(context.Background(), "gone-sid", "fake")
+	att, err := reg.Attach(context.Background(), "gone-sid", "fake", "")
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -646,7 +647,7 @@ func TestResolve_NoticeOnlyWhenTheDeadSessionHadHistory(t *testing.T) {
 				reg.History.RecordUser("gone-sid", "something I said earlier")
 			}
 
-			att, err := reg.Attach(context.Background(), "gone-sid", "fake")
+			att, err := reg.Attach(context.Background(), "gone-sid", "fake", "")
 			if err != nil {
 				t.Fatalf("Attach: %v", err)
 			}
@@ -674,12 +675,37 @@ func TestHasHistory(t *testing.T) {
 	if h.HasHistory("never-existed") {
 		t.Error("HasHistory of an unknown sid = true, want false")
 	}
-	h.RecordUser("sid-a", "hello")
-	if !h.HasHistory("sid-a") {
+	// Realistic ids: HasHistory now shares ValidSessionID with the /api/v1/sessions
+	// route (it is the one HistoryStore entry point reached with a RAW client sid),
+	// and that guard bounds length and alphabet — so a 5-character stand-in would
+	// fail here while every real sid passes.
+	h.RecordUser("sid-alpha-0001", "hello")
+	if !h.HasHistory("sid-alpha-0001") {
 		t.Error("HasHistory after RecordUser = false, want true")
 	}
-	if h.HasHistory("sid-b") {
+	if h.HasHistory("sid-bravo-0002") {
 		t.Error("HasHistory leaked across sids")
+	}
+
+	// The traversal guard, staged so it can actually FAIL. HasHistory is the one
+	// HistoryStore entry point reached with a RAW client sid (Attachment.resolve asks
+	// it about a.reqSID straight off `/wt/chat?sid=`), so an unguarded version is a
+	// stat oracle for any file named history.jsonl.
+	//
+	// The planted file is the point: asking about a traversal path that does not
+	// exist answers false whether or not the guard is there, which is an assertion
+	// that cannot fail and therefore is not evidence.
+	base := t.TempDir()
+	outside := filepath.Join(base, "outside")
+	if err := os.MkdirAll(outside, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "history.jsonl"), []byte("{\"role\":\"user\"}\n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	h2 := NewHistoryStore(filepath.Join(base, "sessions"))
+	if h2.HasHistory("../outside") {
+		t.Error("HasHistory answered about a file OUTSIDE its own directory; a traversal-shaped sid must be refused")
 	}
 }
 
@@ -699,7 +725,7 @@ func TestWaitSID_ReturnsTheFallbackSid(t *testing.T) {
 	dp := &deadThenLiveProvider{dead: dead, live: live}
 	reg := NewRegistry(dp)
 
-	att, err := reg.Attach(context.Background(), "gone-sid", "fake")
+	att, err := reg.Attach(context.Background(), "gone-sid", "fake", "")
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -733,7 +759,7 @@ func TestWaitSID_UnblocksWhenResolveFails(t *testing.T) {
 	dp := &deadOnlyProvider{dead: newDeadSession()}
 	reg := NewRegistry(dp)
 
-	att, err := reg.Attach(context.Background(), "", "fake")
+	att, err := reg.Attach(context.Background(), "", "fake", "")
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -783,7 +809,7 @@ func TestSetOwner_WorksBeforeTheEntryIsRekeyed(t *testing.T) {
 		ready := make(chan struct{})
 		fs := &fakeSession{sid: "sid-race", events: make(chan agent.Event, 4), sidReady: ready}
 		reg := NewRegistry(&fakeProvider{sess: fs})
-		att, err := reg.Attach(context.Background(), "", "fake")
+		att, err := reg.Attach(context.Background(), "", "fake", "")
 		if err != nil {
 			t.Fatalf("Attach: %v", err)
 		}
@@ -808,7 +834,7 @@ func TestSetOwner_WorksBeforeTheEntryIsRekeyed(t *testing.T) {
 func TestSetOwner_StillRejectsADifferentClient(t *testing.T) {
 	fs := &fakeSession{sid: "sid-owned", events: make(chan agent.Event, 4)}
 	reg := NewRegistry(&fakeProvider{sess: fs})
-	att, err := reg.Attach(context.Background(), "", "fake")
+	att, err := reg.Attach(context.Background(), "", "fake", "")
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -832,7 +858,7 @@ func TestResolve_IsIdempotent(t *testing.T) {
 	dp := &deadThenLiveProvider{dead: dead, live: live}
 	reg := NewRegistry(dp)
 
-	att, err := reg.Attach(context.Background(), "gone-sid", "fake")
+	att, err := reg.Attach(context.Background(), "gone-sid", "fake", "")
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -865,7 +891,7 @@ func TestResolve_CancelledConnectionIsNotReportedAsAFailedResume(t *testing.T) {
 	reg := NewRegistry(dp)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	att, err := reg.Attach(ctx, "gone-sid", "fake")
+	att, err := reg.Attach(ctx, "gone-sid", "fake", "")
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -897,7 +923,7 @@ func TestResolve_FallbackWhenSessionIDBlocks(t *testing.T) {
 	dp := &deadThenLiveProvider{dead: dead, live: live}
 	reg := NewRegistry(dp)
 
-	att, err := reg.Attach(context.Background(), "gone-sid", "fake")
+	att, err := reg.Attach(context.Background(), "gone-sid", "fake", "")
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -974,7 +1000,7 @@ func TestResolve_ReapsTheFailedResumeSubprocess(t *testing.T) {
 	dp := &deadThenLiveProvider{dead: dead, live: live, holdDeadStreamOpen: true}
 	reg := NewRegistry(dp)
 
-	att, err := reg.Attach(context.Background(), "gone-sid", "fake")
+	att, err := reg.Attach(context.Background(), "gone-sid", "fake", "")
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}

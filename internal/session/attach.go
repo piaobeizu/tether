@@ -32,7 +32,7 @@ import (
 //
 // # Lifecycle
 //
-//	att, err := reg.Attach(ctx, sid, provider)   // spawns: resume or fresh
+//	att, err := reg.Attach(ctx, sid, provider, wsID) // spawns: resume or fresh
 //	att.Subscribe(ch)                            // survives a fallback swap
 //	go func() { for … { att.SendPrompt(ctx, t) } }
 //	res, err := att.Resolve(ctx)                 // confirms, or falls back
@@ -47,6 +47,16 @@ type Attachment struct {
 	// Retained after a fallback so the notice gate can ask whether THAT session
 	// had history.
 	reqSID string
+	// ws is the workspace this attachment's sessions run in — already validated by
+	// resolveWorkspace. Carried so the FALLBACK spawns in the same workspace as the
+	// resume it replaces; without it, recovering from a failed resume would
+	// silently relocate the conversation to the daemon default (tether#52).
+	ws WorkspaceBinding
+	// rebound records that the sid the client brought was dropped because it
+	// belongs to a different workspace (resolveWorkspace row 5). It makes the fresh
+	// session report itself as a recovery, so the user is TOLD their context did
+	// not come with them instead of finding an unexplained empty transcript.
+	rebound bool
 
 	mu sync.Mutex
 	// entry is the live binding. It is REPLACED (not mutated) by a fallback, so
@@ -87,18 +97,44 @@ type Resolution struct {
 	// SID is the confirmed session id: the resumed one, the minted one, or the
 	// one minted by a fallback. Always non-empty when Resolve returns no error.
 	SID string
-	// Recovered is true when a --resume attempt failed and Resolve fell back to a
-	// brand-new session, i.e. the conversation's context is gone even though the
-	// connection succeeded. Consumed for logging and to gate Notice; the browser
-	// adopts SID from session_ready either way.
+	// Recovered is true when the sid the client asked for is NOT the sid that
+	// answered, i.e. the connection succeeded but the conversation's context did
+	// not come with it. Two ways to get here: a `--resume` attempt failed and
+	// Resolve fell back to a brand-new session (tether#50), or the sid belonged to
+	// a different workspace and was deliberately dropped (tether#52 — see
+	// Rebound). Consumed for logging and to gate Notice; the browser adopts SID
+	// from session_ready either way.
 	Recovered bool
 	// Notice is true when the user should be TOLD that context was lost:
-	// Recovered AND the dead session actually had persisted history. See
+	// Recovered AND the requested session actually had persisted history. See
 	// HistoryStore.HasHistory for why the gate exists.
 	Notice bool
+	// Rebound distinguishes the two Recovered cases, because they need different
+	// words. A failed resume means the old conversation is GONE; a rebind means it
+	// is intact and still resumable — just not from this workspace. Telling a user
+	// their context "could not be restored" when it is sitting safely in workspace A
+	// is a lie that would make them stop trusting the notice. serveChat picks the
+	// sentence from this flag (tether#52).
+	Rebound bool
 }
 
-// Attach binds to sid, or spawns a session to bind to.
+// Attach binds to sid, or spawns a session to bind to, in the workspace named by
+// wsID.
+//
+// # wsID is a workspace ID, never a path (tether#52)
+//
+// It is resolved here — through Registry.Workspaces, i.e. the user's own
+// workspace registry — and an id that is not registered is an ERROR, before
+// anything is spawned. This is the only entry point that resolves one, which is
+// the point: the agent's cwd is where it reads and writes files, so "which
+// directory may a request choose?" has exactly one gate rather than one per
+// caller. An empty wsID means "no workspace selected" and keeps the pre-tether#52
+// behaviour, the daemon-global Registry.Workdir.
+//
+// The workspace also decides whether sid may be used at all — see
+// resolveWorkspace for the table and for why an existing sid presented under a
+// DIFFERENT workspace becomes a fresh session rather than a refusal or a resume
+// in the wrong directory.
 //
 // Three cases, in order of preference:
 //
@@ -151,14 +187,27 @@ type Resolution struct {
 //     subprocess, which cannot simply be Closed (see the os/exec note in resolve).
 //     That is a self-contained piece of work, not a line, and it is deliberately
 //     not smuggled in here; tether#60 tracks it.
-func (r *Registry) Attach(ctx context.Context, sid, providerName string) (*Attachment, error) {
+func (r *Registry) Attach(ctx context.Context, sid, providerName, wsID string) (*Attachment, error) {
+	// FIRST, before any spawn: an unknown workspace id must cost nothing. Returning
+	// here is what makes "the daemon does not start anything in an unintended
+	// directory" a property of program order rather than of care downstream.
+	dec, err := r.resolveWorkspace(sid, wsID)
+	if err != nil {
+		return nil, err
+	}
+
 	a := &Attachment{
 		reg:      r,
 		provider: providerName,
 		reqSID:   sid,
+		ws:       dec.Binding,
 		subs:     make(map[chan wire.Envelope]struct{}),
 		resolved: make(chan struct{}),
 	}
+	want := r.workdirFor(dec.Binding)
+	// Set only when a LIVE session had to be left alone below; carried so the single
+	// rebind log line can say which of the two cases it is.
+	var liveElsewhere string
 
 	// liveEntry, not a bare r.sessions lookup: an entry that is still registered
 	// is not necessarily an agent that is still running, and adopting a corpse
@@ -196,18 +245,41 @@ func (r *Registry) Attach(ctx context.Context, sid, providerName string) (*Attac
 	//     and Alive() keeps saying true forever. That is a gap in
 	//     opencodeSession's own lifecycle, tracked separately — reporting it here
 	//     would mean this gate second-guessing the provider.
-	if e, ok := r.liveEntry(sid); ok {
-		a.entry = e
-		return a, nil
+	if e, ok := r.liveEntry(dec.ResumeSID); ok {
+		if e.workdir == want {
+			a.entry = e
+			return a, nil
+		}
+		// A live session whose cwd is not the one this connection resolved to.
+		// resolveWorkspace normally rules this out — it derives the session's own
+		// workspace FROM this entry, so the two agree — but not when the entry's
+		// workdir is empty, which happens when neither a workspace nor
+		// --workspace-root gave the daemon a directory. Handled as row 5 rather
+		// than by reuse or by resuming: reusing would put this connection in a
+		// directory it did not ask for, and `--resume` of a still-live sid would
+		// duplicate the session that tether#54 went to some trouble to make
+		// findable. Leave the live one alone and start fresh here.
+		liveElsewhere = e.workdir
+		dec.ResumeSID = ""
+		dec.Rebound = true
+	}
+	if dec.Rebound {
+		a.rebound = true
+		// One line for one event: `live_workdir` is empty unless the branch above
+		// fired, which is how an operator tells "its recorded workspace differs" from
+		// "it is running right now, elsewhere".
+		slog.Info("chat: the requested session does not belong to the requested workspace; starting a fresh session there",
+			"requested_sid", a.reqSID, "workspace_id", dec.Binding.WorkspaceID,
+			"workdir", want, "live_workdir", liveElsewhere)
 	}
 
-	cfg := agent.SpawnConfig{ResumeSessionID: sid}
-	e, err := r.spawnEntry(ctx, providerName, cfg)
+	cfg := agent.SpawnConfig{ResumeSessionID: dec.ResumeSID}
+	e, err := r.spawnEntry(ctx, providerName, cfg, dec.Binding)
 	if err != nil {
 		return nil, err
 	}
 	a.entry = e
-	a.resuming = sid != ""
+	a.resuming = dec.ResumeSID != ""
 	return a, nil
 }
 
@@ -312,12 +384,23 @@ func (a *Attachment) Resolve(ctx context.Context) (Resolution, error) {
 
 func (a *Attachment) resolve(ctx context.Context) (Resolution, error) {
 	a.mu.Lock()
-	e, resuming := a.entry, a.resuming
+	e, resuming, rebound := a.entry, a.resuming, a.rebound
 	a.mu.Unlock()
 
 	// Blocks until system/init lands (the session is real) or the process exits
 	// without one (tether#49's done channel), which yields "".
 	if sid := e.Session().SessionID(); sid != "" {
+		// A rebound attachment (resolveWorkspace row 5) confirmed a session the
+		// client did not ask for — its sid belonged to another workspace and was
+		// dropped. Reported through the SAME two flags a failed resume uses, because
+		// it is the same thing from the user's side: they reconnected and their
+		// context did not come with them. Saying so is what stops the fresh session
+		// from arriving as an unexplained empty transcript. The notice is still gated
+		// on there having BEEN a conversation to lose (see HistoryStore.HasHistory).
+		if rebound {
+			notice := a.reg.History != nil && a.reg.History.HasHistory(a.reqSID)
+			return Resolution{SID: sid, Recovered: true, Notice: notice, Rebound: true}, nil
+		}
 		return Resolution{SID: sid}, nil
 	}
 
@@ -371,7 +454,12 @@ func (a *Attachment) resolve(ctx context.Context) (Resolution, error) {
 		slog.Debug("reaped the failed-resume subprocess", "requested_sid", a.reqSID, "err", err)
 	}
 
-	fresh, err := a.reg.spawnEntry(ctx, a.provider, agent.SpawnConfig{})
+	// a.ws, not the zero binding: the replacement must run in the SAME workspace as
+	// the resume it replaces (tether#52). Spawning into the daemon default here
+	// would move the user's conversation to a different directory as the price of
+	// recovering it — and every subsequent reconnect would then resume it there,
+	// making the relocation permanent and invisible.
+	fresh, err := a.reg.spawnEntry(ctx, a.provider, agent.SpawnConfig{}, a.ws)
 	if err != nil {
 		return Resolution{}, fmt.Errorf("resume %s failed and fresh spawn failed: %w", a.reqSID, err)
 	}

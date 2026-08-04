@@ -62,6 +62,7 @@ beforeEach(() => {
     sessionId: 'sid-previous',
     messages: [],
     notices: [{ id: 'n1', text: 'context lost', ts: 5 }],
+    workspacesLoaded: false, // tether#52 — the store is a module singleton; reset the gate each test
   })
 })
 
@@ -100,5 +101,59 @@ describe('Workspace session list (tether#61)', () => {
     expect(reconnects()).toBe(1)
     await waitFor(() => expect(useStore.getState().sessionId).toBe(SID_EMPTY))
     expect(localStorage.getItem('tether_last_sid')).toBe(SID_EMPTY)
+  })
+})
+
+// tether#52 — ChatPane's first-connect gate (store.ts's workspacesLoaded) must
+// release once THIS fetch settles, on both the success and the error path —
+// see index.tsx's load(). A gate that only releases on success would leave a
+// sid-less first connect waiting forever whenever /api/v1/workspaces 500s or
+// the network is down (the 2s fallback timer in ChatPane is a backstop, not a
+// substitute — this test is what proves the primary release path works at all).
+describe('WorkspacePane workspacesLoaded gate (tether#52)', () => {
+  it('sets workspacesLoaded once the workspaces fetch resolves', async () => {
+    mockDaemon()
+    expect(useStore.getState().workspacesLoaded).toBe(false)
+    render(<WorkspacePane />)
+    await waitFor(() => expect(useStore.getState().workspacesLoaded).toBe(true))
+  })
+
+  it('still sets workspacesLoaded when the workspaces fetch fails', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url === '/api/v1/workspaces') return { ok: false, status: 500, json: async () => ({}) }
+      if (url === '/api/v1/sessions') return { ok: true, status: 200, json: async () => [] }
+      throw new Error(`unexpected fetch: ${url}`)
+    }))
+    expect(useStore.getState().workspacesLoaded).toBe(false)
+    render(<WorkspacePane />)
+    await waitFor(() => expect(useStore.getState().workspacesLoaded).toBe(true))
+  })
+
+  // The composition test that the first version of this slice was missing, and
+  // that would have caught it: it is not enough for the gate to OPEN, the
+  // workspace has to be published in the same breath.
+  //
+  // ChatPane's gate subscription runs synchronously inside the store update that
+  // opens the gate, and it connects immediately, reading `activeWorkspace` via
+  // getState(). A brand-new session's cwd is pinned at spawn, so an
+  // `activeWorkspace` that is still null at that instant means the session runs
+  // in the daemon's default directory for the rest of its life. Publishing it
+  // from the pane's [activeId, workspaces] effect — one React commit later —
+  // looks identical in every other test and is exactly the bug.
+  it('has already published the selection in the update that opens the gate', async () => {
+    mockDaemon()
+    const atRelease: Array<{ ws: string | null }> = []
+    const unsub = useStore.subscribe(s => {
+      if (s.workspacesLoaded && atRelease.length === 0) {
+        atRelease.push({ ws: s.activeWorkspace?.id ?? null })
+      }
+    })
+    try {
+      render(<WorkspacePane />)
+      await waitFor(() => expect(atRelease.length).toBe(1))
+    } finally {
+      unsub()
+    }
+    expect(atRelease[0]).toEqual({ ws: 'ws-1' })
   })
 })

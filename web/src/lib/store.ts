@@ -213,6 +213,16 @@ interface AppState {
   // Carries the abspath so @ can insert @<abspath> (cc reads it regardless of cwd).
   activeWorkspace: { id: string; path: string } | null
 
+  // tether#52 — gates ChatPane's FIRST connect (see index.tsx's mount effect
+  // and chatUrl.ts). WorkspacePane's GET /api/v1/workspaces resolves strictly
+  // after ChatPane mounts, so on a cold profile (no remembered sid) connecting
+  // immediately would pin a brand-new session's cwd before the browsed
+  // workspace is known. Set true on BOTH the success and the error path of
+  // that fetch (see workspace/index.tsx load()) — a failed/offline fetch must
+  // still release the gate, else a sid-less first connect would wait forever
+  // (the 2s fallback timer in ChatPane is the other half of that guarantee).
+  workspacesLoaded: boolean
+
   setSessionId: (id: string) => void
   loadHistory: (msgs: Message[]) => void
   /** Drop the notice list when the USER deliberately opens a different session
@@ -231,6 +241,8 @@ interface AppState {
   select: (sel: { wiId?: string | null; file?: SelectedFile | null } | null) => void
   setWorkProject: (p: string) => void
   setActiveWorkspace: (ws: { id: string; path: string } | null) => void
+  setWorkspacesLoaded: (v: boolean) => void
+  settleWorkspaces: (ws: { id: string; path: string } | null) => void
 }
 
 // finalizeTurn closes the current assistant turn — stamps the answer duration
@@ -264,6 +276,7 @@ export const useStore = create<AppState>((set, get) => ({
   selectedFile: null,
   workProject: '',
   activeWorkspace: null,
+  workspacesLoaded: false,
 
   setSessionId: (id) => {
     localStorage.setItem('tether_last_sid', id)
@@ -620,4 +633,23 @@ export const useStore = create<AppState>((set, get) => ({
 
   setWorkProject: (p) => set({ workProject: p }),
   setActiveWorkspace: (ws) => set({ activeWorkspace: ws }),
+  setWorkspacesLoaded: (v) => set({ workspacesLoaded: v }),
+
+  // tether#52 — publish the initial workspace selection and release ChatPane's
+  // first-connect gate in ONE update. The single `set` is the whole point, not a
+  // tidiness: zustand notifies listeners SYNCHRONOUSLY from inside `set`, and
+  // ChatPane's gate listener calls doConnect right there, which reads
+  // `activeWorkspace` via getState(). So anything that flips `workspacesLoaded`
+  // in a separate update from the one that publishes the workspace hands
+  // doConnect an EMPTY selection — and a new session's cwd is pinned at spawn,
+  // for that session's whole life.
+  //
+  // That is not hypothetical: the first version of this slice released the gate
+  // from load()'s `finally` while `activeWorkspace` was published by a
+  // `useEffect`, i.e. one React commit later. The gate fired first, every fresh
+  // session connected with no `ws`, and the agent always spawned in
+  // --workspace-root — the feature was inert with a fully green test suite.
+  // store.test.ts pins the ordering by asserting on a subscriber's FIRST
+  // notification; keep the two fields in one `set` and it cannot come back.
+  settleWorkspaces: (ws) => set({ activeWorkspace: ws, workspacesLoaded: true }),
 }))

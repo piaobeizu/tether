@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { TetherWT } from '../../lib/wt'
 import { ControlClient } from '../../lib/control'
+import { chatURL } from '../../lib/chatUrl'
 import { useStore, historyEntryToMessage, mergeTranscript, type HistoryEntry, type ToolCall } from '../../lib/store'
 import { CopyButton } from '../../lib/CopyButton'
 import { Icon } from '../../lib/icons'
@@ -19,6 +20,12 @@ type ConnState = 'connecting' | 'connected' | 'reconnecting' | 'failed'
 const RECONNECT_BASE_MS = 1_000
 const RECONNECT_MAX_MS = 16_000
 const RECONNECT_MAX_ATTEMPTS = 5
+// tether#52 — how long the FIRST connect waits for the workspace list before
+// giving up and connecting without a workspace. A backstop, not the normal path:
+// WorkspacePane releases the gate as soon as its fetch settles either way, so this
+// only fires if that request hangs — and connecting late is better than a chat pane
+// that never connects at all.
+const WORKSPACE_GATE_TIMEOUT_MS = 2_000
 
 const SLASH_CMDS = [
   { cmd: '/spec',   desc: 'write a spec for this task' },
@@ -70,6 +77,26 @@ export function growHeight(
   const min = (o.minLines ?? 1) * o.lineHeightPx
   const max = o.maxLines * o.lineHeightPx
   return { height: Math.max(min, Math.min(scrollHeight, max)), scroll: scrollHeight > max }
+}
+
+// tether#52 — first-connect ordering. A brand-new session's cwd is pinned at
+// spawn (chatUrl.ts), so if the pane connects before the browsed workspace is
+// known, a fresh session locks into the daemon's default directory for its
+// entire life — there's no fixing it after the fact (see chatUrl.ts's doc
+// comment on why `ws` can't just be resent later). WorkspacePane publishes
+// `activeWorkspace`/`workspacesLoaded` only once its own GET
+// /api/v1/workspaces resolves, which happens strictly AFTER ChatPane mounts,
+// so "just connect on mount" races that fetch and — on a cold browser profile
+// — normally loses.
+//
+// The gate applies ONLY to the sid-less path: with a remembered `tether_last_
+// sid`, the daemon already knows that session's workspace and ignores
+// anything we'd send (chatUrl.ts), so making the overwhelmingly common
+// reconnect wait on `workspacesLoaded` would add latency for zero behavioral
+// effect. Extracted pure (mirrors shouldSendOnEnter/growHeight above) so this
+// ordering decision is unit-testable without mounting the pane (WebTransport).
+export function shouldDeferFirstConnect(o: { hasLastSid: boolean; workspacesLoaded: boolean }): boolean {
+  return !o.hasLastSid && !o.workspacesLoaded
 }
 
 // tether#47 — @-file mention. parseAtQuery locates the @token the caret is
@@ -176,6 +203,11 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const unmountedRef = useRef(false)
+  // tether#52 — guards the mount effect's deferred-first-connect path so the
+  // store-subscription and the 2s fallback timer (both of which can fire)
+  // trigger doConnect at most once. Reset at the top of that effect on each
+  // run (relevant under StrictMode's dev double-invoke).
+  const firstConnectedRef = useRef(false)
   const chatRef = useRef<HTMLDivElement>(null)
   const taRef = useRef<HTMLTextAreaElement>(null)
   const [providers, setProviders] = useState<string[]>(['claude-code'])
@@ -325,6 +357,13 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const doConnect = () => {
+    // tether#52 — mark the first connect as done HERE, not only in the mount
+    // effect's startOnce. manualRetry (the `tether:retry-connection` event, which
+    // openSession, the error banner and the WT pill all dispatch) calls doConnect
+    // directly, so a retry that lands inside the deferred window would otherwise
+    // still be followed by the gate's own connect — tearing down the connection
+    // the user's action just opened.
+    firstConnectedRef.current = true
     cancelPendingReconnect()
     setConnState('connecting')
     setConnError(null)
@@ -341,7 +380,16 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
 
     // Resume last session if available — keeps history consistent across refreshes.
     const lastSid = localStorage.getItem('tether_last_sid') ?? ''
-    const url = `https://${location.host}/wt/chat?provider=${encodeURIComponent(selectedProvider)}${lastSid ? `&sid=${encodeURIComponent(lastSid)}` : ''}`
+    // tether#52 — read the browsed workspace via getState(), NOT the reactive
+    // `activeWorkspace` selector below (that one exists for the @-mention
+    // picker's re-renders). A plain read here means a workspace switch while
+    // connected can never retrigger this closure — the only thing that can
+    // start a new connection is a fresh mount or an explicit retry/reconnect,
+    // which is exactly what must stay true: a live session's workspace is
+    // immutable, so browsing elsewhere must not tear down the WebTransport
+    // (see the mount effect below and chatUrl.ts's doc comment for why).
+    const wsID = useStore.getState().activeWorkspace?.id ?? ''
+    const url = chatURL({ host: location.host, provider: selectedProvider, sid: lastSid, wsID })
     const wt = new TetherWT({
       url,
       onEnvelope: useStore.getState().handleEnvelope,
@@ -390,16 +438,56 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
     return () => window.removeEventListener('tether:retry-connection', onRetry)
   }, [])
 
+  // tether#52 — first-connect ordering (see shouldDeferFirstConnect above).
+  // Only the sid-less path defers, and only until `workspacesLoaded` flips
+  // true or a 2s fallback elapses — whichever comes first — so a hung/failed
+  // /api/v1/workspaces degrades to today's behaviour (connect with no `ws`)
+  // rather than never connecting. `activeWorkspace` itself is intentionally
+  // NOT in this effect's reactive surface (no dependency, no selector) — this
+  // effect decides WHEN the first connect fires, never RE-fires it, which is
+  // what guarantees browsing a different workspace later can't tear down a
+  // live WebTransport (see doConnect's wsID comment / chatUrl.ts).
   useEffect(() => {
     unmountedRef.current = false
-    doConnect()
-    return () => {
+    firstConnectedRef.current = false
+    const startOnce = () => {
+      if (firstConnectedRef.current) return // double-connect guard
+      firstConnectedRef.current = true
+      doConnect()
+    }
+    const cleanupConnection = () => {
       unmountedRef.current = true
       cancelPendingReconnect()
       writerRef.current?.releaseLock()
       wtRef.current?.close()
       controlRef.current?.stop()
       controlRef.current = null
+    }
+
+    const hasLastSid = !!(localStorage.getItem('tether_last_sid') ?? '')
+    if (!shouldDeferFirstConnect({ hasLastSid, workspacesLoaded: useStore.getState().workspacesLoaded })) {
+      startOnce()
+      return cleanupConnection
+    }
+
+    // Deferred: wait for WorkspacePane's fetch to settle, or bail out after
+    // WORKSPACE_GATE_TIMEOUT_MS so a hung request can't block chat forever.
+    //
+    // The store update that opens the gate ALSO carries the workspace
+    // (store.ts settleWorkspaces) — this listener runs synchronously inside it and
+    // connects immediately, so a gate that opened one update before the value was
+    // published would connect with no workspace. That was this slice's original bug;
+    // see settleWorkspaces.
+    let fallback: ReturnType<typeof setTimeout> | undefined
+    const unsub = useStore.subscribe((s) => {
+      if (s.workspacesLoaded) { unsub(); clearTimeout(fallback); startOnce() }
+    })
+    fallback = setTimeout(() => { unsub(); startOnce() }, WORKSPACE_GATE_TIMEOUT_MS)
+
+    return () => {
+      unsub()
+      clearTimeout(fallback)
+      cleanupConnection()
     }
   }, [])
 

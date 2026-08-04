@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 	"testing"
+
+	"github.com/piaobeizu/tether/internal/session"
 )
 
 // TestBuildPTYCommand_SetsWorkdir — the PTY shell pane resumes the CHAT
@@ -51,5 +53,40 @@ func TestBuildPTYCommand_NoSidOmitsResume(t *testing.T) {
 	cmd := buildPTYCommand(context.Background(), "/bin/true", "", "/some/workspace")
 	if len(cmd.Args) != 1 {
 		t.Errorf("cmd.Args = %v, want just the binary (no --resume)", cmd.Args)
+	}
+}
+
+// TestShellWorkdirFollowsTheChatSessionsWorkspace — tether#52 composition. The
+// shell pane is handed the CHAT session's sid, and since chat may now run in any
+// registered workspace, handleWTShell asks the registry where THAT session lives
+// instead of passing the daemon-global root. Passing the root would resume in a
+// directory the conversation was never created in and drop the user into an empty
+// one (see buildPTYCommand's doc for why cc behaves that way).
+//
+// This pins the pair — WorkdirForSession feeding buildPTYCommand — not the
+// handler: handleWTShell takes a concrete *webtransport.Session, so reaching the
+// call site from a test needs a real QUIC connection and no such harness exists
+// here. Same known gap as admitChat's call site (see wt_chat.go); the composition
+// is pinned, the wiring is covered by live_verify only.
+func TestShellWorkdirFollowsTheChatSessionsWorkspace(t *testing.T) {
+	reg := session.NewRegistry()
+	reg.Bindings = session.NewBindingStore(t.TempDir())
+	reg.Workdir = "/daemon/default"
+	if err := reg.Bindings.Save("chat-sid", session.WorkspaceBinding{
+		WorkspaceID: "ws-a", Path: "/srv/project-a",
+	}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	cmd := buildPTYCommand(context.Background(), "/bin/true", "chat-sid", reg.WorkdirForSession("chat-sid"))
+	if cmd.Dir != "/srv/project-a" {
+		t.Errorf("cmd.Dir = %q, want the chat session's workspace %q", cmd.Dir, "/srv/project-a")
+	}
+
+	// A sid the daemon knows nothing about is ordinary (a shell opened before any
+	// chat session, or a sid from a previous daemon) and falls back to the default.
+	cmd = buildPTYCommand(context.Background(), "/bin/true", "unknown-sid", reg.WorkdirForSession("unknown-sid"))
+	if cmd.Dir != "/daemon/default" {
+		t.Errorf("cmd.Dir = %q, want the daemon default %q", cmd.Dir, "/daemon/default")
 	}
 }

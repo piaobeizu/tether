@@ -8,26 +8,13 @@ import (
 	"github.com/piaobeizu/tether/internal/session"
 )
 
-// validSID accepts only the alphabet that real cc / opencode session IDs use
-// (UUID hex + dashes, or `ses_` / `t-` prefixes with [A-Za-z0-9]). Anything
-// else — `..`, slashes, control chars, URL-encoded escapes — is rejected so
-// that history.historyPath() can't escape its baseDir.
-func validSID(sid string) bool {
-	if len(sid) < 8 || len(sid) > 128 {
-		return false
-	}
-	for _, c := range sid {
-		switch {
-		case c >= 'a' && c <= 'z':
-		case c >= 'A' && c <= 'Z':
-		case c >= '0' && c <= '9':
-		case c == '-' || c == '_':
-		default:
-			return false
-		}
-	}
-	return true
-}
+// validSID is session.ValidSessionID, kept as a name this package's handler reads
+// naturally. The implementation moved into internal/session in tether#52: the sid
+// reaches a path through HistoryStore AND BindingStore, so the guard belongs with
+// the types that build those paths rather than with one of the two HTTP routes
+// that happens to feed them. Two copies with different contracts is what this
+// avoids — see ValidSessionID's doc.
+func validSID(sid string) bool { return session.ValidSessionID(sid) }
 
 // sessionAPIHandlers returns HTTP handlers for session history.
 func sessionAPIHandlers(history *session.HistoryStore) (listSessions, getMessages http.HandlerFunc) {

@@ -197,7 +197,7 @@ func TestSpawn_RegistersNoKeyItWasNotGiven(t *testing.T) {
 	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
 		t.Fatalf("GetOrSpawnEntry: %v", err)
 	}
-	if _, err := reg.Attach(context.Background(), "some-old-sid", "fake"); err != nil {
+	if _, err := reg.Attach(context.Background(), "some-old-sid", "fake", ""); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
 
@@ -233,7 +233,7 @@ func TestOwnedByOther_DoesNotRejectASessionNobodyOwnsYet(t *testing.T) {
 	reg := NewRegistry(p)
 	defer p.closeAll()
 
-	att, err := reg.Attach(context.Background(), "", "fake")
+	att, err := reg.Attach(context.Background(), "", "fake", "")
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -305,7 +305,7 @@ func TestEvict_DoesNotTakeOutALiveReplacementUnderTheSameKey(t *testing.T) {
 
 	// Its agent exits; the reconnect notices and un-registers it, then resumes.
 	corpse.dead.Store(true)
-	att, err := reg.Attach(context.Background(), "shared-sid", "fake")
+	att, err := reg.Attach(context.Background(), "shared-sid", "fake", "")
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -346,7 +346,7 @@ func TestAttach_ResumeRegistersUnderTheRequestedSidBeforeReturning(t *testing.T)
 	reg := NewRegistry(p)
 	defer p.closeAll()
 
-	if _, err := reg.Attach(context.Background(), "old-sid", "fake"); err != nil {
+	if _, err := reg.Attach(context.Background(), "old-sid", "fake", ""); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
 
@@ -386,7 +386,7 @@ func TestResolve_SidIsRegisteredTheInstantResolveReturns(t *testing.T) {
 	for i := 0; i < n; i++ {
 		p := &pinningProvider{gate: true}
 		reg := NewRegistry(p)
-		att, err := reg.Attach(context.Background(), "", "fake")
+		att, err := reg.Attach(context.Background(), "", "fake", "")
 		if err != nil {
 			t.Fatalf("Attach: %v", err)
 		}
@@ -422,11 +422,11 @@ func TestAttach_SameDeadSidResumesOnce(t *testing.T) {
 	reg := NewRegistry(p)
 	defer p.closeAll()
 
-	a1, err := reg.Attach(context.Background(), "shared-sid", "fake")
+	a1, err := reg.Attach(context.Background(), "shared-sid", "fake", "")
 	if err != nil {
 		t.Fatalf("first Attach: %v", err)
 	}
-	a2, err := reg.Attach(context.Background(), "shared-sid", "fake")
+	a2, err := reg.Attach(context.Background(), "shared-sid", "fake", "")
 	if err != nil {
 		t.Fatalf("second Attach: %v", err)
 	}
@@ -696,7 +696,7 @@ func TestResolve_FailedResumeUnregistersTheRequestedSid(t *testing.T) {
 	defer close(live.events)
 	defer close(dead.events)
 
-	att, err := reg.Attach(context.Background(), "gone-sid", "fake")
+	att, err := reg.Attach(context.Background(), "gone-sid", "fake", "")
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -798,7 +798,7 @@ func TestRegistry_ConcurrentAttachResolveOwnAndEnd_NoRace(t *testing.T) {
 			if i%3 == 0 {
 				sid = "contended-sid" // several goroutines fight over one sid
 			}
-			att, err := reg.Attach(context.Background(), sid, "fake")
+			att, err := reg.Attach(context.Background(), sid, "fake", "")
 			if err != nil {
 				t.Errorf("Attach: %v", err)
 				return

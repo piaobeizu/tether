@@ -57,7 +57,7 @@ func TestAdmitChat_LetsASecondClientJoinASessionNobodyOwnsYet(t *testing.T) {
 	p := &admissionProvider{}
 	reg := session.NewRegistry(p)
 
-	att, err := reg.Attach(context.Background(), "", "fake")
+	att, err := reg.Attach(context.Background(), "", "fake", "")
 	if err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
@@ -109,7 +109,7 @@ func TestAdmitChat_AdmitsAResumeAttemptFromTheSameClient(t *testing.T) {
 	p := &admissionProvider{}
 	reg := session.NewRegistry(p)
 
-	if _, err := reg.Attach(context.Background(), "old-sid", "fake"); err != nil {
+	if _, err := reg.Attach(context.Background(), "old-sid", "fake", ""); err != nil {
 		t.Fatalf("Attach: %v", err)
 	}
 	defer close(p.last.events)

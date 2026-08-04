@@ -79,9 +79,14 @@ type SpawnConfig struct {
 	// launched from — which matters because cc keys its on-disk conversation
 	// (and therefore `--resume`) on cwd (tether#51).
 	//
-	// Note this is ONE daemon-global directory, not a per-workspace one: the
-	// chat wire protocol carries no workspace selector, so it cannot yet be
-	// the `Path` of a specific internal/workspace.Registry entry.
+	// Since tether#52 it is PER-SESSION, not daemon-global: a chat connection
+	// selects a registered workspace with `?ws=<id>` on /wt/chat and the agent
+	// runs in that workspace's `Path` (internal/workspace.Registry), with the
+	// resolved --workspace-root as the fallback for a connection that selects
+	// none. The daemon resolves the id — a caller-supplied PATH is never
+	// accepted — and remembers the choice per session, because cc keys its
+	// transcript on cwd and so a session cannot be resumed anywhere else.
+	// See session.Registry.Attach and session/workspace.go.
 	Workdir string
 }
 

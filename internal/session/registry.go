@@ -38,11 +38,26 @@ type Registry struct {
 	mintedIDIgnored map[string]bool
 	PermEndpoint    string        // injected into cc subprocess env if non-empty
 	History         *HistoryStore // nil = history disabled
-	// Workdir is the agent subprocess cwd (workspace root); "" = daemon cwd.
-	// Wired by internal/server/lifecycle.go Step 3b once the workspace root
-	// is resolved (tether#51) — Step 1 builds the Registry before wsRoot is
-	// known, so it can't be set at construction time.
+	// Workdir is the DEFAULT agent subprocess cwd — the resolved
+	// --workspace-root; "" = daemon cwd. Wired by internal/server/lifecycle.go
+	// Step 3b once the workspace root is resolved (tether#51) — Step 1 builds the
+	// Registry before wsRoot is known, so it can't be set at construction time.
+	//
+	// Since tether#52 it is the fallback, not the answer: a session that selected
+	// a workspace runs in that workspace's path instead (see workspace.go). This
+	// stays the cwd for every session that selected none, which is what keeps a
+	// client that sends no `ws` behaving exactly as it did before.
 	Workdir string
+	// Workspaces resolves a client-supplied workspace id to a path. nil = this
+	// daemon cannot honour a `ws` request at all, and says so rather than
+	// substituting a directory of its own (tether#52 — see resolveWorkspace).
+	// Wired from internal/workspace.Registry in lifecycle.go Step 2b.
+	Workspaces WorkspaceLookup
+	// Bindings remembers which workspace each session belongs to, across daemon
+	// restarts. nil = not remembered, in which case a reconnect can only land in
+	// the workspace its client asks for (or the default). Wired in lifecycle.go
+	// Step 2a alongside History, which shares its directory.
+	Bindings *BindingStore
 }
 
 // Entry is the per-session bundle of agent.Session + subscriber set. Exposed
@@ -66,6 +81,17 @@ type Entry struct {
 	// provider is the AgentProvider name this session was spawned from, carried so
 	// rekey's self-check can name it. Immutable after construction.
 	provider string
+	// workdir is the cwd this session's agent was actually spawned in, and ws the
+	// workspace that decided it (zero when none was selected). Both immutable
+	// after construction — written before the entry is published under
+	// Registry.mu, which is what makes every later read of them race-free.
+	//
+	// They are recorded on the ENTRY, not merely on disk, because the live
+	// registration is the only thing that knows where a running process is: the
+	// reconnect decision compares against it (see sessionBinding), and the shell
+	// pane resumes a chat session by asking for it (WorkdirForSession).
+	workdir string
+	ws      WorkspaceBinding
 }
 
 // Session returns the underlying agent.Session.
@@ -210,14 +236,24 @@ func (r *Registry) GetOrSpawnEntry(ctx context.Context, sid, providerName string
 	// (attach.go) and is opt-in. Keeping the always-fresh behaviour on this entry
 	// point means a caller that has no recovery story cannot accidentally acquire
 	// a resume it cannot recover from.
-	return r.spawnEntry(ctx, providerName, agent.SpawnConfig{})
+	//
+	// The zero WorkspaceBinding is likewise not a placeholder: this entry point has
+	// no workspace to select from and no client to have chosen one, so it spawns in
+	// the daemon default. Selecting a workspace requires the validation and the
+	// remembering that only Attach does (tether#52).
+	return r.spawnEntry(ctx, providerName, agent.SpawnConfig{}, WorkspaceBinding{})
 }
 
 // spawnEntry starts a new agent subprocess, wraps it in an Entry, registers the
 // Entry under its sid and starts its fanOut loop. cfg is the caller's spawn
-// intent; Env and Workdir are filled in here (they are registry-wide, not
-// per-call), so callers only choose between "pin this freshly minted id" and
-// "resume this existing one".
+// intent; Env is filled in here (it is registry-wide, not per-call), so callers
+// choose between "pin this freshly minted id" and "resume this existing one", and
+// — since tether#52 — which workspace to run in.
+//
+// ws is an ALREADY-VALIDATED workspace, or the zero value for the daemon default.
+// This function does not resolve ids and must not be given one: validation lives
+// in resolveWorkspace, reached only through Attach, so that a caller cannot spawn
+// into a directory of its choosing by skipping the check.
 //
 // A fresh spawn always pins a minted SessionID (tether#50): cc adopts it and
 // echoes it on init (mem_2ruSlrHR ①), so the daemon knows the session's id — and
@@ -256,7 +292,7 @@ func (r *Registry) GetOrSpawnEntry(ctx context.Context, sid, providerName string
 // one (via Attach's liveEntry) instead of duplicating it. That is a reuse of an
 // as-yet-unconfirmed resume, and the consequence is deliberate: see the note in
 // Attach.
-func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agent.SpawnConfig) (*Entry, error) {
+func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agent.SpawnConfig, ws WorkspaceBinding) (*Entry, error) {
 	if providerName == "" {
 		providerName = "claude-code"
 	}
@@ -274,7 +310,7 @@ func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agen
 		env = append(env, cfg.Env...)
 		cfg.Env = append(env, "TETHER_DAEMON_PERM_ENDPOINT="+r.PermEndpoint)
 	}
-	cfg.Workdir = r.Workdir
+	cfg.Workdir = r.workdirFor(ws)
 	if cfg.ResumeSessionID == "" && cfg.SessionID == "" {
 		cfg.SessionID = agent.NewSessionID()
 	}
@@ -298,6 +334,8 @@ func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agen
 		fenceParser: NewFenceParser(),
 		regKey:      key,
 		provider:    providerName,
+		workdir:     cfg.Workdir,
+		ws:          ws,
 	}
 
 	// Registered BEFORE fanOut starts, and the order is load-bearing rather than
@@ -309,6 +347,25 @@ func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agen
 	r.mu.Lock()
 	r.sessions[key] = e
 	r.mu.Unlock()
+
+	// Remember where this session lives, so a reconnect that brings only a sid
+	// still lands in the right directory — including after a daemon restart, which
+	// is the case the ENTRY above cannot answer (tether#52). Recorded under the
+	// registration key, i.e. the id the client will come back with. A provider that
+	// mints its own id is registered under the pinned one until it announces; rekey
+	// re-records it there.
+	//
+	// Only for a session whose id we just MINTED (cfg.SessionID set ⇒ a fresh
+	// spawn; see the mutual exclusion in agent.SpawnConfig). A resume must not write
+	// one: the key would be the CLIENT's sid, and the record would assert where that
+	// session lives on the strength of a request rather than of having created it
+	// there. resolveWorkspace now only ever resumes in the session's own directory,
+	// so such a write would at best restate what is already on disk — and at worst,
+	// if that reasoning were ever loosened again, silently rebind someone else's
+	// session. Writing only what we created keeps the file's meaning exact.
+	if cfg.SessionID != "" {
+		r.saveBinding(key, ws)
+	}
 
 	// background goroutine: fan out events to subscribers
 	go r.fanOut(e)
@@ -383,6 +440,14 @@ func (r *Registry) rekey(e *Entry, sid string) {
 	firstForProvider := !r.mintedIDIgnored[e.provider]
 	r.mintedIDIgnored[e.provider] = true
 	r.mu.Unlock()
+
+	// The workspace binding follows the registration (tether#52). Without this, a
+	// provider that mints its own id would have its binding filed under the id
+	// nobody will ever ask about, and every reconnect of that session — the only
+	// caller that reads the file — would miss it and fall back to the default
+	// directory. Written after the unlock for the same reason the logging below is:
+	// this is I/O, and r.mu is registry-wide.
+	r.saveBinding(sid, e.ws)
 
 	const msg = "agent reported a session id it was not spawned under; re-keying"
 	if firstForProvider {

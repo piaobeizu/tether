@@ -210,7 +210,9 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   // re-confirms the same sid (cc --resume keeps its id) as a no-op; a different
   // sid re-fires the effect, but its msgs.length>0 guard drops an EMPTY /messages
   // so it can't wipe restored history (a non-empty payload for that sid replaces,
-  // intentionally). Mirrors switchSession's proven path.
+  // intentionally). A DELIBERATE switch is the other case and does not come
+  // through here — see lib/session.ts openSession, which owns that load and
+  // explains why its guards differ from this effect's (tether#61).
   useEffect(() => {
     if (!useStore.getState().sessionId) {
       const last = localStorage.getItem('tether_last_sid')
@@ -484,36 +486,13 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
     return () => window.removeEventListener('tether:inject-prompt', onInject)
   }, [])
 
-  // T12 click-to-work — switch to an existing session (e.g. a wi already
-  // being driven by another tab/browser visit): persist it as the "last
-  // session", load its history the same way WorkspacePane's session list
-  // does, and reconnect the WT so it resumes that sid.
-  const switchSession = (sid: string) => {
-    if (!sid) return
-    localStorage.setItem('tether_last_sid', sid)
-    // tether#57 — a notice describes the session you are LEAVING, so a
-    // deliberate switch retires it. Before #57 loadHistory's replace did this
-    // implicitly (the notice lived in `messages`); now that notices survive
-    // that replace by design, this call site has to say so explicitly.
-    useStore.getState().clearNotices()
-    useStore.getState().setSessionId(sid)
-    fetch(`/api/v1/sessions/${encodeURIComponent(sid)}/messages`)
-      .then(r => r.ok ? r.json() : [])
-      .then((msgs: HistoryEntry[]) => {
-        if (msgs.length > 0) useStore.getState().loadHistory(msgs.map(historyEntryToMessage))
-      })
-      .catch(() => {})
-    manualRetryRef.current()
-  }
-
-  const switchSessionRef = useRef(switchSession)
-  switchSessionRef.current = switchSession
-
-  useEffect(() => {
-    const onSwitchSession = (e: Event) => switchSessionRef.current((e as CustomEvent<string>).detail)
-    window.addEventListener('tether:switch-session', onSwitchSession)
-    return () => window.removeEventListener('tether:switch-session', onSwitchSession)
-  }, [])
+  // tether#61 — ChatPane used to own "switch to session X" (switchSession) and
+  // publish it as a `tether:switch-session` window event for WorkDetail's
+  // click-to-work to call. That operation now lives in lib/session.ts
+  // openSession, which its callers import directly, so both the local copy and
+  // the event relay are gone: one implementation, reached one way. ChatPane's
+  // remaining part in a switch is the reconnect, which arrives on the
+  // pre-existing `tether:retry-connection` channel above — it owns the WT.
 
   // D-19 §5 / tether#8 T8 — DagBlock's approve button. Sends an "action"
   // ClientFrame on the /wt/control channel, which is not otherwise

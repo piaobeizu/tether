@@ -8,6 +8,7 @@ import { lazy, Suspense, useEffect, useState } from 'react'
 import { AihubError, fetchItem, fetchSteps } from '../../lib/aihub'
 import type { WorkItemDetail, WorkSteps } from '../../lib/wire.gen'
 import { useStore } from '../../lib/store'
+import { openSession } from '../../lib/session'
 import { Dag } from './Dag'
 import type { DagEdge, DagNode } from './Dag'
 import EventTimeline from './EventTimeline'
@@ -85,7 +86,11 @@ export default function WorkDetail({ id }: { id: string }) {
     const sid = localStorage.getItem('tether_wi_sid:' + slug)
     window.dispatchEvent(new CustomEvent('tether:select-tab', { detail: 'chat' }))
     if (sid) {
-      window.dispatchEvent(new CustomEvent('tether:switch-session', { detail: sid }))
+      // tether#61 — one shared implementation of "open that session", called
+      // directly. This used to go out as a `tether:switch-session` event that
+      // ChatPane picked up and handled its own way; the workspace session list
+      // handled it a third, broken way. Now there is nothing to keep in sync.
+      openSession(sid)
     } else {
       window.dispatchEvent(new CustomEvent('tether:inject-prompt', { detail: `/pf-work ${slug} --resume` }))
     }

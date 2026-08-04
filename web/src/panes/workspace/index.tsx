@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Icon } from '../../lib/icons'
-import { useStore, historyEntryToMessage, type HistoryEntry } from '../../lib/store'
+import { useStore } from '../../lib/store'
+import { openSession } from '../../lib/session'
 import WorkspaceTree from './WorkspaceTree'
 
 interface Workspace {
@@ -219,24 +220,13 @@ export default function WorkspacePane() {
                   key={sid}
                   className={`tree-row${sid === currentSid ? ' active' : ''}`}
                   style={{ paddingLeft: 12, fontSize: 11 }}
-                  onClick={() => {
-                    // tether#57 — notices outlive loadHistory by design now, so a
-                    // deliberate session switch has to retire them explicitly (they
-                    // describe the session being left). Cleared synchronously at the
-                    // START of the switch, matching ChatPane's switchSession: doing it
-                    // after the fetch resolves would both leave it undone when the
-                    // session has no history and wipe a notice that arrived meanwhile.
-                    useStore.getState().clearNotices()
-                    fetch(`/api/v1/sessions/${encodeURIComponent(sid)}/messages`)
-                      .then(r => r.ok ? r.json() : [])
-                      .then((msgs: HistoryEntry[]) => {
-                        if (msgs.length > 0) {
-                          useStore.getState().loadHistory(msgs.map(historyEntryToMessage))
-                          useStore.getState().setSessionId(sid)
-                        }
-                      })
-                      .catch(() => {})
-                  }}
+                  // tether#61 — opening a session is ONE operation, and it lives
+                  // in lib/session.ts. This list used to inline its own version
+                  // that never reconnected the WebTransport channel (so the live
+                  // stream, and the next prompt sent, stayed on the session the
+                  // user had just left) and that hid setSessionId — hence
+                  // tether_last_sid — behind a non-empty history.
+                  onClick={() => openSession(sid)}
                 >
                   <span className="ws-dot" style={{ background: sid === currentSid ? 'var(--success)' : undefined }} />
                   <span className="tree-label" style={{ fontFamily: 'var(--font-mono)', fontSize: 10 }}>

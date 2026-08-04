@@ -3,6 +3,10 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -38,6 +42,13 @@ type fakeSession struct {
 	mu             sync.Mutex
 	prompts        []string
 	interruptCalls int
+	// closes counts Close() calls so a test can assert the session's agent was
+	// REAPED on teardown and not merely un-registered (tether#56). Counted rather
+	// than flagged because "exactly once" is the property that matters: fanOut's
+	// teardown and Attachment.resolve can both reach a given session, and the real
+	// ccSession absorbs the second call in a sync.Once — a double call here would
+	// mean the registry is relying on that absorption instead of owning the reap.
+	closes int
 }
 
 func (f *fakeSession) SessionID() string {
@@ -72,7 +83,19 @@ func (f *fakeSession) Interrupt() error {
 	f.interruptCalls++
 	return nil
 }
-func (f *fakeSession) Close() error { return nil }
+func (f *fakeSession) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closes++
+	return nil
+}
+
+// Closes returns how many times Close() has been called on this session.
+func (f *fakeSession) Closes() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closes
+}
 
 // announceInit emits the system/init this fake's sid arrives on.
 //
@@ -995,6 +1018,220 @@ func TestRegistry_EvictsEntryOnSessionEnd(t *testing.T) {
 	if n := regLen(reg); n != 0 {
 		t.Fatalf("registry holds %d entries after session end, want 0", n)
 	}
+}
+
+// TestRegistry_ReapsAgentOnSessionEnd — (tether#56) ending a session must REAP
+// its agent, not merely un-register it. agent.Session.Close is the only thing in
+// the daemon that can wait on a cc subprocess, and until this slice its sole
+// production caller was Attachment.resolve's failed-resume path — so every session that ended the
+// ORDINARY way left a `[claude] <defunct>` zombie, a goroutine parked in
+// exec.CommandContext's watchdog and an unclosed stdin fd behind, held for the
+// rest of the daemon's life.
+//
+// Exactly once, not at-least-once: the real ccSession absorbs a second Close in a
+// sync.Once, so a ">= 1" assertion would keep passing if teardown ever started
+// leaning on that absorption instead of owning the reap.
+func TestRegistry_ReapsAgentOnSessionEnd(t *testing.T) {
+	fs := &fakeSession{sid: "sid-reap", events: make(chan agent.Event, 8)}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+
+	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	fs.events <- agent.Event{Kind: agent.EventInit, SessionID: "sid-reap"}
+	waitForRegistered(t, reg, "sid-reap")
+
+	// A live session must not be closed — teardown is a session-END action, and an
+	// implementation that reaped eagerly would kill conversations mid-turn.
+	if n := fs.Closes(); n != 0 {
+		t.Fatalf("Close() called %d times on a LIVE session, want 0", n)
+	}
+
+	// Session ends: closing Events() unblocks fanOut's range and runs its
+	// teardown defer.
+	close(fs.events)
+	waitForEvicted(t, reg, "sid-reap")
+
+	// Eviction and the reap are two statements in teardown, deliberately in that
+	// order, so poll rather than assume the second landed with the first.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) && fs.Closes() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	if n := fs.Closes(); n != 1 {
+		t.Fatalf("Close() called %d times after the session ended, want exactly 1 "+
+			"(0 = the agent is never reaped, which is tether#56)", n)
+	}
+}
+
+// TestRegistry_TeardownReapsARealChildProcess makes the same claim as the test
+// above, but asks the operating system instead of a counter. "fanOut called
+// Close()" is the mechanism; "the child is no longer a zombie" is what tether#56
+// was actually about, and the two only coincide for as long as Close really
+// waits.
+//
+// The child exits on its own, so the zombie exists BEFORE the teardown — the test
+// asserts state Z first, which is what stops the second half from being vacuous
+// (a pid that had already been reaped, or never existed, would sail through a
+// bare "it's gone now" check).
+func TestRegistry_TeardownReapsARealChildProcess(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("zombie state is read from /proc, which is Linux-only")
+	}
+
+	// Exits immediately, with a distinctive status so the harvested ProcessState
+	// is recognisably THIS child's and not a default zero value.
+	cmd := exec.Command("sh", "-c", "exit 7")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start child: %v", err)
+	}
+	pid := cmd.Process.Pid
+	ps := &procSession{cmd: cmd, events: make(chan agent.Event, 4)}
+	t.Cleanup(func() { _ = ps.Close() }) // so a failed test never leaks the zombie itself
+
+	reg := NewRegistry(&procProvider{sess: ps})
+	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "proc"); err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	waitForCount(t, reg, 1)
+
+	// The leak, staged: an exited child with nobody waiting on it sits in the
+	// process table as a zombie.
+	waitForProcState(t, pid, "Z")
+
+	close(ps.events)
+	waitForCount(t, reg, 0)
+
+	// Poll the mutex-guarded counter rather than cmd.ProcessState directly: the
+	// Wait happens on fanOut's goroutine, and the mutex is what gives this
+	// goroutine a happens-before edge to read what it produced.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && ps.Closes() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	if n := ps.Closes(); n != 1 {
+		t.Fatalf("Close() called %d times after the session ended, want exactly 1", n)
+	}
+	if got := ps.ExitCode(); got != 7 {
+		t.Errorf("harvested exit code = %d, want 7 — the reap did not collect THIS child's status", got)
+	}
+	if st := waitForProcGone(t, pid); st != "" {
+		t.Fatalf("child pid %d is still in the process table as state %q after teardown; "+
+			"the session ended without reaping its agent (tether#56)", pid, st)
+	}
+}
+
+// procSession is an agent.Session backed by a REAL child process — the double
+// that lets a registry test ask the OS whether teardown reaped anything, which
+// the in-memory fakeSession cannot. Its Close mirrors ccSession.Close's essential
+// half (wait for the child) and deliberately does NOT copy the sync.Once: the
+// property under test is that the registry closes it exactly once, and a
+// once-guard here would hide a second call instead of exposing it.
+type procSession struct {
+	cmd    *exec.Cmd
+	events chan agent.Event
+
+	mu       sync.Mutex
+	closes   int
+	exitCode int
+}
+
+func (p *procSession) SessionID() string                        { return "" }
+func (p *procSession) Alive() bool                              { return true }
+func (p *procSession) SendPrompt(context.Context, string) error { return nil }
+func (p *procSession) Events() <-chan agent.Event               { return p.events }
+func (p *procSession) Interrupt() error                         { return nil }
+
+func (p *procSession) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closes > 0 {
+		// Counted but not re-waited: a second cmd.Wait would return "exec: Wait was
+		// already called", which would make the t.Cleanup safety net look like a
+		// failure rather than the no-op it is.
+		p.closes++
+		return nil
+	}
+	err := p.cmd.Wait()
+	p.closes++
+	if p.cmd.ProcessState != nil {
+		p.exitCode = p.cmd.ProcessState.ExitCode()
+	}
+	return err
+}
+
+func (p *procSession) Closes() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.closes
+}
+
+func (p *procSession) ExitCode() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.exitCode
+}
+
+type procProvider struct{ sess *procSession }
+
+func (p *procProvider) Name() string { return "proc" }
+func (p *procProvider) Spawn(context.Context, agent.SpawnConfig) (agent.Session, error) {
+	return p.sess, nil
+}
+
+// procState returns the single-letter state Linux publishes for pid in
+// /proc/<pid>/stat — "Z" for a zombie — or "" once the pid is gone, which for a
+// child of this process means it has been reaped. The comm field is parenthesised
+// and may itself contain spaces, so the state is read from after the LAST ')'
+// rather than by splitting the whole line.
+func procState(t *testing.T, pid int) string {
+	t.Helper()
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if os.IsNotExist(err) {
+		return ""
+	}
+	if err != nil {
+		t.Fatalf("read /proc/%d/stat: %v", pid, err)
+	}
+	i := strings.LastIndex(string(b), ")")
+	if i < 0 {
+		t.Fatalf("unparseable /proc/%d/stat: %q", pid, b)
+	}
+	f := strings.Fields(string(b)[i+1:])
+	if len(f) == 0 {
+		t.Fatalf("unparseable /proc/%d/stat: %q", pid, b)
+	}
+	return f[0]
+}
+
+// waitForProcState polls until pid reports state want. Bounded — a child that
+// never gets there fails the test instead of hanging it.
+func waitForProcState(t *testing.T, pid int, want string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var got string
+	for time.Now().Before(deadline) {
+		if got = procState(t, pid); got == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("child pid %d state = %q, want %q", pid, got, want)
+}
+
+// waitForProcGone polls until pid leaves the process table, returning the last
+// state observed ("" on success) so the caller can report what it got stuck as.
+func waitForProcGone(t *testing.T, pid int) string {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var got string
+	for time.Now().Before(deadline) {
+		if got = procState(t, pid); got == "" {
+			return ""
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return got
 }
 
 // TestRegistry_EvictedEntryNotResurrectedByRekey — (tether#12, carried into

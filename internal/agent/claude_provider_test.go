@@ -489,9 +489,13 @@ func eventKinds(evs []Event) []EventKind {
 // closeOnce wraps sess.Close so a test can close at a CHOSEN point — necessary
 // whenever it inspects the subprocess's exit status, or reads a writer that
 // os/exec only flushes when cmd.Wait() returns (the withStderr sink) — while
-// still deferring a safety net for the early-t.Fatalf path. Calling Close twice
-// would call cmd.Wait twice and report "Wait was already called"; the sync.Once
-// makes the second call a no-op that replays the first result.
+// still deferring a safety net for the early-t.Fatalf path.
+//
+// The once is now belt AND braces: since tether#56 ccSession.Close carries its
+// own sync.Once (two production call sites can reach one session), so a double
+// Close no longer reports "Wait was already called". Kept anyway — this helper is
+// about a test choosing WHEN the close happens, and it should not silently start
+// depending on the production guard to make its safety-net deferral harmless.
 func closeOnce(sess Session) func() error {
 	var (
 		once sync.Once
@@ -1131,5 +1135,69 @@ func TestCCSession_AliveDoesNotBlock(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Alive() blocked on a session that has not emitted system/init — it must never wait on the agent")
+	}
+}
+
+// TestCCSession_CloseReapsTheSubprocessAndIsIdempotent — (tether#56) both halves
+// of Close's contract, asserted against a real subprocess.
+//
+// REAPS: a child that has exited with nobody waiting on it stays in the process
+// table as a zombie, and cmd.ProcessState stays nil — the same fact seen from
+// inside the daemon. Staging that state BEFORE the close is what stops the
+// after-assertion from being vacuous; without it the test would pass just as
+// happily against a child something else had already reaped.
+//
+// IDEMPOTENT: since tether#56 two independent call sites reach one session —
+// Registry.teardown from fanOut's defer, and Attachment.resolve reaping a failed
+// resume eagerly on another goroutine — and a bare cmd.Wait answers whichever
+// arrives second with "exec: Wait was already called", an error about bookkeeping
+// that caller did not do. Remove the sync.Once from ccSession.Close and the
+// second call below goes red.
+func TestCCSession_CloseReapsTheSubprocessAndIsIdempotent(t *testing.T) {
+	h := newFakeCCHarness(t)
+	h.ExitEarly = true // record the invocation and exit; no turn needed here
+
+	p := NewClaudeCodeProvider(fakeCCPath(t))
+	sess, err := p.Spawn(context.Background(), SpawnConfig{Env: h.Env()})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	// Reaching through the interface to the concrete session is the one piece of
+	// white-box in this test, and it is not avoidable: "was this child waited on"
+	// has no representation in agent.Session, and every OS-level proxy for it is
+	// worse — kill(pid,0) succeeds for a zombie (which is the whole reason
+	// tether#55 stopped probing processes), and /proc parsing would tie an
+	// otherwise portable agent-package test to Linux. cmd.ProcessState is nil
+	// before Wait and non-nil after, which is exactly the question.
+	cc, ok := sess.(*ccSession)
+	if !ok {
+		t.Fatalf("Spawn returned %T, want *ccSession", sess)
+	}
+	defer func() { _ = sess.Close() }()
+
+	// Draining Events() to close IS Close's documented precondition: that channel
+	// closes in readLoop's last defer, so nothing is reading the subprocess's
+	// stdout any more and cmd.Wait cannot pull the pipe out from under a reader.
+	drainEvents(t, sess)
+
+	if st := cc.cmd.ProcessState; st != nil {
+		t.Fatalf("ProcessState = %v before Close() — something other than Close reaped "+
+			"the child, so this test cannot observe the leak it is about", st)
+	}
+
+	if err := sess.Close(); err != nil {
+		t.Fatalf("first Close() = %v, want nil (the fake cc exits 0)", err)
+	}
+	if cc.cmd.ProcessState == nil {
+		t.Fatal("ProcessState still nil after Close() — the subprocess was never waited on, " +
+			"so it is a zombie and its exec watchdog goroutine and stdin fd are still held (tether#56)")
+	}
+	if code := cc.cmd.ProcessState.ExitCode(); code != 0 {
+		t.Errorf("subprocess exit code = %d, want 0", code)
+	}
+
+	if err := sess.Close(); err != nil {
+		t.Fatalf("second Close() = %v, want nil — Close must be idempotent so the "+
+			"failed-resume reap and fanOut's teardown reap can both reach one session", err)
 	}
 }

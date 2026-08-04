@@ -25,21 +25,44 @@ import (
 // failure mode rather than a silently-succeeding write.
 type deadSession struct {
 	events chan agent.Event
-	dead   atomic.Bool
-	mu     sync.Mutex
-	sends  int
-	closes int
+	// emitted is closed once dying() has finished putting the terminal event on
+	// the stream, so endStream can close the channel without racing that send.
+	emitted chan struct{}
+	dead    atomic.Bool
+	mu      sync.Mutex
+	sends   int
+	closes  int
 }
 
 func newDeadSession() *deadSession {
-	return &deadSession{events: make(chan agent.Event, 4)}
+	return &deadSession{events: make(chan agent.Event, 4), emitted: make(chan struct{})}
 }
 
 // die emits the single empty EventResult a failed resume produces and closes the
 // stream, exactly as ccSession.readLoop does when the process EOFs.
 func (d *deadSession) die() {
+	d.dying()
+	d.endStream()
+}
+
+// dying is the first half of die(): the process is gone and every liveness signal
+// says so, but the event stream has not closed yet. Real cc has exactly this gap —
+// readLoop closes `done` before it closes `events` — and holding a test inside it
+// is what makes a Close() attributable. fanOut cannot reach its teardown reap
+// (tether#56) while the stream is open, so a Close() observed here came from
+// Attachment.resolve's eager reap (tether#50) and from nothing else.
+func (d *deadSession) dying() {
 	d.events <- agent.Event{Kind: agent.EventResult, Text: ""}
 	d.dead.Store(true)
+	close(d.emitted)
+}
+
+// endStream closes the event stream, releasing whatever is ranging over it — i.e.
+// letting the ordinary teardown run. It waits for dying() to have finished
+// emitting first, because dying() runs on its own goroutine and closing a channel
+// out from under a send is a panic, not merely a race.
+func (d *deadSession) endStream() {
+	<-d.emitted
 	close(d.events)
 }
 
@@ -84,6 +107,11 @@ var errBrokenPipe = brokenPipe{}
 type deadThenLiveProvider struct {
 	dead *deadSession
 	live *fakeSession
+	// holdDeadStreamOpen leaves the dead session's event stream open, parking its
+	// fanOut short of the teardown reap so a test can attribute a Close() to
+	// Attachment.resolve alone — see deadSession.dying. Set it only when that
+	// attribution is the point; every other test wants the ordinary full death.
+	holdDeadStreamOpen bool
 
 	mu     sync.Mutex
 	cfgs   []agent.SpawnConfig
@@ -99,7 +127,11 @@ func (p *deadThenLiveProvider) Spawn(_ context.Context, cfg agent.SpawnConfig) (
 	p.spawns++
 	if p.spawns == 1 {
 		// The resume attempt: hand back a cc that is already on its way out.
-		go p.dead.die()
+		if p.holdDeadStreamOpen {
+			go p.dead.dying()
+		} else {
+			go p.dead.die()
+		}
 		return p.dead, nil
 	}
 	return p.live, nil
@@ -911,14 +943,19 @@ func TestResolve_FallbackWhenSessionIDBlocks(t *testing.T) {
 }
 
 // TestResolve_ReapsTheFailedResumeSubprocess — the abandoned cc must be Close()d,
-// which is the only thing in the daemon that calls cmd.Wait() and therefore the
-// only thing that reaps the process.
+// which is the only thing in the daemon that waits on a cc subprocess and
+// therefore the only thing that reaps one.
 //
-// Measured live before this was added: driving three successive dead-sid
-// reconnects against one daemon left 5 zombie `claude` children without this
-// call and 2 with it — exactly one leaked process per failed resume. It matters
+// Measured live when this was added (tether#50): driving three successive dead-sid
+// reconnects against one daemon left 5 zombie `claude` children without this call
+// and 2 with it — exactly one leaked process per failed resume. It mattered
 // because tether#50 makes a failed resume an ORDINARY reload event rather than a
-// rare one, so the leak rate scales with how often users reload.
+// rare one, so the leak rate scaled with how often users reload.
+//
+// Read those numbers as history, not as current behaviour: the residual 2 were the
+// ordinary-teardown leak, and tether#56 closed that by adding a SECOND reaper in
+// Registry.teardown. This test is now about the EAGER one specifically — see the
+// holdDeadStreamOpen comment below for how the two are told apart.
 //
 // Safety of calling Close() here (i.e. cmd.Wait() while readLoop may still be
 // reading stdout) rests on WHY we are on this path: SessionID() returned ""
@@ -927,7 +964,14 @@ func TestResolve_FallbackWhenSessionIDBlocks(t *testing.T) {
 func TestResolve_ReapsTheFailedResumeSubprocess(t *testing.T) {
 	dead := newDeadSession()
 	live := &fakeSession{sid: "recovered-sid", events: make(chan agent.Event, 8)}
-	dp := &deadThenLiveProvider{dead: dead, live: live}
+	// Hold the dead session's event stream open. tether#56 added a SECOND reaper —
+	// Registry.teardown, from the same entry's fanOut defer — and it fires on its
+	// own goroutine the instant that stream closes, so with an ordinary death the
+	// count below is 1 or 2 depending on scheduling (measured: it fails within ~50
+	// iterations of -count). Parking fanOut short of its defer is what keeps this
+	// test about the EAGER reap: it is the only thing that can have closed the
+	// session while the stream is still open.
+	dp := &deadThenLiveProvider{dead: dead, live: live, holdDeadStreamOpen: true}
 	reg := NewRegistry(dp)
 
 	att, err := reg.Attach(context.Background(), "gone-sid", "fake")
@@ -941,5 +985,19 @@ func TestResolve_ReapsTheFailedResumeSubprocess(t *testing.T) {
 
 	if got := dead.Closes(); got != 1 {
 		t.Errorf("dead session Close() calls = %d, want 1; without it the cc subprocess stays a zombie for the daemon's lifetime", got)
+	}
+
+	// Now let the stream close, i.e. let the ordinary teardown run too. The two
+	// reapers deliberately overlap and the real ccSession absorbs the second call
+	// in a sync.Once (tether#56) — asserted here so that "resolve can stop reaping,
+	// teardown covers it" is a visible change to this test rather than a silent one.
+	dead.endStream()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && dead.Closes() < 2 {
+		time.Sleep(time.Millisecond)
+	}
+	if got := dead.Closes(); got != 2 {
+		t.Errorf("dead session Close() calls after its stream closed = %d, want 2 "+
+			"(the eager reap plus Registry.teardown's)", got)
 	}
 }

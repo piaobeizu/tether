@@ -269,9 +269,10 @@ func TestFakeCC_FreshSessionBecomesResumable(t *testing.T) {
 }
 
 // TestFakeCC_SilentUntilFirstPrompt — under --input-format stream-json cc emits
-// nothing until a user message arrives. That is why Registry.GetOrSpawnEntry
-// registers a pending placeholder key instead of blocking on SessionID(); a fake
-// that emitted init at startup would erase that constraint from every test.
+// nothing until a user message arrives. That is why Registry.spawnEntry registers
+// the entry under the sid it MINTED rather than waiting on SessionID(): there is
+// nothing to wait for until the client has typed. A fake that emitted init at
+// startup would erase that constraint from every test.
 func TestFakeCC_SilentUntilFirstPrompt(t *testing.T) {
 	h := newFakeCCHarness(t)
 	cwd := t.TempDir()

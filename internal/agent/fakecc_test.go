@@ -54,8 +54,9 @@ package agent
 // are just as load-bearing:
 //
 //   - in --input-format stream-json mode cc emits nothing until the first user
-//     message arrives (internal/session/registry.go's pending-key comment), so
-//     the fake blocks on stdin before emitting a single line;
+//     message arrives (Registry.spawnEntry's comment on why the daemon minting the
+//     sid is what lets it register a session before cc has said anything), so the
+//     fake blocks on stdin before emitting a single line;
 //   - cc re-emits system/init on EVERY turn as a metadata refresh, not a new
 //     session boundary (Registry.fanOut's ResetTurn comment), so the fake does
 //     too.

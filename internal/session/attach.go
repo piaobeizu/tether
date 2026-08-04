@@ -112,34 +112,45 @@ type Resolution struct {
 //     silently forgot everything.
 //   - sid is empty → fresh session under a newly minted id.
 //
-// KNOWN LIMITS, both rooted in the same thing — an entry is registered under the
-// `pending-%p` placeholder and only re-keyed to its real sid once cc emits
-// system/init, which under stream-json needs the client's FIRST PROMPT. So the
-// window in which a session reads as "not live" is not an instant; it lasts until
-// the user types.
+// # Concurrent attaches on one sid (tether#54)
 //
-//  1. Two attaches carrying the same dead sid inside that window both miss and
-//     both run `cc --resume <sid>` on one transcript. This is reachable from a
-//     SINGLE browser: the sid lives in localStorage, which is shared across tabs
-//     of the origin, so two tabs reconnecting after a daemon restart is enough.
-//     Since tether#55 a REGISTERED-but-dead sid reaches the same window (both
-//     attaches judge it dead and both resume), which is a new route into this
-//     limit but not a new limit: an evicted dead sid always behaved this way, and
-//     the alternative — keeping the corpse so the second attach "finds" it —
-//     is the bug tether#55 fixes.
-//     Both then re-key to the same map key, so one Entry silently displaces the
-//     other in r.sessions and the displaced cc keeps running unreachable
-//     (Registry.evict is by-value and only reclaims the pointer it is given).
-//  2. Symmetrically, an attach inside the window can miss a session that is
-//     genuinely alive and resume ITS transcript.
+// An entry is registered under the sid it is resuming (or the one minted for it)
+// from before its process exists, so a second attach carrying the same sid FINDS
+// the first one through the liveEntry gate above instead of starting a second
+// `cc --resume` of the same transcript. That matters more than it sounds: the sid
+// lives in localStorage, which tabs of an origin share, so two tabs reconnecting
+// after a daemon restart used to be enough to duplicate a resume, silently
+// displace one of the two entries in r.sessions, and leave the displaced cc
+// running unreachable.
 //
-// Closing both properly means keying the entry under its real sid at spawn time —
-// which tether#50 makes possible for the first time, since the id is now known
-// before provider.Spawn is called — and retiring the placeholder/re-key/evicted
-// machinery that tether#12 hardened. That is a focused change to a
-// concurrency-sensitive area, tracked separately rather than bolted onto this
-// slice. Deliberately allowing concurrent clients on one transcript would want
-// cc's `--fork-session` instead of any of this.
+// The reused entry may be a resume that has not CONFIRMED yet, and the second
+// attach adopts it non-fallback-eligible (resuming stays false), exactly as it
+// adopts any other live session. So if that resume then fails, the first attach
+// recovers by falling back and replaying, while the second gets "agent exited
+// before emitting session id". For the one caller that exists that means a
+// reconnect: serveChat surfaces the error and closes, and the browser's automatic
+// reconnect resumes, fails, and falls back on its own. A future caller that does
+// NOT reconnect would instead LOSE that turn's prompts, which is the sharper way
+// to state the trade — accepted because the alternative is both clients writing
+// into one transcript in the common case where the resume succeeds. Making the
+// second attach fallback-eligible instead would fork the conversation in two,
+// which is what cc's `--fork-session` is for and not something to arrive at by
+// accident.
+//
+// RESIDUAL, stated rather than implied — the window is narrowed, not closed:
+//
+//   - It is now the duration of one provider.Spawn call, rather than "until the
+//     user types". For cc that is an exec.Start.
+//   - Inside it, both attaches still spawn, and the second registration
+//     OVERWRITES the first under the same key — so the displaced entry, and the cc
+//     it owns, are exactly as unreachable as before. What changed is how long the
+//     door is open, not what is behind it.
+//   - Closing it needs a reservation: the key claimed before the process exists,
+//     released if the spawn fails, with the loser waiting on the winner's Entry
+//     rather than racing it — plus an answer for the loser's already-started
+//     subprocess, which cannot simply be Closed (see the os/exec note in resolve).
+//     That is a self-contained piece of work, not a line, and it is deliberately
+//     not smuggled in here; tether#60 tracks it.
 func (r *Registry) Attach(ctx context.Context, sid, providerName string) (*Attachment, error) {
 	a := &Attachment{
 		reg:      r,
@@ -226,21 +237,23 @@ func (a *Attachment) Unsubscribe(ch chan wire.Envelope) {
 // SetOwner claims this session for clientID, returning false only if a DIFFERENT
 // client already owns it.
 //
-// It resolves ownership against the Entry this attachment holds instead of going
-// through Registry.SetOwner's sid lookup, and that is the whole point. The entry
-// is keyed under `pending-%p` until the re-key goroutine wakes from SessionID() —
-// the same wakeup Resolve races — so a sid-keyed lookup here returns false
-// whenever Resolve gets there first, and serveChat treats false as a fatal
-// ownership race: it sends an error envelope and drops the connection while the
-// user's first answer is still in flight. That is worse on the tether#50 reload
-// path than it was before, because session_ready never goes out, so the browser
-// keeps the DEAD sid in localStorage and its automatic reconnect repeats the
-// resume that just failed — while the prompt that WAS persisted (under the fresh
-// sid, via WaitSID) sits in a history file the browser will never ask for.
+// It resolves ownership against the Entry this attachment holds rather than
+// looking the sid up in the registry, and that is the whole point: the attachment
+// already knows which Entry it is talking to, so there is nothing to look up and
+// no race to lose. A sid-keyed variant existed (Registry.SetOwner) and is gone —
+// see Entry.setOwner.
 //
-// Going through the pointer sidesteps the map entirely: the attachment already
-// knows which Entry it is talking to, so there is nothing to look up and no race
-// to lose.
+// The lookup was not merely redundant, it lost: until tether#54 the entry sat
+// under a `pending-%p` placeholder until a goroutine parked in SessionID() moved
+// it, and Resolve waits on that SAME wakeup, so a sid lookup here returned false
+// whenever Resolve got there first — which serveChat reads as a fatal ownership
+// race and answers by sending an error envelope and dropping the connection while
+// the user's first answer is in flight. An adversarial review of tether#50
+// measured that at 500/500 in a tight harness. Retiring the placeholder removes
+// the window for cc (the entry is keyed under its real sid from before the
+// process existed), but NOT for a provider that mints its own id and can only be
+// keyed correctly once it announces it (Registry.rekey). Holding the pointer is
+// what makes this correct for both.
 func (a *Attachment) SetOwner(clientID string) bool {
 	a.mu.Lock()
 	e := a.entry

@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,9 +24,9 @@ type fakeSession struct {
 	sid    string
 	events chan agent.Event
 	// sidReady, when non-nil, gates SessionID() until it is closed — mimics
-	// ccSession.SessionID() blocking on system/init, used by the tether#12
-	// eviction-race test to end a session while the re-key goroutine is still
-	// parked in SessionID(). Nil (the default) returns the sid immediately,
+	// ccSession.SessionID() blocking on system/init. It exists so a test can choose
+	// the instant Resolve is released, which is how the tether#50 ownership race is
+	// staged deterministically. Nil (the default) returns the sid immediately,
 	// preserving every other test's behavior.
 	sidReady chan struct{}
 	// dead, when set, makes Alive() report false while SessionID() keeps handing
@@ -72,6 +73,19 @@ func (f *fakeSession) Interrupt() error {
 	return nil
 }
 func (f *fakeSession) Close() error { return nil }
+
+// announceInit emits the system/init this fake's sid arrives on.
+//
+// The fake models a provider that MINTS ITS OWN id (opencode: Spawn ignores
+// SpawnConfig.SessionID and the id shows up later on the event stream), which is
+// the only shape that still needs Registry.rekey since tether#54. So a test that
+// wants to find this session by its hard-coded sid must let it announce that sid
+// first — the registry keyed the entry under the id it PINNED at spawn, and
+// nothing but this event tells it otherwise. Real cc needs no equivalent: it
+// adopts the pinned id, so the key is right from the start.
+func (f *fakeSession) announceInit() {
+	f.events <- agent.Event{Kind: agent.EventInit, SessionID: f.sid}
+}
 
 // Prompts returns a snapshot of every string passed to SendPrompt so far.
 func (f *fakeSession) Prompts() []string {
@@ -130,7 +144,8 @@ func TestGetOrSpawnEntry_LiveSidReused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first spawn: %v", err)
 	}
-	waitForRegistered(t, reg, "live-sid") // wait for the async re-key tempKey → real sid
+	fp.sess.announceInit()
+	waitForRegistered(t, reg, "live-sid")
 	e2, err := reg.GetOrSpawnEntry(context.Background(), "live-sid", "fake")
 	if err != nil {
 		t.Fatalf("reuse: %v", err)
@@ -160,6 +175,7 @@ func TestGetOrSpawnEntry_RegisteredButDeadSpawnsFresh(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed spawn: %v", err)
 	}
+	corpse.announceInit()
 	waitForRegistered(t, reg, "dead-sid")
 	corpse.dead.Store(true)
 
@@ -194,6 +210,7 @@ func TestIsLive_FalseOnceTheAgentExits(t *testing.T) {
 	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
 		t.Fatalf("GetOrSpawnEntry: %v", err)
 	}
+	fs.announceInit()
 	waitForRegistered(t, reg, "islive-sid") // this itself asserts IsLive is true
 	if !reg.IsLive("islive-sid") {
 		t.Fatal("IsLive = false for a healthy registered session")
@@ -796,13 +813,15 @@ collect:
 	}
 }
 
-// waitForRegistered polls until sid is registered in reg. GetOrSpawnEntry
-// registers a fresh session under a temp key and re-keys it to the real sid
-// on a separate goroutine once sess.SessionID() resolves (see its doc
-// comment) — production code observes the same async window, so tests that
-// look sid up by its real id must wait for it rather than assuming it's
-// already there the instant GetOrSpawnEntry returns. Bounded so a genuine
-// bug (sid never registered) fails fast instead of hanging.
+// waitForRegistered polls until sid is registered in reg.
+//
+// Needed only because these fakes model a provider that mints its own id (see
+// announceInit): the entry is keyed under the id the registry pinned at spawn and
+// moves to the announced one when fanOut processes the init, which is another
+// goroutine. A provider that adopts the pinned id — real cc — is registered under
+// its final sid before spawnEntry returns, and asserting THAT needs no polling at
+// all (see TestSpawn_RegistersUnderTheMintedSidBeforeReturning). Bounded so a
+// genuine bug (sid never registered) fails fast instead of hanging.
 func waitForRegistered(t *testing.T, reg *Registry, sid string) {
 	t.Helper()
 	deadline := time.Now().Add(500 * time.Millisecond)
@@ -826,6 +845,7 @@ func TestRegistry_DeliverAction_Approve(t *testing.T) {
 	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
 		t.Fatalf("GetOrSpawnEntry: %v", err)
 	}
+	fs.announceInit()
 	waitForRegistered(t, reg, "sid-approve")
 
 	if err := reg.DeliverAction("sid-approve", "approve", "s-0", "planner"); err != nil {
@@ -871,6 +891,7 @@ func TestRegistry_InterruptSession_CallsAgentInterrupt(t *testing.T) {
 	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
 		t.Fatalf("GetOrSpawnEntry: %v", err)
 	}
+	fs.announceInit()
 	waitForRegistered(t, reg, "sid-pause")
 
 	if err := reg.InterruptSession("sid-pause"); err != nil {
@@ -935,29 +956,18 @@ func waitForCount(t *testing.T, reg *Registry, n int) {
 	t.Fatalf("registry never reached %d entries; has %d", n, regLen(reg))
 }
 
-// waitForFanOutDone polls until e has been evicted, which happens in fanOut's own
-// deferred evict — i.e. fanOut has RETURNED, and every envelope it was ever going
-// to broadcast has already been broadcast.
-//
-// Distinct from waitForCount, and the distinction matters for negative
-// assertions: spawnEntry's re-key goroutine deletes the pending key as soon as
-// SessionID() resolves, so with a fake whose SessionID() returns immediately,
-// waitForCount(reg, 0) can be satisfied WITHOUT fanOut having processed anything.
-// A "nothing was broadcast" check gated on waitForCount would then pass by
-// scheduling luck rather than by ordering.
-func waitForFanOutDone(t *testing.T, reg *Registry, e *Entry) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		reg.mu.Lock()
-		done := e.evicted
-		reg.mu.Unlock()
-		if done {
-			return
-		}
-		time.Sleep(time.Millisecond)
+// regKeys returns the keys the registry currently holds, read under its lock.
+// White-box, same-package: used to assert WHICH key an entry is registered under,
+// not merely that some lookup succeeds (tether#54).
+func regKeys(reg *Registry) []string {
+	reg.mu.RLock()
+	defer reg.mu.RUnlock()
+	keys := make([]string, 0, len(reg.sessions))
+	for k := range reg.sessions {
+		keys = append(keys, k)
 	}
-	t.Fatal("fanOut never returned (entry was never evicted)")
+	sort.Strings(keys)
+	return keys
 }
 
 // TestRegistry_EvictsEntryOnSessionEnd — (tether#12) once a session's agent
@@ -987,39 +997,60 @@ func TestRegistry_EvictsEntryOnSessionEnd(t *testing.T) {
 	}
 }
 
-// TestRegistry_EvictedEntryNotResurrectedByRekey — (tether#12) guards the race
-// between fanOut's eviction and GetOrSpawnEntry's re-key goroutine. The
-// session ends BEFORE its sid is published (SessionID() is gated on sidReady),
-// so fanOut evicts the pending-keyed entry while the re-key goroutine is still
-// parked in SessionID(). When SessionID() is then released with a real sid,
-// the re-key goroutine must observe e.evicted and refuse to re-insert the dead
-// entry — otherwise it resurrects the very leak this task fixes.
+// TestRegistry_EvictedEntryNotResurrectedByRekey — (tether#12, carried into
+// tether#54) an entry that has already been un-registered must not come back when
+// its agent announces a session id.
+//
+// tether#12 met this as "fanOut evicted the pending-keyed entry while a goroutine
+// was still parked in SessionID()", and guarded it with an `evicted` flag. That
+// goroutine is gone: re-keying now happens inside fanOut, so the ORDINARY
+// teardown cannot race itself. What remains is the two evictors that run on other
+// goroutines — liveEntry dropping a corpse, Attachment.resolve dropping a failed
+// resume — either of which can un-register the entry before fanOut gets to an init
+// still sitting in the channel buffer. Registry.rekey therefore MOVES a
+// registration and never creates one; this stages exactly that.
 func TestRegistry_EvictedEntryNotResurrectedByRekey(t *testing.T) {
-	ready := make(chan struct{})
-	fs := &fakeSession{sid: "sid-race", events: make(chan agent.Event, 4), sidReady: ready}
+	fs := &fakeSession{sid: "sid-race", events: make(chan agent.Event, 4)}
 	reg := NewRegistry(&fakeProvider{sess: fs})
 
-	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
+	e, err := reg.GetOrSpawnEntry(context.Background(), "", "fake")
+	if err != nil {
 		t.Fatalf("GetOrSpawnEntry: %v", err)
 	}
+	keys := regKeys(reg)
+	if len(keys) != 1 {
+		t.Fatalf("registry keys after spawn = %v, want exactly one (the minted sid)", keys)
+	}
+	// Subscribing gives the assertion below a BARRIER rather than a sleep: an
+	// envelope on this channel proves fanOut has already processed everything
+	// queued ahead of the event that produced it.
+	ch := make(chan wire.Envelope, 8)
+	e.Subscribe(ch)
 
-	// End the session before init: fanOut evicts the pending entry while the
-	// re-key goroutine is blocked in SessionID() (ready not yet closed).
-	close(fs.events)
+	// A concurrent evictor un-registers the entry: the agent is dead, and the
+	// reconnect path notices before fanOut has looked at anything.
+	fs.dead.Store(true)
+	if reg.IsLive(keys[0]) {
+		t.Fatal("IsLive = true for a session whose agent reports dead")
+	}
 	waitForCount(t, reg, 0)
 
-	// Release the re-key goroutine with a real sid; it must NOT re-insert.
-	close(ready)
-	deadline := time.Now().Add(200 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if reg.IsLive("sid-race") {
-			t.Fatal("evicted entry was resurrected by the re-key goroutine")
-		}
-		time.Sleep(time.Millisecond)
+	// The init was already in flight. Processing it must not re-register.
+	fs.announceInit()
+	fs.events <- agent.Event{Kind: agent.EventText, Text: "past the init\n"}
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fanOut never processed the in-flight init; the assertion below would be vacuous")
 	}
-	if n := regLen(reg); n != 0 {
-		t.Fatalf("registry holds %d entries, want 0 (re-key must not resurrect)", n)
+
+	// Read the map directly. IsLive would hide a resurrection here: it re-evicts
+	// whatever it finds dead, so it would report "not live" about an entry it had
+	// just found registered.
+	if got := regKeys(reg); len(got) != 0 {
+		t.Fatalf("an evicted entry was resurrected by the re-key, under %v; want an empty registry", got)
 	}
+	close(fs.events)
 }
 
 // ─── tether#50: the failed-resume empty `result` must never reach the browser ──
@@ -1051,11 +1082,13 @@ func TestFanOut_SuppressesInitlessEmptyResult(t *testing.T) {
 	fs.events <- agent.Event{Kind: agent.EventResult, Text: ""}
 	close(fs.events)
 
-	// Gate on fanOut having RETURNED, not on the registry being empty: the re-key
-	// goroutine empties the registry on its own here (this fake's SessionID()
-	// returns immediately), which would make the negative assertion below pass
-	// without fanOut ever having looked at the event.
-	waitForFanOutDone(t, reg, e)
+	// An empty registry now means fanOut RETURNED: the entry is registered under
+	// the id spawnEntry minted for it, and the only thing that removes it is
+	// fanOut's own deferred evict (tether#54 — before it, a re-key goroutine could
+	// empty the map on its own, so this had to gate on a separate signal, and a
+	// "nothing was broadcast" assertion gated on the count would have passed by
+	// scheduling luck).
+	waitForCount(t, reg, 0)
 
 	select {
 	case env := <-ch:

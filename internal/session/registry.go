@@ -15,12 +15,29 @@ import (
 
 // Registry holds all live sessions and the set of event subscribers per session.
 type Registry struct {
-	mu           sync.RWMutex
-	sessions     map[string]*Entry // keyed by sid (real or pending placeholder)
-	locks        map[string]*SessionLock
-	providers    map[string]agent.AgentProvider
-	PermEndpoint string        // injected into cc subprocess env if non-empty
-	History      *HistoryStore // nil = history disabled
+	mu sync.RWMutex
+	// sessions is keyed by sid. Every entry is registered before spawnEntry
+	// returns, under the sid it told its agent to use — so for a provider that
+	// ADOPTS that id (cc, mem_2ruSlrHR ①) the key is the session's final sid from
+	// before the process existed, so no lookup can miss it for want of a re-key
+	// (tether#54). Two attaches racing to spawn the SAME sid is a separate, much
+	// narrower window — see the RESIDUAL note in Attach and tether#60.
+	//
+	// Not a universal invariant, and the difference matters: a provider that mints
+	// its own id (OpenCodeProvider ignores SpawnConfig.SessionID) is registered
+	// under an id nothing else will ever ask about until it announces its own, at
+	// which point rekey moves it. Such an entry is addressable — evict and
+	// BroadcastAll find it, which the old placeholder also allowed — but NOT by any
+	// sid a client holds. See rekey, and the RESIDUAL note in Attach.
+	sessions  map[string]*Entry
+	locks     map[string]*SessionLock
+	providers map[string]agent.AgentProvider
+	// mintedIDIgnored records the providers already observed to report a session id
+	// other than the one they were spawned under, so rekey's self-check warns ONCE
+	// per provider instead of once per session. Guarded by mu.
+	mintedIDIgnored map[string]bool
+	PermEndpoint    string        // injected into cc subprocess env if non-empty
+	History         *HistoryStore // nil = history disabled
 	// Workdir is the agent subprocess cwd (workspace root); "" = daemon cwd.
 	// Wired by internal/server/lifecycle.go Step 3b once the workspace root
 	// is resolved (tether#51) — Step 1 builds the Registry before wsRoot is
@@ -37,12 +54,18 @@ type Entry struct {
 	subsMu        sync.RWMutex
 	ownerClientID string
 	fenceParser   *FenceParser // D-19 fenced-block extraction (tether#8 T6); one per session
-	// evicted is set true by Registry.evict once this session's fanOut loop
-	// has returned (session ended / client disconnected). Guarded by
-	// Registry.mu (NOT subsMu). It exists so the re-key goroutine in
-	// GetOrSpawnEntry, if it wins the race and runs AFTER eviction, refuses to
-	// re-insert this dead entry under its real sid (tether#12).
-	evicted bool
+	// regKey is the key this entry is registered under in Registry.sessions —
+	// its sid, known before the agent process existed (see spawnEntry). Guarded
+	// by Registry.mu (NOT subsMu), because it is part of the map's shape rather
+	// than of the entry's own state: Registry.rekey moves a registration and
+	// updates this in the same critical section, so the two can never disagree.
+	//
+	// It exists only for the provider that cannot be told its session's id
+	// (tether#54 — see rekey); for cc it is written once and never changes.
+	regKey string
+	// provider is the AgentProvider name this session was spawned from, carried so
+	// rekey's self-check can name it. Immutable after construction.
+	provider string
 }
 
 // Session returns the underlying agent.Session.
@@ -71,9 +94,10 @@ func NewRegistry(providers ...agent.AgentProvider) *Registry {
 		pm[p.Name()] = p
 	}
 	return &Registry{
-		sessions:  make(map[string]*Entry),
-		locks:     make(map[string]*SessionLock),
-		providers: pm,
+		sessions:        make(map[string]*Entry),
+		locks:           make(map[string]*SessionLock),
+		providers:       pm,
+		mintedIDIgnored: make(map[string]bool),
 	}
 }
 
@@ -145,11 +169,9 @@ func (r *Registry) liveEntry(sid string) (*Entry, bool) {
 	return e, true
 }
 
-// GetOrSpawnEntry returns the *Entry for the given sid, or spawns a new
-// agent process and registers a fresh Entry. If sid is empty, a new
-// process is spawned and re-keyed once its system/init provides the real
-// SessionID. providerName selects the AgentProvider; defaults to
-// "claude-code" if empty.
+// GetOrSpawnEntry returns the *Entry for the given sid, or spawns a new agent
+// process and registers a fresh Entry under a newly minted sid. providerName
+// selects the AgentProvider; defaults to "claude-code" if empty.
 //
 // Returning *Entry (rather than just agent.Session) lets the caller call
 // Entry.Subscribe BEFORE sending the first prompt — necessary because the
@@ -188,16 +210,48 @@ func (r *Registry) GetOrSpawnEntry(ctx context.Context, sid, providerName string
 }
 
 // spawnEntry starts a new agent subprocess, wraps it in an Entry, registers the
-// Entry and starts its fanOut loop. cfg is the caller's spawn intent; Env and
-// Workdir are filled in here (they are registry-wide, not per-call), so callers
-// only choose between "pin this freshly minted id" and "resume this existing
-// one".
+// Entry under its sid and starts its fanOut loop. cfg is the caller's spawn
+// intent; Env and Workdir are filled in here (they are registry-wide, not
+// per-call), so callers only choose between "pin this freshly minted id" and
+// "resume this existing one".
 //
 // A fresh spawn always pins a minted SessionID (tether#50): cc adopts it and
 // echoes it on init (mem_2ruSlrHR ①), so the daemon knows the session's id — and
 // therefore its on-disk transcript name — before cc has emitted a single byte.
 // Empty-vs-minted is not left to the caller because an unpinned fresh session is
 // exactly the un-resumable state this slice exists to eliminate.
+//
+// # The sid is known BEFORE the process exists, so registration is synchronous
+//
+// Both spawn intents name the session up front: a fresh one under the id just
+// minted for it, a reconnect under the id it is resuming. So the key this entry
+// belongs under is computable before provider.Spawn is called, and the entry is
+// in the map before this function returns — no window, nothing to re-key
+// (tether#54).
+//
+// What that replaces was a `pending-%p` placeholder key plus a goroutine parked
+// in sess.SessionID() to move the entry to its real sid once cc announced it. It
+// existed because before tether#50 the daemon did not choose the id: under
+// `--input-format stream-json` cc emits nothing at all until the first prompt
+// arrives, so "the entry's real key" was genuinely unavailable until the user
+// typed. Two defects grew in that window, both now closed by construction rather
+// than by care:
+//
+//   - Attachment.Resolve waits on the SAME SessionID() wakeup the re-key
+//     goroutine did, so it routinely returned while the map still held only the
+//     placeholder. Any ownership/liveness question asked by sid at that moment
+//     answered "no such session" about a session that was right there — which
+//     serveChat read as a fatal ownership race and answered by dropping the
+//     connection mid-answer.
+//   - A second attach carrying the same sid inside the window missed and spawned
+//     its own `cc --resume` of the same transcript; both then re-keyed to the same
+//     map key, so one entry silently displaced the other and the displaced cc kept
+//     running unreachable.
+//
+// Registering under the known key also makes the SECOND attach find the first
+// one (via Attach's liveEntry) instead of duplicating it. That is a reuse of an
+// as-yet-unconfirmed resume, and the consequence is deliberate: see the note in
+// Attach.
 func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agent.SpawnConfig) (*Entry, error) {
 	if providerName == "" {
 		providerName = "claude-code"
@@ -221,42 +275,123 @@ func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agen
 		cfg.SessionID = agent.NewSessionID()
 	}
 
+	// The two fields are mutually exclusive (see agent.SpawnConfig), and the
+	// branch above guarantees one of them is set, so exactly one of these is the
+	// session's id and key is never empty.
+	key := cfg.SessionID
+	if key == "" {
+		key = cfg.ResumeSessionID
+	}
+
 	sess, err := provider.Spawn(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("spawn: %w", err)
 	}
 
-	e := &Entry{sess: sess, subs: make(map[chan wire.Envelope]struct{}), fenceParser: NewFenceParser()}
+	e := &Entry{
+		sess:        sess,
+		subs:        make(map[chan wire.Envelope]struct{}),
+		fenceParser: NewFenceParser(),
+		regKey:      key,
+		provider:    providerName,
+	}
 
-	// Register entry under a synthetic placeholder key BEFORE waiting for
-	// SessionID. This breaks the deadlock: cc's stream-json `--input-format`
-	// mode does NOT emit system/init until the first user prompt arrives,
-	// but serveChat needs the entry registered to call Subscribe and start
-	// reading user prompts. Solution: register under a temp key now, re-key
-	// once cc emits system/init asynchronously.
-	tempKey := fmt.Sprintf("pending-%p", e)
+	// Registered BEFORE fanOut starts, and the order is load-bearing rather than
+	// tidy: fanOut is what calls rekey, and rekey deliberately moves an existing
+	// registration instead of creating one, so an entry whose init were processed
+	// before this insert would be left permanently unreachable by its real sid.
+	// (Not pinned by a test — staging it needs a hook between these two
+	// statements — so treat the order as an invariant, not a preference.)
 	r.mu.Lock()
-	r.sessions[tempKey] = e
+	r.sessions[key] = e
 	r.mu.Unlock()
 
 	// background goroutine: fan out events to subscribers
 	go r.fanOut(e)
 
-	// Re-key once cc emits system/init asynchronously.
-	go func() {
-		sid := sess.SessionID()
-		r.mu.Lock()
-		delete(r.sessions, tempKey)
-		// Skip the re-key if the session already ended and fanOut evicted the
-		// entry while we were parked in SessionID() (tether#12). Without this
-		// guard a fast session teardown could be resurrected here and leak.
-		if sid != "" && !e.evicted {
-			r.sessions[sid] = e
-		}
-		r.mu.Unlock()
-	}()
-
 	return e, nil
+}
+
+// rekey MOVES e's registration to sid. It never creates one, and that is the
+// whole safety argument: an entry evicted concurrently (by liveEntry finding it
+// dead, or by Attachment.resolve dropping a failed resume) is no longer under
+// its own key, so this becomes a no-op and cannot resurrect it. tether#12 needed
+// an `evicted` flag for that because its re-key ran on a goroutine of its own
+// with no relationship to eviction; this one is called from fanOut, i.e. from the
+// same goroutine whose deferred evict ends the session — so "re-keyed after
+// eviction" is not merely guarded against, it is unreachable in program order
+// for the ordinary teardown, and the move-not-create rule covers the two
+// concurrent evictors.
+//
+// # Who needs it at all
+//
+// Nobody, for cc: spawnEntry already registered the entry under the id it told
+// cc to adopt, and cc echoes that id back on every system/init (mem_2ruSlrHR ①),
+// so sid == e.regKey and this returns without touching the map. The call is kept
+// on that path ANYWAY, as the self-check the id-minting never had: if cc's
+// `--session-id` adoption ever regresses, the daemon says so in the log and ends
+// up correctly keyed, instead of silently reverting to pre-tether#50 semantics
+// (an orphaned history directory and a transcript that truncates on reload, with
+// Resolution.Recovered false so the user is not even told).
+//
+// It IS load-bearing for OpenCodeProvider, which ignores SpawnConfig.SessionID
+// and mints its own id inside `opencode serve`. Such a provider cannot be keyed
+// correctly at spawn time by anyone, so the id has to be adopted from the event
+// that announces it. Note the consequence, which is the residual of tether#54
+// rather than a new defect: between Resolve returning (opencode publishes its sid
+// to SessionID() waiters from the SSE loop) and fanOut processing the same
+// EventInit, a lookup BY SID can still miss. That is why serveChat claims
+// ownership through Attachment.SetOwner's *Entry and not by sid.
+//
+// # The self-check is once per PROVIDER, not once per session
+//
+// A provider that mints its own id trips the mismatch on every single session, so
+// warning each time would bury the signal it exists for under the noise it cannot
+// avoid — an operator who has learned to ignore the line cannot use it to notice cc
+// regressing. The first mismatch from a given provider is therefore a Warn naming
+// that provider (actionable: `provider=opencode` is a known limitation,
+// `provider=claude-code` means `--session-id` adoption has broken and sessions are
+// silently reverting to pre-tether#50 semantics); every later one is a Debug.
+//
+// The logging happens AFTER r.mu is released. Writing to a log handler is I/O, and
+// holding the registry-wide lock across I/O is the same mistake liveEntry
+// deliberately avoids with Alive().
+func (r *Registry) rekey(e *Entry, sid string) {
+	if sid == "" {
+		return
+	}
+	r.mu.Lock()
+	if e.regKey == sid {
+		r.mu.Unlock()
+		return
+	}
+	if r.sessions[e.regKey] != e {
+		// Already evicted (or displaced by a newer session under the same key):
+		// there is no registration to move, and creating one would be a
+		// resurrection.
+		r.mu.Unlock()
+		return
+	}
+	from := e.regKey
+	delete(r.sessions, from)
+	r.sessions[sid] = e
+	e.regKey = sid
+	firstForProvider := !r.mintedIDIgnored[e.provider]
+	r.mintedIDIgnored[e.provider] = true
+	r.mu.Unlock()
+
+	const msg = "agent reported a session id it was not spawned under; re-keying"
+	if firstForProvider {
+		// Both readings are spelled out because this line cannot tell them apart —
+		// only the provider field can, and printing one diagnosis would print the
+		// reassuring one at the exact moment the alarming one is true.
+		slog.Warn(msg+" — expected once per session from a provider that mints its own id; "+
+			"from one that accepts --session-id it means sessions are silently losing "+
+			"their pinned id (pre-tether#50 semantics: orphaned history, truncated reloads)",
+			"provider", e.provider, "spawned_under", from, "reported", sid)
+		return
+	}
+	slog.Debug(msg, "provider", e.provider, "spawned_under", from, "reported", sid)
 }
 
 // GetOrSpawn is a thin wrapper that hides the Entry behind the Session.
@@ -285,17 +420,15 @@ func (r *Registry) GetOrSpawn(ctx context.Context, sid, providerName string) (ag
 // which is why no idle timer or grace period is needed — the connection
 // context already bounds the subprocess lifetime (tether#12).
 //
-// Eviction is by value: it deletes whatever key maps to e, catching the entry
-// whether it is keyed under its real sid or still under the pending-%p
-// placeholder from GetOrSpawnEntry. The placeholder case matters — a session
-// that dies before emitting system/init: since tether#49, ccSession.SessionID()
-// returns "" on that death (it selects on the process-exit `done` channel, no
-// longer parking forever), so the re-key goroutine wakes, deletes the tempKey,
-// and skips the re-insert (sid == ""). This by-value scan remains the safety
-// net that reclaims the slot regardless of goroutine timing. Setting e.evicted
-// first makes a late-waking re-key goroutine refuse to re-insert the entry (see
-// GetOrSpawnEntry). Deleting during range is safe per the Go spec, and this
-// runs once per session lifetime — not on a hot path.
+// Eviction is by value: it deletes whatever key maps to e rather than trusting
+// e.regKey. Since tether#54 an entry is registered under its sid from before its
+// process existed and only Registry.rekey ever moves it, so the two agree — the
+// by-value scan is kept because it is what makes this idempotent and
+// order-independent for its three callers (fanOut's defer, liveEntry dropping a
+// corpse, Attachment.resolve dropping a failed resume), and because it cannot
+// take out a DIFFERENT entry that has since been registered under the same key.
+// Deleting during range is safe per the Go spec, and this runs once per session
+// lifetime — not on a hot path.
 //
 // r.locks is deliberately NOT cleaned here: the per-sid SessionLock is shared
 // with shell sessions (handleWTShell calls GetLock for the same sid), so its
@@ -304,7 +437,6 @@ func (r *Registry) GetOrSpawn(ctx context.Context, sid, providerName string) (ag
 func (r *Registry) evict(e *Entry) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	e.evicted = true
 	for k, v := range r.sessions {
 		if v == e {
 			delete(r.sessions, k)
@@ -366,24 +498,17 @@ func (r *Registry) Unsubscribe(sid string, ch chan wire.Envelope) {
 	e.subsMu.Unlock()
 }
 
-// SetOwner records ownerClientID using compare-and-set. Returns true if this call set the owner.
+// setOwner is the compare-and-set that records ownership. Reached only through
+// Attachment.SetOwner, i.e. from a caller that already holds the *Entry.
 //
-// Callers that already hold the *Entry should prefer Attachment.SetOwner: the
-// sid lookup here fails for an entry that has not been re-keyed off its
-// `pending-%p` placeholder yet, which is a race the chat path used to lose (see
-// Attachment.SetOwner).
-func (r *Registry) SetOwner(sid, clientID string) bool {
-	r.mu.RLock()
-	e, ok := r.sessions[sid]
-	r.mu.RUnlock()
-	if !ok {
-		return false
-	}
-	return e.setOwner(clientID)
-}
-
-// setOwner is the compare-and-set itself, independent of how the Entry was
-// found. Returns false only when a DIFFERENT client already owns the session;
+// There is deliberately no sid-keyed Registry.SetOwner wrapper. One existed until
+// tether#54 and had no callers left: the chat path stopped using it when its
+// lookup turned out to lose a race with the placeholder re-key, and while
+// retiring the placeholder makes such a lookup sound for cc, it stays racy for a
+// provider that mints its own id (see Registry.rekey). Ownership is asked about
+// the entry you are holding; re-deriving it from the map is the shape of the bug.
+//
+// Returns false only when a DIFFERENT client already owns the session;
 // re-claiming by the same client is idempotent.
 func (e *Entry) setOwner(clientID string) bool {
 	e.subsMu.Lock()
@@ -404,18 +529,58 @@ func (e *Entry) setOwner(clientID string) bool {
 // calling this in a loop and expecting it to observe without disturbing.
 //
 // It goes through liveEntry (not a bare map lookup) so it cannot disagree with
-// the reuse decision Attach makes microseconds later on the same sid. Its one
-// production caller is serveChat's ownership gate, and a corpse answering "live"
-// there is its own small failure: the gate consults the owner recorded on the
-// dead entry, so reconnecting a sid whose agent has exited from a SECOND device
-// was rejected outright ("session owned by another client") instead of recovering
-// the conversation. Under tether's one-human-many-devices model a dead sid is
-// nobody's to own — and it already behaves that way for a sid the registry has
-// finished forgetting, so this makes the two agree rather than loosening the gate
-// (see serveChat's note on the gate being inert for restorable sids).
+// the reuse decision Attach makes microseconds later on the same sid.
+//
+// Since tether#54 it has NO production caller: serveChat's admission gate used to
+// compose it with IsOwner and now asks OwnedByOther instead, which folds the same
+// liveness check in (and is why a dead sid is still nobody's to own — under
+// tether's one-human-many-devices model, reconnecting a sid whose agent has exited
+// from a SECOND device must recover the conversation, not be told the corpse owns
+// it). What remains is a liveness PROBE for tests, including tests in other
+// packages, which is the only reason it stays exported.
 func (r *Registry) IsLive(sid string) bool {
 	_, ok := r.liveEntry(sid)
 	return ok
+}
+
+// OwnedByOther reports whether sid names a live session that a DIFFERENT client
+// has already claimed. It is the question serveChat's admission gate actually
+// wants, and asking it in one call is what stops the gate from rejecting a
+// session that simply has no owner yet.
+//
+// # Why this exists rather than IsLive() && !IsOwner()
+//
+// That composition reads "reject unless this client owns it", and an UNOWNED
+// session fails it: IsOwner compares against an empty ownerClientID and says no.
+// Ownership is claimed only after Attachment.Resolve confirms the session, and
+// for cc confirmation needs the user's first prompt — so "live but not yet
+// owned" is a state that lasts as long as the user takes to type.
+//
+// Before tether#54 the gate got away with it: the entry sat under a placeholder
+// key, so IsLive(sid) answered false for that whole window and the gate simply
+// did not fire. Registering under the real sid closes that window and would have
+// converted it into a false rejection — a second tab of the SAME browser (the
+// client id is per-credential, so tabs share it) told "session owned by another
+// client", a message the frontend renders as nothing at all before its automatic
+// reconnect tries again with the same sid, i.e. a silent reconnect loop until the
+// first turn finishes. Which is also exactly the case tether#54 set out to make
+// WORK, by letting the second attach reuse the first session.
+//
+// So the gate's expression is corrected to match its documented intent (#83):
+// reject only a session that exists AND is owned by someone else. Two clients on
+// one unowned session now proceed into Attach, where the liveEntry gate hands the
+// second one the session the first is already using.
+// Not a pure predicate: it goes through liveEntry, so asking it about a sid whose
+// agent has exited UNREGISTERS that session as a side effect (see liveEntry for why
+// the answer is made stable rather than merely reported).
+func (r *Registry) OwnedByOther(sid, clientID string) bool {
+	e, ok := r.liveEntry(sid)
+	if !ok {
+		return false
+	}
+	e.subsMu.RLock()
+	defer e.subsMu.RUnlock()
+	return e.ownerClientID != "" && e.ownerClientID != clientID
 }
 
 // IsOwner returns true if clientID is the recorded owner of sid.
@@ -588,6 +753,12 @@ func (r *Registry) fanOut(e *Entry) {
 		if ev.Kind == agent.EventInit && ev.SessionID != "" {
 			sid = ev.SessionID
 			sawInit = true
+			// Adopt the id the agent actually reports. A no-op for cc, which was
+			// spawned under this very id; the one path that needs it is a provider
+			// that mints its own (see rekey). Done HERE, on the loop's own
+			// goroutine, so it is ordered before every envelope this session
+			// broadcasts and strictly before the deferred evict above.
+			r.rekey(e, ev.SessionID)
 			e.fenceParser.ResetTurn()
 		}
 		slog.Debug("fanOut: agent event", "kind", ev.Kind, "text_preview", truncStr(ev.Text, 60))

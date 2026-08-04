@@ -116,9 +116,13 @@ func (p *fakeActionProvider) Spawn(_ context.Context, _ agent.SpawnConfig) (agen
 	return p.sess, nil
 }
 
-// waitForLive polls until sid is registered in reg (GetOrSpawnEntry re-keys
-// asynchronously once the session's real id resolves — see its doc
-// comment), bounded so a genuine bug fails fast instead of hanging.
+// waitForLive polls until sid is registered in reg.
+//
+// These fakes model a provider that mints its own id (like opencode) rather than
+// adopting the one the registry pins, so the entry starts out keyed under the
+// pinned id and moves to the announced one when Registry.fanOut processes the
+// init — another goroutine, hence the wait. Bounded so a genuine bug fails fast
+// instead of hanging.
 func waitForLive(t *testing.T, reg *session.Registry, sid string) {
 	t.Helper()
 	deadline := time.Now().Add(500 * time.Millisecond)
@@ -141,6 +145,7 @@ func TestHandleActionFrame_ApproveRoutesToSession(t *testing.T) {
 	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
 		t.Fatalf("GetOrSpawnEntry: %v", err)
 	}
+	fs.events <- agent.Event{Kind: agent.EventInit, SessionID: "sid-approve-1"}
 	waitForLive(t, reg, "sid-approve-1")
 
 	handleActionFrame(reg, wire.ClientFrame{
@@ -199,6 +204,7 @@ func TestHandleActionFrame_PauseRoutesToInterrupt(t *testing.T) {
 	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
 		t.Fatalf("GetOrSpawnEntry: %v", err)
 	}
+	fs.events <- agent.Event{Kind: agent.EventInit, SessionID: "sid-pause"}
 	waitForLive(t, reg, "sid-pause")
 
 	handleActionFrame(reg, wire.ClientFrame{
@@ -243,6 +249,7 @@ func TestHandleActionFrame_RollbackIgnored(t *testing.T) {
 	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
 		t.Fatalf("GetOrSpawnEntry: %v", err)
 	}
+	fs.events <- agent.Event{Kind: agent.EventInit, SessionID: "sid-rollback"}
 	waitForLive(t, reg, "sid-rollback")
 
 	handleActionFrame(reg, wire.ClientFrame{

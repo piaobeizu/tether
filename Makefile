@@ -6,7 +6,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev
 all: build
 
 build:
-	bash scripts/build.sh
+	VERSION="$(VERSION)" bash scripts/build.sh
 
 codegen:
 	bash scripts/codegen.sh

@@ -25,3 +25,8 @@
 
 # Local dev runtime state from scripts/dev.sh
 .dev/
+
+# A filled-in copy of deploy/tether.env.example holds the access token.
+# deploy/tether.env is the obvious name to reach for; make it un-committable.
+/deploy/tether.env
+/deploy/*.env

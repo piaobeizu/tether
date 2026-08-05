@@ -4,13 +4,15 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"
+
 echo "==> codegen"
 bash scripts/codegen.sh
 
 echo "==> web build"
 (cd web && pnpm install --frozen-lockfile && pnpm build)
 
-echo "==> go build"
-go build -o bin/tether ./cmd/tether
+echo "==> go build (version: ${VERSION})"
+go build -ldflags "-X main.version=${VERSION}" -o bin/tether ./cmd/tether
 
 echo "==> done: bin/tether"

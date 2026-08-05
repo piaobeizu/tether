@@ -289,9 +289,24 @@ func Run(cfg *Config) error {
 	cfg.DevFrontendURL = cfg.devFrontend()
 
 	// Step 4c: auth state.
-	accessToken, err := auth.LoadOrGenToken(cfg.Token)
+	accessToken, tokenSource, err := auth.LoadOrGenToken(cfg.Token)
 	if err != nil {
 		return fmt.Errorf("auth token: %w", err)
+	}
+	// Deliberately logs the source label only, never the token value — lets
+	// an operator (and live-verification) confirm which credential path
+	// (flag/env/file/generated) is actually energised. The key is
+	// "token_source" rather than "source" because slog reserves the latter
+	// for call-site information under AddSource.
+	slog.Info("auth: access token loaded", "token_source", string(tokenSource))
+	// An operator-supplied token is the one tether does not control the
+	// strength of, and /api/v1/auth/verify has no rate limit while the
+	// listener binds every interface. Warn on an obviously weak one — the
+	// generated tokens are 64 hex chars, so this never fires for them.
+	// Reports neither the value nor its exact length.
+	if (tokenSource == auth.TokenSourceFlag || tokenSource == auth.TokenSourceEnv) && len(accessToken) < 32 {
+		slog.Warn("auth: supplied access token is short; prefer `openssl rand -hex 32`",
+			"token_source", string(tokenSource))
 	}
 	jwtSecret, err := auth.LoadOrGenSecret()
 	if err != nil {

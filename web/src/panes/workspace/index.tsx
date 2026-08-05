@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Icon } from '../../lib/icons'
-import { useStore } from '../../lib/store'
+import { rememberedWorkspaceId, useStore } from '../../lib/store'
 import { openSession } from '../../lib/session'
 import WorkspaceTree from './WorkspaceTree'
 
@@ -12,21 +12,87 @@ interface Workspace {
   activeSid?: string
 }
 
+/**
+ * resolveSelection decides which workspace is selected once a
+ * GET /api/v1/workspaces response is in hand. Extracted as a pure function
+ * (mirrors chatURL / shouldDeferFirstConnect) because it is the whole of
+ * tether#66: which of these three candidates wins.
+ *
+ * Order, and why each rung exists:
+ *
+ *  1. `currentId`, if the registry still contains it. load() re-runs after every
+ *     add and delete, and it must never yank the selection out from under a user
+ *     who is working in it.
+ *  2. `persistedId`, if the registry still contains it. THIS RUNG IS THE FIX.
+ *     Selecting a workspace only ever decides where the NEXT session runs
+ *     (a session's cwd is pinned at spawn and cc's --resume is cwd-scoped, so it
+ *     can never be moved — see chatUrl.ts), and the only way to get a next
+ *     session is App's startNewSession, which drops the sid and calls
+ *     location.reload(). Before tether#66 the selection lived in component state
+ *     only, so the reload that acted on the choice was also the thing that
+ *     destroyed it: every new chat landed in registry[0] no matter what the user
+ *     had clicked, and re-ordering ~/.tether/workspaces.json was the workaround.
+ *     An id the registry no longer contains falls through: a removed workspace is
+ *     not a selection, and a bad or hand-edited value can never reach the wire
+ *     because it has to be found in the fetched registry to be published at all.
+ *  3. `registry[0]`, so a profile that has never chosen still gets a workspace
+ *     rather than the daemon's --workspace-root. Note this rung REPLACES the
+ *     remembered id rather than leaving it alone — whatever it returns is
+ *     published and therefore persisted by the caller. That is what you want for
+ *     a workspace the user deleted; it also means a response that is missing the
+ *     remembered workspace for any other reason (a registry file caught
+ *     mid-rewrite, a different daemon on the same origin) costs the user their
+ *     preference. Acceptable: the alternative is holding a selection the daemon
+ *     would refuse, and load() only ever sees a 200 it could parse.
+ *
+ * Null only when the registry is EMPTY. That is deliberate: null makes chatURL
+ * omit `ws` entirely, and the daemon then falls back to --workspace-root — the
+ * right answer when there is genuinely nothing registered, and (since the row
+ * click no longer clears the selection, see onRowClick) the only way to get it.
+ *
+ * Scope of the persistence: it is one key for the whole origin, last writer
+ * wins. Two tabs do converge (a second tab has no `currentId`, so it adopts the
+ * remembered id), but a click in one tab moves the preference under the other,
+ * whose sidebar keeps highlighting the old row until it reloads. Fine for a
+ * single-user daemon; it is a preference, not session state.
+ */
+export function resolveSelection<T extends { id: string }>(o: {
+  registry: T[]
+  currentId: string | null
+  persistedId: string | null
+}): T | null {
+  const live = o.currentId ? o.registry.find(w => w.id === o.currentId) : undefined
+  if (live) return live
+  const saved = o.persistedId ? o.registry.find(w => w.id === o.persistedId) : undefined
+  if (saved) return saved
+  return o.registry[0] ?? null
+}
+
 export default function WorkspacePane() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([])
   const [error, setError] = useState<string | null>(null)
-  const [activeId, setActiveId] = useState<string | null>(null)
+  // tether#66 — SELECTION and DISCLOSURE are two different things, and one
+  // useState used to be both. `selectedId` is a durable preference ("new chats
+  // run here", persisted); `expandedId` is which row's file tree is open right
+  // now. They were the same variable, which meant the second click on the open
+  // row — an ordinary collapse — also cleared the selection. Harmless while the
+  // selection died at every reload anyway; a footgun the moment it survives one,
+  // since collapsing a tree would durably move new sessions to
+  // --workspace-root with nothing on screen saying so.
+  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [expandedId, setExpandedId] = useState<string | null>(null)
   const [sessions, setSessions] = useState<string[]>([])
   const [sessionsOpen, setSessionsOpen] = useState(false)
   const currentSid = useStore(s => s.sessionId)
 
-  // tether#47 — publish the browsed workspace (id + abspath) to the store so
-  // chat's @-mention picker knows which workspace's files to offer. Covers all
-  // setActiveId paths (initial default, expand/collapse, delete). Null when none.
+  // tether#47 — publish the selected workspace (id + abspath) to the store so
+  // chat's @-mention picker knows which workspace's files to offer, and so a
+  // sid-less connect can pin its cwd to it (tether#52 chatUrl.ts). Covers every
+  // setSelectedId path (initial resolve, row click, delete). Null when none.
   useEffect(() => {
-    const ws = workspaces.find(w => w.id === activeId)
+    const ws = workspaces.find(w => w.id === selectedId)
     useStore.getState().setActiveWorkspace(ws ? { id: ws.id, path: ws.path } : null)
-  }, [activeId, workspaces])
+  }, [selectedId, workspaces])
   const [filter, setFilter] = useState('')
   const filterRef = useRef<HTMLInputElement>(null)
   const [adding, setAdding] = useState(false)
@@ -47,20 +113,37 @@ export default function WorkspacePane() {
       const data = await res.json() as Workspace[]
       setWorkspaces(data)
       setError(null)
-      const first = data.length > 0 && !activeId ? data[0] : null
-      if (first) setActiveId(first.id)
+      // tether#66 — the remembered id outranks data[0]; see resolveSelection.
+      // `selectedId` is this render's value: a click that lands while this fetch
+      // is in flight is not seen here, so the resolve republishes the selection
+      // the user just left. It corrects itself on the next commit because
+      // setWorkspaces installs a fresh array and the publishing effect below
+      // re-runs on it — unreachable today (there are no rows to click before the
+      // first load resolves) but it is why that effect must not be memoized away.
+      const sel = resolveSelection({
+        registry: data,
+        currentId: selectedId,
+        persistedId: rememberedWorkspaceId(),
+      })
+      if (sel && sel.id !== selectedId) {
+        setSelectedId(sel.id)
+        // Open the newly-selected row's tree. Only reached when the selection
+        // actually moved (first load, or a delete that took the selected one),
+        // so a load() triggered by add/delete cannot re-open a tree the user
+        // has since collapsed.
+        setExpandedId(sel.id)
+      }
       // tether#52 — release ChatPane's first-connect gate, and publish the
       // selection IN THE SAME store update (store.ts settleWorkspaces).
       //
       // The selection is computed here rather than left to the
-      // [activeId, workspaces] effect below, and that is the fix for a real bug:
-      // the effect runs one React commit LATER, while zustand notifies ChatPane's
-      // gate listener synchronously, so releasing the gate from here and
-      // publishing from there meant every fresh session connected before the
+      // [selectedId, workspaces] effect below, and that is the fix for a real
+      // bug: the effect runs one React commit LATER, while zustand notifies
+      // ChatPane's gate listener synchronously, so releasing the gate from here
+      // and publishing from there meant every fresh session connected before the
       // workspace was known — with no `ws`, into --workspace-root, permanently.
-      // The effect still owns every LATER change (expand/collapse, delete) and
+      // The effect still owns every LATER change (row click, delete) and
       // re-publishes the same value idempotently.
-      const sel = first ?? data.find(w => w.id === activeId) ?? null
       useStore.getState().settleWorkspaces(sel ? { id: sel.id, path: sel.path } : null)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -117,8 +200,33 @@ export default function WorkspacePane() {
   const remove = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation()
     await fetch(`/api/v1/workspaces/${id}`, { method: 'DELETE' })
-    if (activeId === id) setActiveId(null)
+    // These do NOT steer the load() below — it closes over this render's
+    // `selectedId` and still sees the old id. Picking the replacement is
+    // resolveSelection's job and needs no help: the deleted id is gone from the
+    // registry, so rungs 1 and 2 both miss and data[0] wins. Deleting the
+    // selected workspace is the one case where "the selection moved and the user
+    // did not choose the new one" is correct.
+    //
+    // What they DO buy is the fail-safe when that reload does not arrive (the
+    // daemon 500s, or goes away between the DELETE and the GET). Without them the
+    // pane would keep a deleted workspace as its published selection, and the
+    // next new session would hand the daemon an id it no longer knows —
+    // `unknown_workspace`, i.e. a refused chat. Clearing them means the worst
+    // case is a null selection and a fall back to --workspace-root.
+    if (selectedId === id) setSelectedId(null)
+    if (expandedId === id) setExpandedId(null)
     await load()
+  }
+
+  // A row click SELECTS (durably — store + localStorage via the effect above)
+  // and toggles that row's file tree. It deliberately never DESELECTS: see the
+  // selectedId/expandedId split above and resolveSelection's closing paragraph.
+  // Selecting cannot disturb a live session — a session's workspace is fixed at
+  // spawn, and chatUrl.ts only ever sends `ws` when there is no sid — so this is
+  // a preference for the next new session, not a rebind of the current one.
+  const onRowClick = (id: string) => {
+    setExpandedId(cur => (cur === id ? null : id))
+    setSelectedId(id)
   }
 
   const filtered = workspaces.filter(ws =>
@@ -185,12 +293,12 @@ export default function WorkspacePane() {
         {filtered.map(ws => (
           <div key={ws.id}>
             <div
-              className={`tree-row${activeId === ws.id ? ' active' : ''}`}
+              className={`tree-row${selectedId === ws.id ? ' active' : ''}`}
               style={{ paddingLeft: 8 }}
-              onClick={() => setActiveId(activeId === ws.id ? null : ws.id)}
+              onClick={() => onRowClick(ws.id)}
             >
               <Icon
-                name={activeId === ws.id ? 'chev-down' : 'chevron'}
+                name={expandedId === ws.id ? 'chev-down' : 'chevron'}
                 size={11}
                 style={{ color: 'var(--ink-quat)', flexShrink: 0 }}
               />
@@ -203,7 +311,7 @@ export default function WorkspacePane() {
                 aria-label={`Remove workspace ${ws.name}`}
               >×</button>
             </div>
-            {activeId === ws.id && (
+            {expandedId === ws.id && (
               <div style={{ paddingLeft: 32, paddingRight: 10, paddingTop: 2, paddingBottom: 6 }}>
                 <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10.5, color: 'var(--ink-quat)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                   {ws.path}
@@ -215,7 +323,7 @@ export default function WorkspacePane() {
                 )}
               </div>
             )}
-            {activeId === ws.id && <WorkspaceTree workspaceId={ws.id} />}
+            {expandedId === ws.id && <WorkspaceTree workspaceId={ws.id} />}
           </div>
         ))}
       </div>

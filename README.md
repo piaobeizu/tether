@@ -40,6 +40,7 @@ Checks: `cc-binary`, `data-dir`, `cert-state`, `port-bindable`, `cc-settings-hoo
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `TETHER_TOKEN` | `""` | Static access token. Precedence: `--token` flag > `TETHER_TOKEN` env > `~/.tether/access-token` file > freshly generated on first run. **The env value is trimmed** (a whitespace-only value counts as unset, so a stray space in an `EnvironmentFile` can't mint a token that always fails auth); the `--token` flag is **not** trimmed — only an empty flag falls through. Intended for `EnvironmentFile=` in a systemd unit so the secret never appears on the command line, where `ps`/`/proc/<pid>/cmdline` would expose it to any local user — see `deploy/README.md`. The daemon logs only which source won (`token_source=…`), never the value, and unsets the variable after reading it so agent and shell subprocesses don't inherit it. Note `scripts/bench-e2e.sh` uses the same name for the *client* credential — an exported value there will be picked up by a daemon started from the same shell. |
 | `TETHER_NO_PERMISSION_HOOK` | `""` | Set to `1` to skip hook injection (auto-allows all tools) |
 | `TETHER_HOST` | `127.0.0.1` | Hostname for startup log URL |
 | `IS_SANDBOX` | auto-set if root | Injected into cc subprocess when running as root |
@@ -51,9 +52,13 @@ Checks: `cc-binary`, `data-dir`, `cert-state`, `port-bindable`, `cc-settings-hoo
 
 ```
 tether server [--port PORT] [--cert-file F] [--key-file F] [--dev] [--dev-url URL]
+              [--token TOKEN] [--workspace-root DIR] [--mcp-port PORT] [--mcp-config PATH]
+              [--acme-domain D] [--acme-email E] [--skip-mcp-inject]
 tether doctor [--port PORT] [--verbose] [--json]
 tether version
 ```
+
+To run tether as a resident systemd service instead of a foreground process, see `deploy/README.md`.
 
 ## Per-task MCP servers (v0.5)
 

@@ -1,0 +1,186 @@
+# tether.service — systemd unit template for running tether as a resident daemon.
+#
+# THIS FILE IS A TEMPLATE. It is NOT installed by anything in this repo, and
+# nothing in this work item ran `systemctl` or touched /etc/. Installing it
+# is a deliberate human action — see deploy/README.md for the step-by-step
+# procedure, the security implications of running resident, and a table of
+# every value below you should decide for your environment before copying it
+# into place.
+#
+# Values below (port 443, User=root, /root/.tether/workspace, ...) are
+# working defaults for the common case: a single operator running tether on
+# their own root-owned box. Read the inline comments before changing them.
+
+[Unit]
+Description=tether — AI workspace daemon (HTTP/3 + WebTransport)
+Documentation=https://github.com/piaobeizu/tether
+# Wait for real network (not just link-up) before starting: tether binds a
+# public-facing port, and if you enable ACME (--acme-domain, not set in this
+# template) it must also reach Let's Encrypt. Both want a working route out,
+# not merely an interface that exists.
+After=network-online.target
+Wants=network-online.target
+
+# Give up instead of crash-looping forever. This has to be stated explicitly:
+# the systemd DEFAULTS (StartLimitIntervalSec=10s, StartLimitBurst=5) can never
+# trip at RestartSec=5s, because 5s spacing yields at most 2-3 starts inside a
+# 10s window. Without these two lines a binary that dies on a bad config churns
+# silently and the unit never reaches "failed". With them, 5 failures inside 5
+# minutes stops the unit and leaves it visibly failed in `systemctl status`.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+# tether has no sd_notify / readiness protocol (no "READY=1" signal), so
+# Type=notify would hang until TimeoutStartSec and then fail spuriously.
+# Type=exec is Type=simple plus one guarantee: `systemctl start` does not
+# report success until the exec() itself succeeded, so a typo'd binary path or
+# a missing library surfaces at start time rather than as a silent immediate
+# exit. It does NOT wait for the port to be listening.
+Type=exec
+
+# Default: run as root. tether writes its own state under $HOME/.tether/
+# (cert.pem, access-token, api-tokens.json, sessions/, workspaces.json,
+# bin/tether-permission-hook, config.json) and compiles/executes a permission
+# hook binary, and the coding agent it drives runs arbitrary shell commands
+# as this user — so User/Group set the blast radius of a compromised token.
+# Switch to a dedicated non-root user for anything beyond a personal/trusted
+# single-operator box; if you do, also add AmbientCapabilities below (already
+# present, commented on) and consider enabling NoNewPrivileges (see the
+# hardening section further down).
+User=root
+Group=root
+
+# HOME determines where ~/.tether/ and ~/.config/claude/settings.json land.
+# Must match the home directory of User= above, or tether will read/write
+# state in the wrong place (or fail to find a token that's actually sitting
+# in a different user's ~/.tether/access-token).
+Environment=HOME=/root
+
+WorkingDirectory=/root
+
+# Secret lives here, not on the command line — see deploy/tether.env.example
+# and the "why EnvironmentFile" note in deploy/README.md. This file must be
+# created by a human (chmod 0600, owned by root) before this unit will start
+# cleanly; systemd will fail the unit if the path doesn't exist.
+EnvironmentFile=/etc/tether/env
+
+# --port 443 is the operator's real deployment port. tether serves the same
+# port over BOTH TCP (HTTPS handshake, HTTP/3 upgrade) and UDP (QUIC/
+# WebTransport data channel) — opening only TCP in your firewall/security
+# group leaves chat and shell permanently stuck at "connecting". See
+# deploy/README.md's operator-decision table.
+# --workspace-root is the MCP sandbox root AND the fallback agent cwd for
+# any chat session that hasn't selected a registered workspace — same value
+# for both, no separate flag. Change it if /root/.tether/workspace isn't
+# where you want agent-driven work to happen by default.
+# TETHER_TOKEN is intentionally NOT passed here as --token: see
+# EnvironmentFile= above.
+ExecStart=/usr/local/bin/tether server --port 443 --workspace-root /root/.tether/workspace
+
+Restart=on-failure
+RestartSec=5s
+
+# Shutdown drains in-flight chat/shell sessions under a 5s budget and then
+# closes the listeners under a second 5s budget, plus an unbounded MCP
+# StopAll — so the realistic worst case is ~10s, not 5s. 15s leaves genuine
+# headroom before systemd escalates to SIGKILL and kills sessions mid-write.
+TimeoutStopSec=15s
+
+# Each chat/shell session holds open file descriptors (PTY, QUIC streams,
+# per-task MCP child processes); the default 1024 is tight under real
+# concurrent usage.
+LimitNOFILE=65536
+
+# Needed ONLY when User= above is a non-root account binding to a
+# privileged port (<1024, e.g. --port 443). A non-root process cannot bind
+# such a port without this capability. Harmless but unnecessary while
+# User=root (root can already bind any port), so it's left enabled here as
+# the correct setting for the day you switch to a dedicated user.
+#
+# One caveat for that day: ambient capabilities are INHERITED by every
+# descendant, and tether's descendants are arbitrary agent-issued shell
+# commands — so they would all carry CAP_NET_BIND_SERVICE. It is a narrow
+# capability and a small widening, but if you want none of it, the cleaner
+# answer for :443 under a non-root user is socket activation (a companion
+# .socket unit with ListenStream=443) rather than a capability.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+# Keep the token OUT of the journal.
+#
+# tether writes its logs to stderr (Go's slog default; this tree installs no
+# custom handler), so the journal keeps every log line. It uses stdout for
+# exactly one thing: on FIRST RUN, when no token was supplied by any source,
+# it generates one and prints it once — `tether access token: <secret>`. Under
+# systemd, stdout is the journal, so that default would persist a long-lived
+# root-equivalent credential into an indexed log readable by every member of
+# systemd-journal/adm. That is the same class of local exposure as putting the
+# token in ExecStart, which is the reason this unit exists — so discard stdout.
+#
+# Nothing is lost: the generated token is also written to
+# $HOME/.tether/access-token with mode 0600, which is where you read it from.
+# Better still, pre-provision TETHER_TOKEN in the EnvironmentFile and never
+# take the generate-and-print path at all (see deploy/tether.env.example).
+StandardOutput=null
+# stderr is left at the default (journal) — that is where the logs are.
+# Read them with `journalctl -u tether -f`.
+
+# --- Reliability settings (NOT containment — see below) ---
+# Restart=on-failure (above): restart on crash/non-zero exit, but not on a
+# clean `systemctl stop`. On its own this would restart forever; the
+# StartLimitIntervalSec/StartLimitBurst pair in [Unit] is what actually stops
+# a persistently crashing binary.
+#
+# Be clear-eyed about what this unit does and does not do: as shipped it runs
+# as root with no filesystem, capability or syscall containment. The ACCESS
+# TOKEN is the security boundary, not systemd. Everything below explains why
+# that is a deliberate choice rather than an oversight.
+
+# NoNewPrivileges=yes
+# ^ Left commented OUT deliberately. It would prevent the process (and
+# anything it execs) from gaining privileges via setuid/setcap/sudo. tether
+# runs a coding agent that legitimately shells out to arbitrary user tooling
+# (package managers, container runtimes, etc.), and with this unit's
+# User=root, agent shells expect `sudo` to work; NoNewPrivileges=yes makes
+# sudo/setuid fail inside those shells ("effective uid is not 0") for very
+# little benefit on a service that is already root. If you switch User= to
+# a dedicated non-root account (recommended for anything beyond a personal
+# box), uncomment this line — the failure mode disappears because sudo
+# wasn't going to work for that account anyway, and you get real protection
+# against privilege-escalation exploits in tether or its dependencies.
+
+# --- Hardening deliberately OMITTED (not forgotten — do not add without re-reading this) ---
+#
+# ProtectSystem=strict / ProtectHome=read-only / ReadOnlyPaths=...
+# ^ Omitted. tether's entire purpose is running a coding agent inside the
+# operator's REAL workspace with the operator's REAL toolchain (compilers,
+# language servers, package managers, git, container tooling, credentials
+# under $HOME). Filesystem namespacing directly breaks the product: the
+# agent needs full read/write access to the workspace tree and to whatever
+# paths the user's toolchain expects (caches, config, sockets). The security
+# boundary for this daemon is the access token plus "the agent runs as the
+# service user" — it is intentionally NOT systemd filesystem sandboxing.
+#
+# PrivateTmp=yes
+# ^ Omitted, and for its own reason rather than the one above. tether itself
+# would be fine with a private /tmp — its MCP loopback is a 127.0.0.1 TCP
+# port, not a /tmp socket. What breaks is the agent's HAND-OFFS through /tmp
+# with the rest of your session: tmux/screen sockets, /tmp/.X11-unix, ssh
+# agent and gpg sockets, scratch files you go on to open in another terminal.
+# A private /tmp makes those silently invisible to each other. Enable it if
+# you never interact with the agent's /tmp from outside the service.
+#
+# CapabilityBoundingSet=...
+# ^ Omitted. The agent executes arbitrary user-issued shell commands,
+# including ones that legitimately want capabilities outside a narrow
+# guess (container tooling, network tools, package managers invoking
+# post-install hooks). A curated bounding set will eventually break some
+# legitimate command in a way that looks like a random tool failure rather
+# than a permissions error, and is very hard for an operator to diagnose
+# from the resulting error message alone.
+#
+# NoNewPrivileges=yes (see above, in the enabled-hardening section) — kept
+# commented out for the stated sudo-inside-agent-shells reason.
+
+[Install]
+WantedBy=multi-user.target

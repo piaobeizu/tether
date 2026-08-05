@@ -247,11 +247,11 @@ interface AppState {
   // render the same project. Empty string = none picked yet.
   workProject: string
 
-  // The workspace the user is currently browsing in the left WorkspacePane
-  // (tether#47). Chat's @-mention picker queries this workspace's files; the
-  // chat session isn't itself bound to a workspace (ActiveSID is unwired and
-  // cc's cwd is decoupled), so following the browsed workspace is the binding.
-  // Carries the abspath so @ can insert @<abspath> (cc reads it regardless of cwd).
+  // The workspace the user has selected in the left WorkspacePane (tether#47).
+  // Chat's @-mention picker queries this workspace's files, and — since
+  // tether#52 — a brand-new chat session's cwd is pinned to it via `?ws=<id>`
+  // (chatUrl.ts). Carries the abspath so @ can insert @<abspath> (cc reads it
+  // regardless of cwd). Persisted since tether#66 — see rememberWorkspace.
   activeWorkspace: { id: string; path: string } | null
 
   // tether#52 — gates ChatPane's FIRST connect (see index.tsx's mount effect
@@ -301,6 +301,55 @@ function finalizeTurn(s: AppState): Partial<AppState> {
     ? s.messages.map(m => (m.id === id ? { ...m, answerMs: Date.now() - started } : m))
     : s.messages
   return { messages, streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null }
+}
+
+/** localStorage key holding the id of the selected workspace (tether#66) —
+ *  deliberately the same layer as `tether_last_sid`, because it has to survive
+ *  exactly the same event: App's startNewSession drops the sid and calls
+ *  `location.reload()`, so anything about the user's intent that lives only in
+ *  React state is gone by the time the new session is created. */
+export const WORKSPACE_ID_KEY = 'tether_ws_id'
+
+/** The workspace id remembered from a previous page (tether#66). Null when this
+ *  profile has never selected one; may name a workspace that has since been
+ *  removed from the registry — resolveSelection (panes/workspace/index.tsx)
+ *  treats an id it cannot find as "not remembered". */
+export function rememberedWorkspaceId(): string | null {
+  return localStorage.getItem(WORKSPACE_ID_KEY)
+}
+
+// rememberWorkspace persists a selection so it survives a reload (tether#66).
+// Hung off the store mutators rather than off the click handler for the same
+// reason setSessionId owns `tether_last_sid`: every path that changes the
+// selection — initial resolve, row click, delete — goes through one of these
+// two setters, so none of them can forget.
+//
+// It only ever RECORDS a selection, never erases one, and that asymmetry is
+// load-bearing. WorkspacePane's publishing effect fires on mount with an empty
+// registry — i.e. `setActiveWorkspace(null)` — strictly BEFORE
+// GET /api/v1/workspaces resolves. An erase-on-null would therefore wipe the
+// remembered id on every single page load, reintroducing tether#66 inside the
+// code that fixes it (and the suite would stay green, since every unit test
+// starts from a cleared localStorage). Not erasing costs nothing: a stale id is
+// ignored by resolveSelection, and an empty registry has nothing to remember.
+//
+// The write is best-effort and MUST NOT be able to throw into a caller. Two
+// reasons, both specific to where it is called from:
+//   - `setItem` throws for real (QuotaExceededError; Safari private browsing),
+//     and unlike every other localStorage write in this app — all of which sit
+//     in DOM event handlers or the WT reader — this one is reached from a React
+//     effect, i.e. the commit phase. There is no ErrorBoundary anywhere in the
+//     tree, so a throw there unmounts the whole root: a blank app, because a
+//     preference could not be saved.
+//   - in settleWorkspaces it would pre-empt the `set` that opens ChatPane's
+//     first-connect gate (see below), which is the one thing in this file that
+//     must not be skipped. Callers set state FIRST and persist after; this
+//     swallow is the second half of that ordering.
+function rememberWorkspace(ws: { id: string; path: string } | null): void {
+  if (!ws) return
+  try {
+    localStorage.setItem(WORKSPACE_ID_KEY, ws.id)
+  } catch { /* preference not saved; the session still runs in the right place */ }
 }
 
 export const useStore = create<AppState>((set, get) => ({
@@ -693,7 +742,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   setWorkProject: (p) => set({ workProject: p }),
-  setActiveWorkspace: (ws) => set({ activeWorkspace: ws }),
+  setActiveWorkspace: (ws) => { set({ activeWorkspace: ws }); rememberWorkspace(ws) },
   setWorkspacesLoaded: (v) => set({ workspacesLoaded: v }),
 
   // tether#52 — publish the initial workspace selection and release ChatPane's
@@ -712,5 +761,10 @@ export const useStore = create<AppState>((set, get) => ({
   // --workspace-root — the feature was inert with a fully green test suite.
   // store.test.ts pins the ordering by asserting on a subscriber's FIRST
   // notification; keep the two fields in one `set` and it cannot come back.
-  settleWorkspaces: (ws) => set({ activeWorkspace: ws, workspacesLoaded: true }),
+  //
+  // tether#66 — this also persists the resolved selection (rememberWorkspace),
+  // which matters on the very first page of a profile: the id chosen here is the
+  // one a plain refresh has to come back to. It runs AFTER the `set`, never
+  // before — the gate must open even if persistence fails.
+  settleWorkspaces: (ws) => { set({ activeWorkspace: ws, workspacesLoaded: true }); rememberWorkspace(ws) },
 }))

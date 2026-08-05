@@ -1,5 +1,8 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
-import { useStore, mergeTranscript, parseErrorPayload, type Message, type Notice } from './store'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  useStore, mergeTranscript, parseErrorPayload, rememberedWorkspaceId, WORKSPACE_ID_KEY,
+  type Message, type Notice,
+} from './store'
 import type { Envelope } from './wire.gen'
 
 // tether#34 — extended-thinking accumulation in the chat store. These drive
@@ -691,6 +694,75 @@ describe('store settleWorkspaces ordering (tether#52)', () => {
 
     // Chat must still connect (falling back to --workspace-root), not hang.
     expect(seen[0]).toEqual({ loaded: true, ws: null })
+  })
+})
+
+// tether#66 — the selection has to outlive the page. `ws` only travels on a
+// sid-less connect (chatUrl.ts), the only way to get one is App's
+// startNewSession → location.reload(), and before this the selection lived in a
+// component useState — so the reload that acted on the choice also erased it and
+// every new session landed in registry[0]. Persistence hangs off BOTH mutators
+// that can move `activeWorkspace`, for the same reason setSessionId owns
+// `tether_last_sid`: one funnel, nothing to remember at the call sites.
+//
+// Both are pinned here because each is a wiring hop — delete either call and the
+// store still behaves correctly in every assertion above.
+describe('store workspace persistence (tether#66)', () => {
+  beforeEach(() => localStorage.clear())
+  afterEach(() => {
+    // Clear on the way OUT too: these are the first tests in this file to write
+    // localStorage, and the tether#52 describe above now writes the key as a
+    // side effect of settleWorkspaces. Leaving it set makes later describes
+    // order-dependent.
+    localStorage.clear()
+    useStore.setState({ workspacesLoaded: false, activeWorkspace: null })
+  })
+
+  // The literal key string is the contract, not WORKSPACE_ID_KEY — asserting
+  // through the constant would let a rename pass, and a rename is what silently
+  // forgets every existing user's selection on deploy.
+  it('settleWorkspaces records the resolved selection under tether_ws_id', () => {
+    useStore.getState().settleWorkspaces({ id: 'ws-a', path: '/srv/project-a' })
+    expect(localStorage.getItem('tether_ws_id')).toBe('ws-a')
+    expect(rememberedWorkspaceId()).toBe('ws-a')
+    expect(WORKSPACE_ID_KEY).toBe('tether_ws_id')
+  })
+
+  // Persistence is best-effort; the gate is not. A storage backend that refuses
+  // writes (quota, Safari private browsing) must not stop settleWorkspaces from
+  // opening ChatPane's first-connect gate — that would hang every new session
+  // rather than merely forget a preference.
+  it('a throwing localStorage does not break the gate', () => {
+    const spy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('quota', 'QuotaExceededError')
+    })
+    try {
+      expect(() => useStore.getState().settleWorkspaces({ id: 'ws-a', path: '/a' })).not.toThrow()
+      expect(useStore.getState().workspacesLoaded).toBe(true)
+      expect(useStore.getState().activeWorkspace?.id).toBe('ws-a')
+      expect(() => useStore.getState().setActiveWorkspace({ id: 'ws-b', path: '/b' })).not.toThrow()
+      expect(useStore.getState().activeWorkspace?.id).toBe('ws-b')
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('setActiveWorkspace records a later change', () => {
+    useStore.getState().setActiveWorkspace({ id: 'ws-b', path: '/srv/project-b' })
+    expect(rememberedWorkspaceId()).toBe('ws-b')
+  })
+
+  // The asymmetry, stated as a property. WorkspacePane's publishing effect fires
+  // on mount with `null` — before GET /api/v1/workspaces resolves — so erasing on
+  // null would blank the remembered id on every page load and put the bug back
+  // with the whole suite still green. Callers get "no selection" persisted as
+  // "nothing new to say", never as "forget what you knew".
+  it('never erases: a null selection leaves the remembered id alone', () => {
+    useStore.getState().setActiveWorkspace({ id: 'ws-b', path: '/srv/project-b' })
+    useStore.getState().setActiveWorkspace(null)
+    expect(rememberedWorkspaceId()).toBe('ws-b')
+    useStore.getState().settleWorkspaces(null)
+    expect(rememberedWorkspaceId()).toBe('ws-b')
   })
 })
 

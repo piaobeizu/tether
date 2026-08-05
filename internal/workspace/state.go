@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -29,6 +31,61 @@ type Registry struct {
 }
 
 // NewRegistry loads (or creates) the workspace registry from ~/.tether/workspaces.json.
+//
+// A MISSING file is not a failure — it is the first-run state, which an empty
+// registry represents exactly. Any OTHER load failure (unreadable file, corrupt
+// JSON) IS returned, and that distinction is the whole reason this function has an
+// error to return (tether#65).
+//
+// # Why a corrupt file must not degrade to an empty registry
+//
+// The caller (server/lifecycle.go Step 2b) leaves session.Registry.Workspaces nil
+// when this errors, and resolveWorkspace answers a `?ws=` request against a nil
+// registry with ErrCodeNoWorkspaceRegistry ("this daemon has no workspace
+// registry") rather than ErrCodeUnknownWorkspace ("that id is not registered").
+// Swallowing the error here — which is what `_ = r.load()` did — produced a
+// non-nil but EMPTY registry instead, so a corrupt workspaces.json refused a
+// `?ws=` request as an UNKNOWN workspace: the browser said "This workspace no
+// longer exists on the daemon." and an operator went looking for a workspace
+// nobody had deleted. tether#52 split those two errors apart precisely to prevent
+// that misdiagnosis, and tether#63 gave each its own wire code; returning the
+// error here is what makes the second branch reachable at all instead of dead
+// code.
+//
+// To be precise about how narrow that misdiagnosis window was: a browser that
+// LOADS against a corrupt-registry daemon never sends `ws` at all (it has no
+// workspace list to choose from), so it does not hit either error. Reaching the
+// wrong one took a tab that had already loaded a good list before the file went
+// bad and the daemon restarted. Narrow, but it is the case where an operator is
+// already confused, and the daemon knew the real answer the whole time.
+//
+// # What this changes besides the diagnosis
+//
+// For the /wt/chat handshake, only the diagnosis: an empty registry already
+// refused every `?ws=` request (there is no id in it to match), so the verdict is
+// unchanged. But server/mux.go gates the whole `/api/v1/workspaces*` family on the
+// same non-nil check, so a corrupt file now takes list/files/file/tree/DELETE out
+// of the mux and they fall to the unconditional `/api/v1/` stub — HTTP 501 —
+// where GET previously answered `[]`. Two consequences worth naming:
+//
+//   - The left workspace pane surfaces the failure instead of rendering an empty
+//     list. That is the intended direction: an empty list is indistinguishable
+//     from "you have not added anything yet".
+//   - POST /api/v1/workspaces also 501s, and it used to succeed — Add's
+//     saveLocked would rewrite the file, so "add a workspace" doubled as an
+//     in-UI repair for a corrupt registry. That path is now gone deliberately:
+//     silently overwriting a file we could not parse destroys whatever the user
+//     might have wanted recovered. Recovery is to fix or remove
+//     ~/.tether/workspaces.json and restart; the error returned here is logged
+//     with the path and the parse error so the operator knows which file.
+//
+// # The other two failure modes are unreachable via `tether server`
+//
+// os.UserHomeDir and MkdirAll are kept because this is a library function with
+// other potential callers, but the daemon cannot reach them: lifecycle.go Step 2
+// calls tetherDataDir(), which performs the identical UserHomeDir + MkdirAll(
+// ~/.tether) and returns on error, and it runs BEFORE Step 2b. So on the daemon
+// path a corrupt registry file is the one way this returns an error.
 func NewRegistry() (*Registry, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -40,7 +97,9 @@ func NewRegistry() (*Registry, error) {
 	}
 	path := filepath.Join(dir, "workspaces.json")
 	r := &Registry{path: path}
-	_ = r.load() // ignore if absent
+	if err := r.load(); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("load %s: %w", path, err)
+	}
 	return r, nil
 }
 

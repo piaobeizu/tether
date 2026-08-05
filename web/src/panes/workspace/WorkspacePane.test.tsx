@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import WorkspacePane from './index'
 import { useStore } from '../../lib/store'
+import { chatURL } from '../../lib/chatUrl'
 
 const SID_WITH_HISTORY = 'sid-has-history-1'
 const SID_EMPTY = 'sid-no-history-2'
@@ -63,6 +64,7 @@ beforeEach(() => {
     messages: [],
     notices: [{ id: 'n1', text: 'context lost', ts: 5 }],
     workspacesLoaded: false, // tether#52 — the store is a module singleton; reset the gate each test
+    activeWorkspace: null,   // same singleton, same reason: a test that publishes one must not leak it
   })
 })
 
@@ -155,5 +157,49 @@ describe('WorkspacePane workspacesLoaded gate (tether#52)', () => {
       unsub()
     }
     expect(atRelease[0]).toEqual({ ws: 'ws-1' })
+  })
+
+  // tether#65 — the mirror of the test above, and the safety property Part B of
+  // that wi rests on.
+  //
+  // tether#65 makes a corrupt ~/.tether/workspaces.json leave the daemon's
+  // workspace registry NIL, so `/api/v1/workspaces` stops being registered at all
+  // (mux.go wires that route family only for a non-nil registry) and the request
+  // falls to mux.go's unconditional `/api/v1/` stub — 501 "not implemented" —
+  // rather than to the SPA shell. A nil registry also refuses any request that DOES
+  // carry `ws`, with no_workspace_registry. Those two facts are only safe together
+  // because of the invariant asserted here: a failed workspaces fetch must publish
+  // NO selection, so `activeWorkspace` stays null, so chatURL omits `ws` entirely
+  // and the session falls back to --workspace-root instead of being refused.
+  //
+  // If this ever regressed to publishing a stale or placeholder selection, a
+  // corrupt registry file would stop being "the file browser is empty" and become
+  // "every new chat is refused" — which is why it is pinned rather than left to
+  // the reading of load()'s catch block. The assertion goes through chatURL, not
+  // just the store, because the store value alone is not the claim.
+  it('publishes no selection when the workspaces fetch fails, so chatURL omits ws', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      // 501 is what a nil-registry daemon actually answers here (mux.go's
+      // `/api/v1/` stub), not a 500 and not the SPA shell — kept faithful so the
+      // mock cannot drift into testing a response the daemon never sends.
+      if (url === '/api/v1/workspaces') {
+        return { ok: false, status: 501, json: async () => ({}) }
+      }
+      if (url === '/api/v1/sessions') return { ok: true, status: 200, json: async () => [] }
+      throw new Error(`unexpected fetch: ${url}`)
+    }))
+
+    render(<WorkspacePane />)
+    await waitFor(() => expect(useStore.getState().workspacesLoaded).toBe(true))
+    expect(useStore.getState().activeWorkspace).toBeNull()
+
+    // The consequence that actually matters, asserted end to end.
+    const url = chatURL({
+      host: 'h',
+      provider: 'claude',
+      sid: '',
+      wsID: useStore.getState().activeWorkspace?.id ?? '',
+    })
+    expect(url).not.toContain('ws=')
   })
 })

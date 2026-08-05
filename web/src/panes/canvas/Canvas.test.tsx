@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import Canvas from './index'
 import { useStore } from '../../lib/store'
@@ -21,6 +21,77 @@ vi.mock('../../lib/aihub', async () => {
 const mockFetchFile = vi.mocked(fetchFile)
 const mockFetchWorkspaces = vi.mocked(fetchWorkspaces)
 
+// ── Why this file needs a warmup and wider budgets (tether#65) ───────────────
+//
+// panes/canvas/index.tsx renders markdown through `lazy()` + <Suspense>, so every
+// assertion below that looks for rendered `.md` output — or for the `.md-body`
+// container, which exists ONLY inside <Markdown> — cannot be satisfied until
+// vitest has resolved that dynamic import. Resolving it means transforming
+// react-markdown + remark-gfm + rehype-highlight, a whole module graph, on first
+// use.
+//
+// @testing-library's default 1000ms `findBy*` budget is calibrated for a state
+// update settling — a microtask or two. Measuring a module-graph load against an
+// update-sized budget is a category error, and it showed up as a flake: tether#63's
+// verify run saw `findByText('Title')` time out and redden a PR that had not
+// touched this pane. Only the FIRST crossing pays the cost (React caches the
+// resolved lazy payload), which is why it was always that one assertion.
+//
+// Two changes, and it is worth being exact about which one does the work, because
+// the first attempt at this fix was the timeout alone and it was measured failing:
+//
+//  1. warmUpMarkdown() below pays the import ONCE, in beforeAll. This is the
+//     actual fix — it takes the module load off every test's critical path instead
+//     of making the window bigger. Measured cost of that one load: ~370ms idle,
+//     ~1.2s with 24 busy loops on 12 CPUs.
+//  2. The budgets exist mainly FOR THE WARMUP, which is now the only place a
+//     module-graph load is awaited. They were sized against what that load
+//     actually cost when it still sat inside a per-test assertion: 4639ms and
+//     4597ms under contention on this host — which is why a budget picked to fit
+//     under vitest's default 5000ms `testTimeout` was measured FAILING 2 of 6
+//     contended runs. Raising the enclosing `it()`/hook timeouts alongside is what
+//     makes 20000 a number that can actually be reached rather than one the
+//     harness silently caps.
+//
+// The per-assertion copies of the budget are a backstop, not the mechanism: once
+// the module is cached, satisfying these assertions was measured at 29ms idle and
+// 80ms under the same contention, so the default 1000ms would in fact do. They are
+// kept so that deleting the warmup cannot quietly restore the flake, and so each
+// site says why it is not on the default.
+//
+// These stay per-assertion / per-test rather than a global `testTimeout` or
+// `asyncUtilTimeout` bump so the widening is visible exactly where it is
+// justified, and a genuinely hung assertion anywhere else still fails fast. The
+// happy path is unaffected: a `findBy*` returns as soon as the element appears, so
+// a larger ceiling costs nothing when things work.
+const LAZY_BUDGET_MS = 20_000
+const LAZY_TEST_TIMEOUT_MS = 30_000
+
+// warmUpMarkdown resolves the lazy <Markdown> boundary once, before any test runs.
+//
+// It goes through <Canvas> itself rather than calling `import('./Markdown')`
+// directly, deliberately: an explicit import here would duplicate a specifier that
+// lives in index.tsx, and if that file ever lazy-imports a different path this
+// warmup would still succeed while silently warming the wrong module — a guard
+// that has quietly stopped guarding. Driving the real component means the warmup
+// exercises whatever index.tsx actually imports, whatever that becomes.
+async function warmUpMarkdown() {
+  mockFetchFile.mockResolvedValue({ path: 'warmup.md', content: '# warmup', truncated: false })
+  useStore.getState().select({ file: { wsId: 'warmup', path: 'warmup.md' } })
+  render(<Canvas />)
+  // Matching on the rendered <h1> text (not the raw '# warmup' the <pre> fallback
+  // shows) is what makes this wait for the boundary rather than for the fallback.
+  await screen.findByText('warmup', undefined, { timeout: LAZY_BUDGET_MS })
+  cleanup()
+  useStore.getState().select(null)
+  // mockReset, not clearAllMocks: the latter drops call history but KEEPS the
+  // resolved value set above, which would leak 'warmup.md' into any later test that
+  // renders without stubbing fetchFile itself.
+  mockFetchFile.mockReset()
+}
+
+beforeAll(warmUpMarkdown, LAZY_TEST_TIMEOUT_MS)
+
 // @testing-library/react's auto-cleanup relies on a global `afterEach`, which
 // isn't registered since vitest's `globals` option is off (matches Dag.test.tsx
 // — no implicit globals). Clean up explicitly instead, and reset the shared
@@ -42,7 +113,10 @@ describe('Canvas — FileMode markdown rendering (tether#21)', () => {
 
     const { container } = render(<Canvas />)
 
-    await screen.findByText('Title')
+    // Crosses the lazy() boundary: the <pre> Suspense fallback holds the RAW
+    // '# Title\n\n- item', so nothing matches 'Title' exactly until <Markdown>
+    // has loaded and rendered the <h1>. See LAZY_BUDGET_MS.
+    await screen.findByText('Title', undefined, { timeout: LAZY_BUDGET_MS })
     const h1 = container.querySelector('h1')
     expect(h1?.textContent).toBe('Title')
 
@@ -51,7 +125,7 @@ describe('Canvas — FileMode markdown rendering (tether#21)', () => {
 
     // must NOT be wrapped in the plain-text <pre> fallback once resolved
     expect(container.querySelector('pre')).toBeNull()
-  })
+  }, LAZY_TEST_TIMEOUT_MS)
 
   it('renders a non-markdown file in a <pre> block, unrendered', async () => {
     mockFetchFile.mockResolvedValue({
@@ -118,9 +192,10 @@ describe('Canvas — markdown XSS safety (tether#21)', () => {
     // never becomes a real <img> element with a live onerror handler.
     // `selector: '.md-body'` restricts the match to that single container so
     // the substring matcher doesn't hit every ancestor element too.
-    await screen.findByText(t => t.includes('onerror'), { selector: '.md-body' })
+    // `.md-body` only exists inside the lazily-imported <Markdown> — see LAZY_BUDGET_MS.
+    await screen.findByText(t => t.includes('onerror'), { selector: '.md-body' }, { timeout: LAZY_BUDGET_MS })
     expect(container.querySelector('img')).toBeNull()
-  })
+  }, LAZY_TEST_TIMEOUT_MS)
 
   it('renders a <script> payload as inert text, never as a real script element', async () => {
     mockFetchFile.mockResolvedValue({
@@ -132,9 +207,10 @@ describe('Canvas — markdown XSS safety (tether#21)', () => {
 
     const { container } = render(<Canvas />)
 
-    await screen.findByText(t => t.includes('alert(1)'), { selector: '.md-body' })
+    // `.md-body` only exists inside the lazily-imported <Markdown> — see LAZY_BUDGET_MS.
+    await screen.findByText(t => t.includes('alert(1)'), { selector: '.md-body' }, { timeout: LAZY_BUDGET_MS })
     expect(container.querySelector('script')).toBeNull()
-  })
+  }, LAZY_TEST_TIMEOUT_MS)
 })
 
 describe('Canvas — home when nothing is selected (tether#33)', () => {

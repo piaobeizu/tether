@@ -2,12 +2,14 @@ package session
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/piaobeizu/tether/internal/agent"
+	"github.com/piaobeizu/tether/internal/wire"
 )
 
 // Session-id fixtures shaped like the real thing (uuid v4, as cc mints), because
@@ -168,6 +170,54 @@ func TestAttach_WorkspaceRequestWithoutARegistryIsRefused(t *testing.T) {
 	}
 	if got := p.Spawns(); got != 0 {
 		t.Errorf("spawns = %d, want 0", got)
+	}
+}
+
+// TestAttach_UnknownWorkspaceVsNoRegistry_DistinctCodes pins the hard
+// requirement from resolveWorkspace's doc comment (the nil-registry branch is
+// "kept a separate branch rather than folded into a deny-everything
+// WorkspaceLookup, because the two states deserve different operator-facing
+// errors"): tether#63 gives each its own wire.ErrorCode, and this test makes
+// collapsing them back into one a failing test rather than a silent
+// regression. See wire.TestUnknownWorkspaceVsNoRegistryDiffer for the
+// wire-level half of the same guarantee (that the two consts themselves are
+// distinct).
+func TestAttach_UnknownWorkspaceVsNoRegistry_DistinctCodes(t *testing.T) {
+	codeOf := func(t *testing.T, err error) wire.ErrorCode {
+		t.Helper()
+		var ref *Refusal
+		if !errors.As(err, &ref) {
+			t.Fatalf("error %v (%T) is not a *Refusal", err, err)
+		}
+		return ref.Code
+	}
+
+	p := &pinningProvider{}
+	registered := newBoundRegistry(t, p, fakeLookup{"known": "/srv/known"})
+	registered.Workdir = "/daemon/default"
+	_, unknownErr := registered.Attach(context.Background(), "", "fake", "forged-id")
+	if unknownErr == nil {
+		t.Fatal("Attach with an unregistered workspace id returned no error")
+	}
+
+	noRegistry := NewRegistry(p) // Workspaces deliberately nil
+	noRegistry.Workdir = "/daemon/default"
+	_, noRegErr := noRegistry.Attach(context.Background(), "", "fake", "any-id")
+	if noRegErr == nil {
+		t.Fatal("Attach with no workspace registry returned no error")
+	}
+
+	unknownCode := codeOf(t, unknownErr)
+	noRegCode := codeOf(t, noRegErr)
+
+	if unknownCode != wire.ErrCodeUnknownWorkspace {
+		t.Errorf("unknown-id code = %q, want %q", unknownCode, wire.ErrCodeUnknownWorkspace)
+	}
+	if noRegCode != wire.ErrCodeNoWorkspaceRegistry {
+		t.Errorf("no-registry code = %q, want %q", noRegCode, wire.ErrCodeNoWorkspaceRegistry)
+	}
+	if unknownCode == noRegCode {
+		t.Fatalf("both paths produced the same code %q — an operator chasing a deleted workspace and one chasing a registry that failed to load at startup must be able to tell those apart", unknownCode)
 	}
 }
 

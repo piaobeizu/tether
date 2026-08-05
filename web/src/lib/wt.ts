@@ -11,10 +11,20 @@ export interface WTOptions {
   onClose?: (code: number, reason: string) => void
 }
 
+// KNOWN COVERAGE GAP (tether#63, stated in the same spirit as
+// internal/server/wt_chat.go's note on admitChat): nothing in the unit suite
+// exercises this class. It needs a real WebTransport, which jsdom does not have
+// and which no harness here stands up, so `pnpm test` stays green if the close
+// handling below is deleted. It is covered only by live_verify — and it IS
+// load-bearing: with the pre-tether#63 `.catch(() => {})` restored, a
+// daemon-side refusal leaves the pane sitting on a dead transport showing no
+// banner, no card and no retry (measured). Treat edits here as behavioural
+// changes that need a live run, not as refactors.
 export class TetherWT {
   private wt: WebTransport | null = null
   private opts: WTOptions
   private closed = false
+  private closeFired = false
 
   constructor(opts: WTOptions) {
     this.opts = opts
@@ -28,9 +38,32 @@ export class TetherWT {
     this.wt = new WebTransport(appendTicket(this.opts.url, ticket), wtOpts)
     await this.wt.ready
     this.readEvents()
-    this.wt.closed.then((info) => {
-      if (!this.closed) this.opts.onClose?.(info.closeCode ?? 0, info.reason ?? '')
-    }).catch(() => {})
+    // BOTH settle paths are a close (tether#63). `closed` REJECTS when the
+    // session went away abruptly rather than through a graceful
+    // CLOSE_WEBTRANSPORT_SESSION, and measurement says that is the ordinary
+    // case here, not the exotic one: a daemon-side refusal produced a
+    // rejection in 5 of 6 live runs ("WebTransportError: Connection lost").
+    // The previous `.catch(() => {})` swallowed exactly those, so the pane's
+    // onClose — which owns the reconnect decision — was never told the
+    // connection had ended. It got away with that only because the death used
+    // to be instant, so `openBidiStream()` threw inside connect()'s own
+    // promise chain and THAT reported the failure instead. Once the daemon
+    // holds a refused session open long enough to deliver its reason
+    // (refusalDrainGrace, wt_chat.go), the bidi stream opens fine and this is
+    // the only signal left — a swallowed rejection would leave the UI sitting
+    // on a dead transport believing it was connected.
+    this.wt.closed
+      .then((info) => this.fireClose(info.closeCode ?? 0, info.reason ?? ''))
+      .catch((err: unknown) => this.fireClose(0, err instanceof Error ? err.message : String(err)))
+  }
+
+  // fireClose reports the close to the caller at most once. Guarded because the
+  // two handlers above are mutually exclusive today but need not stay that way,
+  // and a doubled onClose would schedule two reconnect ladders.
+  private fireClose(code: number, reason: string): void {
+    if (this.closed || this.closeFired) return
+    this.closeFired = true
+    this.opts.onClose?.(code, reason)
   }
 
   private async readEvents(): Promise<void> {
@@ -59,6 +92,14 @@ export class TetherWT {
     for (const line of text.split('\n')) {
       const l = line.trim()
       if (!l) continue
+      // Drop anything that arrives after the caller closed this transport
+      // (tether#63). ChatPane builds a NEW TetherWT per connect and closes the
+      // old one, but a stream already in flight can still resolve afterwards —
+      // and since a KindError payload now MUTATES SHARED STATE (store.fatal), a
+      // superseded transport's late refusal could otherwise strand a fatal on
+      // the healthy connection that replaced it and stop its ladder. Envelopes
+      // used to be append-only, which is why this did not matter before.
+      if (this.closed) continue
       try {
         const env = JSON.parse(l) as Envelope
         this.opts.onEnvelope?.(env)

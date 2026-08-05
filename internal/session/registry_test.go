@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -138,6 +139,55 @@ func (p *fakeProvider) Spawn(_ context.Context, cfg agent.SpawnConfig) (agent.Se
 	p.lastCfg = cfg
 	p.spawns++
 	return p.sess, nil
+}
+
+// erroringProvider always fails to spawn, for exercising spawnEntry's
+// ErrCodeSpawnFailed refusal path (tether#63) — none of the other doubles in
+// this file ever return an error from Spawn.
+type erroringProvider struct{}
+
+func (p *erroringProvider) Name() string { return "fake" }
+func (p *erroringProvider) Spawn(_ context.Context, _ agent.SpawnConfig) (agent.Session, error) {
+	return nil, errors.New(`exec: "cc": executable file not found in $PATH`)
+}
+
+// TestSpawnEntry_RefusalCodes pins the two classified refusals spawnEntry can
+// produce (tether#63): an unregistered provider name (terminal — the set of
+// registered providers is fixed at daemon startup) and the registered
+// provider's own Spawn failing (retryable — a transient exec failure can
+// succeed on the very next attempt).
+func TestSpawnEntry_RefusalCodes(t *testing.T) {
+	reg := NewRegistry(&erroringProvider{})
+
+	_, err := reg.spawnEntry(context.Background(), "not-registered", agent.SpawnConfig{}, WorkspaceBinding{})
+	if err == nil {
+		t.Fatal("spawnEntry with an unregistered provider name returned no error")
+	}
+	var ref *Refusal
+	if !errors.As(err, &ref) {
+		t.Fatalf("error %v (%T) is not a *Refusal", err, err)
+	}
+	if ref.Code != wire.ErrCodeUnknownProvider {
+		t.Errorf("code = %q, want %q", ref.Code, wire.ErrCodeUnknownProvider)
+	}
+	if !ref.Code.Terminal() {
+		t.Error("ErrCodeUnknownProvider must be terminal")
+	}
+
+	_, err = reg.spawnEntry(context.Background(), "fake", agent.SpawnConfig{}, WorkspaceBinding{})
+	if err == nil {
+		t.Fatal("spawnEntry returned no error when the provider's Spawn failed")
+	}
+	ref = nil
+	if !errors.As(err, &ref) {
+		t.Fatalf("error %v (%T) is not a *Refusal", err, err)
+	}
+	if ref.Code != wire.ErrCodeSpawnFailed {
+		t.Errorf("code = %q, want %q", ref.Code, wire.ErrCodeSpawnFailed)
+	}
+	if ref.Code.Terminal() {
+		t.Error("ErrCodeSpawnFailed must be retryable, not terminal")
+	}
 }
 
 // TestGetOrSpawnEntry_StaleSidSpawnsFresh — a sid the registry does NOT track
@@ -697,6 +747,33 @@ func TestTranslateEvent_Usage(t *testing.T) {
 	}
 	if got := translateEvent(agent.Event{Kind: agent.EventUsage, Usage: nil}); got != nil {
 		t.Errorf("translateEvent(EventUsage{nil}) = %+v, want nil", got)
+	}
+}
+
+// TestTranslateEvent_Error — (tether#63) an EventError becomes a classified
+// wire.KindError envelope carrying wire.ErrCodeAgent, which is retryable: the
+// agent is reporting something about the turn it is mid-way through, not the
+// daemon refusing the connection, and the session is still alive.
+func TestTranslateEvent_Error(t *testing.T) {
+	env := translateEvent(agent.Event{Kind: agent.EventError, Err: errors.New("boom")})
+	if env == nil {
+		t.Fatal("translateEvent(EventError) = nil, want a KindError envelope")
+	}
+	if env.Kind != wire.KindError {
+		t.Errorf("Kind = %q, want %q", env.Kind, wire.KindError)
+	}
+	payload, ok := env.Payload.(wire.ErrorPayload)
+	if !ok {
+		t.Fatalf("Payload = %T, want wire.ErrorPayload", env.Payload)
+	}
+	if payload.Code != wire.ErrCodeAgent {
+		t.Errorf("Code = %q, want %q", payload.Code, wire.ErrCodeAgent)
+	}
+	if payload.Message != "boom" {
+		t.Errorf("Message = %q, want %q", payload.Message, "boom")
+	}
+	if payload.Terminal {
+		t.Error("ErrCodeAgent must be retryable, not terminal")
 	}
 }
 

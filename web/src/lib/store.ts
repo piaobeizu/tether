@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { Envelope, FencedBlock } from './wire.gen'
+import type { Envelope, ErrorPayload, FencedBlock } from './wire.gen'
 
 /** A single tool_use content block the daemon already extracts and puts on the
  *  wire ({name,input}); tether#37 is where the frontend finally KEEPS it instead
@@ -161,6 +161,38 @@ export interface Connection {
   attempt: number
 }
 
+/**
+ * FatalRefusal is what the store keeps of a terminal wire.ErrorPayload
+ * (tether#63) — just enough for the failed-connection card to explain WHY and
+ * for a code→sentence lookup (ChatPane) to render something better than the
+ * raw message. Deliberately does NOT keep `terminal`: by the time a value
+ * exists in this field the caller (the 'error' handler below) has already
+ * decided it was true, and re-checking a stale bool off a struct nobody
+ * mutates would only invite the two to drift.
+ */
+export interface FatalRefusal {
+  code: string
+  message: string
+}
+
+/**
+ * parseErrorPayload defensively narrows a KindError envelope's `payload` to
+ * wire.ErrorPayload's shape. Pure and exported so it tests without a store —
+ * "defensive" here means a payload that ISN'T this shape (the pre-tether#63
+ * bare string a stale daemon binary might still send, or `null`/garbage) is
+ * simply not a classified error, not a crash: the caller treats a null return
+ * as "nothing to update `fatal` with," which is exactly the old un-classified
+ * behaviour for a payload this build doesn't recognize.
+ */
+export function parseErrorPayload(payload: unknown): ErrorPayload | null {
+  if (!payload || typeof payload !== 'object') return null
+  const p = payload as Record<string, unknown>
+  if (typeof p['code'] !== 'string') return null
+  if (typeof p['message'] !== 'string') return null
+  if (typeof p['terminal'] !== 'boolean') return null
+  return { code: p['code'], message: p['message'], terminal: p['terminal'] }
+}
+
 /** A selected file within a workspace, identified by workspace id + path
  *  relative to the workspace root (matches fetchFile's `path` param). */
 export interface SelectedFile {
@@ -182,6 +214,15 @@ interface AppState {
   connected: boolean
   streaming: boolean
   connection: Connection
+  // tether#63 — a terminal wire.ErrorPayload (session.Refusal classified
+  // Terminal=true), or null when there is none. Deliberately a TOP-LEVEL
+  // field, not nested inside `connection`: `connection` is reconnect-ladder
+  // bookkeeping that setConnected/setConnection reset wholesale on every
+  // state change, and a fatal refusal must survive exactly those resets — it
+  // is what TELLS the ladder to stop, not something the ladder's own state
+  // transitions get to clear as a side effect. Only clearFatal (deliberate)
+  // and doConnect (a fresh attempt deserves a fresh chance) reset it.
+  fatal: FatalRefusal | null
   streamingMsgId: string | null   // id of the bubble receiving ANSWER text (drives the cursor)
   // tether#34 — ONE assistant bubble per turn: thinking + answer text accumulate
   // into it, so a turn with interleaved thinking blocks (thinking→text→thinking→
@@ -230,6 +271,9 @@ interface AppState {
    *  changes the sid, and clearing there would discard the very notice that
    *  explains the change. */
   clearNotices: () => void
+  /** Drop a terminal refusal once the caller is giving the connection a fresh
+   *  chance (tether#63) — see `fatal`'s doc comment on why nothing else clears it. */
+  clearFatal: () => void
   addMessage: (msg: Message) => void
   /** Remove one request from the queue after it's decided (tether#40). */
   resolvePermission: (id: string) => void
@@ -272,6 +316,7 @@ export const useStore = create<AppState>((set, get) => ({
   answerStartTs: null,
   stopped: false,
   connection: { state: 'connecting', latency: 0, attempt: 0 },
+  fatal: null,
   selectedWiId: null,
   selectedFile: null,
   workProject: '',
@@ -315,6 +360,7 @@ export const useStore = create<AppState>((set, get) => ({
   // so an unconditional set() would re-render it (and invalidate the transcript
   // memo) on every session switch whether or not a notice existed.
   clearNotices: () => set((s) => (s.notices.length === 0 ? {} : { notices: [] })),
+  clearFatal: () => set((s) => (s.fatal === null ? {} : { fatal: null })),
   addMessage: (msg) => set((s) => ({
     messages: [...s.messages, msg],
     // A new user turn ends the prior assistant turn's accumulation (tether#34).
@@ -549,11 +595,26 @@ export const useStore = create<AppState>((set, get) => ({
         // interrupted) turn, so later deltas belong to a fresh turn.
         set((s) => ({ ...finalizeTurn(s), stopped: false }))
         break
-      case 'error':
+      case 'error': {
         // Clear the thinking/streaming indicator on a daemon-surfaced error so
-        // the UI doesn't get stuck showing "Claude is thinking…" forever.
+        // the UI doesn't get stuck showing "Claude is thinking…" forever. This
+        // clear happens regardless of the payload's classification below —
+        // even a terminal refusal ends whatever turn was in flight.
         set({ streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null, stopped: false })
+        // tether#63 — record a TERMINAL refusal so ChatPane's onClose can tell
+        // "the daemon just refused this connection for good" apart from an
+        // ordinary transient drop and stop the reconnect ladder instead of
+        // retrying forever (see wire/errors.go's package doc for why Terminal
+        // travels as its own field). A non-terminal or unparsable payload
+        // (including the pre-tether#63 bare-string shape a stale daemon build
+        // might still send) leaves `fatal` untouched — there is nothing new to
+        // act on, not a reason to clear a refusal that may already be set.
+        const parsed = parseErrorPayload(env.payload)
+        if (parsed && parsed.terminal) {
+          set({ fatal: { code: parsed.code, message: parsed.message } })
+        }
         break
+      }
       case 'fenced': {
         // D-19 fenced block, live-replace-by-BlockID (tether#8 T8, contract §3):
         // if a message already carries a block with this BlockID, replace that

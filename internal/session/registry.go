@@ -298,7 +298,7 @@ func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agen
 	}
 	provider, ok := r.providers[providerName]
 	if !ok {
-		return nil, fmt.Errorf("unknown provider: %s", providerName)
+		return nil, refuse(wire.ErrCodeUnknownProvider, "unknown provider: %s", providerName)
 	}
 
 	if r.PermEndpoint != "" {
@@ -325,7 +325,7 @@ func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agen
 
 	sess, err := provider.Spawn(ctx, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("spawn: %w", err)
+		return nil, refuse(wire.ErrCodeSpawnFailed, "spawn: %w", err)
 	}
 
 	e := &Entry{
@@ -1072,7 +1072,15 @@ func translateEvent(ev agent.Event) *wire.Envelope {
 			}}
 		}
 	case agent.EventError:
-		return &wire.Envelope{Kind: wire.KindError, Payload: ev.Err.Error()}
+		// tether#63: classified so the browser can tell this — the agent
+		// reporting an error about the turn it is mid-way through, on a
+		// session that is still alive and usable — apart from a daemon-side
+		// refusal that ends the connection. ErrCodeAgent is retryable for
+		// exactly that reason: there is nothing here for a reconnect to fix,
+		// but there is also nothing here that should make the browser stop
+		// trying.
+		env := wire.NewErrorEnvelope(wire.ErrCodeAgent, ev.Err.Error())
+		return &env
 	}
 	return nil
 }

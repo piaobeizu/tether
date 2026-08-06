@@ -227,13 +227,18 @@ export interface ProviderListResponse {
 export type ClientFrameKind = string;
 export const ClientFramePing: ClientFrameKind = "ping";
 export const ClientFrameAction: ClientFrameKind = "action";
+export const ClientFrameResize: ClientFrameKind = "resize";
 /**
  * ClientFrame is a client→server message on /wt/control. Kind selects the
  * interpretation of the remaining fields: "ping" carries only TS (RTT
  * probe); "action" carries SessionID/BlockID/Action/Skill — a fenced-block
- * callback (D-19 §5) routed to the named session (tether#8 T8). The
- * /wt/control channel is not otherwise session-scoped, so SessionID is the
- * only way the daemon knows which session an action targets.
+ * callback (D-19 §5) routed to the named session (tether#8 T8); "resize"
+ * carries SessionID/Cols/Rows and retargets that session's PTY (tether#68).
+ * The /wt/control channel is not otherwise session-scoped, so SessionID is
+ * the only way the daemon knows which session a frame targets.
+ * Resize rides here rather than on /wt/shell because that stream is raw PTY
+ * bytes by contract (D-05a §2 fact 4) — there is no field to put a size in
+ * without introducing framing on the hot path.
  */
 export interface ClientFrame {
   kind: ClientFrameKind;
@@ -242,6 +247,8 @@ export interface ClientFrame {
   blockId?: string;
   action?: string;
   skill?: string;
+  cols?: number /* uint16 */;
+  rows?: number /* uint16 */;
 }
 /**
  * ControlFrame is a server→client message on /wt/control.

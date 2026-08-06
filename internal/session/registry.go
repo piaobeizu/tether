@@ -29,9 +29,16 @@ type Registry struct {
 	// which point rekey moves it. Such an entry is addressable — evict and
 	// BroadcastAll find it, which the old placeholder also allowed — but NOT by any
 	// sid a client holds. See rekey, and the RESIDUAL note in Attach.
-	sessions  map[string]*Entry
-	locks     map[string]*SessionLock
-	providers map[string]agent.AgentProvider
+	sessions map[string]*Entry
+	locks    map[string]*SessionLock
+	// shellResize is keyed by the sid a /wt/shell connection was opened with,
+	// and holds that PTY's resize func (tether#68). Deliberately NOT part of
+	// Entry: a shell can exist for a sid that has no chat Entry at all (the
+	// sid may even be ""), so hanging it off sessions would make resize
+	// unroutable in exactly the cases where the pane is already on screen.
+	// One shell per sid is already the invariant — locks is keyed the same way.
+	shellResize map[string]func(cols, rows uint16) error
+	providers   map[string]agent.AgentProvider
 	// mintedIDIgnored records the providers already observed to report a session id
 	// other than the one they were spawned under, so rekey's self-check warns ONCE
 	// per provider instead of once per session. Guarded by mu.
@@ -122,6 +129,7 @@ func NewRegistry(providers ...agent.AgentProvider) *Registry {
 	return &Registry{
 		sessions:        make(map[string]*Entry),
 		locks:           make(map[string]*SessionLock),
+		shellResize:     make(map[string]func(cols, rows uint16) error),
 		providers:       pm,
 		mintedIDIgnored: make(map[string]bool),
 	}
@@ -831,6 +839,50 @@ func (r *Registry) InterruptSession(sid string) error {
 		return fmt.Errorf("interrupt session: unknown session %q", sid)
 	}
 	return e.sess.Interrupt()
+}
+
+// RegisterShellResize records how to resize the PTY behind sid's /wt/shell
+// connection (tether#68). handleWTShell calls this right after starting the
+// PTY and unregisters on the way out.
+//
+// A second registration for the same sid replaces the first rather than
+// erroring: the shell lock (GetLock) already guarantees one live shell per
+// sid, so the only way to reach here twice is a reconnect whose predecessor
+// has not finished its deferred unregister — and in that race the newer PTY
+// is the one a resize should reach.
+func (r *Registry) RegisterShellResize(sid string, fn func(cols, rows uint16) error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.shellResize[sid] = fn
+}
+
+// UnregisterShellResize drops sid's PTY resize func. Safe to call for a sid
+// that was never registered.
+func (r *Registry) UnregisterShellResize(sid string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.shellResize, sid)
+}
+
+// ResizeShell applies a client-reported terminal size to sid's PTY (tether#68).
+//
+// Without this the PTY keeps whatever size it was started with while the
+// browser's xterm fits itself to the pane, so the remote TUI renders for one
+// width and is displayed at another — the wrapped/clipped Shell tab this
+// slice exists to fix.
+//
+// Returns an error (never panics) when sid has no registered shell — same
+// expected race as DeliverAction/InterruptSession, since /wt/control is not
+// session-scoped and a resize can arrive after the shell closed. Callers log
+// and drop.
+func (r *Registry) ResizeShell(sid string, cols, rows uint16) error {
+	r.mu.RLock()
+	fn, ok := r.shellResize[sid]
+	r.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("resize shell: no shell for session %q", sid)
+	}
+	return fn(cols, rows)
 }
 
 // Providers returns the names of all registered providers, sorted.

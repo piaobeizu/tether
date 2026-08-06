@@ -63,6 +63,36 @@ func admitChat(reg *session.Registry, sid, clientID string) bool {
 	return !reg.OwnedByOther(sid, clientID)
 }
 
+// promptErrorEnvelope decides whether a failed SendPrompt is one the browser must be
+// told about, and what to tell it (tether#59). The second return is false for "log
+// it and say nothing".
+//
+// A classified session.Refusal is the discriminator, and it is not a proxy for
+// severity — it is precisely the difference that matters here. Attachment.SendPrompt
+// returns the transport error UNCHANGED on the paths that recover themselves (for cc
+// a bare *os.PathError from the stdin write, which Attachment.resolve answers by
+// replaying onto a fresh session), and everything Attachment.reopen returns wraps a
+// Refusal built by spawnEntry. So "carries a Refusal" reads exactly as "the daemon
+// tried to recover this and could not", which is the only case where staying silent
+// costs the user a spinner that never ends.
+//
+// Wrong in either direction is a real cost, which is why this is not "always send"
+// or "never send": an envelope on the recoverable path shows an error for a turn
+// that then answers normally (and clears the browser's turn state mid-flight —
+// store.ts's 'error' branch resets streaming), while silence on the unrecoverable
+// path is the tether#59 hang one step further out.
+func promptErrorEnvelope(err error) (wire.Envelope, bool) {
+	var ref *session.Refusal
+	if !errors.As(err, &ref) {
+		return wire.Envelope{}, false
+	}
+	// errorEnvelope, not a hand-built one: the code comes from the Refusal and the
+	// words from the whole wrapped error, which on this path is what names both
+	// causes ("reused session X stopped accepting prompts (...) and could not be
+	// re-opened: spawn: ...").
+	return errorEnvelope(err), true
+}
+
 func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Registry, clientID string) {
 	defer wtsess.CloseWithError(0, "")
 	ctx := wtsess.Context()
@@ -182,8 +212,48 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 			// attachment buffered the prompt and Resolve replays it onto a fresh
 			// session, so this must stay a warning — bailing out here is exactly
 			// the wedge tether#49 removed.
+			//
+			// Since tether#59 an error is ALSO no longer the last word on a REUSED
+			// session: SendPrompt itself re-opens one that has died (by resuming its
+			// own sid) and delivers the prompt there. Do not "improve" this into
+			// recovery logic; the attachment is where the state to recover with
+			// lives, and this goroutine holds none of it.
+			//
+			// So two different failures arrive here and they must NOT be treated
+			// alike:
+			//
+			//   - The expected one above: an unclassified transport error (for cc a
+			//     bare *os.PathError from the stdin write) on a path that recovers
+			//     itself. Log only. Telling the browser about a prompt that Resolve
+			//     is about to replay would surface an error for a turn that then
+			//     answers normally.
+			//   - A recovery the daemon KNOWS it could not complete: everything
+			//     Attachment.reopen returns wraps a classified session.Refusal
+			//     (spawnEntry builds it). Nothing downstream will retry it and the
+			//     re-open budget is spent, so if this only reached the log the user
+			//     would sit on a spinner while every later prompt failed silently.
+			//     That is the failure this whole slice is about, one step further
+			//     out, so the classified subset is sent to the browser.
+			//
+			// The Refusal is the discriminator rather than a new flag because the
+			// two paths already differ in exactly that way — it costs nothing and
+			// cannot mistake one for the other.
+			//
+			// sendEnvelope directly, NOT refuse(): refuse exists for refusals that
+			// END the connection, and pays 300ms of drain grace for the close race
+			// that implies. This connection stays open — the session is still
+			// usable, a later prompt may well work — and sleeping here would stall
+			// the prompt reader for every subsequent line the browser has sent.
+			//
+			// The decision is promptErrorEnvelope, so that it is testable without
+			// standing up a WebTransport session — same reason and same residual as
+			// admitChat above: what is pinned is the decision, not that this call
+			// site still makes it.
 			if err := att.SendPrompt(ctx, msg.Text); err != nil {
 				slog.Warn("send prompt", "err", err)
+				if env, ok := promptErrorEnvelope(err); ok {
+					sendEnvelope(wtsess, env)
+				}
 			}
 			// Record the user message under the sid that actually answered it.
 			// WaitSID (not the session's own SessionID) because a fallback

@@ -84,8 +84,10 @@ export default function App() {
     setRightTab(t)
     localStorage.setItem(STORAGE_KEY_TAB, t) // tether#45 — remember across reloads
     setVisitedTabs(v => (v[t] ? v : { ...v, [t]: true }))
-    // xterm measures 0 while display:none; nudge a refit once Shell is visible again.
-    if (t === 'shell') requestAnimationFrame(() => window.dispatchEvent(new Event('resize')))
+    // No Shell refit nudge here any more: ShellPane observes its own container
+    // (tether#68), so revealing the pane — 0×0 while display:none, sized once
+    // it is flex — fires that observer directly. The synthetic window resize
+    // this replaced only ever covered the tab-switch path, never a divider drag.
   }
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null)

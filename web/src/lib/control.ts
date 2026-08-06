@@ -2,13 +2,30 @@
 // Started after the main WT connection (chat) is live; feeds smoothed
 // latency samples into the app store for display in the titlebar/Settings.
 import type { ClientFrame, ControlFrame } from './wire.gen'
-import { ClientFramePing, ControlPong } from './wire.gen'
+import { ClientFramePing, ClientFrameResize, ControlPong } from './wire.gen'
 import { createWT } from './wt'
 import { applyLatencySample } from './latency'
 import { useStore } from './store'
 
 const PING_INTERVAL_MS = 5000
 const RECONNECT_DELAY_MS = 5000
+
+/**
+ * The ControlClient currently owning the /wt/control lane, if any.
+ *
+ * ChatPane constructs and owns it (it must not start before the chat
+ * connection is live), but ShellPane needs the same lane to report terminal
+ * size — and opening a second /wt/control session just for that would mean a
+ * second WT session and a second ping loop measuring the same RTT. The lane is
+ * a singleton in practice, so it is published here rather than threaded
+ * through props/context across two unrelated panes. tether#68.
+ */
+let active: ControlClient | null = null
+
+/** activeControlClient returns the live control lane, or null if none. */
+export function activeControlClient(): ControlClient | null {
+  return active
+}
 
 /**
  * ControlClient owns a /wt/control WebTransport session: it opens a bidi
@@ -27,6 +44,7 @@ export class ControlClient {
   /** start (re)enables the control lane and connects to /wt/control. */
   async start(): Promise<void> {
     this.stopped = false
+    active = this
     await this.connect()
   }
 
@@ -66,6 +84,7 @@ export class ControlClient {
   /** stop permanently disables the control lane (no further reconnects). */
   stop(): void {
     this.stopped = true
+    if (active === this) active = null
     if (this.timer !== null) { clearInterval(this.timer); this.timer = null }
     if (this.reconnectTimer !== null) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null }
     try { this.writer?.releaseLock() } catch { /* already released */ }
@@ -95,6 +114,28 @@ export class ControlClient {
    * connected, and there's no ack to await.
    */
   async sendAction(frame: ClientFrame): Promise<void> {
+    await this.writeFrame(frame)
+  }
+
+  /**
+   * sendResize tells the daemon the size ShellPane is actually rendering the
+   * terminal at, so it can retarget that session's PTY (tether#68).
+   *
+   * It rides the control lane because /wt/shell carries raw PTY bytes and has
+   * nowhere to put a size. Best-effort like the rest of this class: if the
+   * control lane is down the frame is dropped, and the PTY keeps the size it
+   * was started with (ShellPane also passes the initial size on the /wt/shell
+   * query string, so a dropped frame degrades rather than breaks).
+   *
+   * A zero dimension is never sent — xterm reports 0 while the pane is
+   * display:none, and a 0-wide PTY blanks the remote TUI.
+   */
+  async sendResize(sessionId: string, cols: number, rows: number): Promise<void> {
+    if (cols <= 0 || rows <= 0) return
+    await this.writeFrame({ kind: ClientFrameResize, sessionId, cols, rows })
+  }
+
+  private async writeFrame(frame: ClientFrame): Promise<void> {
     if (!this.writer) return
     const line = JSON.stringify(frame) + '\n'
     try {

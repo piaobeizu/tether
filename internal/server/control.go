@@ -86,11 +86,7 @@ func serveControl(wtsess *webtransport.Session, reg *session.Registry) {
 			if err := json.Unmarshal(raw, &frame); err != nil {
 				continue
 			}
-			if frame.Kind == wire.ClientFrameAction {
-				handleActionFrame(reg, frame)
-				continue
-			}
-			resp, ok := RespondToControl(frame)
+			resp, ok := routeClientFrame(reg, frame)
 			if !ok {
 				continue
 			}
@@ -102,6 +98,42 @@ func serveControl(wtsess *webtransport.Session, reg *session.Registry) {
 				return // write failure = client gone
 			}
 		}
+	}
+}
+
+// routeClientFrame dispatches one decoded client frame to its handler and
+// returns the reply to write back, if any.
+//
+// Split out of serveControl's read loop so the kind→handler wiring is
+// reachable from a test without standing up a WebTransport session: the
+// handlers themselves are already unit-testable, but "does a frame of this
+// kind actually reach that handler" was not, and that is precisely the hop
+// that silently does nothing when a case is missing.
+func routeClientFrame(reg *session.Registry, f wire.ClientFrame) (*wire.ControlFrame, bool) {
+	switch f.Kind {
+	case wire.ClientFrameAction:
+		handleActionFrame(reg, f)
+		return nil, false
+	case wire.ClientFrameResize:
+		handleResizeFrame(reg, f)
+		return nil, false
+	}
+	return RespondToControl(f)
+}
+
+// handleResizeFrame applies a client-reported terminal size to the PTY behind
+// f.SessionID's shell (tether#68).
+//
+// An unknown session is an expected race, not a bug — /wt/control is not
+// session-scoped, so a resize can arrive after the shell closed, or before it
+// opened. Log at debug and drop; there is nothing to tell the user.
+func handleResizeFrame(reg *session.Registry, f wire.ClientFrame) {
+	if f.Cols == 0 || f.Rows == 0 {
+		return // a zero dimension would blank the remote TUI
+	}
+	if err := reg.ResizeShell(f.SessionID, f.Cols, f.Rows); err != nil {
+		slog.Debug("serveControl: shell resize dropped",
+			"sid", f.SessionID, "cols", f.Cols, "rows", f.Rows, "err", err)
 	}
 }
 

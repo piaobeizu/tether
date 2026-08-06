@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -80,13 +82,20 @@ func handleWTShell(reg *session.Registry, wts *webtransport.Server, authState *a
 		cmd := buildPTYCommand(ctx, resolveClaudePath(), sid, reg.WorkdirForSession(sid))
 		cmd.Env = buildPTYEnv(reg.PermEndpoint)
 
-		ptmx, err := pty.Start(cmd)
+		// Start the PTY at the size the browser already knows it will render
+		// at, rather than at the kernel default. Waiting for the first resize
+		// frame instead would paint one screenful of TUI at the wrong width and
+		// then reflow it, and would leave the size wrong for the whole session
+		// whenever /wt/control never connects.
+		ptmx, err := startPTY(cmd, parseWinsize(r.URL.Query()))
 		if err != nil {
 			_, _ = stream.Write([]byte("\r\n[tether] failed to start shell: " + err.Error() + "\r\n"))
 			_ = stream.Close()
 			_ = wtSess.CloseWithError(1, "pty start failed")
 			return
 		}
+
+		defer attachShellResize(reg, sid, ptmx)()
 
 		done := make(chan struct{})
 		var closeOnce sync.Once
@@ -119,6 +128,48 @@ func handleWTShell(reg *session.Registry, wts *webtransport.Server, authState *a
 		_ = stream.Close()
 		_ = cmd.Wait()
 	}
+}
+
+// attachShellResize routes later /wt/control resize frames to this PTY and
+// returns the detach func, so the caller can write `defer attach(...)()`.
+//
+// Size changes cannot ride the /wt/shell stream — it is raw PTY bytes by
+// contract (D-05a §2 fact 4) — so they arrive on /wt/control and are routed
+// back by sid, the same key the shell lock uses, which is what guarantees at
+// most one live shell owns it. tether#68.
+//
+// Extracted from handleWTShell (rather than inlined there) so the whole path
+// from a control frame to the kernel's winsize is reachable from a test: the
+// handler itself needs a live WebTransport session, and an untested seam here
+// is exactly the kind that keeps compiling while doing nothing.
+func attachShellResize(reg *session.Registry, sid string, ptmx *os.File) func() {
+	reg.RegisterShellResize(sid, func(cols, rows uint16) error {
+		return pty.Setsize(ptmx, &pty.Winsize{Rows: rows, Cols: cols})
+	})
+	return func() { reg.UnregisterShellResize(sid) }
+}
+
+// parseWinsize reads the terminal size the browser reported on the /wt/shell
+// query string. Returns nil when either dimension is absent, unparseable, or
+// zero — the caller then starts the PTY at the kernel default, which is what
+// every shell did before tether#68. A bad size is not worth failing a shell
+// over; it degrades to the old behaviour and the first resize frame corrects it.
+func parseWinsize(q url.Values) *pty.Winsize {
+	cols, errCols := strconv.ParseUint(q.Get("cols"), 10, 16)
+	rows, errRows := strconv.ParseUint(q.Get("rows"), 10, 16)
+	if errCols != nil || errRows != nil || cols == 0 || rows == 0 {
+		return nil
+	}
+	return &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)}
+}
+
+// startPTY starts cmd on a PTY, sized when the client told us a size and at
+// the kernel default when it did not.
+func startPTY(cmd *exec.Cmd, ws *pty.Winsize) (*os.File, error) {
+	if ws == nil {
+		return pty.Start(cmd)
+	}
+	return pty.StartWithSize(cmd, ws)
 }
 
 // handleLockForce handles POST /api/v1/session/{sid}/lock/force (D-15 force-takeover).

@@ -62,14 +62,20 @@ type ClientFrameKind string
 const (
 	ClientFramePing   ClientFrameKind = "ping"
 	ClientFrameAction ClientFrameKind = "action"
+	ClientFrameResize ClientFrameKind = "resize"
 )
 
 // ClientFrame is a client→server message on /wt/control. Kind selects the
 // interpretation of the remaining fields: "ping" carries only TS (RTT
 // probe); "action" carries SessionID/BlockID/Action/Skill — a fenced-block
-// callback (D-19 §5) routed to the named session (tether#8 T8). The
-// /wt/control channel is not otherwise session-scoped, so SessionID is the
-// only way the daemon knows which session an action targets.
+// callback (D-19 §5) routed to the named session (tether#8 T8); "resize"
+// carries SessionID/Cols/Rows and retargets that session's PTY (tether#68).
+// The /wt/control channel is not otherwise session-scoped, so SessionID is
+// the only way the daemon knows which session a frame targets.
+//
+// Resize rides here rather than on /wt/shell because that stream is raw PTY
+// bytes by contract (D-05a §2 fact 4) — there is no field to put a size in
+// without introducing framing on the hot path.
 type ClientFrame struct {
 	Kind      ClientFrameKind `json:"kind"`
 	TS        int64           `json:"ts,omitempty"`
@@ -77,6 +83,8 @@ type ClientFrame struct {
 	BlockID   string          `json:"blockId,omitempty"`
 	Action    string          `json:"action,omitempty"`
 	Skill     string          `json:"skill,omitempty"`
+	Cols      uint16          `json:"cols,omitempty"`
+	Rows      uint16          `json:"rows,omitempty"`
 }
 
 // ControlFrame is a server→client message on /wt/control.

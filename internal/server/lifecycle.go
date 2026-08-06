@@ -352,12 +352,23 @@ func Run(cfg *Config) error {
 	oauthH := oauth.NewHandlers(oauthCS, apiTokens, oauthIssuer)
 
 	// Step 5: build and start listeners.
-	srv := newServer(cfg, bundle, pm, authState, mcpSrv, apiTokens, oauthH)
+	certs := newCertHolder(bundle)
+	srv := newServer(cfg, certs, pm, authState, mcpSrv, apiTokens, oauthH)
+
+	// A managed cert lives 14 days and this daemon is meant to stay up for
+	// weeks, but LoadOrGenCert above only runs on the way in — so without this
+	// loop the cert simply expires underneath a running process, and the
+	// symptom (browser refuses the connection) points nowhere near the cause.
+	// See startCertRotation for what it deliberately does not cover.
+	startCertRotation(runCtx, bundle, certs, certRotateInterval, loadOrRotateManaged)
 
 	errCh := make(chan error, 2)
 
 	go func() {
-		// TCP ListenAndServeTLS with empty cert/key paths uses TLSConfig.Certificates.
+		// Empty cert/key paths are fine: net/http skips loading from disk when
+		// the TLSConfig can already produce a cert, and GetCertificate counts
+		// (see http.Server.ServeTLS's configHasCert). The managed path sets
+		// only GetCertificate so rotation is visible per handshake.
 		if err := srv.tcp.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
 			errCh <- fmt.Errorf("TCP: %w", err)
 		}

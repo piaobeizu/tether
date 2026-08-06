@@ -25,22 +25,19 @@ type Server struct {
 
 // newServer constructs (but does not start) the dual-listener server.
 // Call Start() to bind and serve.
-func newServer(cfg *Config, bundle CertBundle, pm *permission.Manager, authState *auth.State, mcpSrv *mcp.Server, mcpTokens *apitoken.Store, oauthH *oauth.Handlers) *Server {
+func newServer(cfg *Config, certs *certHolder, pm *permission.Manager, authState *auth.State, mcpSrv *mcp.Server, mcpTokens *apitoken.Store, oauthH *oauth.Handlers) *Server {
 	addr := cfg.addr()
 
 	// When ACME is active, certmagic provides a tls.Config with GetCertificate
 	// already wired for auto-renewal. Clone it and override ALPN per listener.
-	// Otherwise fall back to the static cert from CertBundle.
+	// Otherwise serve the managed cert through the holder.
 	makeTLS := func(protos []string) *tls.Config {
 		if cfg.acmeTLSBase != nil {
 			c := cfg.acmeTLSBase.Clone()
 			c.NextProtos = protos
 			return c
 		}
-		return &tls.Config{
-			Certificates: []tls.Certificate{bundle.TLS},
-			NextProtos:   protos,
-		}
+		return certTLSConfig(certs, protos)
 	}
 
 	// TCP: HTTP/2 + HTTP/1.1 over TLS.
@@ -71,7 +68,7 @@ func newServer(cfg *Config, bundle CertBundle, pm *permission.Manager, authState
 		CheckOrigin: func(r *http.Request) bool { return originAllowed(r.Header.Get("Origin"), cfg.Port) },
 	}
 
-	mux := buildMux(cfg, bundle, wts, cfg.Registry, pm, authState, mcpSrv, mcpTokens, oauthH, cfg.MCPLifecycle)
+	mux := buildMux(cfg, certs, wts, cfg.Registry, pm, authState, mcpSrv, mcpTokens, oauthH, cfg.MCPLifecycle)
 
 	tcpServer := &http.Server{
 		Addr:      addr,

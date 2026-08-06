@@ -24,11 +24,60 @@ export const MAX_RIGHT = 1000
  */
 export const MIN_MID = 320
 
-/** Default right-pane width for a browser that has never been resized. */
-export const DEFAULT_RIGHT = 560
+/**
+ * Fallback right-pane width for a browser that has never been resized AND whose
+ * window cannot be measured.
+ *
+ * Prefer defaultRightWidth(), which knows the viewport. This constant only
+ * covers the case that function cannot answer (jsdom before layout, a hidden
+ * tab). It is still sized so the right pane wins on a nominal 1440px screen —
+ * 1440 - 240 - 640 = 560 for the middle — because a fallback that quietly
+ * reintroduces the bug it exists beside is worse than no fallback.
+ */
+export const DEFAULT_RIGHT = 640
+
+/**
+ * Share of the space beside the left pane that the right pane takes by default.
+ *
+ * The right pane is where the work happens — Work, Chat, Skills, Shell — so it
+ * is the primary column, and "primary" is a RATIO, not a number of pixels. That
+ * distinction is the whole reason this is a share:
+ *
+ *   right > middle  <=>  DEFAULT_RIGHT_ish > (windowWidth - leftWidth) / 2
+ *
+ * A scalar default satisfies that at exactly one viewport. 560 (what this
+ * replaced) failed at 1440 — the middle got 640. Any scalar large enough for
+ * 1920 pins the middle to MIN_MID on a 1280 laptop, and since MAX_RIGHT caps at
+ * 1000, no scalar at all can hold past ~2240. A share holds everywhere the
+ * clamps leave room, and hands the decision back to the clamps where they do
+ * not. Anything above 0.5 makes the right pane the widest; 0.56 does it with a
+ * visible margin without squeezing the canvas.
+ */
+export const DEFAULT_RIGHT_SHARE = 0.56
 
 /** Default left-pane (workspace tree) width. */
 export const DEFAULT_LEFT = 240
+
+/**
+ * defaultRightWidth is the right-pane width for a browser that has never
+ * dragged the divider: a share of whatever sits beside the left pane.
+ *
+ * UNCLAMPED on purpose — callers pass the result through clampRightWidth, which
+ * owns MIN_RIGHT/MAX_RIGHT and the MIN_MID guarantee. Keeping the two apart
+ * means the share never has to re-derive rules that already exist, and the
+ * ceiling stays stated in one place: above roughly (MAX_RIGHT / share) of
+ * available width the cap binds and the middle pane becomes the wider one
+ * again, which is deliberate — a 1300px chat column is not a feature.
+ *
+ * A non-finite or non-positive windowWidth falls back to the constant, matching
+ * clampRightWidth's rule for the same bogus measurement: better a fixed width
+ * than one computed from a number known to be wrong.
+ */
+export function defaultRightWidth(windowWidth: number, leftWidth: number): number {
+  if (!Number.isFinite(windowWidth) || windowWidth <= 0) return DEFAULT_RIGHT
+  const beside = windowWidth - Math.max(0, leftWidth)
+  return Math.round(beside * DEFAULT_RIGHT_SHARE)
+}
 
 /**
  * clampRightWidth returns the right-pane width to actually use.
@@ -70,6 +119,12 @@ export function clampRightWidth(desired: number, windowWidth: number, leftWidth:
  * wide monitor would otherwise reproduce a crushed middle pane every time the
  * app loads on a narrower one — the classic gap in "persist + clamp" code,
  * where only the write path is guarded.
+ *
+ * With nothing persisted the default comes from defaultRightWidth, so a first
+ * visit gets a right pane sized to the actual viewport rather than to a number
+ * that was only ever right on one monitor (tether#71). Note the default is fed
+ * THROUGH clampRightWidth rather than around it — the share is a preference,
+ * the clamp is the guarantee, and the guarantee wins.
  */
 export function loadRightWidth(
   stored: string | null,
@@ -77,6 +132,7 @@ export function loadRightWidth(
   leftWidth: number,
 ): number {
   const parsed = stored !== null ? Number(stored) : NaN
-  const desired = Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_RIGHT
+  const desired =
+    Number.isFinite(parsed) && parsed > 0 ? parsed : defaultRightWidth(windowWidth, leftWidth)
   return clampRightWidth(desired, windowWidth, leftWidth)
 }

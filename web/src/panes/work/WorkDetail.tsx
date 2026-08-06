@@ -69,7 +69,7 @@ export default function WorkDetail({ id }: { id: string }) {
   const dagNodes: DagNode[] = (steps?.nodes ?? []).map((n) => ({ id: n.id, label: n.id, status: n.status }))
   const dagEdges: DagEdge[] = buildStepEdges(steps?.nodes ?? [])
 
-  // queued/unclaimed → not started (offer ▶开始做); else offer →进入 chat.
+  // queued/unclaimed → not started (offer "▶ Start"); else offer "→ Open in chat".
   const isUnstarted = !item?.status || item.status === 'queued' || item.status === 'pending'
 
   const startWi = () => {
@@ -119,8 +119,8 @@ export default function WorkDetail({ id }: { id: string }) {
 
           <div className="work-action-bar">
             {isUnstarted
-              ? <button className="btn-primary-sm" onClick={startWi}>▶ 开始做</button>
-              : <button className="btn-ghost-sm" onClick={resumeWi}>→ 进入 chat</button>}
+              ? <button className="btn-primary-sm" onClick={startWi}>▶ Start</button>
+              : <button className="btn-ghost-sm" onClick={resumeWi}>→ Open in chat</button>}
           </div>
 
           {item.content && (

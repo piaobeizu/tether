@@ -45,6 +45,7 @@ type Config struct {
 	DevMode        bool   // if true, proxy SPA to DevFrontendURL
 	DevFrontendURL string // default http://localhost:5173 when DevMode=true
 	Token          string // static access token; empty = auto-generate from ~/.tether/access-token
+	Version        string // what GET /api/v1/version reports; see wire.VersionResponse
 	Registry       *session.Registry
 	WsRegistry     *workspace.Registry
 	SkillRegistry  *skill.Registry

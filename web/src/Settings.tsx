@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useStore } from './lib/store'
 import { Icon } from './lib/icons'
-import { APP_VERSION } from './lib/version'
+import { useAppVersion } from './lib/version'
 
 // Fired after a skill is installed/removed so other views (right-pane
 // SkillPane) can refetch. Mirrors the existing tether:provider-changed event.
@@ -25,6 +25,7 @@ interface Props {
 export function Settings({ onClose, initialTab = 'connection' }: Props) {
   const [tab, setTab] = useState<SettingsTab>(initialTab)
   const { connection } = useStore()
+  const appVersion = useAppVersion()
   const [isDark, setIsDark] = useState(
     document.documentElement.getAttribute('data-theme') === 'dark'
   )
@@ -144,7 +145,7 @@ export function Settings({ onClose, initialTab = 'connection' }: Props) {
     { id: 'skills',     label: 'skills',     sub: `${skills.length} installed` },
     { id: 'appearance', label: 'appearance', sub: isDark ? 'dark' : 'light' },
     { id: 'connection', label: 'connection', sub: connection.state },
-    { id: 'about',      label: 'about',      sub: APP_VERSION },
+    { id: 'about',      label: 'about',      sub: appVersion },
   ]
 
   return (
@@ -165,7 +166,7 @@ export function Settings({ onClose, initialTab = 'connection' }: Props) {
             <Icon name="x" size={15} />
           </button>
           <span style={{ fontWeight: 600, fontSize: 14 }}>Settings</span>
-          <span className="pill" style={{ marginLeft: 'auto', fontSize: 10 }}>{APP_VERSION}</span>
+          <span className="pill" style={{ marginLeft: 'auto', fontSize: 10 }}>{appVersion}</span>
         </div>
 
         <div className="settings-grid">
@@ -340,7 +341,7 @@ export function Settings({ onClose, initialTab = 'connection' }: Props) {
                 <div className="set-section">tether</div>
                 <div className="set-row">
                   <span className="set-label">Version</span>
-                  <span className="set-value mono">{APP_VERSION}</span>
+                  <span className="set-value mono">{appVersion}</span>
                 </div>
                 <div className="set-row">
                   <span className="set-label">Platform</span>

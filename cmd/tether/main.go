@@ -132,6 +132,10 @@ func newServerCmd() *cobra.Command {
 		Use:   "server",
 		Short: "Start the tether HTTP/3 + WebTransport server",
 		RunE: func(_ *cobra.Command, _ []string) error {
+			// Same resolver `tether version` uses, so GET /api/v1/version — and
+			// therefore the version shown in the UI — can never disagree with
+			// the CLI's answer for this binary.
+			cfg.Version = resolveVersion()
 			return server.Run(cfg)
 		},
 	}

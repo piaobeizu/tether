@@ -3,6 +3,7 @@ import { useStore } from './lib/store'
 import { Icon } from './lib/icons'
 import { Settings, type SettingsTab } from './Settings'
 import { useAppVersion } from './lib/version'
+import { clampRightWidth, loadRightWidth, DEFAULT_LEFT } from './lib/layout'
 import WorkspacePane from './panes/workspace'
 import SkillPane from './panes/skill'
 import ChatPane from './panes/chat'
@@ -32,8 +33,6 @@ export function loadRightTab(): RightTab {
 
 const MIN_LEFT  = 160
 const MAX_LEFT  = 480
-const MIN_RIGHT = 260
-const MAX_RIGHT = 600
 
 function loadWidth(key: string, fallback: number): number {
   const v = localStorage.getItem(key)
@@ -91,8 +90,13 @@ export default function App() {
   }
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null)
-  const [leftW,  setLeftW]  = useState(() => loadWidth(STORAGE_KEY_LEFT,  240))
-  const [rightW, setRightW] = useState(() => loadWidth(STORAGE_KEY_RIGHT, 380))
+  const [leftW,  setLeftW]  = useState(() => loadWidth(STORAGE_KEY_LEFT, DEFAULT_LEFT))
+  // tether#69 — clamped against the window being restored into, not just against
+  // constants: a width persisted on a wide monitor would otherwise crush the
+  // middle pane every time the app loads on a narrower one.
+  const [rightW, setRightW] = useState(() =>
+    loadRightWidth(localStorage.getItem(STORAGE_KEY_RIGHT), window.innerWidth, loadWidth(STORAGE_KEY_LEFT, DEFAULT_LEFT)),
+  )
   // Local-only UI dismissals; reset whenever the underlying connection state
   // changes so a fresh failure/reconnect re-surfaces the affordance.
   const [bannerDismissed, setBannerDismissed] = useState(false)
@@ -187,7 +191,7 @@ export default function App() {
   }
   const resizeRight = (dx: number) => {
     setRightW(w => {
-      const next = Math.max(MIN_RIGHT, Math.min(MAX_RIGHT, w - dx))
+      const next = clampRightWidth(w - dx, window.innerWidth, leftW)
       localStorage.setItem(STORAGE_KEY_RIGHT, String(next))
       return next
     })

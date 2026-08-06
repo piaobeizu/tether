@@ -221,6 +221,19 @@ export interface ProviderListResponse {
   providers: string[];
 }
 /**
+ * VersionResponse is the response body for GET /api/v1/version.
+ * The UI reads its version from here rather than from a constant of its own.
+ * The SPA is embedded in this binary, so the daemon's version IS the UI's
+ * version — and asking for it makes the two structurally incapable of
+ * disagreeing. A frontend-side literal had already drifted (the UI claimed
+ * v0.5.0 while the binary reported v0.5.1-…), which is the same failure as
+ * tether#67: a version string that reads like an authority but is wired to
+ * nothing.
+ */
+export interface VersionResponse {
+  version: string;
+}
+/**
  * ClientFrameKind is the discriminator for client→server frames sent on
  * the /wt/control bidi stream.
  */

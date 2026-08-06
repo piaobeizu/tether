@@ -2,7 +2,7 @@ import { lazy, Suspense, useEffect, useRef, useState } from 'react'
 import { useStore } from './lib/store'
 import { Icon } from './lib/icons'
 import { Settings, type SettingsTab } from './Settings'
-import { APP_VERSION } from './lib/version'
+import { useAppVersion } from './lib/version'
 import WorkspacePane from './panes/workspace'
 import SkillPane from './panes/skill'
 import ChatPane from './panes/chat'
@@ -102,6 +102,7 @@ export default function App() {
   // an exhausted reconnect ladder, which is the wrong story when the daemon
   // named a cause. See showBanner / showCatchupFailed.
   const { connection, sessionId, fatal } = useStore()
+  const appVersion = useAppVersion()
 
   useEffect(() => {
     setBannerDismissed(false)
@@ -392,7 +393,7 @@ export default function App() {
         </span>
         <span className="sb-cell mono">main</span>
         <span style={{ flex: 1 }} />
-        <span className="sb-cell mono">{APP_VERSION}</span>
+        <span className="sb-cell mono">{appVersion}</span>
       </div>
     </div>
   )

@@ -131,6 +131,10 @@ func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *ses
 		}
 	})
 
+	// The UI asks for the version instead of carrying its own copy, so the
+	// number on screen is always this binary's (see wire.VersionResponse).
+	mux.HandleFunc("/api/v1/version", handleVersion(cfg.Version))
+
 	// /mcp on HTTPS: served by MCPHTTPSHandler when store is configured (v0.3.2+).
 	// One handler instance is shared for both patterns so the SDK's session map
 	// is not split between /mcp and /mcp/ registrations.
@@ -196,7 +200,6 @@ func WithOriginGuard(port int, h http.Handler) http.Handler {
 	})
 }
 
-
 // originAllowed returns true when origin matches one of the daemon's own HTTPS
 // origins (127.0.0.1, localhost, or TETHER_HOST at the given port).
 //
@@ -205,6 +208,25 @@ func WithOriginGuard(port int, h http.Handler) http.Handler {
 // (no ":443"). Accept both the explicit-port and the bare form on 443, mirroring
 // the OAuth-issuer normalization in Run() (lifecycle.go). Without this, every
 // non-safe-method request (login, wt-ticket) is rejected 403 on a :443 host.
+// handleVersion serves GET /api/v1/version with the version it is given.
+//
+// Taking the string as an argument rather than reading a package global is what
+// makes the "does the value the daemon resolved actually reach the wire" hop
+// testable — the hop that, left unguarded, is how the UI ended up displaying a
+// number nobody had updated (tether#70).
+//
+// An empty version is reported verbatim as "": the UI shows a placeholder for
+// it, which is honest, whereas substituting a plausible default here would
+// recreate exactly the bug being fixed.
+func handleVersion(version string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(wire.VersionResponse{Version: version}); err != nil {
+			slog.Warn("version: encode error", "err", err)
+		}
+	}
+}
+
 func originAllowed(origin string, port int) bool {
 	suffixes := []string{fmt.Sprintf(":%d", port)}
 	if port == 443 {

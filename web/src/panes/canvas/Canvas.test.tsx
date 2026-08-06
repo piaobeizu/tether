@@ -218,9 +218,9 @@ describe('Canvas — home when nothing is selected (tether#33)', () => {
     mockFetchWorkspaces.mockResolvedValue([])
     render(<Canvas />)
     expect(screen.getByText('tether')).toBeTruthy()
-    expect(screen.getByText('对话')).toBeTruthy()
-    expect(screen.getByText('选个 wi')).toBeTruthy()
-    expect(screen.getByText('打开文件')).toBeTruthy()
+    expect(screen.getByText('Chat')).toBeTruthy()
+    expect(screen.getByText('Pick a wi')).toBeTruthy()
+    expect(screen.getByText('Open file')).toBeTruthy()
   })
 
   it('shows the primary workspace name + path (and count when multiple)', async () => {
@@ -240,7 +240,7 @@ describe('Canvas — home when nothing is selected (tether#33)', () => {
     mockFetchWorkspaces.mockRejectedValue(new Error('boom'))
     const { container } = render(<Canvas />)
     expect(screen.getByText('tether')).toBeTruthy()
-    expect(screen.getByText('对话')).toBeTruthy()
+    expect(screen.getByText('Chat')).toBeTruthy()
     // Flush microtasks + a macrotask so the rejected fetch fully settles; this
     // would catch a regression where the .catch erroneously set workspace state.
     await new Promise((r) => setTimeout(r, 0))
@@ -255,9 +255,9 @@ describe('Canvas — home when nothing is selected (tether#33)', () => {
     window.addEventListener('tether:select-tab', onSelect)
     window.addEventListener('tether:focus-files', onFocus)
     render(<Canvas />)
-    fireEvent.click(screen.getByText('对话'))
-    fireEvent.click(screen.getByText('选个 wi'))
-    fireEvent.click(screen.getByText('打开文件'))
+    fireEvent.click(screen.getByText('Chat'))
+    fireEvent.click(screen.getByText('Pick a wi'))
+    fireEvent.click(screen.getByText('Open file'))
     window.removeEventListener('tether:select-tab', onSelect)
     window.removeEventListener('tether:focus-files', onFocus)
     expect(events).toEqual(['select-tab:chat', 'select-tab:work', 'focus-files'])

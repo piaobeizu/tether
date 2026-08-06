@@ -35,19 +35,19 @@ describe('fmtThinkMs (tether#34)', () => {
 describe('ThinkingBlock (tether#34)', () => {
   it('renders live streaming thinking while live', () => {
     render(<ThinkingBlock thinking="pondering the plan" live expanded={false} onToggle={() => {}} />)
-    expect(screen.getByText('思考中…')).toBeTruthy()
+    expect(screen.getByText('thinking…')).toBeTruthy()
     expect(screen.getByText('pondering the plan')).toBeTruthy()
   })
 
-  it('collapses to a "思考 Xs" summary once no longer live, hiding the text', () => {
+  it('collapses to a "thought Xs" summary once no longer live, hiding the text', () => {
     render(<ThinkingBlock thinking="secret reasoning" thinkingMs={8000} live={false} expanded={false} onToggle={() => {}} />)
-    expect(screen.getByText('思考 8s')).toBeTruthy()
+    expect(screen.getByText('thought 8s')).toBeTruthy()
     expect(screen.queryByText('secret reasoning')).toBeNull()
   })
 
-  it('a collapsed thinking-only turn (no duration) still shows a bare "思考" summary', () => {
+  it('a collapsed thinking-only turn (no duration) still shows a bare "thought" summary', () => {
     render(<ThinkingBlock thinking="only thought" live={false} expanded={false} onToggle={() => {}} />)
-    expect(screen.getByText('思考')).toBeTruthy()
+    expect(screen.getByText('thought')).toBeTruthy()
     expect(screen.queryByText('only thought')).toBeNull()
   })
 
@@ -59,7 +59,7 @@ describe('ThinkingBlock (tether#34)', () => {
   it('clicking the collapsed summary calls onToggle', () => {
     const onToggle = vi.fn()
     render(<ThinkingBlock thinking="x" thinkingMs={8000} live={false} expanded={false} onToggle={onToggle} />)
-    fireEvent.click(screen.getByText('思考 8s'))
+    fireEvent.click(screen.getByText('thought 8s'))
     expect(onToggle).toHaveBeenCalledTimes(1)
   })
 
@@ -202,11 +202,11 @@ describe('ToolCallList (tether#37)', () => {
     expect(container.querySelector('.msg-tools')).toBeNull()
   })
 
-  it('folds beyond the threshold into a "用了 N 个工具" summary, hiding rows until expanded', () => {
+  it('folds beyond the threshold into a "used N tools" summary, hiding rows until expanded', () => {
     const { container } = render(<ToolCallList tools={mk(8)} />)
     expect(container.querySelectorAll('.msg-tool-row').length).toBe(0) // collapsed by default
     const fold = container.querySelector('.msg-tool-fold')!
-    expect(fold.textContent).toContain('用了 8 个工具')
+    expect(fold.textContent).toContain('used 8 tools')
     fireEvent.click(fold)
     expect(container.querySelectorAll('.msg-tool-row').length).toBe(8) // expanded
   })
@@ -227,7 +227,7 @@ describe('summarizeToolResult (tether#38)', () => {
     expect(summarizeToolResult('Bash', { content: '  go version go1.25  \nextra', isError: false })).toBe('go version go1.25')
   })
   it('marks errors and empty content', () => {
-    expect(summarizeToolResult('Bash', { content: 'boom', isError: true })).toBe('出错')
+    expect(summarizeToolResult('Bash', { content: 'boom', isError: true })).toBe('error')
     expect(summarizeToolResult('Read', { content: '', isError: false })).toBe('')
   })
 })
@@ -239,12 +239,12 @@ describe('truncateResult (tether#38)', () => {
   it('clamps by line count with a marker', () => {
     const out = truncateResult(Array.from({ length: 30 }, (_, i) => `L${i}`).join('\n'))
     expect(out.split('\n').length).toBe(21) // 20 kept + the marker line
-    expect(out.endsWith('…（已截断）')).toBe(true)
+    expect(out.endsWith('…(truncated)')).toBe(true)
   })
   it('clamps by char count with a marker', () => {
     const out = truncateResult('x'.repeat(3000))
     expect(out.length).toBeLessThan(3000)
-    expect(out.endsWith('…（已截断）')).toBe(true)
+    expect(out.endsWith('…(truncated)')).toBe(true)
   })
 })
 
@@ -261,7 +261,7 @@ describe('ToolCallList results (tether#38)', () => {
   })
   it('marks an error result with the err class on preview and block', () => {
     const { container } = render(<ToolCallList tools={withResult(true)} />)
-    expect(container.querySelector('.msg-tool-preview.err')?.textContent).toBe('出错')
+    expect(container.querySelector('.msg-tool-preview.err')?.textContent).toBe('error')
     fireEvent.click(container.querySelector('.msg-tool-row.clickable')!)
     expect(container.querySelector('.msg-tool-result.err')).toBeTruthy()
   })
@@ -297,12 +297,12 @@ describe('PermissionQueue (tether#40)', () => {
     expect(screen.getByText('Read')).toBeTruthy()
   })
 
-  it('two or more requests show a count header + 全部批准/全部拒绝 and one block each', () => {
+  it('two or more requests show a count header + Approve all / Deny all and one block each', () => {
     const { container } = render(<PermissionQueue requests={reqs(3)} onDecide={() => {}} onDecideAll={() => {}} />)
     expect(container.querySelectorAll('.perm-block').length).toBe(3)
     expect(container.querySelector('.perm-queue-count')?.textContent).toContain('3')
-    expect(screen.getByText('全部批准')).toBeTruthy()
-    expect(screen.getByText('全部拒绝')).toBeTruthy()
+    expect(screen.getByText('Approve all')).toBeTruthy()
+    expect(screen.getByText('Deny all')).toBeTruthy()
   })
 
   it('clicking a block Allow calls onDecide(id, true) for that request', () => {
@@ -319,12 +319,12 @@ describe('PermissionQueue (tether#40)', () => {
     expect(onDecide).toHaveBeenCalledWith('r0', false)
   })
 
-  it('全部批准 / 全部拒绝 call onDecideAll with the right flag', () => {
+  it('Approve all / Deny all call onDecideAll with the right flag', () => {
     const onDecideAll = vi.fn()
     render(<PermissionQueue requests={reqs(3)} onDecide={() => {}} onDecideAll={onDecideAll} />)
-    fireEvent.click(screen.getByText('全部批准'))
+    fireEvent.click(screen.getByText('Approve all'))
     expect(onDecideAll).toHaveBeenCalledWith(true)
-    fireEvent.click(screen.getByText('全部拒绝'))
+    fireEvent.click(screen.getByText('Deny all'))
     expect(onDecideAll).toHaveBeenCalledWith(false)
   })
 
@@ -336,7 +336,7 @@ describe('PermissionQueue (tether#40)', () => {
 })
 
 // tether#40 — postDecide is the by-id decide POST reused by both a single block
-// and the bulk 全部批准/全部拒绝 loop. Assert the endpoint contract (URL + body)
+// and the bulk Approve all / Deny all loop. Assert the endpoint contract (URL + body)
 // so a route/shape drift is caught (review nit: this was the untested seam).
 describe('postDecide (tether#40)', () => {
   afterEach(() => { vi.unstubAllGlobals() })

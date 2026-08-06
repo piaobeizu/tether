@@ -158,8 +158,8 @@ export default function DetailDrawer({
           <span className="work-drawer-handle" />
           <button
             className="icon-btn-sm"
-            title="关闭"
-            aria-label="关闭详情"
+            title="Close"
+            aria-label="Close detail"
             // don't let a pointerdown on × start a drag on the grip
             onPointerDown={(e) => e.stopPropagation()}
             onClick={onClose}

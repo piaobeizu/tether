@@ -577,7 +577,7 @@ export const useStore = create<AppState>((set, get) => ({
                   streaming: true,
                   // If a tool_use opened this bubble before any thinking (tether#37),
                   // thinkingStartTs is still null — stamp it at the first thinking
-                  // delta so the collapsed "思考 Xs" badge still measures (tether#34
+                  // delta so the collapsed "thought Xs" badge still measures (tether#34
                   // regression fix). No-op in the common thinking-first path where the
                   // new-bubble branch below already set it.
                   ...(s.thinkingStartTs == null ? { thinkingStartTs: Date.now() } : {}),
@@ -604,7 +604,7 @@ export const useStore = create<AppState>((set, get) => ({
           if (s.curTurnId) {
             // Append answer text to the current turn's bubble. On the FIRST answer
             // delta after thinking, stamp the thinking duration so the live
-            // "思考中…" block collapses to "思考 Xs" in place (tether#34).
+            // "thinking…" block collapses to "thought Xs" in place (tether#34).
             const id = s.curTurnId
             const started = s.thinkingStartTs
             return {

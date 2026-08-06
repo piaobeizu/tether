@@ -70,16 +70,16 @@ function CanvasHome() {
       )}
       <div className="canvas-home-actions">
         <button className="canvas-home-action" onClick={() => selectTab('chat')}>
-          <span className="canvas-home-glyph">▶</span> 对话
+          <span className="canvas-home-glyph">▶</span> Chat
         </button>
         <button className="canvas-home-action" onClick={() => selectTab('work')}>
-          <span className="canvas-home-glyph">◱</span> 选个 wi
+          <span className="canvas-home-glyph">◱</span> Pick a wi
         </button>
         <button
           className="canvas-home-action"
           onClick={() => window.dispatchEvent(new CustomEvent('tether:focus-files'))}
         >
-          <span className="canvas-home-glyph mono">⌘P</span> 打开文件
+          <span className="canvas-home-glyph mono">⌘P</span> Open file
         </button>
       </div>
     </div>

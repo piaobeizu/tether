@@ -1,11 +1,13 @@
 import { describe, it, expect } from 'vitest'
 import {
   clampRightWidth,
+  defaultRightWidth,
   loadRightWidth,
   MIN_RIGHT,
   MAX_RIGHT,
   MIN_MID,
   DEFAULT_RIGHT,
+  DEFAULT_RIGHT_SHARE,
 } from './layout'
 
 /** What the middle pane is left with for a given window/left/right. */
@@ -81,17 +83,75 @@ describe('clampRightWidth', () => {
   })
 })
 
+describe('defaultRightWidth', () => {
+  it('takes its share of the space beside the left pane', () => {
+    expect(defaultRightWidth(1440, 240)).toBe(Math.round(1200 * DEFAULT_RIGHT_SHARE))
+    expect(defaultRightWidth(1440, 240)).toBe(672)
+  })
+
+  it('falls back to the constant when the window cannot be measured', () => {
+    for (const bogus of [0, -1, NaN, Infinity]) {
+      expect(defaultRightWidth(bogus, 240)).toBe(DEFAULT_RIGHT)
+    }
+  })
+
+  it('treats a negative left width as zero rather than widening the right pane', () => {
+    expect(defaultRightWidth(1440, -1000)).toBe(defaultRightWidth(1440, 0))
+  })
+
+  // The constant is only reachable through the bogus-window branch, but it is
+  // still a default width, so it has to satisfy the same property as the
+  // computed one on the viewport it is nominally sized for.
+  it('the fallback constant would itself be the widest pane at 1440/240', () => {
+    expect(DEFAULT_RIGHT).toBeGreaterThan(mid(1440, 240, DEFAULT_RIGHT))
+  })
+})
+
 describe('loadRightWidth', () => {
-  it('uses the default when nothing was persisted', () => {
-    expect(loadRightWidth(null, 1920, 240)).toBe(DEFAULT_RIGHT)
+  it('uses the viewport-derived default when nothing was persisted', () => {
+    expect(loadRightWidth(null, 1920, 240)).toBe(defaultRightWidth(1920, 240))
   })
 
   it.each([['', 'empty'], ['abc', 'garbage'], ['0', 'zero'], ['-40', 'negative']])(
     'falls back to the default for a %s stored value (%s)',
     (stored) => {
-      expect(loadRightWidth(stored, 1920, 240)).toBe(DEFAULT_RIGHT)
+      expect(loadRightWidth(stored, 1920, 240)).toBe(defaultRightWidth(1920, 240))
     },
   )
+
+  // tether#71 — the point of the whole item. The right pane is the primary
+  // column, so on a first visit it must be the WIDEST column, not merely a
+  // usable one. Stated over a table because a single-viewport assertion is
+  // exactly the bug being fixed: DEFAULT_RIGHT = 560 was "correct" at 1274px
+  // and nowhere anyone actually works.
+  it.each([1280, 1366, 1440, 1536, 1600, 1920])(
+    'makes the right pane the widest pane on a first visit at %ipx',
+    (windowWidth) => {
+      const left = 240
+      const right = loadRightWidth(null, windowWidth, left)
+      expect(right).toBeGreaterThan(0) // never pass on an absent measurement
+      expect(right).toBeGreaterThan(mid(windowWidth, left, right))
+      expect(mid(windowWidth, left, right)).toBeGreaterThanOrEqual(MIN_MID)
+    },
+  )
+
+  // The band has an upper edge, and it is MAX_RIGHT's doing rather than an
+  // oversight: past roughly MAX_RIGHT/SHARE of available width the cap binds and
+  // the middle pane is wider again. Asserted so the ceiling is a decision on
+  // record — a 1300px chat column is not what "primary" should mean.
+  it('lets MAX_RIGHT win on a very wide monitor, leaving the middle wider', () => {
+    const right = loadRightWidth(null, 2560, 240)
+    expect(right).toBe(MAX_RIGHT)
+    expect(right).toBeLessThan(mid(2560, 240, right))
+  })
+
+  it('still clamps the default so the middle pane survives a narrow window', () => {
+    // 900 - 240 = 660 beside the left pane; the share would ask for 370 and the
+    // MIN_MID rule allows 340. The guarantee outranks the preference.
+    const right = loadRightWidth(null, 900, 240)
+    expect(right).toBeLessThan(defaultRightWidth(900, 240))
+    expect(mid(900, 240, right)).toBeGreaterThanOrEqual(MIN_MID)
+  })
 
   it('restores a persisted width unchanged when it still fits', () => {
     expect(loadRightWidth('700', 1920, 240)).toBe(700)

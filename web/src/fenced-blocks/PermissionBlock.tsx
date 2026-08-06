@@ -3,7 +3,7 @@ import type { PermissionRequest } from '../lib/store'
 // postDecide — POST a single approve/deny decision (D-05b §6.2). Keyed by
 // requestId, so parallel requests are each decided independently (tether#40).
 // The /decide endpoint stays cookie-gated (tether#39), so this same-origin fetch
-// carries the auth cookie. Exported so the bulk 全部批准/全部拒绝 toolbar reuses it.
+// carries the auth cookie. Exported so the bulk approve-all/deny-all toolbar reuses it.
 export async function postDecide(requestId: string, allow: boolean): Promise<void> {
   await fetch(`/api/v1/agent/permission/${requestId}/decide`, {
     method: 'POST',
@@ -46,13 +46,13 @@ interface QueueProps {
   requests: PermissionRequest[]
   /** Decide one request by id (parent does postDecide + resolvePermission). */
   onDecide: (id: string, allow: boolean) => void
-  /** Decide every queued request at once (全部批准/全部拒绝). */
+  /** Decide every queued request at once (Approve all / Deny all). */
   onDecideAll: (allow: boolean) => void
 }
 
 // PermissionQueue — renders ALL pending permission requests (tether#40). A single
 // request shows just its block (keeps the minimal look); two or more add a header
-// with the count and 全部批准/全部拒绝 bulk shortcuts. Each block decides
+// with the count and Approve all / Deny all bulk shortcuts. Each block decides
 // independently by id, so a parallel-tool turn no longer clobbers all-but-one
 // request into a timeout (the old single-slot pendingPermission bug).
 export function PermissionQueue({ requests, onDecide, onDecideAll }: QueueProps) {
@@ -64,10 +64,10 @@ export function PermissionQueue({ requests, onDecide, onDecideAll }: QueueProps)
           <span className="perm-queue-count">Tool requests ({requests.length})</span>
           <span className="perm-queue-bulk">
             <button type="button" className="perm-btn perm-btn-allow" onClick={() => onDecideAll(true)}>
-              全部批准
+              Approve all
             </button>
             <button type="button" className="perm-btn perm-btn-deny" onClick={() => onDecideAll(false)}>
-              全部拒绝
+              Deny all
             </button>
           </span>
         </div>

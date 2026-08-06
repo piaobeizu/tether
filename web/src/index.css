@@ -372,6 +372,22 @@ body {
 }
 .ws-tree { padding: 2px 0 6px 12px; }
 
+/* tether#71 — per-row hide control and the "+N hidden" fold.
+   Hover-only, mirroring .ws-remove-btn: the tree is read far more often than it
+   is configured, so the affordance stays out of the reading path. */
+.tree-hide-btn {
+  background: none; border: 0; color: var(--ink-quat); cursor: pointer;
+  padding: 0; width: 12px; text-align: center;
+  font-size: 11px; line-height: 1;
+  flex-shrink: 0; opacity: 0; transition: opacity .1s;
+}
+.tree-row:hover .tree-hide-btn, .tree-hide-btn:focus-visible { opacity: 1; }
+.tree-hide-btn:hover { color: var(--ink-secondary); }
+/* A revealed hidden row stays visibly set apart, so "shown for now" never reads
+   as "not hidden any more". */
+.tree-row-hidden .tree-label { opacity: .45; font-style: italic; }
+.tree-hidden-row .tree-label { color: var(--ink-quat); font-size: 10.5px; }
+
 /* ── Middle pane ────────────────────────────────────────────── */
 .dt-mid {
   background: var(--bg-app);

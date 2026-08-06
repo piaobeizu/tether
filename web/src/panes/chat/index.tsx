@@ -274,7 +274,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   })
   // Which message ids have their collapsed thinking block expanded (tether#34).
   // Live thinking (before the answer) always renders expanded; once the answer
-  // starts it collapses to a one-line "思考 Xs" summary that this Set re-opens.
+  // starts it collapses to a one-line "thought Xs" summary that this Set re-opens.
   const [expandedThinking, setExpandedThinking] = useState<Set<string>>(() => new Set())
   const toggleThinking = (id: string) => setExpandedThinking(prev => {
     const next = new Set(prev)
@@ -1191,7 +1191,7 @@ interface ThinkingBlockProps {
    *  (it is the store's thinkingBufId). Goes false the moment the answer starts
    *  OR the turn ends (result/error) — either way the block collapses, so a
    *  thinking-only turn (e.g. thinking → tool_use with no answer text) does not
-   *  get stuck showing "思考中…" forever. */
+   *  get stuck showing "thinking…" forever. */
   live: boolean
   expanded: boolean
   onToggle: () => void
@@ -1239,7 +1239,7 @@ export function AnswerBody({ text, streaming }: { text: string; streaming: boole
 // bubble; this renders them as a compact activity log above the answer — one
 // line per call: icon + name + a best-effort one-line arg summary. A turn can
 // fire 10+ tools, so beyond TOOL_FOLD_THRESHOLD they collapse behind a
-// "用了 N 个工具" toggle. No tool result (that needs daemon tool_result parsing —
+// "used N tools" toggle. No tool result (that needs daemon tool_result parsing —
 // a later slice).
 const TOOL_FOLD_THRESHOLD = 5
 
@@ -1274,7 +1274,7 @@ export function summarizeToolInput(name: string, input: unknown): string {
 // short marker, else the first non-empty output line (truncated). Best-effort +
 // defensive; '' when there's nothing useful to preview. Exported for tests.
 export function summarizeToolResult(name: string, result: { content: string; isError: boolean }): string {
-  if (result.isError) return '出错'
+  if (result.isError) return 'error'
   const c = result.content ?? ''
   if (!c) return ''
   if (name === 'Read' || name === 'Write' || name === 'Edit' || name === 'NotebookEdit') {
@@ -1301,7 +1301,7 @@ export function truncateResult(s: string): string {
   if (out.length > RESULT_MAX_CHARS) { out = out.slice(0, RESULT_MAX_CHARS); cut = true }
   const lines = out.split('\n')
   if (lines.length > RESULT_MAX_LINES) { out = lines.slice(0, RESULT_MAX_LINES).join('\n'); cut = true }
-  return cut ? out + '\n…（已截断）' : out
+  return cut ? out + '\n…(truncated)' : out
 }
 
 // ToolCallList — the per-turn tool activity log. Each row shows the call
@@ -1326,7 +1326,7 @@ export function ToolCallList({ tools }: { tools: ToolCall[] }) {
       {foldable && (
         <button type="button" className="msg-tool-fold" onClick={() => setOpen(o => !o)} aria-expanded={open}>
           <span className="msg-thinking-chevron">{open ? '⌄' : '›'}</span>
-          <span>{open ? `${tools.length} 个工具` : `用了 ${tools.length} 个工具`}</span>
+          <span>{open ? `${tools.length} tools` : `used ${tools.length} tools`}</span>
         </button>
       )}
       {!rowsHidden && tools.map((t, i) => {
@@ -1363,15 +1363,15 @@ export function ToolCallList({ tools }: { tools: ToolCall[] }) {
 }
 
 // Extended-thinking display (tether#34). While thinking is live it renders
-// expanded ("思考中…"); once it stops being live (answer began, or turn ended)
-// it collapses to a one-line "思考 Xs" summary that clicking re-expands.
+// expanded ("thinking…"); once it stops being live (answer began, or turn ended)
+// it collapses to a one-line "thought Xs" summary that clicking re-expands.
 // Exported and prop-controlled so it unit-tests directly, without the ChatPane
 // WebTransport wiring.
 export function ThinkingBlock({ thinking, thinkingMs, live, expanded, onToggle }: ThinkingBlockProps) {
   if (live) {
     return (
       <div className="msg-thinking msg-thinking-live">
-        <div className="msg-thinking-label">思考中…</div>
+        <div className="msg-thinking-label">thinking…</div>
         <div className="msg-thinking-text"><Markdown text={thinking} /></div>
       </div>
     )
@@ -1381,7 +1381,7 @@ export function ThinkingBlock({ thinking, thinkingMs, live, expanded, onToggle }
     <div className="msg-thinking msg-thinking-done">
       <button type="button" className="msg-thinking-toggle" onClick={onToggle} aria-expanded={expanded}>
         <span className="msg-thinking-chevron">{expanded ? '⌄' : '›'}</span>
-        <span className="msg-thinking-summary">思考{dur ? ` ${dur}` : ''}</span>
+        <span className="msg-thinking-summary">thought{dur ? ` ${dur}` : ''}</span>
       </button>
       {expanded && <div className="msg-thinking-text"><Markdown text={thinking} /></div>}
     </div>

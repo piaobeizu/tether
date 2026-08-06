@@ -177,7 +177,7 @@ export default function WorkGraphView() {
               // While searching the whole project is shown, so the mode filter is
               // inert — disable it to signal the search override (tether#29).
               disabled={searching}
-              title={searching ? '搜索时显示全部（清空搜索恢复筛选）' : undefined}
+              title={searching ? 'search shows everything — clear the search to filter again' : undefined}
               onClick={() => setMode(m)}
             >
               {m}
@@ -189,7 +189,7 @@ export default function WorkGraphView() {
             className="fg-type-select"
             value={typeF}
             disabled={searching}
-            title={searching ? '搜索时显示全部（清空搜索恢复筛选）' : undefined}
+            title={searching ? 'search shows everything — clear the search to filter again' : undefined}
             onChange={(e) => setTypeF(e.target.value)}
           >
             <option value="">all types</option>

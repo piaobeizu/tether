@@ -237,7 +237,7 @@ describe('store tool-call visibility (tether#37)', () => {
 
   it('a tool call BEFORE thinking still stamps thinkingMs (review MINOR: #34 badge regression)', () => {
     // tool_use opens the bubble first, so thinking takes the append path — which
-    // must still start the thinking clock, else the "思考 Xs" badge never measures.
+    // must still start the thinking clock, else the "thought Xs" badge never measures.
     const h = useStore.getState().handleEnvelope
     h(toolEnv('Read', { file_path: 'a.ts' }))
     h(thinkingEnv('now pondering'))

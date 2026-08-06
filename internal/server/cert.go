@@ -109,6 +109,13 @@ func GenerateCert() (CertBundle, error) {
 		return CertBundle{}, fmt.Errorf("X509KeyPair: %w", err)
 	}
 
+	// Set Leaf explicitly instead of relying on X509KeyPair to have done it.
+	// That behaviour is GODEBUG-gated (crypto/tls honours x509keypairleaf=0),
+	// so an operator can turn it off and leave Leaf nil — and callers here do
+	// dereference it, e.g. the rotation loop reads Leaf.NotAfter. We already
+	// have the parsed cert, so there is no reason to depend on the toggle.
+	tlsCert.Leaf = parsed
+
 	return CertBundle{
 		TLS:  tlsCert,
 		DER:  sha256.Sum256(der),

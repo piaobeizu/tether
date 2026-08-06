@@ -22,6 +22,39 @@ import (
 	"github.com/piaobeizu/tether/internal/workspace"
 )
 
+// handleCertHash serves one of the certificate fingerprints as 64 hex chars.
+//
+// The hash is read from the holder per request rather than precomputed: the
+// browser pins whatever this endpoint returns, so after a rotation it has to
+// describe the cert the listener is actually presenting. A value captured at
+// startup — which is what this replaced — would keep handing out the hash of a
+// cert that is no longer served, and the WT handshake would fail outright.
+// That is a worse failure than the expiry the rotation exists to prevent, so
+// the hash and the served cert have to move together.
+//
+// When using a CA-signed cert (--cert-file or ACME), do NOT serve the hash —
+// W3C serverCertificateHashes requires ≤14d validity + ECDSA P-256 +
+// self-signed. Letting the browser pin a hash for a CA cert that violates
+// these constraints causes Chrome to reject the WT connection silently with
+// QUIC_NETWORK_IDLE_TIMEOUT. With 404, wt.ts falls back to standard CA
+// validation (which works for any browser-trusted cert).
+func handleCertHash(certs *certHolder, pick func(CertBundle) [32]byte) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		b := certs.Get()
+		if b.External {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		// This value used to be fixed for the life of the process; now it
+		// changes when the cert rotates. A cached copy would be the hash of a
+		// cert the server no longer presents, which is exactly the failure the
+		// per-request read exists to avoid.
+		w.Header().Set("Cache-Control", "no-store")
+		fmt.Fprintln(w, HashHex(pick(b)))
+	}
+}
+
 // buildMux constructs the shared route table used by both the TCP and UDP
 // listeners. Routes per §10.B.4:
 //
@@ -34,34 +67,11 @@ import (
 //	/wt/events      → broadcast events channel (s4)
 //	/wt/control     → client→server control channel: ping/pong RTT, action callbacks (tether#8 F1)
 //	/wt/_smoke      → WT bidi pure-byte echo (D-22 §6 #2 acceptance gate)
-func buildMux(cfg *Config, bundle CertBundle, wts *webtransport.Server, reg *session.Registry, pm *permission.Manager, authState *auth.State, mcpSrv *mcp.Server, mcpTokens *apitoken.Store, oauthH *oauth.Handlers, lm *mcplifecycle.LifecycleManager) http.Handler {
+func buildMux(cfg *Config, certs *certHolder, wts *webtransport.Server, reg *session.Registry, pm *permission.Manager, authState *auth.State, mcpSrv *mcp.Server, mcpTokens *apitoken.Store, oauthH *oauth.Handlers, lm *mcplifecycle.LifecycleManager) http.Handler {
 	mux := http.NewServeMux()
 
-	derHex := HashHex(bundle.DER)
-	spkiHex := HashHex(bundle.SPKI)
-
-	// When using a CA-signed cert (--cert-file), do NOT serve the hash —
-	// W3C serverCertificateHashes requires ≤14d validity + ECDSA P-256 +
-	// self-signed. Letting the browser pin a hash for a CA cert that
-	// violates these constraints causes Chrome to reject the WT connection
-	// silently with QUIC_NETWORK_IDLE_TIMEOUT. With 404, wt.ts falls back
-	// to standard CA validation (which works for any browser-trusted cert).
-	mux.HandleFunc("/cert-hash", func(w http.ResponseWriter, r *http.Request) {
-		if bundle.External {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		fmt.Fprintln(w, derHex)
-	})
-	mux.HandleFunc("/cert-hash-spki", func(w http.ResponseWriter, r *http.Request) {
-		if bundle.External {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		fmt.Fprintln(w, spkiHex)
-	})
+	mux.HandleFunc("/cert-hash", handleCertHash(certs, func(b CertBundle) [32]byte { return b.DER }))
+	mux.HandleFunc("/cert-hash-spki", handleCertHash(certs, func(b CertBundle) [32]byte { return b.SPKI }))
 
 	// WT smoke-test echo (D-22 §6 #2): pure byte echo, no prefix, no framing.
 	mux.HandleFunc("/wt/_smoke", func(w http.ResponseWriter, r *http.Request) {

@@ -124,7 +124,10 @@ func checkCertState(verbose bool) CheckResult {
 	}
 	remaining := time.Until(cert.NotAfter)
 	if remaining < 24*time.Hour {
-		return CheckResult{Name: "cert-state", OK: false, Message: fmt.Sprintf("cert expires in %v (< 24h); restart server to rotate", remaining.Round(time.Minute))}
+		// A running server rotates on its own within the hour, so seeing this
+		// against a live daemon means the rotation loop is failing (check the
+		// log for "cert rotation failing") — not that a restart is owed.
+		return CheckResult{Name: "cert-state", OK: false, Message: fmt.Sprintf("cert expires in %v (< 24h); a running server rotates within the hour — if it has not, check ~/.tether writability", remaining.Round(time.Minute))}
 	}
 	r := CheckResult{Name: "cert-state", OK: true, Message: fmt.Sprintf("cert valid, expires in %v", remaining.Round(time.Hour))}
 	if verbose {

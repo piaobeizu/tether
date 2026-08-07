@@ -134,6 +134,37 @@ export const ErrCodeSessionUnconfirmed: ErrorCode = "session_unconfirmed";
  */
 export const ErrCodeAgent: ErrorCode = "agent_error";
 /**
+ * ErrCodePromptUndelivered means the user's prompt did not reach any agent
+ * and no further recovery is coming for it (session/attach.go reopen, on
+ * every branch that gives up rather than the ones that hand the problem to
+ * machinery which will retry).
+ * Named for the prompt rather than for the session because the session
+ * state differs across those branches while the user-visible fact does
+ * not: the reopen budget may be spent, or a live replacement may have been
+ * found and refused the prompt anyway. All of them mean the same thing to
+ * the person who just pressed enter — those words are gone — and that is
+ * what the message needs to say.
+ * Retryable, and deliberately: the attachment was armed — either its session
+ * confirmed, or it reused one that was live — so an ordinary reconnect lands
+ * on the `--resume` path, which has its full fallback machinery behind it
+ * for the case where the transcript turns out not to exist, and a fresh
+ * attachment gets a fresh reopen budget. Marking it terminal would stop the
+ * browser's ladder on the one failure a reconnect actually fixes.
+ * "Armed" and not "confirmed": reopenSID has two arming sites of different
+ * strength and session/attach.go is explicit that collapsing them is wrong
+ * ("Do not collapse these two into 'armed ⟹ the transcript exists'"). The
+ * reuse site observes only liveEntry, so this code can reach the browser
+ * from an attachment whose session never emitted a session id. The verdict
+ * is the same either way, which is exactly why it is worth stating the
+ * weaker premise it actually rests on.
+ * Not ErrCodeAgent, which would be the closest existing fit and is wrong
+ * in the way that matters here: that code means the agent REPORTED
+ * something about a turn it is still able to continue. On these branches
+ * the agent said nothing at all — it died, or was never reachable — and
+ * the connection is not usable until it is remade.
+ */
+export const ErrCodePromptUndelivered: ErrorCode = "prompt_undelivered";
+/**
  * ErrorPayload is the Payload of a KindError Envelope once it carries a Code.
  * Message is unchanged from the pre-tether#63 behaviour (cc's error text, or a
  * hand-written sentence) and is human-readable but NOT parsed by the browser;

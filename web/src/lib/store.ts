@@ -1,5 +1,9 @@
 import { create } from 'zustand'
 import type { Envelope, ErrorPayload, FencedBlock } from './wire.gen'
+// A value import, not a type: the generated const is the single source of the
+// code string, so a rename on the Go side breaks this at build time instead of
+// silently un-gating the branch below (tether#77).
+import { ErrCodePromptUndelivered } from './wire.gen'
 
 /** A single tool_use content block the daemon already extracts and puts on the
  *  wire ({name,input}); tether#37 is where the frontend finally KEEPS it instead
@@ -661,6 +665,74 @@ export const useStore = create<AppState>((set, get) => ({
         const parsed = parseErrorPayload(env.payload)
         if (parsed && parsed.terminal) {
           set({ fatal: { code: parsed.code, message: parsed.message } })
+          break
+        }
+        // tether#77 — a prompt_undelivered error used to stop here, having done
+        // nothing but clear the spinner above. That is not a small omission:
+        // the daemon classified an error, decided it was worth a frame, sent
+        // it, and the user saw a tab that looked idle and healthy. Every prompt
+        // typed afterwards vanished the same way. The daemon-side half of #77
+        // (attach.go's reopen now classifying the branches where a prompt is
+        // gone for good) would have changed nothing at all without this line —
+        // the frame would have arrived and been dropped right here.
+        //
+        // Gated on the ONE code that means "the words you just sent are gone",
+        // not on `!terminal`, which is a much larger set and a different claim.
+        // The other retryable codes are all excluded for a reason:
+        //
+        //   - connection_closed is produced when the browser's own context is
+        //     already done, so there is nobody left to show it to.
+        //   - spawn_failed and session_unconfirmed accompany a connection the
+        //     daemon is closing. The reconnect ladder and its failed card
+        //     already speak for those, and each ladder attempt would add
+        //     another copy of the same line.
+        //   - agent_error is the important one to leave out. It arrives on a
+        //     LIVE session, does not close the connection, and is not bounded
+        //     by anything: opencode emits one for every concurrent prompt, so
+        //     an ordinary busy session would stack them here for as long as the
+        //     tab lives. That those errors are invisible today is a real gap,
+        //     but it is a different one — the session is fine and the message
+        //     is about the turn's content, not about a prompt being lost — and
+        //     answering it by aliasing it onto this line would be wrong even
+        //     where it is not noisy. Tracked as its own wi.
+        //
+        // It lands in `notices`, not `messages`, for tether#57's reason: a
+        // history refetch replaces `messages` wholesale, and an explanation of
+        // why the last thing you typed did not happen is exactly the thing that
+        // must not disappear when the transcript reloads.
+        //
+        // NOT deduplicated against the previous notice, unlike the session
+        // notice above. That dedup exists because its text is a compile-time
+        // constant that a long-lived tab can stack identical copies of with no
+        // new information. These correspond one-to-one with a prompt the user
+        // pressed enter on, so three identical lines are three lost prompts —
+        // collapsing them would under-report exactly the thing being reported.
+        //
+        // Prefixed, because `message` is the daemon's diagnostic text (session
+        // ids, `write |1: broken pipe`) and the one thing the user needs from
+        // it is the part the daemon never says: their message did not go.
+        if (parsed && parsed.code === ErrCodePromptUndelivered) {
+          set((s) => ({
+            notices: [...s.notices, {
+              id: crypto.randomUUID(),
+              text: `Message not delivered — ${parsed.message}`,
+              // Strictly after everything already in the transcript, which is
+              // this line's meaning: it explains the last thing the user sent,
+              // so reading above that prompt inverts it. A bare Date.now() is
+              // not enough — mergeTranscript inserts a notice before the first
+              // message whose ts is at or AFTER its own, so a tie puts the
+              // notice first, and the prompt and its failure land in the same
+              // millisecond often enough that a test written the obvious way
+              // caught it. The tie-break itself is right for tether#50's
+              // session-level banner and only wrong for a per-prompt line like
+              // this one, so the fix belongs here.
+              //
+              // This also absorbs the clock skew mergeTranscript's doc warns
+              // about (history carries the DAEMON's clock, live bubbles the
+              // browser's): whatever those stamps say, this lands last.
+              ts: Math.max(Date.now(), (s.messages.at(-1)?.ts ?? 0) + 1),
+            }],
+          }))
         }
         break
       }

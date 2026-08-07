@@ -140,11 +140,13 @@ type Session interface {
 	// non-blocking answer can be (the agent may be exiting as the call returns).
 	// Callers must still handle SendPrompt errors; Alive exists to stop them
 	// ADOPTING a session that is already known-dead, not to make error handling
-	// unnecessary. Worth knowing that today's chat path does NOT yet convert such
-	// an error into recovery — internal/server/wt_chat.go logs it and moves on —
-	// so a session that dies AFTER it was adopted still loses its turn. Closing
-	// that needs the third attachment state described in
-	// session.Registry.Attach, not a stronger promise from this method.
+	// unnecessary. Since tether#59 the chat path does convert such an error into
+	// recovery — session.Attachment.SendPrompt re-opens a session it had REUSED, by
+	// resuming that same sid — and it does so from the error alone, deliberately
+	// without consulting this method, because "true" here is compatible with a
+	// process that has already exited (see the window note below). That is the
+	// third attachment state described in session.Registry.Attach; it needed no
+	// stronger promise from this method, and must not be given one.
 	//
 	// # Must not block
 	//

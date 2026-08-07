@@ -698,6 +698,27 @@ func (e *Entry) setOwner(clientID string) bool {
 	return true
 }
 
+// owner returns the client id recorded on this entry, or "" if nobody has claimed
+// it. It exists for Attachment.reopen, which carries an existing claim onto the
+// session it re-opens: a recovery that silently returned the conversation to unowned
+// would let a different client join what it was refused moments earlier.
+//
+// Read under subsMu, the lock setOwner writes it under — and the guard is not
+// decoration even though ownerClientID is a single word: setOwner runs from
+// serveChat's own goroutine while reopen reads this from the prompt reader, so an
+// unguarded read here is a data race in the ordinary two-goroutine case, not an
+// exotic one. It is pinned by TestEntryOwner_ReadIsGuardedAgainstAConcurrentClaim,
+// which needs -race to fail (this repo's baseline).
+//
+// Note what this deliberately is NOT: a sid-keyed Registry.Owner. Ownership is asked
+// of the entry you are already holding — re-deriving it from the map is the shape of
+// the bug tether#54 removed (see setOwner above).
+func (e *Entry) owner() string {
+	e.subsMu.RLock()
+	defer e.subsMu.RUnlock()
+	return e.ownerClientID
+}
+
 // IsLive returns true if the session exists AND its agent has not exited.
 //
 // NOT a pure predicate: like every liveEntry caller it UNREGISTERS a session it
@@ -1056,6 +1077,49 @@ func (r *Registry) fanOut(e *Entry) {
 			continue
 		}
 		r.broadcast(e, *env)
+	}
+
+	// The stream has ENDED, and if this session ever init'd it may have died in the
+	// middle of a turn. Close that turn, because nothing else will (tether#59):
+	// ccSession.readLoop just runs `defer close(s.events)` with no terminal event,
+	// evict only deletes registry keys, and the subscriber channel is never closed —
+	// so a mid-answer death leaves the browser on "thinking…" until its transport
+	// dies, which for a live daemon is never.
+	//
+	// tether#58 already shipped this answer for the OTHER provider, inside the
+	// provider: opencodeSession.watchServeExit emits a terminal EventError before
+	// closeEvents, and its comment states this same symptom and why honest liveness
+	// does not cure it ("Alive() is only consulted on the NEXT attach, so it saves the
+	// next turn, not this one"). cc cannot be given the same treatment from inside —
+	// readLoop learns of the death by its scan loop simply ending — so the daemon's
+	// own seam is where it belongs, and this is the seam: one goroutine per Entry
+	// whose whole job is the session's event stream, already deferring teardown on
+	// exactly this signal.
+	//
+	// sawInit is the entire discriminator, and it is what keeps this from undoing
+	// tether#50. A FAILED `--resume` produces a stream that closes without ever
+	// emitting init, and its turn must stay OPEN so Attachment.resolve can fall back,
+	// replay, and let the REPLACEMENT close it — the same condition, for the same
+	// reason, as the empty-result suppression above.
+	//
+	// Flush and FinalizeAssistant, not merely the envelope, so the half-answer the
+	// agent did produce is not abandoned in two places: the fence parser (harmless —
+	// it dies with the entry) and, load-bearing, HistoryStore's per-SID pending
+	// buffer, where the next FinalizeAssistant for that sid would glue it onto the
+	// front of whatever answers next under the same id — a recovered session
+	// (tether#59) or any later resume. Finalizing here makes the dead session's
+	// fragment its own assistant message instead.
+	if sawInit {
+		emitSegments(e.fenceParser.Flush())
+		if r.History != nil && sid != "" {
+			r.History.FinalizeAssistant(sid)
+		}
+		// No payload: KindResult's payload is a stop reason and there is no honest one
+		// to report — the agent did not say why it stopped, it stopped saying anything.
+		// The frontend's 'result' branch only calls finalizeTurn and paints nothing
+		// (web/src/lib/store.ts), and finalizeTurn is idempotent, so this is also free
+		// on the ordinary path where a completed turn already closed itself.
+		r.broadcast(e, wire.Envelope{Kind: wire.KindResult})
 	}
 }
 

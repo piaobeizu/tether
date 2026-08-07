@@ -39,10 +39,22 @@ type fakeSession struct {
 	// an atomic because a test flips it from one goroutine while the registry
 	// reads it from another (and -race would otherwise flag the reuse tests).
 	dead atomic.Bool
+	// sendFails, when set, makes SendPrompt refuse like the broken pipe a write to
+	// an exited cc's stdin produces, WITHOUT the session losing its cached sid —
+	// the mid-turn death tether#59 recovers from. Atomic for the same reason as
+	// dead. Default false, so every test written before it keeps describing a
+	// session that accepts prompts.
+	//
+	// A refused prompt is counted (Refused) rather than appended to prompts: the
+	// write failed, so the agent never saw it, and a test asking "what did this
+	// session receive" must not be told about a prompt that went nowhere.
+	sendFails atomic.Bool
 
 	mu             sync.Mutex
 	prompts        []string
 	interruptCalls int
+	// refused counts SendPrompt calls rejected because sendFails was set.
+	refused int
 	// closes counts Close() calls so a test can assert the session's agent was
 	// REAPED on teardown and not merely un-registered (tether#56). Counted rather
 	// than flagged because "exactly once" is the property that matters: fanOut's
@@ -74,8 +86,40 @@ func (f *fakeSession) Alive() bool { return !f.dead.Load() }
 func (f *fakeSession) SendPrompt(_ context.Context, text string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.sendFails.Load() {
+		f.refused++
+		return errBrokenPipe
+	}
 	f.prompts = append(f.prompts, text)
 	return nil
+}
+
+// kill puts this session in the state an exited cc leaves behind MID-TURN
+// (tether#59): Alive() reports false, SendPrompt fails with the broken pipe a
+// write to a dead process's stdin produces, and SessionID() keeps handing back the
+// id it cached at init.
+//
+// Both flags together, because that is the only combination a real provider
+// produces once its process is gone, and each half alone models something that
+// cannot happen for long: a corpse that still takes prompts, or a dead process
+// that reports itself healthy forever. (Tests that only need the REUSE gate's view
+// still set dead alone — they never send to the corpse, so its stdin never
+// matters.)
+//
+// It deliberately does NOT close the event stream. The entry's fanOut is what
+// drains that, and a test held inside "the process is gone, its stream has not
+// closed yet" is what makes a Close() attributable — see deadSession.dying for the
+// same trick on the failed-resume path.
+func (f *fakeSession) kill() {
+	f.dead.Store(true)
+	f.sendFails.Store(true)
+}
+
+// Refused returns how many SendPrompt calls this session rejected.
+func (f *fakeSession) Refused() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.refused
 }
 func (f *fakeSession) Events() <-chan agent.Event { return f.events }
 func (f *fakeSession) Interrupt() error {

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   useStore, mergeTranscript, parseErrorPayload, rememberedWorkspaceId, WORKSPACE_ID_KEY,
+  appendAgentErrorNotice, nextNoticeTs, AGENT_ERROR_NOTICE_LIMIT,
   type Message, type Notice,
 } from './store'
 import type { Envelope } from './wire.gen'
@@ -972,7 +973,12 @@ describe('store retryable error visibility (tether#77)', () => {
 // because a review mutation that widened it back to every retryable code
 // survived the entire suite. It is the largest behavioural decision in this
 // change and it was, until these two cases, written down nowhere but a comment.
-describe('store retryable error visibility is scoped to prompt_undelivered (tether#77)', () => {
+//
+// tether#80 moved one code out of the excluded set: agent_error now has its OWN
+// branch and its own sentence (see below). The three that remain are excluded
+// for reasons that have nothing to do with noise, so they are still asserted
+// here — widening the gate to `!terminal` must still fail.
+describe('store retryable error visibility is scoped by code (tether#77, tether#80)', () => {
   beforeEach(() => {
     reset()
     useStore.setState({ fatal: null })
@@ -982,23 +988,15 @@ describe('store retryable error visibility is scoped to prompt_undelivered (teth
     useStore.setState({ fatal: null })
   })
 
-  // agent_error is the one that matters. It arrives on a LIVE session, does not
-  // close the connection, and is unbounded — opencode emits one per concurrent
-  // prompt — so aliasing it onto this line would stack system lines for the
-  // life of the tab. It is also a different statement: the turn had a problem,
-  // not "your prompt is gone".
-  it('says nothing for a retryable code that is not about a lost prompt', () => {
+  // connection_closed arrives when the browser's own context is already done, so
+  // there is nobody left to show it to; spawn_failed and session_unconfirmed
+  // accompany a connection the daemon is closing, where the reconnect ladder and
+  // its failed card already speak and each attempt would add another copy.
+  // None of those changed in tether#80.
+  it('says nothing for the retryable codes that are about the connection, not the user', () => {
     const h = useStore.getState().handleEnvelope
-    for (const code of ['agent_error', 'connection_closed', 'spawn_failed', 'session_unconfirmed']) {
+    for (const code of ['connection_closed', 'spawn_failed', 'session_unconfirmed']) {
       h(errorEnv({ code, message: `daemon text for ${code}`, terminal: false }))
-    }
-    expect(useStore.getState().notices).toHaveLength(0)
-  })
-
-  it('a busy session emitting many agent errors does not accumulate lines', () => {
-    const h = useStore.getState().handleEnvelope
-    for (let i = 0; i < 50; i++) {
-      h(errorEnv({ code: 'agent_error', message: 'busy: another prompt is running', terminal: false }))
     }
     expect(useStore.getState().notices).toHaveLength(0)
   })
@@ -1006,6 +1004,12 @@ describe('store retryable error visibility is scoped to prompt_undelivered (teth
   it('still says it for prompt_undelivered', () => {
     const h = useStore.getState().handleEnvelope
     h(errorEnv({ code: 'prompt_undelivered', message: 'gone', terminal: false }))
+    expect(useStore.getState().notices).toHaveLength(1)
+  })
+
+  it('and says it for agent_error too, which it did not before tether#80', () => {
+    const h = useStore.getState().handleEnvelope
+    h(errorEnv({ code: 'agent_error', message: 'busy: another prompt is running', terminal: false }))
     expect(useStore.getState().notices).toHaveLength(1)
   })
 })
@@ -1052,5 +1056,409 @@ describe('store prompt_undelivered ordering (tether#77)', () => {
     s.handleEnvelope(errorEnv({ code: 'prompt_undelivered', message: 'gone', terminal: false }))
 
     expect(rendered().map((l) => l.role)).toEqual(['user', 'assistant', 'system'])
+  })
+})
+
+// ─── tether#80 ────────────────────────────────────────────────────────────────
+//
+// The agent's OWN error text (wire.ErrCodeAgent, from registry.go translateEvent
+// on agent.EventError) reached the browser and was dropped on the floor: the
+// handler cleared the spinner and fell through to `break`, so the turn simply
+// stopped and nothing said why. tether#77 shipped the visibility MECHANISM but
+// deliberately gated it to one code, and its review measured why this one could
+// not just join that branch: an agent error arrives on a LIVE connection that
+// nothing closes, at a rate the AGENT decides (opencode emits one per concurrent
+// prompt), and nothing prunes `notices` short of a session switch or a reload —
+// 200 frames would be 200 permanent lines.
+//
+// So the assertions here come in two halves that have to hold TOGETHER, and
+// either one alone is a bug: it must be VISIBLE, and it must be BOUNDED.
+describe('agent errors are visible (tether#80)', () => {
+  beforeEach(() => {
+    reset()
+    useStore.setState({ fatal: null })
+  })
+  afterEach(() => {
+    reset()
+    useStore.setState({ fatal: null })
+  })
+
+  const agentErr = (message: string) => errorEnv({ code: 'agent_error', message, terminal: false })
+
+  it('surfaces the agent\'s error text as a system line in the rendered transcript', () => {
+    useStore.getState().handleEnvelope(agentErr('busy: another prompt is running'))
+    const lines = rendered()
+    expect(lines).toHaveLength(1)
+    expect(lines[0]?.role).toBe('system')
+    // Both halves: who is speaking (the agent, not tether — the session is still
+    // alive), and verbatim what it said.
+    expect(lines[0]?.text).toContain('The agent reported an error')
+    expect(lines[0]?.text).toContain('busy: another prompt is running')
+  })
+
+  // Not `messages`, and for a stronger reason than tether#57's: registry.go's
+  // fanOut never writes agent.EventError to HistoryStore at all (it persists
+  // thinking / tool_use / tool_result / text / blocks and forwards the error
+  // without recording it), so the live frame is the ONLY copy that exists. In
+  // `messages`, the history refetch session_ready triggers would replace it away
+  // permanently.
+  it('keeps the agent error where a history refetch cannot eat it', () => {
+    useStore.getState().handleEnvelope(agentErr('opencode serve exited unexpectedly'))
+    expect(useStore.getState().messages).toHaveLength(0)
+    expect(useStore.getState().notices).toHaveLength(1)
+
+    useStore.getState().loadHistory([])
+    expect(rendered()).toHaveLength(1)
+  })
+
+  // Where it lands is part of what it says: it is about the turn the user just
+  // started, so it has to read after that prompt. Same millisecond is the
+  // ordinary case, and mergeTranscript's tie-break resolves a tie the other way
+  // round (right for tether#50's banner, backwards for this).
+  //
+  // The clock is PINNED, not merely read twice. tether#77's equivalent case
+  // stamps the message with a live Date.now() and relies on the notice landing in
+  // the same millisecond — which is the ordinary case but not a guaranteed one,
+  // so it only fails PROBABILISTICALLY against a bare-Date.now() stamp. A
+  // mutation run that replaced nextNoticeTs with Date.now() survived it. Freezing
+  // the clock makes the tie certain and the mutant dead.
+  it('reads after the prompt whose turn it is about, even in the same millisecond', () => {
+    const frozen = 1_800_000_000_000
+    const now = vi.spyOn(Date, 'now').mockReturnValue(frozen)
+    try {
+      const s = useStore.getState()
+      s.addMessage({ id: 'u1', role: 'user', text: 'do the thing', ts: frozen })
+      s.handleEnvelope(agentErr('busy: another prompt is running'))
+      const lines = rendered()
+      expect(lines.map((l) => l.role)).toEqual(['user', 'system'])
+      expect(lines[1]?.text).toContain('The agent reported an error')
+    } finally {
+      now.mockRestore()
+    }
+  })
+
+  it('still clears the streaming indicator (pre-existing behaviour for every error)', () => {
+    useStore.setState({ streaming: true, streamingMsgId: 'm1', curTurnId: 'm1' })
+    useStore.getState().handleEnvelope(agentErr('busy: another prompt is running'))
+    const s = useStore.getState()
+    expect(s.streaming).toBe(false)
+    expect(s.streamingMsgId).toBeNull()
+    expect(s.curTurnId).toBeNull()
+  })
+
+  // The self-contradictory payload, same shape as tether#77's: Terminal travels
+  // as its own wire field precisely so the two sides CAN disagree across a
+  // partial deploy (wire/errors.go's package doc), and the fatal card is the
+  // louder answer. This is what makes the terminal branch's early `break`
+  // load-bearing rather than tidy for this code too.
+  it('a payload claiming agent_error AND terminal gets the card, not also a line', () => {
+    useStore.getState().handleEnvelope(errorEnv({ code: 'agent_error', message: 'gone', terminal: true }))
+    expect(useStore.getState().fatal).toEqual({ code: 'agent_error', message: 'gone' })
+    expect(useStore.getState().notices).toHaveLength(0)
+  })
+
+  it('adds nothing for the pre-tether#63 bare-string payload a stale daemon might send', () => {
+    useStore.getState().handleEnvelope(errorEnv('legacy plain-string error'))
+    expect(useStore.getState().notices).toHaveLength(0)
+  })
+})
+
+// The other half. Visibility without a bound is the failure tether#77's review
+// refused to ship, so these are not "nice to have" cases — remove the collapse
+// or the cap and the fix above becomes the bug it was rejected as.
+describe('agent error lines stay bounded (tether#80)', () => {
+  beforeEach(() => {
+    reset()
+    useStore.setState({ fatal: null })
+  })
+  afterEach(() => {
+    reset()
+    useStore.setState({ fatal: null })
+  })
+
+  const agentErr = (message: string) => errorEnv({ code: 'agent_error', message, terminal: false })
+
+  // The measured case: opencode's SendPrompt busy branch fires for every
+  // concurrent prompt, on a connection that stays open for the life of the tab.
+  it('200 identical agent errors are ONE line carrying the count', () => {
+    const h = useStore.getState().handleEnvelope
+    for (let i = 0; i < 200; i++) h(agentErr('busy: another prompt is running'))
+    expect(useStore.getState().notices).toHaveLength(1)
+    const lines = rendered()
+    expect(lines).toHaveLength(1)
+    expect(lines[0]?.text).toContain('busy: another prompt is running')
+    // The count is information, not decoration: that branch DROPS the prompt
+    // (opencode_provider.go returns nil after emitting), so 200 arrivals are 200
+    // prompts the user typed and lost — the same fact tether#77 keeps for its own
+    // line by refusing to dedup it.
+    expect(lines[0]?.text).toContain('(×200)')
+  })
+
+  it('a single arrival renders no count at all', () => {
+    useStore.getState().handleEnvelope(agentErr('busy: another prompt is running'))
+    expect(rendered()[0]?.text).toBe('The agent reported an error — busy: another prompt is running')
+  })
+
+  // The collapsed line follows the conversation instead of going stale at the
+  // position of its first arrival.
+  it('a repeat moves the line down to the turn that just triggered it', () => {
+    const s = useStore.getState()
+    s.handleEnvelope(agentErr('busy: another prompt is running'))
+    s.addMessage({ id: 'u1', role: 'user', text: 'try again', ts: Date.now() + 1000 })
+    s.handleEnvelope(agentErr('busy: another prompt is running'))
+    expect(rendered().map((l) => l.role)).toEqual(['user', 'system'])
+  })
+
+  // The second bound, for the case the collapse cannot reach: opencode's
+  // session.error carries whatever the provider said, and several emit sites
+  // wrap a varying underlying error, so distinct texts are not bounded either.
+  it('distinct agent errors are capped, keeping the most recent', () => {
+    const h = useStore.getState().handleEnvelope
+    const n = AGENT_ERROR_NOTICE_LIMIT + 3
+    for (let i = 0; i < n; i++) h(agentErr(`distinct failure ${i}`))
+    expect(useStore.getState().notices).toHaveLength(AGENT_ERROR_NOTICE_LIMIT)
+    const texts = rendered().map((l) => l.text)
+    expect(texts.some((t) => t.includes(`distinct failure ${n - 1}`))).toBe(true)
+    expect(texts.some((t) => t.includes('distinct failure 0'))).toBe(false)
+  })
+
+  // Eviction is least-recently-SEEN, not first-arrived. A line that keeps
+  // refreshing is the session's live complaint; dropping it to make room for a
+  // one-off would discard the more useful of the two. Position alone cannot tell
+  // these apart, because a refresh does not move the entry in the array.
+  //
+  // The turns are what advance the clock here (nextNoticeTs stamps a notice at
+  // the last message's ts + 1), so no clock mocking is needed — and it has to be
+  // advanced by SOMETHING: a first draft fired every arrival in one tight loop,
+  // where every ts is the same millisecond, ties make least-recently-seen and
+  // first-arrived identical, and the mutant that swapped them survived.
+  it('a repeatedly-refreshed line survives eviction by a newer one-off', () => {
+    const s = useStore.getState()
+    const h = s.handleEnvelope
+    const base = Date.now()
+    // Each "turn" is a user message dated further into the future, so the notice
+    // that follows it is stamped strictly later than the previous one.
+    const turn = (k: number) => s.addMessage({ id: `m${k}`, role: 'user', text: `turn ${k}`, ts: base + k * 1000 })
+
+    turn(1); h(agentErr('the recurring one'))
+    for (let i = 0; i < AGENT_ERROR_NOTICE_LIMIT - 1; i++) { turn(2 + i); h(agentErr(`one-off ${i}`)) }
+    // Refresh the recurring line: now the most recently SEEN, but still the
+    // FIRST entry in the array — the only arrangement that tells the two
+    // eviction rules apart.
+    turn(50); h(agentErr('the recurring one'))
+    turn(51); h(agentErr('the newcomer')) // one over the cap
+
+    const texts = rendered().map((l) => l.text)
+    expect(useStore.getState().notices).toHaveLength(AGENT_ERROR_NOTICE_LIMIT)
+    expect(texts.some((t) => t.includes('the recurring one'))).toBe(true)
+    expect(texts.some((t) => t.includes('the newcomer'))).toBe(true)
+    expect(texts.some((t) => t.includes('one-off 0'))).toBe(false)
+  })
+
+  // The two classes must not touch each other. tether#77's line is deliberately
+  // NOT deduplicated (three identical lines mean three lost prompts) and an
+  // existing case above asserts that; the cap must not evict one either.
+  it('does not collapse, count, or evict a prompt_undelivered line', () => {
+    const h = useStore.getState().handleEnvelope
+    const lost = errorEnv({ code: 'prompt_undelivered', message: 'session abc is gone', terminal: false })
+    h(lost)
+    h(lost)
+    h(lost)
+    for (let i = 0; i < AGENT_ERROR_NOTICE_LIMIT + 3; i++) h(agentErr(`distinct failure ${i}`))
+    const lines = rendered()
+    expect(lines.filter((l) => l.text.includes('Message not delivered'))).toHaveLength(3)
+    expect(lines.filter((l) => l.text.includes('The agent reported an error'))).toHaveLength(AGENT_ERROR_NOTICE_LIMIT)
+    // And no count leaks onto them.
+    for (const l of lines.filter((x) => x.text.includes('Message not delivered'))) {
+      expect(l.text).not.toContain('(×')
+    }
+  })
+
+  // An agent error whose text happens to match tether#50's session banner must
+  // not be collapsed into it (or vice versa) — the classes are matched on `kind`,
+  // not on text alone.
+  it('does not collapse into a session notice that happens to read the same', () => {
+    const shared = 'The agent reported an error — collision'
+    useStore.setState({ notices: [{ id: 'n0', text: shared, ts: Date.now(), kind: 'session' }] })
+    useStore.getState().handleEnvelope(agentErr('collision'))
+    expect(useStore.getState().notices).toHaveLength(2)
+    expect(useStore.getState().notices[0]?.repeats).toBeUndefined()
+  })
+
+  // The store-level form of the eviction defect the pure test pins below: the
+  // clock really can run backwards between arrivals, because nextNoticeTs reads
+  // it off the transcript and a history refetch swaps whose clock that is.
+  it('shows the newest agent error even after the transcript clock runs backwards', () => {
+    const s = useStore.getState()
+    // A daemon-ahead history. Every notice stamped now lands far in the future.
+    s.loadHistory([{ id: 'h1', role: 'user', text: 'turn 1', ts: Date.now() + 600_000 }])
+    for (let i = 0; i < AGENT_ERROR_NOTICE_LIMIT; i++) s.handleEnvelope(agentErr(`early failure ${i}`))
+    // …then the transcript is replaced, so the browser clock governs again and is
+    // behind every ts already in the notice list.
+    s.loadHistory([])
+    s.handleEnvelope(agentErr('the newest failure'))
+
+    const texts = rendered().map((l) => l.text)
+    expect(useStore.getState().notices).toHaveLength(AGENT_ERROR_NOTICE_LIMIT)
+    expect(texts.some((t) => t.includes('the newest failure'))).toBe(true)
+  })
+})
+
+// tether#80 — the cascading half of adding a class to Notice: tether#50's banner
+// collapse used to compare the LAST notice's text outright, so any unrelated line
+// arriving in between un-gated it. tether#80's line can now be that unrelated
+// line, and often, so the comparison is scoped to the last SESSION banner.
+describe('the session-notice collapse survives an interposed line (tether#50, tether#80)', () => {
+  beforeEach(() => { reset(); useStore.setState({ fatal: null }) })
+  afterEach(() => { reset(); useStore.setState({ fatal: null }) })
+
+  const noticeEnv = (text: string): Envelope => ({ kind: 'message', payload: { type: 'notice', text } })
+  const banner = 'Started a new session — the previous conversation\'s context could not be restored.'
+
+  it('still collapses an identical banner after an agent-error line has landed', () => {
+    const h = useStore.getState().handleEnvelope
+    h(noticeEnv(banner))
+    h(errorEnv({ code: 'agent_error', message: 'busy: another prompt is running', terminal: false }))
+    h(noticeEnv(banner))
+    const texts = useStore.getState().notices.map((n) => n.text)
+    expect(texts.filter((t) => t === banner)).toHaveLength(1)
+    expect(useStore.getState().notices).toHaveLength(2)
+  })
+
+  // The other direction: a DIFFERENT banner is new information and must still land
+  // (tether#52's rebind wording vs the context-lost wording).
+  it('does not collapse a banner that says something different', () => {
+    const h = useStore.getState().handleEnvelope
+    h(noticeEnv(banner))
+    h(noticeEnv('Started a new session in this workspace — the previous conversation belongs to a different workspace and stays there.'))
+    expect(useStore.getState().notices).toHaveLength(2)
+  })
+
+  // Notice.kind's doc says every production site sets it. That claim needs a test
+  // rather than a comment, because an unset class is INVISIBLE today: only the
+  // agent-error and session rules read the field, so leaving 'prompt_undelivered'
+  // off changes no behaviour at all — a mutation run confirmed that dropping it
+  // killed nothing. It would surface only the next time a rule is scoped by kind,
+  // which is precisely how tether#50's collapse came to be un-gated by an
+  // unrelated line in the first place.
+  it('labels every notice with the class its own rules are scoped on', () => {
+    const h = useStore.getState().handleEnvelope
+    h(noticeEnv(banner))
+    h(errorEnv({ code: 'prompt_undelivered', message: 'gone', terminal: false }))
+    h(errorEnv({ code: 'agent_error', message: 'busy', terminal: false }))
+    expect(useStore.getState().notices.map((n) => n.kind)).toEqual(['session', 'prompt_undelivered', 'agent_error'])
+  })
+})
+
+// The bounding rules as pure functions, so the cases above assert BEHAVIOUR and
+// these assert the RULES — including the ones that are hard to provoke through
+// handleEnvelope because they depend on a clock.
+describe('appendAgentErrorNotice (tether#80)', () => {
+  const mk = (text: string, ts: number, repeats?: number): Notice =>
+    ({ id: `id-${text}-${ts}`, text, ts, kind: 'agent_error', ...(repeats ? { repeats } : {}) })
+
+  it('appends a first arrival with a count of one', () => {
+    const out = appendAgentErrorNotice([], { id: 'a', text: 'boom', ts: 100 })
+    expect(out).toEqual([{ id: 'a', text: 'boom', ts: 100, kind: 'agent_error', repeats: 1 }])
+  })
+
+  it('collapses a repeat into the existing entry, keeping its id', () => {
+    const out = appendAgentErrorNotice([mk('boom', 100)], { id: 'b', text: 'boom', ts: 200 })
+    expect(out).toHaveLength(1)
+    expect(out[0]?.id).toBe('id-boom-100')
+    expect(out[0]?.repeats).toBe(2)
+    expect(out[0]?.ts).toBe(200)
+  })
+
+  // ts moves FORWARD only. A refresh stamped from a clock behind the one that
+  // stamped the original (mergeTranscript's doc: daemon vs browser clocks, skew
+  // unbounded) must not drag the line back above a message it already reads
+  // below — which is the whole reason its position is refreshed at all.
+  it('never moves a collapsed line backwards in the transcript', () => {
+    const out = appendAgentErrorNotice([mk('boom', 5000)], { id: 'b', text: 'boom', ts: 100 })
+    expect(out[0]?.ts).toBe(5000)
+    expect(out[0]?.repeats).toBe(2)
+  })
+
+  it('evicts the least-recently-seen agent line once over the cap', () => {
+    let notices: Notice[] = []
+    for (let i = 0; i < AGENT_ERROR_NOTICE_LIMIT; i++) {
+      notices = appendAgentErrorNotice(notices, { id: `a${i}`, text: `e${i}`, ts: 100 + i })
+    }
+    // Refresh the OLDEST so it is no longer least-recently-seen.
+    notices = appendAgentErrorNotice(notices, { id: 'x', text: 'e0', ts: 9000 })
+    notices = appendAgentErrorNotice(notices, { id: 'new', text: 'newcomer', ts: 9001 })
+    expect(notices).toHaveLength(AGENT_ERROR_NOTICE_LIMIT)
+    expect(notices.map((n) => n.text)).toContain('e0')
+    expect(notices.map((n) => n.text)).not.toContain('e1')
+  })
+
+  // Found by tether#80's review, and the worst possible defect for this wi: the
+  // eviction scan originally ranked the just-appended line alongside the rest, so
+  // when every existing line held a LATER ts, the newcomer was the
+  // least-recently-seen entry and evicted itself. The newest agent error would
+  // never be shown — the exact silence this change exists to remove.
+  //
+  // That is not a contrived arrangement: nextNoticeTs derives ts from the last
+  // message in the transcript, which carries the daemon's clock after a refetch,
+  // so lines stamped while a daemon-ahead history was loaded outrank everything
+  // stamped after it was replaced. The store-level case for that path is below.
+  it('never evicts the line that just arrived, even when every older line is stamped later', () => {
+    let notices: Notice[] = []
+    for (let i = 0; i < AGENT_ERROR_NOTICE_LIMIT; i++) {
+      notices = appendAgentErrorNotice(notices, { id: `old${i}`, text: `old ${i}`, ts: 9000 + i })
+    }
+    notices = appendAgentErrorNotice(notices, { id: 'new', text: 'the newest failure', ts: 100 })
+    expect(notices).toHaveLength(AGENT_ERROR_NOTICE_LIMIT)
+    expect(notices.map((n) => n.text)).toContain('the newest failure')
+    // …and the one it displaced is the genuinely oldest of the rest.
+    expect(notices.map((n) => n.text)).not.toContain('old 0')
+  })
+
+  it('never evicts a notice of another class to make room', () => {
+    const session: Notice = { id: 'sess', text: 'Started a new session', ts: 1 }
+    let notices: Notice[] = [session]
+    for (let i = 0; i < AGENT_ERROR_NOTICE_LIMIT + 2; i++) {
+      notices = appendAgentErrorNotice(notices, { id: `a${i}`, text: `e${i}`, ts: 100 + i })
+    }
+    expect(notices).toContainEqual(session)
+    expect(notices.filter((n) => n.kind === 'agent_error')).toHaveLength(AGENT_ERROR_NOTICE_LIMIT)
+  })
+})
+
+describe('nextNoticeTs (tether#77 rule, shared since tether#80)', () => {
+  // The clock is pinned rather than read twice, for the reason the ordering case
+  // above documents: with a live clock this passes even for a bare Date.now() most
+  // of the time, so it would only fail probabilistically and would not be a guard.
+  it('is strictly after the last message even when they share a millisecond', () => {
+    const frozen = 1_800_000_000_000
+    const spy = vi.spyOn(Date, 'now').mockReturnValue(frozen)
+    try {
+      expect(nextNoticeTs([{ id: 'm', role: 'user', text: 'x', ts: frozen }])).toBe(frozen + 1)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('is after a transcript carrying a clock from the future', () => {
+    const ahead = Date.now() + 60_000
+    expect(nextNoticeTs([{ id: 'm', role: 'user', text: 'x', ts: ahead }])).toBe(ahead + 1)
+  })
+
+  it('falls back to the wall clock for an empty transcript', () => {
+    const before = Date.now()
+    expect(nextNoticeTs([])).toBeGreaterThanOrEqual(before)
+  })
+})
+
+describe('mergeTranscript renders a repeat count (tether#80)', () => {
+  it('shows the count above one and nothing at one or absent', () => {
+    const msgs: Message[] = []
+    const notices: Notice[] = [
+      { id: 'a', text: 'once', ts: 1, kind: 'agent_error', repeats: 1 },
+      { id: 'b', text: 'twice', ts: 2, kind: 'agent_error', repeats: 2 },
+      { id: 'c', text: 'plain', ts: 3 },
+    ]
+    expect(mergeTranscript(msgs, notices).map((m) => m.text)).toEqual(['once', 'twice (×2)', 'plain'])
   })
 })

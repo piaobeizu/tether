@@ -1871,7 +1871,7 @@ func TestSendPrompt_ReopenStaysInTheSameWorkspace(t *testing.T) {
 	ws := WorkspaceBinding{WorkspaceID: "ws-1", Path: dir}
 
 	// Seed a session that lives in a workspace, the way an Attach carrying ?ws= would.
-	if _, err := reg.spawnEntry(context.Background(), "fake", agent.SpawnConfig{}, ws); err != nil {
+	if _, _, err := reg.spawnEntry(context.Background(), "fake", agent.SpawnConfig{}, ws); err != nil {
 		t.Fatalf("seed spawn: %v", err)
 	}
 	reused.announceInit()
@@ -2122,7 +2122,7 @@ func TestFanOut_StreamEndFlushesAFenceTheAgentDiedInsideOf(t *testing.T) {
 func TestFanOut_StreamEndStaysSilentForASessionThatNeverInited(t *testing.T) {
 	never := &fakeSession{sid: "never-inits", events: make(chan agent.Event, 4)}
 	reg := NewRegistry(&fakeProvider{sess: never})
-	e, err := reg.spawnEntry(context.Background(), "fake", agent.SpawnConfig{}, WorkspaceBinding{})
+	e, _, err := reg.spawnEntry(context.Background(), "fake", agent.SpawnConfig{}, WorkspaceBinding{})
 	if err != nil {
 		t.Fatalf("spawn: %v", err)
 	}
@@ -2184,7 +2184,7 @@ func TestFanOut_StreamEndFlushesTheHalfAnswerSoItCannotGlueOntoTheNextTurn(t *te
 	}
 
 	// The replacement answers under the SAME sid and completes its turn.
-	e2, err := reg.spawnEntry(context.Background(), "fake", agent.SpawnConfig{ResumeSessionID: "shared-sid"}, WorkspaceBinding{})
+	e2, _, err := reg.spawnEntry(context.Background(), "fake", agent.SpawnConfig{ResumeSessionID: "shared-sid"}, WorkspaceBinding{})
 	if err != nil {
 		t.Fatalf("replacement spawn: %v", err)
 	}

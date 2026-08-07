@@ -203,7 +203,7 @@ func (p *erroringProvider) Spawn(_ context.Context, _ agent.SpawnConfig) (agent.
 func TestSpawnEntry_RefusalCodes(t *testing.T) {
 	reg := NewRegistry(&erroringProvider{})
 
-	_, err := reg.spawnEntry(context.Background(), "not-registered", agent.SpawnConfig{}, WorkspaceBinding{})
+	_, _, err := reg.spawnEntry(context.Background(), "not-registered", agent.SpawnConfig{}, WorkspaceBinding{})
 	if err == nil {
 		t.Fatal("spawnEntry with an unregistered provider name returned no error")
 	}
@@ -218,7 +218,7 @@ func TestSpawnEntry_RefusalCodes(t *testing.T) {
 		t.Error("ErrCodeUnknownProvider must be terminal")
 	}
 
-	_, err = reg.spawnEntry(context.Background(), "fake", agent.SpawnConfig{}, WorkspaceBinding{})
+	_, _, err = reg.spawnEntry(context.Background(), "fake", agent.SpawnConfig{}, WorkspaceBinding{})
 	if err == nil {
 		t.Fatal("spawnEntry returned no error when the provider's Spawn failed")
 	}

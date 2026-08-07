@@ -1412,13 +1412,21 @@ func TestSendPrompt_FailedResumeIsNotReopened(t *testing.T) {
 	}
 }
 
-// TestAttach_OnlyTheReusePathIsReopenable pins WHERE the third state is set, which
-// is the wiring the rest of this section depends on and which nothing else asserts.
+// TestAttach_OnlyTheReusePathIsArmedBeforeResolve pins WHERE the third state is set
+// AT ATTACH TIME, which is the wiring the rest of this section depends on and which
+// nothing else asserts.
 //
 // It also pins the exclusivity the two recovery paths rest on: no attach may come
 // back both fallback-eligible and re-openable, because the two disagree about what
 // recovery means (fresh session vs this session).
-func TestAttach_OnlyTheReusePathIsReopenable(t *testing.T) {
+//
+// The name matters (tether#76). This test previously read "only the reuse path is
+// re-openable", which states a property of ATTACH as though it were a property of
+// the attachment for its whole life — and that reading is exactly the bug tether#76
+// fixes: every confirmed attachment is re-openable, it is just armed later, in
+// Resolve. What is pinned here is the BEFORE-Resolve picture; the after picture is
+// pinned by the tether#76 section at the end of this file.
+func TestAttach_OnlyTheReusePathIsArmedBeforeResolve(t *testing.T) {
 	t.Run("reuse → re-openable, not fallback-eligible", func(t *testing.T) {
 		reused := &fakeSession{sid: "reused-sid", events: make(chan agent.Event, 8)}
 		p := &reopenProvider{first: reused, second: &fakeSession{sid: "reused-sid", events: make(chan agent.Event, 8)}}
@@ -2504,5 +2512,453 @@ func TestSendPrompt_ASpentAttachmentStillAdoptsALiveReplacement(t *testing.T) {
 	}
 	if got := s3.Prompts(); len(got) != 2 || got[1] != "tab1 again" {
 		t.Errorf("live session prompts = %v, want tab2's then tab1's", got)
+	}
+}
+
+// ── tether#76: confirming is what arms reopen, not being a reuse ───────────────
+//
+// tether#59 armed reopenSID in one place, Attach's reuse branch. Everything above
+// this line therefore tests recovery through a session someone ELSE created. The
+// connection that created it, and the one whose `--resume` succeeded, reached
+// reopen's `sid == ""` gate and got nothing — and because that gate precedes the
+// sibling-adoption check, such a connection could not even adopt a replacement
+// another attachment had already re-opened for the same sid.
+
+// seedFresh is seedReuse's counterpart: one connection that CREATED its session,
+// registered under the sid it announced.
+//
+// Unlike seedReuse's, the spawn-count assertion here is a SANITY check and not a
+// discriminator: `Attach` with an empty sid can only ever spawn once, because
+// liveEntry("") is unconditionally false. What actually pins the fresh-spawn path
+// is the arming assertions in the callers — an accidental reuse would arm at attach
+// time and the "before Resolve, nothing is armed" checks would fail.
+func seedFresh(t *testing.T, p *reopenProvider, sid string) (*Registry, *Attachment) {
+	t.Helper()
+	reg := NewRegistry(p)
+	att, err := reg.Attach(context.Background(), "", "fake", "")
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	att.mu.Lock()
+	armed := att.reopenSID
+	att.mu.Unlock()
+	if armed != "" {
+		t.Fatalf("a fresh attach came back armed with %q: this is not the FRESH-SPAWN path", armed)
+	}
+	p.first.announceInit()
+	waitForRegistered(t, reg, sid)
+	if got := p.Spawns(); got != 1 {
+		t.Fatalf("spawns after attach = %d, want 1", got)
+	}
+	return reg, att
+}
+
+// unconfirmedThenLiveProvider hands back a session that is ALIVE but has NOT
+// confirmed (SessionID() == "", SendPrompt refuses) and then a live one.
+//
+// deadSession's zero value already is that shape — it only becomes dead once
+// die()/dying() is called — and no existing provider double leaves it there, which
+// is why this one exists. The state it stages is Attach's tether#54 second-attach
+// case: a `--resume` still in flight, adopted by a later connection through the
+// liveEntry gate, which then turns out to have failed.
+type unconfirmedThenLiveProvider struct {
+	first  *deadSession
+	second *fakeSession
+
+	mu     sync.Mutex
+	cfgs   []agent.SpawnConfig
+	spawns int
+}
+
+func (p *unconfirmedThenLiveProvider) Name() string { return "fake" }
+
+func (p *unconfirmedThenLiveProvider) Spawn(_ context.Context, cfg agent.SpawnConfig) (agent.Session, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.cfgs = append(p.cfgs, cfg)
+	p.spawns++
+	if p.spawns == 1 {
+		return p.first, nil
+	}
+	return p.second, nil
+}
+
+func (p *unconfirmedThenLiveProvider) Configs() []agent.SpawnConfig {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]agent.SpawnConfig(nil), p.cfgs...)
+}
+
+func (p *unconfirmedThenLiveProvider) Spawns() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.spawns
+}
+
+// TestResolve_AFailedResolveDoesNotDisarmAReusedAttachment pins the half of the
+// arming gate that is easy to read as decoration.
+//
+// The gate is `if a.resErr == nil && a.res.SID != ""`. Each half ALONE is redundant
+// — every error path in resolve returns the zero Resolution, so the two conditions
+// agree — which makes "simplify it away" look free. It is not: Attach's reuse branch
+// arms at attach time, and a reused attachment CAN still fail to resolve. Assigning
+// unconditionally writes "" over that arming and hands tether#59's own case back the
+// silent hang it was built to end.
+//
+// Staged as the tether#54 second-attach: conn1's `--resume` is in flight (alive, no
+// system/init yet), conn2 adopts it through the liveEntry gate and is armed, and the
+// resume then turns out to have failed.
+func TestResolve_AFailedResolveDoesNotDisarmAReusedAttachment(t *testing.T) {
+	inflight := newDeadSession()
+	replacement := &fakeSession{sid: "inflight-sid", events: make(chan agent.Event, 8)}
+	p := &unconfirmedThenLiveProvider{first: inflight, second: replacement}
+	reg := NewRegistry(p)
+
+	if _, err := reg.Attach(context.Background(), "inflight-sid", "fake", ""); err != nil {
+		t.Fatalf("conn1 Attach: %v", err)
+	}
+	waitForRegistered(t, reg, "inflight-sid")
+
+	conn2, err := reg.Attach(context.Background(), "inflight-sid", "fake", "")
+	if err != nil {
+		t.Fatalf("conn2 Attach: %v", err)
+	}
+	if got := p.Spawns(); got != 1 {
+		t.Fatalf("spawns after conn2 attached = %d, want 1: conn2 must REUSE the in-flight resume", got)
+	}
+	conn2.mu.Lock()
+	armedBefore := conn2.reopenSID
+	conn2.mu.Unlock()
+	if armedBefore != "inflight-sid" {
+		t.Fatalf("conn2 armed with %q before Resolve, want \"inflight-sid\": the reuse branch is what "+
+			"this test needs to have armed", armedBefore)
+	}
+
+	// The resume it adopted never confirmed: SessionID() is "" and conn2 is a reuse,
+	// so resolve takes the `!resuming` branch and refuses.
+	if _, err := conn2.Resolve(context.Background()); err == nil {
+		t.Fatal("conn2 Resolve returned nil; this test needs a FAILED resolution")
+	}
+	conn2.mu.Lock()
+	armedAfter := conn2.reopenSID
+	conn2.mu.Unlock()
+	if armedAfter != "inflight-sid" {
+		t.Errorf("conn2 armed with %q after a failed Resolve, want it left at \"inflight-sid\": a "+
+			"resolution that failed must not DISARM an attachment Attach already armed", armedAfter)
+	}
+
+	// And behaviourally, which is what the field is for.
+	if err := conn2.SendPrompt(context.Background(), "still there?"); err != nil {
+		t.Fatalf("conn2 SendPrompt = %v; a disarmed attachment returns the bare send error and "+
+			"recovers nothing", err)
+	}
+	if got := p.Spawns(); got != 2 {
+		t.Errorf("spawns = %d, want 2 (the in-flight resume, then conn2's re-open)", got)
+	}
+	if cfgs := p.Configs(); len(cfgs) > 1 && cfgs[1].ResumeSessionID != "inflight-sid" {
+		t.Errorf("re-open ResumeSessionID = %q, want \"inflight-sid\"", cfgs[1].ResumeSessionID)
+	}
+}
+
+// TestResolve_ArmsReopenForTheConnectionThatCreatedTheSession is the headline of
+// tether#76, and the case that was measured failing against the tether#59 build:
+// the creating tab's prompts were dropped in silence while the reusing tab
+// recovered normally.
+//
+// Note where the assertion sits — AFTER Resolve. That is the whole fix: a confirmed
+// sid is a sid with a transcript, which is all reopen ever needed.
+func TestResolve_ArmsReopenForTheConnectionThatCreatedTheSession(t *testing.T) {
+	created := &fakeSession{sid: "created-sid", events: make(chan agent.Event, 8)}
+	reopened := &fakeSession{sid: "created-sid", events: make(chan agent.Event, 8)}
+	p := &reopenProvider{first: created, second: reopened}
+	_, att := seedFresh(t, p, "created-sid")
+
+	res, err := att.Resolve(context.Background())
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if res.SID != "created-sid" || res.Recovered {
+		t.Fatalf("Resolution = %+v, want SID=created-sid Recovered=false", res)
+	}
+
+	created.kill()
+	if err := att.SendPrompt(context.Background(), "still there?"); err != nil {
+		t.Fatalf("SendPrompt after the created session died = %v; an unrecovered error here is "+
+			"the tab that looks healthy (tether#59's turn-ender stopped its spinner) and swallows "+
+			"everything typed after it", err)
+	}
+	if got := created.Refused(); got != 1 {
+		t.Errorf("the dead session refused %d prompts, want 1: this test is not staging the death", got)
+	}
+	if got := p.Spawns(); got != 2 {
+		t.Fatalf("spawns = %d, want 2 (the fresh spawn, then the re-open)", got)
+	}
+	cfgs := p.Configs()
+	if cfgs[1].ResumeSessionID != "created-sid" {
+		t.Errorf("re-open ResumeSessionID = %q, want \"created-sid\": recovery must re-open THIS "+
+			"conversation, not spawn a blind fresh one that throws its context away", cfgs[1].ResumeSessionID)
+	}
+	if got := reopened.Prompts(); len(got) != 1 || got[0] != "still there?" {
+		t.Errorf("re-opened session prompts = %v, want [\"still there?\"]", got)
+	}
+}
+
+// TestResolve_ArmsReopenForAResumeThatSucceeded covers the variant that is almost
+// certainly hit more often than the one the wi was filed for: a browser reconnects
+// with the sid it kept in localStorage, the `--resume` succeeds, and cc dies some
+// turns later. Before tether#76 that attachment held resuming==true and reopenSID=="",
+// so reopen refused it and Resolve — already run once, and guarded by resolveOnce —
+// could not fall back either. Silent hang, on the ordinary reconnect path.
+//
+// It also pins the exclusivity invariant at the one point where it could now break:
+// this is the only path on which `resuming` is true when the arming happens.
+func TestResolve_ArmsReopenForAResumeThatSucceeded(t *testing.T) {
+	resumed := &fakeSession{sid: "resumed-sid", events: make(chan agent.Event, 8)}
+	reopened := &fakeSession{sid: "resumed-sid", events: make(chan agent.Event, 8)}
+	p := &reopenProvider{first: resumed, second: reopened}
+	reg := NewRegistry(p)
+
+	att, err := reg.Attach(context.Background(), "resumed-sid", "fake", "")
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	waitForRegistered(t, reg, "resumed-sid")
+	if got := p.Configs(); len(got) != 1 || got[0].ResumeSessionID != "resumed-sid" {
+		t.Fatalf("first spawn cfgs = %+v, want one --resume of resumed-sid: this test is not on the resume path", got)
+	}
+	att.mu.Lock()
+	armedBefore, resumingBefore := att.reopenSID, att.resuming
+	att.mu.Unlock()
+	if armedBefore != "" || !resumingBefore {
+		t.Fatalf("before Resolve: reopenSID=%q resuming=%v, want \"\" and true — a resume attempt is "+
+			"fallback-eligible and not yet re-openable, because it has not confirmed", armedBefore, resumingBefore)
+	}
+
+	if _, err := att.Resolve(context.Background()); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	att.mu.Lock()
+	armed, resuming := att.reopenSID, att.resuming
+	att.mu.Unlock()
+	if armed != "resumed-sid" {
+		t.Errorf("reopenSID after a confirmed resume = %q, want \"resumed-sid\"", armed)
+	}
+	if resuming {
+		t.Error("resuming stayed true after the resume CONFIRMED: reopenSID != \"\" ⟹ resuming == false " +
+			"is the invariant the two recovery paths rest on, and resolveOnce means no fallback can run anyway")
+	}
+
+	resumed.kill()
+	if err := att.SendPrompt(context.Background(), "and then?"); err != nil {
+		t.Fatalf("SendPrompt after the resumed session died = %v", err)
+	}
+	if got := p.Spawns(); got != 2 {
+		t.Fatalf("spawns = %d, want 2 (the resume, then the re-open)", got)
+	}
+	if cfgs := p.Configs(); cfgs[1].ResumeSessionID != "resumed-sid" {
+		t.Errorf("re-open ResumeSessionID = %q, want \"resumed-sid\"", cfgs[1].ResumeSessionID)
+	}
+	if got := reopened.Prompts(); len(got) != 1 || got[0] != "and then?" {
+		t.Errorf("re-opened session prompts = %v, want [\"and then?\"]", got)
+	}
+}
+
+// TestResolve_ArmsReopenWithTheSidThatAnsweredNotTheOneRequested is the fallback
+// path: the requested sid could not be resumed, Resolve spawned a fresh session,
+// and THAT session is what a later death must re-open.
+//
+// Arming with a.reqSID instead of a.res.SID is the plausible slip — reqSID is right
+// there in the struct and reads like "this connection's session" — and it would
+// spawn `--resume <the sid that already failed to resume once>`, spend the budget on
+// a process certain to die, and leave the turn hung exactly as before.
+func TestResolve_ArmsReopenWithTheSidThatAnsweredNotTheOneRequested(t *testing.T) {
+	dead := newDeadSession()
+	live := &fakeSession{sid: "recovered-sid", events: make(chan agent.Event, 8)}
+	dp := &deadThenLiveProvider{dead: dead, live: live}
+	reg := NewRegistry(dp)
+
+	att, err := reg.Attach(context.Background(), "gone-sid", "fake", "")
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	res, err := att.Resolve(context.Background())
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if res.SID != "recovered-sid" || !res.Recovered {
+		t.Fatalf("Resolution = %+v, want the fallback SID=recovered-sid Recovered=true", res)
+	}
+
+	att.mu.Lock()
+	armed, resuming := att.reopenSID, att.resuming
+	att.mu.Unlock()
+	if armed != "recovered-sid" {
+		t.Errorf("reopenSID after a fallback = %q, want \"recovered-sid\" (the sid that ANSWERED). "+
+			"%q would re-resume the transcript that could not be found a moment ago", armed, att.reqSID)
+	}
+	if resuming {
+		t.Error("resuming stayed true after the fallback settled")
+	}
+}
+
+// TestSendPrompt_AnUnconfirmedSessionIsStillNotReopenable pins what is LEFT of
+// reopen's `sid == ""` gate after tether#76 widened who gets past it.
+//
+// The gate still has a job: a session inside Resolve has no transcript to re-open,
+// and both shapes that live there are owned by machinery that would fight a reopen —
+// a failed resume replays this very prompt from a.pending, and a fresh spawn that
+// never emitted init is reported as ErrCodeSessionUnconfirmed so the browser
+// reconnects onto the resume path. Arming at spawn time instead of at confirmation —
+// the placement this wi was originally sketched with — is what this forbids.
+func TestSendPrompt_AnUnconfirmedSessionIsStillNotReopenable(t *testing.T) {
+	created := &fakeSession{sid: "created-sid", events: make(chan agent.Event, 8)}
+	p := &reopenProvider{first: created, second: &fakeSession{sid: "created-sid", events: make(chan agent.Event, 8)}}
+	_, att := seedFresh(t, p, "created-sid")
+
+	// Deliberately no Resolve: this is the window between Attach and confirmation.
+	created.kill()
+	if err := att.SendPrompt(context.Background(), "too early"); err == nil {
+		t.Error("SendPrompt before Resolve returned nil; the error must reach the caller unchanged " +
+			"so Resolve's own reporting owns this window")
+	}
+	if got := p.Spawns(); got != 1 {
+		t.Errorf("spawns = %d, want 1: nothing may be re-opened before the sid has confirmed", got)
+	}
+}
+
+// TestSendPrompt_TheCreatingConnectionAdoptsTheReusersReplacement reproduces the
+// exact two-connection sequence measured against the tether#59 build (its
+// live_verify, claim F): conn0 creates the session, conn1 reuses it, cc dies,
+// conn1 recovers — and conn0 is left holding the corpse.
+//
+// This is the assertion that says the bug was not "conn0 needs its own re-open" but
+// "conn0 could not even reach the adoption branch": the fix must cost ZERO extra
+// spawns here, because a live replacement already exists under this sid. A version
+// that armed conn0 but left it spawning its own second `cc --resume` would pass a
+// naive "conn0 recovered" check while recreating the two-cc-on-one-transcript state
+// tether#54 exists to prevent.
+func TestSendPrompt_TheCreatingConnectionAdoptsTheReusersReplacement(t *testing.T) {
+	created := &fakeSession{sid: "shared-sid", events: make(chan agent.Event, 8)}
+	reopened := &fakeSession{sid: "shared-sid", events: make(chan agent.Event, 8)}
+	third := &fakeSession{sid: "shared-sid", events: make(chan agent.Event, 8)}
+	p := &reopenProvider{first: created, second: reopened, third: third}
+
+	reg, conn0 := seedFresh(t, p, "shared-sid")
+	if _, err := conn0.Resolve(context.Background()); err != nil {
+		t.Fatalf("conn0 Resolve: %v", err)
+	}
+	conn1, err := reg.Attach(context.Background(), "shared-sid", "fake", "")
+	if err != nil {
+		t.Fatalf("conn1 Attach: %v", err)
+	}
+	if got := p.Spawns(); got != 1 {
+		t.Fatalf("spawns after conn1 attached = %d, want 1: conn1 must REUSE conn0's session", got)
+	}
+
+	created.kill()
+
+	// conn1 recovers first, exactly as it did before this fix.
+	if err := conn1.SendPrompt(context.Background(), "from conn1"); err != nil {
+		t.Fatalf("conn1 SendPrompt: %v", err)
+	}
+	if got := p.Spawns(); got != 2 {
+		t.Fatalf("spawns after conn1 recovered = %d, want 2", got)
+	}
+
+	// conn0 — the tab that created this conversation — must land on that same
+	// replacement rather than being silently dropped or spawning a rival.
+	if err := conn0.SendPrompt(context.Background(), "from conn0"); err != nil {
+		t.Fatalf("conn0 SendPrompt = %v; this is the measured failure: the creating tab's spinner "+
+			"had already stopped, so it looked healthy while swallowing every prompt", err)
+	}
+	if got := p.Spawns(); got != 2 {
+		t.Errorf("spawns = %d, want 2: adopting the replacement conn1 already started must spawn "+
+			"NOTHING — a second `cc --resume shared-sid` is two agents appending to one transcript", got)
+	}
+	if attEntry(conn0) != attEntry(conn1) {
+		t.Error("conn0 and conn1 hold different entries after the recovery; every sid-keyed route " +
+			"(DeliverAction, InterruptSession, /wt/events) points at one of them")
+	}
+	if got := reopened.Prompts(); len(got) != 2 || got[0] != "from conn1" || got[1] != "from conn0" {
+		t.Errorf("replacement prompts = %v, want both connections' prompts in order", got)
+	}
+	if got := third.Prompts(); len(got) != 0 {
+		t.Errorf("a third session received %v; nothing should have spawned it", got)
+	}
+}
+
+// TestResolve_ArmingIsPublishedAtomicallyWithTheResolution pins that the arming and
+// the resolution become visible in the SAME critical section.
+//
+// Hoisting the two arming lines below a.mu.Unlock() is the tidy-looking edit — they
+// have nothing to do with sid/settled/pending, so they read like they belong after —
+// and it opens a window in which an attachment is settled but not yet recoverable. A
+// prompt failing inside it is dropped exactly as before, one instruction narrower.
+//
+// The assertion is the invariant itself rather than -race, deliberately. A first
+// version of this test ran eight Resolves against eight SendPrompts and let the race
+// detector judge; the hoisted-arming mutant SURVIVED it, because the sends all landed
+// on a LIVE session, so reopen — the only concurrent reader of reopenSID — was never
+// entered and there was no read to race against. What is asserted here instead is
+// what an ordinary reader can OBSERVE while holding a.mu: for this fixture the
+// session always confirms, so `settled` and a non-empty reopenSID must arrive
+// together, and seeing one without the other is the window itself.
+func TestResolve_ArmingIsPublishedAtomicallyWithTheResolution(t *testing.T) {
+	// Repeated because the window is a few instructions wide: one round can miss it,
+	// and a guard that only sometimes fires would be worse than none. Any round that
+	// observes the torn state is enough, so this stops at the first one.
+	for round := 0; round < 200; round++ {
+		created := &fakeSession{sid: "racy-sid", events: make(chan agent.Event, 8), sidReady: make(chan struct{})}
+		reopened := &fakeSession{sid: "racy-sid", events: make(chan agent.Event, 8)}
+		p := &reopenProvider{first: created, second: reopened}
+		_, att := seedFresh(t, p, "racy-sid")
+
+		var torn atomic.Bool
+		stop := make(chan struct{})
+		var obs sync.WaitGroup
+		obs.Add(1)
+		go func() {
+			defer obs.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				att.mu.Lock()
+				// settled without an arming is the tear. It can only be legitimate for
+				// a resolution that produced no sid, and this fixture always produces
+				// one — SessionID() returns as soon as sidReady closes.
+				if att.settled && att.reopenSID == "" {
+					torn.Store(true)
+				}
+				att.mu.Unlock()
+			}
+		}()
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := att.Resolve(context.Background()); err != nil {
+				t.Errorf("Resolve: %v", err)
+			}
+		}()
+		close(created.sidReady) // release Resolve while the observer is spinning
+		wg.Wait()
+		close(stop)
+		obs.Wait()
+
+		if torn.Load() {
+			t.Fatalf("round %d observed the attachment settled with reopenSID unset: a prompt failing "+
+				"in that window is dropped, which is the bug tether#76 fixes", round)
+		}
+
+		att.mu.Lock()
+		armed, resuming := att.reopenSID, att.resuming
+		att.mu.Unlock()
+		if armed != "racy-sid" || resuming {
+			t.Fatalf("round %d: reopenSID=%q resuming=%v, want \"racy-sid\" and false", round, armed, resuming)
+		}
 	}
 }

@@ -71,25 +71,76 @@ type Attachment struct {
 	// resuming is true while entry was spawned with --resume, i.e. while a
 	// fallback is still possible.
 	resuming bool
-	// reopenSID is the THIRD attachment state (tether#59): non-empty means this
-	// attachment REUSED a session that was alive at attach time, and that if that
-	// session turns out to be dead it may be recovered by RE-OPENING this very sid
-	// — `--resume reopenSID` — rather than by spawning a fresh one.
+	// reopenSID is the THIRD attachment state (tether#59): non-empty means that if
+	// this attachment's session turns out to be dead it may be recovered by
+	// RE-OPENING this very sid — `--resume reopenSID` — rather than by spawning a
+	// fresh one.
 	//
-	// It is not a synonym for `resuming`, and the two are mutually exclusive BY
-	// CONSTRUCTION rather than by care: Attach's reuse branch returns before
-	// `resuming` is ever assigned, so reopenSID != "" ⟹ resuming == false. That
-	// exclusivity is what keeps the two recovery paths from interfering, and they
-	// must not be merged because they recover opposite situations. A failed resume
-	// means the transcript could not be found, so recovery is a FRESH session (and
-	// resuming that sid again would loop). A reused session that dies means the
-	// transcript is sitting on disk holding the whole conversation, so recovery is
-	// resuming it (and a fresh session would answer the turn while silently
-	// throwing the context away — the user keeps their scrollback and their sid,
-	// and cc alone has forgotten everything).
+	// The two arming sites do NOT establish that equally, and the difference is
+	// load-bearing rather than pedantic — see "When it is set" below.
 	//
-	// Written once, in Attach, before the attachment is handed to anyone; read
-	// under mu anyway, so that no reader has to know that.
+	// # When it is set, and why that is the whole condition (tether#76)
+	//
+	// tether#59 set it in one place, Attach's reuse branch, and phrased it as "this
+	// attachment reused a live session". That description named a sufficient
+	// condition and was read as the necessary one, so every OTHER connection — the
+	// one that CREATED the session, and the one whose `--resume` succeeded — reached
+	// reopen's `sid == ""` gate and got nothing. Since that gate precedes even the
+	// sibling-adoption branch, such a connection could not so much as adopt the
+	// replacement a sibling had already re-opened. Measured: the creating tab's
+	// prompts were dropped in silence while the reusing tab recovered normally.
+	//
+	// The real condition is not "was it reused" but "is there a transcript to
+	// resume". Two sites answer that, with DIFFERENT strength:
+	//
+	//   - Resolve, on confirmation — the strong one, and the one tether#76 adds. A
+	//     non-empty SessionID() means cc emitted system/init, and under
+	//     `--input-format stream-json` cc emits nothing until a user message arrives
+	//     (see this type's doc; pinned by TestFakeCC_SilentUntilFirstPrompt), so a
+	//     confirmed sid has a turn written behind it. This covers the fresh spawn,
+	//     the `--resume` that succeeded, and the fresh session a failed resume fell
+	//     back to.
+	//   - Attach's reuse branch, at attach time — the WEAK one, unchanged from
+	//     tether#59. All it observes is liveEntry, i.e. Alive(), which for cc is a
+	//     non-blocking poll of the `done` channel: "the process has not exited". That
+	//     says nothing about init, so this site can arm an attachment whose session
+	//     has NOT confirmed — concretely, a second attach adopting a `--resume` that
+	//     is still in flight (Attach's tether#54 note). It is armed early anyway
+	//     because a reused session is already answering and can refuse a prompt
+	//     before Resolve has run, and the cost of being wrong is bounded by
+	//     reopenSpent.
+	//
+	// That asymmetry is exactly why reopen's "What it deliberately does not cover"
+	// still lists the reuse-of-an-unconfirmed-resume case. Do not collapse these two
+	// into "armed ⟹ the transcript exists": it is true of the Resolve site and false
+	// of the reuse site, and believing the universal form would read that residual as
+	// dead text.
+	//
+	// What tether#76 does NOT do is arm at SPAWN time, which is the placement its own
+	// wi sketched. A session armed before it confirms could be re-opened into a
+	// transcript that was never written — the strictly worse version of the weak site
+	// above, reached on every fresh connection rather than on a rare double-attach.
+	//
+	// # Still not a synonym for `resuming`
+	//
+	// The two remain mutually exclusive BY CONSTRUCTION, though the construction has
+	// moved: Attach's reuse branch still returns before `resuming` is ever assigned,
+	// and the Resolve-time arming clears `resuming` in the same critical section it
+	// sets this — accurately, not defensively, because resolveOnce means no fallback
+	// can run after that point. So reopenSID != "" ⟹ resuming == false still holds.
+	//
+	// The exclusivity is what keeps the two recovery paths from interfering, and they
+	// must not be merged because they recover opposite situations. A resume that
+	// failed means the transcript could not be found, so recovery is a FRESH session
+	// (and resuming that sid again would loop). A session that confirmed and then
+	// died means the transcript is sitting on disk holding the whole conversation, so
+	// recovery is resuming it (and a fresh session would answer the turn while
+	// silently throwing the context away — the user keeps their scrollback and their
+	// sid, and cc alone has forgotten everything).
+	//
+	// Written at most twice and never to a different value: once in Attach for a
+	// reuse, once in Resolve on confirmation. Read under mu, so that no reader has to
+	// know that.
 	reopenSID string
 	// reopenSpent records that the ONE reopen this attachment is allowed has been
 	// used (or attempted). See reopen for why the budget is one.
@@ -268,9 +319,13 @@ func (r *Registry) Attach(ctx context.Context, sid, providerName, wsID string) (
 	//     machinery spawns fresh. tether#59 covers this in two halves, and the split
 	//     is worth stating exactly because neither half does the other's job:
 	//
-	//     — the NEXT prompt is recovered, by the third attachment state this branch
-	//     now sets (reopenSID): Attachment.SendPrompt re-opens the same sid and
-	//     delivers there. Not a change to this gate — the gate still decides once.
+	//     — the NEXT prompt is recovered, by the third attachment state (reopenSID):
+	//     Attachment.SendPrompt re-opens the same sid and delivers there. Not a
+	//     change to this gate — the gate still decides once. tether#59 armed that
+	//     state only in this branch, which left the connection that CREATED the
+	//     session, and the one whose `--resume` succeeded, with no recovery at all;
+	//     tether#76 arms every confirmed attachment in Resolve instead. See
+	//     Attachment.reopenSID.
 	//     — the IN-FLIGHT turn is closed rather than answered, by Registry.fanOut
 	//     broadcasting a terminal KindResult when an init'd session's stream ends.
 	//     The half-answer stays truncated and the prompt that was already delivered
@@ -296,6 +351,14 @@ func (r *Registry) Attach(ctx context.Context, sid, providerName, wsID string) (
 			// the key the entry was just found under, i.e. exactly the transcript it
 			// is working in, so it is the id to resume; taking e.regKey instead would
 			// mean reading a field guarded by r.mu to learn the same string.
+			//
+			// This is the EARLY arming, not the only one (tether#76). Every other
+			// path is armed when Resolve confirms; this branch is armed here, before
+			// the attachment is handed to anyone, because a reused session is already
+			// answering and can refuse a prompt before Resolve has run. Resolve's
+			// arming then writes the same sid again — liveEntry found this entry under
+			// it, so it is the sid the entry reports — which is why the two cannot
+			// disagree.
 			a.reopenSID = dec.ResumeSID
 			return a, nil
 		}
@@ -424,8 +487,10 @@ func (a *Attachment) SendPrompt(ctx context.Context, text string) error {
 // # Why the recovery is the SAME sid
 //
 // resolve's fallback spawns a fresh session because there the transcript could
-// not be found. Here the opposite is true: this session was alive when it was
-// adopted, so its transcript exists and holds the whole conversation. A fresh
+// not be found. Here the opposite is expected: this attachment is armed, which in
+// the ordinary case means its session confirmed and its transcript holds the whole
+// conversation. (The one armed state that does NOT guarantee that is the reuse of a
+// still-unconfirmed resume — see reopenSID, and the residual listed below.) A fresh
 // spawn would answer the turn and lose the context — the browser keeps its sid,
 // the user keeps their scrollback, and cc alone has forgotten everything, which
 // is a worse failure than the hang because it is silent. Resuming has a second,
@@ -532,9 +597,25 @@ func (a *Attachment) reopen(ctx context.Context, dead *Entry, text string, sendE
 	a.mu.Unlock()
 
 	if sid == "" {
-		// Not a reuse: this is the failed-resume path (Resolve falls back and
-		// replays) or a fresh spawn (nothing to recover to). Unchanged behaviour,
-		// and the reason the two recovery paths cannot collide.
+		// Never armed, so there is no transcript this attachment may claim. Both
+		// shapes that reach here are owned by machinery that a reopen would fight:
+		// a `--resume` still in flight or already failed, where Resolve falls back
+		// and replays this very prompt from a.pending; and a fresh spawn that has
+		// not emitted system/init, where Resolve reports ErrCodeSessionUnconfirmed
+		// and the browser reconnects onto the resume path. Returning sendErr
+		// unchanged is what hands those back to the machinery that owns them, and
+		// is the reason the two recovery paths cannot collide.
+		//
+		// "Never armed" is not the same as "still resolving": an attachment whose
+		// Resolve FAILED stays here permanently (settled, with an empty sid). That
+		// is the right answer for it too — nothing confirmed, so there is nothing to
+		// resume — but it is a terminal state rather than a window.
+		//
+		// Before tether#76 this branch also swallowed every CONFIRMED attachment
+		// that had not come through Attach's reuse branch, which is the bug that wi
+		// exists for. Note where it sits: ahead of the sibling-adoption check below,
+		// so such a connection could not even adopt a replacement another attachment
+		// had already re-opened for the same sid.
 		return sendErr
 	}
 	if cur != dead {
@@ -579,6 +660,25 @@ func (a *Attachment) reopen(ctx context.Context, dead *Entry, text string, sendE
 	//
 	// Deliberately BEFORE the spent check: adoption spawns nothing, so a spent budget
 	// is no reason to refuse a prompt a live session is right there to answer.
+	//
+	// RESIDUAL, stated rather than implied — this check NARROWS the window, it does
+	// not close it, and tether#76 widened what can enter it:
+	//
+	//   - Two armed attachments whose prompts fail together can both pass this check
+	//     before either one's spawnEntry has registered, and then both spawn
+	//     `cc --resume <sid>`. The second registration displaces the first, so the two
+	//     tabs end up on different *Entry values with two cc appending to one
+	//     transcript — the state the paragraph above says this check prevents.
+	//     reopenMu is per-ATTACHMENT and does not serialise across connections.
+	//   - The window is the same one tether#60 tracks for Attach's own liveEntry gate:
+	//     between the check and the registration, i.e. one provider.Spawn (for cc, an
+	//     exec.Start). Same shape, same fix — a registry-level reservation — which is
+	//     why tether#60 now names this call site too rather than a separate wi
+	//     re-implementing the primitive.
+	//   - What tether#76 changed is reachability, not severity. Before it, a two-tab
+	//     session had exactly ONE armed attachment, so reaching this needed three
+	//     tabs; now two suffice, and two tabs sharing a sid through localStorage is
+	//     the ordinary case rather than the exotic one.
 	if sibling, ok := a.reg.liveEntry(sid); ok && sibling != dead {
 		slog.Info("chat: the reused session was already re-opened by another attachment; adopting it",
 			"sid", sid, "err", sendErr)
@@ -702,6 +802,11 @@ func (a *Attachment) WaitSID() string {
 // Resolve waits for the session to confirm itself and, if a resume attempt
 // failed, falls back to a fresh session and replays the buffered prompts.
 // Idempotent: repeat calls return the first outcome without re-resolving.
+//
+// Confirming is also what ARMS reopen for every attachment that did not come
+// through Attach's reuse branch (tether#76). A confirmed sid is a sid with a
+// transcript, which is the entire precondition reopen needs; see reopenSID for why
+// that is the right condition and why arming any earlier would be wrong.
 func (a *Attachment) Resolve(ctx context.Context) (Resolution, error) {
 	a.resolveOnce.Do(func() {
 		a.res, a.resErr = a.resolve(ctx)
@@ -712,6 +817,32 @@ func (a *Attachment) Resolve(ctx context.Context) (Resolution, error) {
 		a.sid = a.res.SID
 		a.settled = true
 		a.pending = nil
+		// Arm reopen (tether#76). Both halves are set in the SAME critical section
+		// that publishes the resolution, so no reader can observe an attachment that
+		// is settled but not yet recoverable — a prompt failing in that gap is the
+		// hang this fixes, one instruction narrower.
+		//
+		// Clearing resuming is what keeps `reopenSID != "" ⟹ resuming == false` true
+		// by construction on the successful-resume path, and it is accurate rather
+		// than defensive: resolveOnce has already run, so resolve's fallback can
+		// never fire again, and a.resuming has no other reader.
+		//
+		// The gate is not "only arm on success", it is "never DISARM". Attach's reuse
+		// branch may already have armed this attachment, and resolve can still fail
+		// for it — a reuse of a `--resume` that never confirmed returns
+		// ErrCodeSessionUnconfirmed — so an unguarded assignment would write "" over
+		// a live arming and silently take tether#59's recovery away from exactly the
+		// attachments it was built for. Pinned by
+		// TestResolve_AFailedResolveDoesNotDisarmAReusedAttachment.
+		//
+		// Each half alone is redundant (every error path in resolve returns the zero
+		// Resolution, so resErr == nil ⟺ res.SID != ""), and a mutant deleting either
+		// one survives. It is the CONJUNCTION that is load-bearing, and deleting the
+		// whole `if` is not an equivalent mutation — it is the bug above.
+		if a.resErr == nil && a.res.SID != "" {
+			a.reopenSID = a.res.SID
+			a.resuming = false
+		}
 		a.mu.Unlock()
 		close(a.resolved)
 	})

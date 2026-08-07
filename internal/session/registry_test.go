@@ -49,6 +49,23 @@ type fakeSession struct {
 	// write failed, so the agent never saw it, and a test asking "what did this
 	// session receive" must not be told about a prompt that went nowhere.
 	sendFails atomic.Bool
+	// aliveHold, when non-nil, makes the FIRST Alive() call announce itself on
+	// aliveEntered and then block until aliveHold is closed. It is the injection point
+	// tether#78 needs and the only one available: a caller has to be held BETWEEN its
+	// own liveness check and spawnEntry's claim, and liveEntry is the single function
+	// on that path that calls out of the registry.
+	//
+	// Blocking inside Alive() is what makes such a staging airtight rather than timed.
+	// liveEntry looks the sid up BEFORE it asks, so a goroutine parked here is
+	// provably holding the entry it found, and when it is released it can only act on
+	// THAT entry — it cannot quietly take a reuse branch on whatever registered while
+	// it was stopped, which is the false green this staging would otherwise produce.
+	//
+	// First call only, so a second caller staged behind the first is not held as well.
+	// Nil (the default) leaves Alive() exactly as every other test expects it.
+	aliveHold    chan struct{}
+	aliveEntered chan struct{}
+	aliveHeld    atomic.Bool
 
 	mu             sync.Mutex
 	prompts        []string
@@ -82,7 +99,15 @@ func (f *fakeSession) SessionID() string {
 // and turn the registered-but-dead tests into tautologies. Keeping the flag
 // independent is what lets a test hold an entry REGISTERED while its session
 // reports dead — the state the fix is about, which cannot otherwise be staged.
-func (f *fakeSession) Alive() bool { return !f.dead.Load() }
+func (f *fakeSession) Alive() bool {
+	if f.aliveHold != nil && f.aliveHeld.CompareAndSwap(false, true) {
+		if f.aliveEntered != nil {
+			f.aliveEntered <- struct{}{}
+		}
+		<-f.aliveHold
+	}
+	return !f.dead.Load()
+}
 func (f *fakeSession) SendPrompt(_ context.Context, text string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

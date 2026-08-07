@@ -797,7 +797,10 @@ describe('parseErrorPayload (tether#63)', () => {
 const errorEnv = (payload: unknown): Envelope => ({ kind: 'error', payload } as unknown as Envelope)
 
 describe('store fatal refusal handling (tether#63)', () => {
-  afterEach(() => useStore.setState({ fatal: null, streaming: false, streamingMsgId: null, curTurnId: null }))
+  // `notices` is in this reset since tether#77: several cases here send
+  // NON-terminal payloads, which now leave a line behind, and without clearing
+  // it they hand the next describe a store that is not empty.
+  afterEach(() => useStore.setState({ fatal: null, notices: [], streaming: false, streamingMsgId: null, curTurnId: null }))
 
   it('sets fatal from a terminal error payload', () => {
     const h = useStore.getState().handleEnvelope
@@ -850,5 +853,204 @@ describe('store fatal refusal handling (tether#63)', () => {
     useStore.setState({ fatal: { code: 'unknown_workspace', message: 'x' } })
     useStore.getState().loadHistory([])
     expect(useStore.getState().fatal).toEqual({ code: 'unknown_workspace', message: 'x' })
+  })
+})
+
+// tether#77 — a RETRYABLE error must still reach the user.
+//
+// The daemon classifies "this prompt is gone and nothing will retry it"
+// (wire.ErrCodePromptUndelivered, from session/attach.go reopen) and sends a
+// frame for it. Before this, the handler cleared the spinner and dropped the
+// payload on the floor unless it was terminal — so the tab went back to looking
+// idle and healthy while having swallowed what the user typed, and every
+// subsequent prompt did the same. The daemon-side classification is inert
+// without this half: the frame arrives either way, and what changes is whether
+// anyone is shown it.
+describe('store retryable error visibility (tether#77)', () => {
+  // beforeEach as well as afterEach: these assert exact notice COUNTS, so a
+  // store left non-empty by an earlier describe reads as this one's own output.
+  // That is not hypothetical — it is how this suite first failed.
+  beforeEach(() => {
+    reset()
+    useStore.setState({ fatal: null })
+  })
+  afterEach(() => {
+    reset()
+    useStore.setState({ fatal: null })
+  })
+
+  it('surfaces a non-terminal error as a system line in the rendered transcript', () => {
+    const h = useStore.getState().handleEnvelope
+    h(errorEnv({
+      code: 'prompt_undelivered',
+      message: 'session abc died again and this connection has already used its one re-open',
+      terminal: false,
+    }))
+    const lines = rendered()
+    expect(lines).toHaveLength(1)
+    expect(lines[0]?.role).toBe('system')
+    // Both halves: the daemon's diagnostic, and the sentence the daemon never
+    // says — that the words the user just sent did not go anywhere.
+    expect(lines[0]?.text).toContain('Message not delivered')
+    expect(lines[0]?.text).toContain('already used its one re-open')
+  })
+
+  // In `notices`, not `messages`, for tether#57's reason: session_ready fires a
+  // history refetch whose loadHistory replaces `messages` wholesale, and the
+  // explanation of why the last thing you typed did not happen is precisely
+  // what must not vanish when the transcript reloads.
+  it('keeps the line where a history refetch cannot eat it', () => {
+    const h = useStore.getState().handleEnvelope
+    h(errorEnv({ code: 'prompt_undelivered', message: 'gone', terminal: false }))
+    expect(useStore.getState().messages).toHaveLength(0)
+    expect(useStore.getState().notices).toHaveLength(1)
+
+    useStore.getState().loadHistory([])
+    expect(rendered()).toHaveLength(1)
+  })
+
+  // The discriminating case. The session notice above collapses a repeat of the
+  // line already showing, because its text is a compile-time constant that
+  // carries no new information the second time. These do: each one is a prompt
+  // the user pressed enter on and lost, so three identical lines mean three
+  // lost prompts. Reusing that dedup here would under-report the exact thing
+  // this wi exists to report.
+  it('records one line per lost prompt, even when the text repeats', () => {
+    const h = useStore.getState().handleEnvelope
+    const env = errorEnv({ code: 'prompt_undelivered', message: 'session abc is gone', terminal: false })
+    h(env)
+    h(env)
+    h(env)
+    expect(rendered()).toHaveLength(3)
+  })
+
+  // A terminal refusal takes the other branch: ChatPane renders `fatal` and
+  // stops the reconnect ladder, so adding a notice too would say it twice.
+  it('does not add a notice for a terminal refusal', () => {
+    const h = useStore.getState().handleEnvelope
+    h(errorEnv({ code: 'unknown_workspace', message: 'unknown workspace "foo"', terminal: true }))
+    expect(useStore.getState().notices).toHaveLength(0)
+    expect(useStore.getState().fatal).toEqual({ code: 'unknown_workspace', message: 'unknown workspace "foo"' })
+  })
+
+  // The case that makes the early `break` load-bearing rather than tidy. Once
+  // the branch below is gated on the CODE, a terminal payload carrying some
+  // other code cannot reach it anyway — so only a payload that claims this code
+  // AND terminal can tell "break" from "fall through". That is not a contrived
+  // input: Terminal travels as its own field precisely so the two sides can
+  // disagree across a partial deploy (wire/errors.go's package doc), and the
+  // fatal card is the louder of the two answers.
+  it('a payload claiming this code AND terminal gets the card, not also a line', () => {
+    const h = useStore.getState().handleEnvelope
+    h(errorEnv({ code: 'prompt_undelivered', message: 'gone', terminal: true }))
+    expect(useStore.getState().fatal).toEqual({ code: 'prompt_undelivered', message: 'gone' })
+    expect(useStore.getState().notices).toHaveLength(0)
+  })
+
+  // The pre-tether#63 bare-string shape a stale daemon might still send stays
+  // exactly as unclassified as it was: nothing to show, nothing to crash on.
+  it('adds nothing for an unparsable payload', () => {
+    const h = useStore.getState().handleEnvelope
+    h(errorEnv('legacy plain-string error'))
+    expect(useStore.getState().notices).toHaveLength(0)
+  })
+
+  // Pre-existing behaviour that must survive: the spinner clear happens for
+  // every error, classified or not.
+  it('still clears the streaming indicator on a non-terminal error', () => {
+    const h = useStore.getState().handleEnvelope
+    useStore.setState({ streaming: true, streamingMsgId: 'm1', curTurnId: 'm1' })
+    h(errorEnv({ code: 'prompt_undelivered', message: 'gone', terminal: false }))
+    const s = useStore.getState()
+    expect(s.streaming).toBe(false)
+    expect(s.streamingMsgId).toBeNull()
+    expect(s.curTurnId).toBeNull()
+  })
+})
+
+// The gate is on the code, not on `!terminal` — asserted in BOTH directions
+// because a review mutation that widened it back to every retryable code
+// survived the entire suite. It is the largest behavioural decision in this
+// change and it was, until these two cases, written down nowhere but a comment.
+describe('store retryable error visibility is scoped to prompt_undelivered (tether#77)', () => {
+  beforeEach(() => {
+    reset()
+    useStore.setState({ fatal: null })
+  })
+  afterEach(() => {
+    reset()
+    useStore.setState({ fatal: null })
+  })
+
+  // agent_error is the one that matters. It arrives on a LIVE session, does not
+  // close the connection, and is unbounded — opencode emits one per concurrent
+  // prompt — so aliasing it onto this line would stack system lines for the
+  // life of the tab. It is also a different statement: the turn had a problem,
+  // not "your prompt is gone".
+  it('says nothing for a retryable code that is not about a lost prompt', () => {
+    const h = useStore.getState().handleEnvelope
+    for (const code of ['agent_error', 'connection_closed', 'spawn_failed', 'session_unconfirmed']) {
+      h(errorEnv({ code, message: `daemon text for ${code}`, terminal: false }))
+    }
+    expect(useStore.getState().notices).toHaveLength(0)
+  })
+
+  it('a busy session emitting many agent errors does not accumulate lines', () => {
+    const h = useStore.getState().handleEnvelope
+    for (let i = 0; i < 50; i++) {
+      h(errorEnv({ code: 'agent_error', message: 'busy: another prompt is running', terminal: false }))
+    }
+    expect(useStore.getState().notices).toHaveLength(0)
+  })
+
+  it('still says it for prompt_undelivered', () => {
+    const h = useStore.getState().handleEnvelope
+    h(errorEnv({ code: 'prompt_undelivered', message: 'gone', terminal: false }))
+    expect(useStore.getState().notices).toHaveLength(1)
+  })
+})
+
+// Where the line LANDS is part of what it says: it explains a specific prompt,
+// so it has to read after that prompt's bubble. mergeTranscript's tie-break puts
+// a notice FIRST when timestamps are equal, which is right for tether#50's
+// session-level banner and backwards for this one. Nothing else in the suite
+// puts a #77 notice into a transcript that already has messages.
+describe('store prompt_undelivered ordering (tether#77)', () => {
+  beforeEach(() => {
+    reset()
+    useStore.setState({ fatal: null })
+  })
+  afterEach(() => {
+    reset()
+    useStore.setState({ fatal: null })
+  })
+
+  it('reads after the prompt it is explaining', () => {
+    const s = useStore.getState()
+    // Same millisecond, which is the ordinary case: the prompt fails on the very
+    // write that sent it. A tie is what mergeTranscript resolves the wrong way
+    // round for this kind of notice.
+    s.addMessage({ id: 'u1', role: 'user', text: 'the lost prompt', ts: Date.now() })
+    s.handleEnvelope(errorEnv({ code: 'prompt_undelivered', message: 'gone', terminal: false }))
+
+    const lines = rendered()
+    expect(lines.map((l) => l.role)).toEqual(['user', 'system'])
+    expect(lines[1]?.text).toContain('Message not delivered')
+  })
+
+  // The other direction mergeTranscript's doc warns about: refetched history
+  // carries the DAEMON's clock, which can be well ahead of the browser's. A
+  // notice stamped with a bare Date.now() would then sort above a conversation
+  // it has nothing to do with.
+  it('reads last even when the transcript carries a clock from the future', () => {
+    const s = useStore.getState()
+    const ahead = Date.now() + 60_000
+    s.loadHistory([
+      { id: 'h1', role: 'user', text: 'turn 1', ts: ahead },
+      { id: 'h2', role: 'assistant', text: 'answer 1', ts: ahead + 1 },
+    ])
+    s.handleEnvelope(errorEnv({ code: 'prompt_undelivered', message: 'gone', terminal: false }))
+
+    expect(rendered().map((l) => l.role)).toEqual(['user', 'assistant', 'system'])
   })
 })

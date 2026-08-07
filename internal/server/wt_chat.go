@@ -71,10 +71,22 @@ func admitChat(reg *session.Registry, sid, clientID string) bool {
 // severity — it is precisely the difference that matters here. Attachment.SendPrompt
 // returns the transport error UNCHANGED on the paths that recover themselves (for cc
 // a bare *os.PathError from the stdin write, which Attachment.resolve answers by
-// replaying onto a fresh session), and everything Attachment.reopen returns wraps a
-// Refusal built by spawnEntry. So "carries a Refusal" reads exactly as "the daemon
-// tried to recover this and could not", which is the only case where staying silent
-// costs the user a spinner that never ends.
+// replaying onto a fresh session, and a cancelled ctx, where the client is already
+// gone); every other non-nil return from Attachment.reopen carries a Refusal. So
+// "carries a Refusal" reads exactly as "the daemon tried to recover this and could
+// not", which is the only case where staying silent costs the user a spinner that
+// never ends.
+//
+// Until tether#77 that read "everything Attachment.reopen returns wraps a Refusal
+// built by spawnEntry", which was true of exactly one of reopen's seven return
+// paths. The other six returned bare errors and were dropped here, which is the
+// silence #77 exists for — worth noting because the sentence was load-bearing and
+// wrong, not merely imprecise: it is the reason nobody looked. The one branch it
+// WAS true of did not classify anything itself either; it inherited whatever
+// spawnEntry attached, and spawnEntry's own awaitSpawn returns unclassified
+// errors on three paths. reopen now classifies at its own boundary instead of
+// depending on that, which is what makes the sentence above checkable by reading
+// one function.
 //
 // Wrong in either direction is a real cost, which is why this is not "always send"
 // or "never send": an envelope on the recoverable path shows an error for a turn
@@ -227,13 +239,15 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 			//     itself. Log only. Telling the browser about a prompt that Resolve
 			//     is about to replay would surface an error for a turn that then
 			//     answers normally.
-			//   - A recovery the daemon KNOWS it could not complete: everything
-			//     Attachment.reopen returns wraps a classified session.Refusal
-			//     (spawnEntry builds it). Nothing downstream will retry it and the
-			//     re-open budget is spent, so if this only reached the log the user
-			//     would sit on a spinner while every later prompt failed silently.
-			//     That is the failure this whole slice is about, one step further
-			//     out, so the classified subset is sent to the browser.
+			//   - A recovery the daemon KNOWS it could not complete: reopen returns
+			//     a classified session.Refusal on every branch where it has run out
+			//     of moves (tether#77 — see promptErrorEnvelope, which owns this
+			//     rule; this comment is not a second source of truth for it).
+			//     Nothing downstream will retry those, so if one only reached the
+			//     log the user would sit on a spinner while every later prompt
+			//     failed silently. That is the failure this whole slice is about,
+			//     one step further out, so the classified subset is sent to the
+			//     browser.
 			//
 			// The Refusal is the discriminator rather than a new flag because the
 			// two paths already differ in exactly that way — it costs nothing and

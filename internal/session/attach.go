@@ -511,6 +511,21 @@ func (a *Attachment) SendPrompt(ctx context.Context, text string) error {
 // recovery is not this attachment's to do — so the failed-resume and fresh-spawn
 // paths behave exactly as they did before tether#59.
 //
+// Every OTHER non-nil return is a *Refusal carrying ErrCodePromptUndelivered
+// (tether#77), because the browser is shown an error frame only for a Refusal
+// (promptErrorEnvelope in internal/server/wt_chat.go) and every one of those
+// branches is the end of the line for the prompt that reached it. The split is
+// not severity: it is whether something else is still going to try. `sid == ""`
+// and a cancelled ctx hand the problem to machinery that will (Resolve's replay)
+// or to nobody who is still listening; the other five have run out of moves.
+//
+// All five go through undelivered, including the spawn-failure branch, which
+// used to inherit whatever code spawnEntry attached. Uniformity here is not
+// tidiness: it is the difference between "classified" being a property of this
+// function and being a property of every error every callee might invent. The
+// old arrangement failed exactly that way — awaitSpawn's three bare returns
+// (tether#60) travelled up this path unclassified and were dropped.
+//
 // # Why the recovery is the SAME sid
 //
 // resolve's fallback spawns a fresh session because there the transcript could
@@ -576,7 +591,14 @@ func (a *Attachment) SendPrompt(ctx context.Context, text string) error {
 // healthy session that died — and a second death inside one connection is left to
 // the browser's reconnect, which arrives at the `--resume` path with the full
 // fallback machinery behind it. The cost is stated rather than hidden: a
-// long-lived connection whose agent dies twice hangs the second time.
+// long-lived connection whose agent dies twice cannot answer the second one.
+//
+// That cost used to read "hangs the second time", and hanging is what it was
+// until tether#59 added a turn-ending frame — after which the spinner stopped
+// and the same refusal became invisible instead of merely stuck. tether#77
+// re-priced it: the bound is unchanged and still one, but spending it is now
+// reported (ErrCodePromptUndelivered) rather than decided behind the user's
+// back. See the `spent` branch in reopen.
 //
 // # It is claude-code-only, by the provider's shape rather than by choice
 //
@@ -650,7 +672,12 @@ func (a *Attachment) reopen(ctx context.Context, dead *Entry, text string, sendE
 		// waiting on reopenMu. Deliver onto the replacement instead of spawning a
 		// second one — this is what makes two prompts in flight during one death
 		// both land, rather than one of them being told the session is broken.
-		return cur.Session().SendPrompt(ctx, text)
+		//
+		// Classified if that delivery fails (tether#77): the replacement is this
+		// attachment's session now, so a refusal here is the end of the line for
+		// this prompt — nothing further retries it.
+		return undelivered(cur.Session().SendPrompt(ctx, text),
+			"session %s was re-opened by another prompt but would not take this one", sid)
 	}
 	if ctx.Err() != nil {
 		return sendErr
@@ -704,11 +731,33 @@ func (a *Attachment) reopen(ctx context.Context, dead *Entry, text string, sendE
 		slog.Info("chat: the reused session was already re-opened by another attachment; adopting it",
 			"sid", sid, "err", sendErr)
 		a.adopt(sibling, dead)
-		return sibling.Session().SendPrompt(ctx, text)
+		// Classified if the adopted session refuses it (tether#77). Adoption is
+		// the recovery on this branch — there is no second one behind it, and the
+		// budget was deliberately left unspent, so the NEXT prompt gets a full
+		// reopen. This one does not.
+		return undelivered(sibling.Session().SendPrompt(ctx, text),
+			"adopted the live session under %s but it would not take the prompt", sid)
 	}
 
 	if spent {
-		return sendErr
+		// tether#77. reopen's doc used to accept this silence outright ("a
+		// long-lived connection whose agent dies twice hangs the second time"),
+		// and while that was written the cost was at least legible: with no
+		// turn-ending frame the spinner kept turning, which is ugly but does say
+		// something is wrong. tether#59 added the turn-ender, so the same refusal
+		// now leaves a tab that looks idle and healthy while swallowing every
+		// prompt typed into it. Same silence, strictly worse symptom.
+		//
+		// The budget is not what is being revisited here — it still bounds how
+		// many `cc --resume` this attachment may start, and one is still the
+		// right number. What changes is that spending it is now something the
+		// user is told about instead of a decision made behind their back.
+		// "already used" rather than "died again": reopenSpent is set both by a
+		// replacement that started and by one that failed to (see the spawn-failure
+		// branch below), so this branch is reached in a state where the session may
+		// have died only once and simply never been replaced.
+		return refuse(wire.ErrCodePromptUndelivered,
+			"session %s stopped accepting prompts and this connection has already used its one re-open: %w", sid, sendErr)
 	}
 
 	slog.Info("chat: the reused session stopped accepting prompts; re-opening it",
@@ -734,7 +783,21 @@ func (a *Attachment) reopen(ctx context.Context, dead *Entry, text string, sendE
 		// replacing had stopped accepting prompts" loses the half that says which
 		// recovery was being attempted (the same reason errorEnvelope keeps the
 		// whole wrapped message).
-		return fmt.Errorf("reused session %s stopped accepting prompts (%v) and could not be re-opened: %w", sid, sendErr, err)
+		//
+		// Through undelivered like every other give-up branch, which changes the
+		// code this used to report (ErrCodeSpawnFailed, borrowed from spawnEntry's
+		// own Refusal) to ErrCodePromptUndelivered. The old code was not wrong so
+		// much as accidental — it was whatever spawnEntry happened to attach — and
+		// relying on it made this branch's classification conditional on a function
+		// two layers away: awaitSpawn (tether#60) returns BARE errors for a
+		// cancelled wait, a winner that published neither entry nor error, and a
+		// workdir mismatch, and every one of those reached this line, escaped
+		// promptErrorEnvelope unclassified, and produced exactly the silence this
+		// wi is about. Classifying here makes "reopen gave up ⇒ the browser is
+		// told" structurally true rather than an invariant maintained at a
+		// distance. The specific cause is not lost — it stays in the message, and
+		// in the error chain under this wrapper.
+		return undelivered(err, "reused session %s stopped accepting prompts (%v) and could not be re-opened", sid, sendErr)
 	}
 
 	// The budget bounds SPAWNING, so a reservation we merely waited on does not
@@ -778,10 +841,37 @@ func (a *Attachment) reopen(ctx context.Context, dead *Entry, text string, sendE
 	// cur != dead branch above.
 	//
 	// Sent outside the lock so a blocked pipe cannot stall SendPrompt/Subscribe.
-	if err := fresh.Session().SendPrompt(ctx, text); err != nil {
-		return fmt.Errorf("re-opened session %s would not take the prompt: %w", sid, err)
+	// Classified (tether#77): the budget above has just been spent on this very
+	// replacement, so a refusal here means the next prompt takes the `spent`
+	// branch. There is no recovery left to wait for.
+	return undelivered(fresh.Session().SendPrompt(ctx, text),
+		"re-opened session %s would not take the prompt", sid)
+}
+
+// undelivered classifies a failed prompt delivery as ErrCodePromptUndelivered,
+// and passes nil through unchanged.
+//
+// It exists because the three branches that use it all end the same way — the
+// prompt is gone and nothing behind them will try again — and because getting
+// that wrong is invisible. A bare error returned from reopen is dropped by
+// promptErrorEnvelope (internal/server/wt_chat.go), which sends a frame only
+// for a *Refusal, so the browser is told nothing at all and the tab goes on
+// looking healthy. Wrapping at each site by hand is one forgotten call from
+// reintroducing exactly that, in a function where the difference between
+// "handed off to machinery that retries" and "given up on" is already the
+// hardest thing to keep straight.
+//
+// Not applied to the two branches that return sendErr bare, which are not
+// giving up: `sid == ""` hands the prompt back to Resolve (which replays it, or
+// reports ErrCodeSessionUnconfirmed itself), and a cancelled ctx means the
+// client is already gone and there is nobody to tell.
+func undelivered(err error, format string, a ...any) error {
+	if err == nil {
+		return nil
 	}
-	return nil
+	// Both halves in one message, the same shape the spawn-failure branch above
+	// uses: what was being attempted, and what the attempt hit.
+	return refuse(wire.ErrCodePromptUndelivered, format+": %w", append(a, err)...)
 }
 
 // adopt re-points this attachment at next and moves the subscriber set off prev.

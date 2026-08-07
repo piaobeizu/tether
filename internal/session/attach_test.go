@@ -2368,11 +2368,27 @@ func TestSendPrompt_UnrecoverableReopenIsClassifiedAndARecoverableSendIsNot(t *t
 			t.Fatalf("error %v (%T) carries no Refusal; serveChat cannot tell it from a send that "+
 				"recovers itself, so the user gets a silent spinner forever", err, err)
 		}
-		if ref.Code != wire.ErrCodeSpawnFailed {
-			t.Errorf("code = %q, want %q", ref.Code, wire.ErrCodeSpawnFailed)
+		// ErrCodePromptUndelivered since tether#77, where this branch used to
+		// report ErrCodeSpawnFailed. Nothing about the spawn failure changed —
+		// the point is where the classification comes FROM. It used to be
+		// inherited from whatever Refusal spawnEntry happened to attach, which
+		// made this branch's "the browser hears about it" guarantee conditional
+		// on a function two layers down: spawnEntry's awaitSpawn returns BARE
+		// errors on three paths (cancelled wait, a winner that published neither
+		// entry nor error, workdir mismatch), and each of those travelled up
+		// here and was dropped by promptErrorEnvelope. reopen now classifies at
+		// its own boundary so the guarantee is a property of reopen. The spawn
+		// failure itself is still named — in the message, and in the error chain
+		// under this wrapper, which the assertions below check.
+		if ref.Code != wire.ErrCodePromptUndelivered {
+			t.Errorf("code = %q, want %q", ref.Code, wire.ErrCodePromptUndelivered)
 		}
 		if ref.Code.Terminal() {
-			t.Error("ErrCodeSpawnFailed must stay retryable: a reconnect re-resumes and may well work")
+			t.Error("this must stay retryable: a reconnect re-resumes and may well work")
+		}
+		if !errors.Is(err, p.spawnErr) {
+			t.Errorf("error %v no longer wraps the spawn failure %v — classifying must not cost "+
+				"the operator the reason", err, p.spawnErr)
 		}
 	})
 }

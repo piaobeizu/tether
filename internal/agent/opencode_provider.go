@@ -504,12 +504,31 @@ func (s *opencodeSession) SendPrompt(ctx context.Context, text string) error {
 				})
 			}
 		}
+		// killedByUs records that the exit status cmd.Wait is about to report is
+		// one WE caused, on a path where neither context is cancelled — so the
+		// usual "was this cancellation?" test below cannot recognise it.
+		killedByUs := false
 		if err := sc.Err(); err != nil {
+			// Same wedge ccSession.abandon describes, same shape (StdoutPipe +
+			// a caller-owned scan + cmd.Wait): the scan gave up while the child
+			// may still be alive, and the cmd.Wait below then blocks in wait4()
+			// while the child blocks in write() on a stdout pipe nobody drains.
+			// Kill before the emit, because a terminal event is delivered rather
+			// than dropped, so emitting first would let a slow consumer delay
+			// the kill (tether#62).
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+				killedByUs = true
+			}
 			s.emit(Event{Kind: EventError, Err: fmt.Errorf("opencode run: stdout scan: %w", err)})
 		}
-		// A non-zero exit that is the result of an Interrupt() (runCtx cancelled)
-		// or session teardown (ctx cancelled) is expected — don't surface it.
-		if err := cmd.Wait(); err != nil && ctx.Err() == nil && runCtx.Err() == nil {
+		// A non-zero exit that is the result of an Interrupt() (runCtx cancelled),
+		// session teardown (ctx cancelled) or the scan-error kill just above is
+		// expected — don't surface it. Without the killedByUs arm the kill would
+		// come back as a SECOND EventError blaming opencode ("run exited: signal:
+		// killed") for a signal tether sent, and the two context checks cannot
+		// catch it: on that path both contexts are deliberately still live.
+		if err := cmd.Wait(); err != nil && !killedByUs && ctx.Err() == nil && runCtx.Err() == nil {
 			s.emit(Event{Kind: EventError, Err: fmt.Errorf("opencode run exited: %w", err)})
 		}
 		// Emit EventResult after opencode run exits (or is interrupted) — closes

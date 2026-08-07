@@ -364,3 +364,40 @@ func TestApplyACME_WarnsWhenTheChallengeCannotReachThisDaemon(t *testing.T) {
 		})
 	}
 }
+
+// --acme-domain silently wins over --cert-file: Step 4b replaces the bundle and
+// the listener takes its config from certmagic, so the files are neither served
+// nor re-read. Since tether#73 the flag help promises they ARE re-read every
+// minute — true of the flag on its own, false of this combination — so the
+// contradiction has to be said out loud rather than left for the operator to
+// infer from a cert that never changes.
+func TestApplyACME_WarnsThatCertFilesAreIgnored(t *testing.T) {
+	base, _ := acmeBase(t)
+	certPath, keyPath := seedOperatorPEM(t, mustGenCert(t))
+	for _, tc := range []struct {
+		name             string
+		cert, key        string
+		wantCertFileWarn bool
+	}{
+		{"both cert flags", certPath, keyPath, true},
+		{"cert flag alone is not an operator cert", certPath, "", false},
+		{"no cert flags", "", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := captureLogs(t)
+			// Port 443 so the unrelated challenge-port warning stays quiet and
+			// this assertion cannot pass on the wrong line.
+			cfg := &Config{Port: acmeChallengePort, AcmeDomain: "tether.test", CertFile: tc.cert, KeyFile: tc.key}
+			if _, err := applyACME(context.Background(), cfg,
+				func(context.Context, string, string) (*tls.Config, CertBundle, error) {
+					return base, CertBundle{External: true}, nil
+				}); err != nil {
+				t.Fatalf("applyACME: %v", err)
+			}
+			logged := strings.Contains(out.String(), "overrides --cert-file")
+			if logged != tc.wantCertFileWarn {
+				t.Fatalf("cert-file override warning = %v, want %v. Log: %s", logged, tc.wantCertFileWarn, out.String())
+			}
+		})
+	}
+}

@@ -114,6 +114,15 @@ func applyACME(ctx context.Context, cfg *Config,
 	setup func(context.Context, string, string) (*tls.Config, CertBundle, error),
 ) (CertBundle, error) {
 	warnACMEPortMismatch(cfg.AcmeDomain, cfg.Port)
+	// --cert-file and --acme-domain together: this call is about to replace the
+	// bundle Step 4 loaded, and the listener will take its tls.Config from
+	// certmagic, so those files stop being served here. Worth a line — since
+	// tether#73 the flag help promises they are re-read every minute, which
+	// stays true of the flags and false of this combination.
+	if externalPEMSource(cfg.CertFile, cfg.KeyFile) {
+		slog.Warn("--acme-domain overrides --cert-file/--key-file; the files will not be served or re-read",
+			"domain", cfg.AcmeDomain, "cert_file", cfg.CertFile)
+	}
 	slog.Info("obtaining ACME cert", "domain", cfg.AcmeDomain)
 
 	acmeTLS, bundle, err := setup(ctx, cfg.AcmeDomain, cfg.AcmeEmail)

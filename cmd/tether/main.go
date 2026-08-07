@@ -140,8 +140,8 @@ func newServerCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().IntVarP(&cfg.Port, "port", "p", 8898, "listen port (TCP + UDP)")
-	cmd.Flags().StringVar(&cfg.CertFile, "cert-file", "", "TLS cert PEM (bypasses auto-rotation)")
-	cmd.Flags().StringVar(&cfg.KeyFile, "key-file", "", "TLS key PEM (bypasses auto-rotation)")
+	cmd.Flags().StringVar(&cfg.CertFile, "cert-file", "", "TLS cert PEM you own (re-read every minute, never re-minted; needs --key-file; ignored with --acme-domain)")
+	cmd.Flags().StringVar(&cfg.KeyFile, "key-file", "", "TLS key PEM for --cert-file (both are needed; either alone falls back to the managed cert)")
 	cmd.Flags().StringVar(&cfg.AcmeDomain, "acme-domain", "", "domain for ACME/Let's Encrypt cert (validated over :443; port 80 unused)")
 	cmd.Flags().StringVar(&cfg.AcmeEmail, "acme-email", "", "contact email for the ACME account (optional; adding it later registers a different account)")
 	cmd.Flags().BoolVar(&cfg.DevMode, "dev", false, "proxy SPA to Vite dev server")

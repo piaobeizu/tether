@@ -6,7 +6,7 @@
 
 | # | Criterion | Status | Notes |
 |---|---|---|---|
-| K.1 | Single binary, `go install` | ✅ | v0.1.0+ |
+| K.1 | Single binary | ✅ | v0.1.0+. **`go install …@latest` is no longer a supported install path** (tether#81): the embedded SPA is generated rather than committed, so a module download will not build once a tag is cut from that commit. Tags up to and including v0.5.0 still carry a committed `web/dist` and still install — with a frontend frozen at that tag. Ship path = release tarball or `make build`. |
 | K.2 | HTTP/3 + WebTransport single-port mux | ✅ | v0.1.0+ |
 | K.3 | Chat channel (`/wt/chat`) stream-json | ✅ | v0.1.0+ |
 | K.4 | Shell channel (`/wt/shell`) PTY | ✅ | v0.1.0+ |

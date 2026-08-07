@@ -15,8 +15,14 @@ PLATFORMS=(
   "windows/amd64"
 )
 
-# Build web assets first.
-(cd web && pnpm install --frozen-lockfile && pnpm build)
+# Build web assets first. CI=true because the committed web/node_modules does not
+# match pnpm-lock.yaml, so --frozen-lockfile purges it and pnpm refuses to do that
+# without a TTY (ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY). Same reason as in
+# scripts/build.sh.
+(cd web && CI=true pnpm install --frozen-lockfile && pnpm build)
+
+# Stamp before any go build so every cross-compiled artifact carries the build id.
+bash scripts/spa-bundle.sh stamp
 
 mkdir -p dist release
 
@@ -36,6 +42,11 @@ for PLATFORM in "${PLATFORMS[@]}"; do
   GOOS="$GOOS" GOARCH="$GOARCH" CGO_ENABLED=0 \
     go build -ldflags="-s -w -X main.version=${VERSION}" \
     -o "${OUTDIR}/tether${EXT}" ./cmd/tether
+
+  # These are the binaries people download, so they get the same embed check the
+  # local build gets. Works on cross-compiled output: -s -w strips symbols and
+  # DWARF, not embedded data.
+  bash scripts/spa-bundle.sh check "${OUTDIR}/tether${EXT}"
 
   # Permission hook binary (D-05b §4.2).
   GOOS="$GOOS" GOARCH="$GOARCH" CGO_ENABLED=0 \

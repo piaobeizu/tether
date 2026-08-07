@@ -1871,7 +1871,7 @@ func TestSendPrompt_ReopenStaysInTheSameWorkspace(t *testing.T) {
 	ws := WorkspaceBinding{WorkspaceID: "ws-1", Path: dir}
 
 	// Seed a session that lives in a workspace, the way an Attach carrying ?ws= would.
-	if _, _, err := reg.spawnEntry(context.Background(), "fake", agent.SpawnConfig{}, ws); err != nil {
+	if _, _, err := reg.spawnEntry(context.Background(), "fake", agent.SpawnConfig{}, ws, spawnIfAbsent); err != nil {
 		t.Fatalf("seed spawn: %v", err)
 	}
 	reused.announceInit()
@@ -2122,7 +2122,7 @@ func TestFanOut_StreamEndFlushesAFenceTheAgentDiedInsideOf(t *testing.T) {
 func TestFanOut_StreamEndStaysSilentForASessionThatNeverInited(t *testing.T) {
 	never := &fakeSession{sid: "never-inits", events: make(chan agent.Event, 4)}
 	reg := NewRegistry(&fakeProvider{sess: never})
-	e, _, err := reg.spawnEntry(context.Background(), "fake", agent.SpawnConfig{}, WorkspaceBinding{})
+	e, _, err := reg.spawnEntry(context.Background(), "fake", agent.SpawnConfig{}, WorkspaceBinding{}, spawnIfAbsent)
 	if err != nil {
 		t.Fatalf("spawn: %v", err)
 	}
@@ -2184,7 +2184,7 @@ func TestFanOut_StreamEndFlushesTheHalfAnswerSoItCannotGlueOntoTheNextTurn(t *te
 	}
 
 	// The replacement answers under the SAME sid and completes its turn.
-	e2, _, err := reg.spawnEntry(context.Background(), "fake", agent.SpawnConfig{ResumeSessionID: "shared-sid"}, WorkspaceBinding{})
+	e2, _, err := reg.spawnEntry(context.Background(), "fake", agent.SpawnConfig{ResumeSessionID: "shared-sid"}, WorkspaceBinding{}, spawnIfAbsent)
 	if err != nil {
 		t.Fatalf("replacement spawn: %v", err)
 	}
@@ -2464,6 +2464,74 @@ func TestSendPrompt_ReopensEvenWhileTheDeadSessionStillReportsItselfAlive(t *tes
 	}
 	if got := attEntry(att); got == registeredEntryByValue(reg, reused) {
 		t.Error("the attachment re-adopted its own corpse instead of replacing it")
+	}
+}
+
+// TestSendPrompt_ASpentAttachmentDoesNotAdoptItsOwnCorpse is the guard on reopen's
+// evict, which tether#82 turned into something load-bearing on a path that could not
+// previously reach it.
+//
+// A session whose pipe has broken but whose `done` has not closed still reports Alive()
+// — the window the test above is about. Since tether#82 a SPENT attachment consults the
+// registration instead of refusing outright, and if its own corpse were still registered
+// when it did, liveEntry would hand it straight back: the attachment would "adopt" the
+// very session it is recovering FROM and write the prompt into the same broken pipe.
+//
+// The evict is NOT new, and this test is not the only thing pinning it — measured, after
+// an earlier version of this comment claimed both. Deleting `a.reg.evict(dead)` also
+// fails TestSendPrompt_ReopensEvenWhileTheDeadSessionStillReportsItselfAlive,
+// TestSendPrompt_ReopenSpawnFailureNamesBothCausesAndDropsTheCorpse and
+// TestResolve_AFailedResolveDoesNotDisarmAReusedAttachment, which is the correct shape:
+// those are exactly the paths where Alive() has not flipped, so the sibling check's own
+// liveEntry returns the corpse and un-registers nothing. What this test adds is the one
+// caller they cannot reach — the SPENT one, whose consult is adopt-only, so a missing
+// evict makes it adopt a corpse instead of merely failing to replace one.
+func TestSendPrompt_ASpentAttachmentDoesNotAdoptItsOwnCorpse(t *testing.T) {
+	reused := &fakeSession{sid: "reused-sid", events: make(chan agent.Event, 8)}
+	reopened := &fakeSession{sid: "reused-sid", events: make(chan agent.Event, 8)}
+	p := &reopenProvider{first: reused, second: reopened}
+	reg, att := seedReuse(t, p, "reused-sid")
+
+	// The first death spends the budget, and `reopened` becomes the registration.
+	reused.kill()
+	if err := att.SendPrompt(context.Background(), "first death"); err != nil {
+		t.Fatalf("first SendPrompt: %v", err)
+	}
+	att.mu.Lock()
+	spent := att.reopenSpent
+	att.mu.Unlock()
+	if !spent {
+		t.Fatal("the budget is not spent: this test says nothing about the adopt-only path")
+	}
+
+	// The replacement's pipe breaks WITHOUT Alive() flipping, so it stays registered and
+	// keeps reading as live. That is the only state in which an un-evicted corpse is
+	// adoptable, and it is why the sibling check above cannot cover this: liveEntry
+	// returns the corpse as alive, `sibling != dead` is false, and nothing evicts it.
+	reopened.sendFails.Store(true)
+	if !reopened.Alive() {
+		t.Fatal("the double is not staging the window: Alive() must still be true here")
+	}
+	if _, ok := reg.liveEntry("reused-sid"); !ok {
+		t.Fatal("the corpse must still be registered AND live for this test to mean anything")
+	}
+
+	err := att.SendPrompt(context.Background(), "second death")
+	wantUndelivered(t, err, errBrokenPipe, "spent, with only its own corpse under the sid")
+	if !strings.Contains(err.Error(), "already used its one re-open") {
+		t.Errorf("error = %q, want the spent refusal: any other message means this attachment "+
+			"adopted or re-opened something, and the only candidate was its own corpse", err)
+	}
+	if got := reopened.Refused(); got != 1 {
+		t.Errorf("the corpse was written to %d times, want 1 (the send that discovered it): a "+
+			"second write means this attachment adopted the session it was recovering from and "+
+			"delivered the user's words into a pipe nobody will read", got)
+	}
+	if got := p.Spawns(); got != 2 {
+		t.Errorf("spawns = %d, want 2: the budget still bounds spawning", got)
+	}
+	if got := registeredEntryByValue(reg, reopened); got != nil {
+		t.Error("the corpse is still registered: the next reconnect will be handed it")
 	}
 }
 

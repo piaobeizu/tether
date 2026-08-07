@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -26,6 +27,12 @@ type gatedProvider struct {
 	// tell the winner's session from a rival's.
 	mk  func(n int) agent.Session
 	err error
+	// errFrom is the first spawn (1-based) that returns err; the ZERO value means
+	// "every spawn", which is what every caller that predates this field expects.
+	// It exists for the same reason gateFrom does — a test that needs a real session
+	// before it can stage a failure of the NEXT one (tether#82's adopt-only waiter,
+	// which inherits a failure it did not cause).
+	errFrom int
 	// gateFrom is the first spawn (1-based) that waits on release; earlier ones
 	// return immediately. It exists so a test can stage a session normally and gate
 	// only the RECOVERY spawn — the reopen path cannot be reached without a live
@@ -63,7 +70,7 @@ func (p *gatedProvider) Spawn(ctx context.Context, cfg agent.SpawnConfig) (agent
 			return nil, ctx.Err()
 		}
 	}
-	if p.err != nil {
+	if p.err != nil && n >= p.errFrom {
 		return nil, p.err
 	}
 	return p.mk(n), nil
@@ -137,7 +144,7 @@ func TestSpawnEntry_ConcurrentCallersForOneKeySpawnOnce(t *testing.T) {
 	}
 	res := make(chan result, 2)
 	spawn := func() {
-		e, outcome, err := reg.spawnEntry(context.Background(), "fake", cfg, WorkspaceBinding{})
+		e, outcome, err := reg.spawnEntry(context.Background(), "fake", cfg, WorkspaceBinding{}, spawnIfAbsent)
 		res <- result{e, outcome, err}
 	}
 
@@ -238,7 +245,7 @@ func TestSpawnEntry_ReservationsAreIndependentPerKey(t *testing.T) {
 		res := make(chan result, 2)
 		for _, cfg := range cfgs {
 			go func(cfg agent.SpawnConfig) {
-				e, _, err := reg.spawnEntry(context.Background(), "fake", cfg, WorkspaceBinding{})
+				e, _, err := reg.spawnEntry(context.Background(), "fake", cfg, WorkspaceBinding{}, spawnIfAbsent)
 				res <- result{e, err}
 			}(cfg)
 		}
@@ -299,7 +306,7 @@ func TestSpawnEntry_TheWaiterGetsTheSpawnFailure(t *testing.T) {
 
 	errs := make(chan error, 2)
 	spawn := func() {
-		_, _, err := reg.spawnEntry(context.Background(), "fake", cfg, WorkspaceBinding{})
+		_, _, err := reg.spawnEntry(context.Background(), "fake", cfg, WorkspaceBinding{}, spawnIfAbsent)
 		errs <- err
 	}
 
@@ -348,7 +355,7 @@ func TestSpawnEntry_AWaiterThatGivesUpDoesNotStrandTheKey(t *testing.T) {
 
 	winner := make(chan *Entry, 1)
 	go func() {
-		e, _, err := reg.spawnEntry(context.Background(), "fake", cfg, WorkspaceBinding{})
+		e, _, err := reg.spawnEntry(context.Background(), "fake", cfg, WorkspaceBinding{}, spawnIfAbsent)
 		if err != nil {
 			t.Errorf("winner: %v", err)
 		}
@@ -359,7 +366,7 @@ func TestSpawnEntry_AWaiterThatGivesUpDoesNotStrandTheKey(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	gaveUp := make(chan error, 1)
 	go func() {
-		_, _, err := reg.spawnEntry(ctx, "fake", cfg, WorkspaceBinding{})
+		_, _, err := reg.spawnEntry(ctx, "fake", cfg, WorkspaceBinding{}, spawnIfAbsent)
 		gaveUp <- err
 	}()
 	p.assertNoFurtherSpawnEntered(t, 250*time.Millisecond)
@@ -674,7 +681,7 @@ func TestSpawnEntry_ALateCallerAdoptsTheRegistrationInsteadOfDisplacingIt(t *tes
 	reg := NewRegistry(p)
 	cfg := agent.SpawnConfig{ResumeSessionID: "shared-sid"}
 
-	first, outcome, err := reg.spawnEntry(context.Background(), "fake", cfg, WorkspaceBinding{})
+	first, outcome, err := reg.spawnEntry(context.Background(), "fake", cfg, WorkspaceBinding{}, spawnIfAbsent)
 	if err != nil {
 		t.Fatalf("winner: %v", err)
 	}
@@ -695,7 +702,7 @@ func TestSpawnEntry_ALateCallerAdoptsTheRegistrationInsteadOfDisplacingIt(t *tes
 			"for consulting r.sessions at claim time is that ordering")
 	}
 
-	second, outcome, err := reg.spawnEntry(context.Background(), "fake", cfg, WorkspaceBinding{})
+	second, outcome, err := reg.spawnEntry(context.Background(), "fake", cfg, WorkspaceBinding{}, spawnIfAbsent)
 	if err != nil {
 		t.Fatalf("late caller: %v", err)
 	}
@@ -735,7 +742,7 @@ func TestSpawnEntry_ALateCallerReplacesARegisteredCorpseRatherThanAdoptingIt(t *
 	reg := NewRegistry(p)
 	cfg := agent.SpawnConfig{ResumeSessionID: "shared-sid"}
 
-	first, _, err := reg.spawnEntry(context.Background(), "fake", cfg, WorkspaceBinding{})
+	first, _, err := reg.spawnEntry(context.Background(), "fake", cfg, WorkspaceBinding{}, spawnIfAbsent)
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -749,7 +756,7 @@ func TestSpawnEntry_ALateCallerReplacesARegisteredCorpseRatherThanAdoptingIt(t *
 		t.Fatal("the corpse was already un-registered: there is nothing here to be tempted to adopt")
 	}
 
-	second, outcome, err := reg.spawnEntry(context.Background(), "fake", cfg, WorkspaceBinding{})
+	second, outcome, err := reg.spawnEntry(context.Background(), "fake", cfg, WorkspaceBinding{}, spawnIfAbsent)
 	if err != nil {
 		t.Fatalf("replacement: %v", err)
 	}
@@ -787,11 +794,11 @@ func TestSpawnEntry_ALateCallerWillNotAdoptARegistrationFromAnotherDirectory(t *
 	reg := NewRegistry(p)
 	cfg := agent.SpawnConfig{ResumeSessionID: "shared-sid"}
 
-	if _, _, err := reg.spawnEntry(context.Background(), "fake", cfg, WorkspaceBinding{Path: "/ws/one"}); err != nil {
+	if _, _, err := reg.spawnEntry(context.Background(), "fake", cfg, WorkspaceBinding{Path: "/ws/one"}, spawnIfAbsent); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
-	e, outcome, err := reg.spawnEntry(context.Background(), "fake", cfg, WorkspaceBinding{Path: "/ws/two"})
+	e, outcome, err := reg.spawnEntry(context.Background(), "fake", cfg, WorkspaceBinding{Path: "/ws/two"}, spawnIfAbsent)
 	if err == nil {
 		t.Fatal("adopted a session registered in /ws/one for a connection that resolved /ws/two")
 	}
@@ -1010,5 +1017,494 @@ func TestSendPrompt_AReopenHeldInItsSiblingCheckAdoptsTheRegistration(t *testing
 	if spent != 1 {
 		t.Errorf("%d of 2 attachments spent their reopen budget, want exactly 1 (the spawner): "+
 			"charging the adopter would refuse it a later recovery over a race it never entered", spent)
+	}
+}
+
+// ── tether#82: the SPENT path reaches the claim too ────────────────────────────
+//
+// The two tests above are the tether#78 wiring hop for an attachment with budget left.
+// The residual they leave is the one below: reopen's spent budget used to return BEFORE
+// spawnEntry, so an attachment that had used its one re-open never reached any of the
+// machinery those tests exercise. Its only chance to notice a live session under the sid
+// was its own sibling check — and that check answers about the entry it FOUND, because
+// liveEntry reads the map and only THEN asks Alive(). Lose it and the prompt is refused
+// with a live session registered under that very sid.
+//
+// Both tests here therefore stage the SAME two schedulings as the pair above (a caller
+// held inside its own liveness check; a caller arriving while a replacement is still
+// inside provider.Spawn) with one difference: the caller is out of budget. That is the
+// whole point — the difference between the two pairs is a mode, not a mechanism.
+
+// stageSpentReopenRace brings the registry to the four-step state the tether#82
+// reproduction needs and hands back the attachments standing in it:
+//
+//   - tab2 has SPENT its one re-open (it recovered the first death) and is now PARKED
+//     inside reopen's sibling check, holding the corpse it found there.
+//   - tab1 still had budget, and while tab2 was parked it completed a full re-open:
+//     its replacement is spawned, registered, and its reservation released.
+//
+// The caller releases tab2 by closing first.aliveHold, and reads its verdict from the
+// returned channel. Parking rather than sleeping is what makes this airtight, for the
+// reason fakeSession.aliveHold documents: liveEntry looks the sid up BEFORE it asks
+// Alive(), so the parked goroutine is provably holding `first` and cannot, on release,
+// quietly take the sibling branch on whatever registered while it was stopped.
+func stageSpentReopenRace(t *testing.T, p *gatedProvider, seed, first *fakeSession) (*Registry, *Attachment, *Attachment, chan error) {
+	t.Helper()
+	reg := NewRegistry(p)
+	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
+		t.Fatalf("seed spawn: %v", err)
+	}
+	seed.announceInit()
+	waitForRegistered(t, reg, "shared-sid")
+
+	tab1, err := reg.Attach(context.Background(), "shared-sid", "fake", "")
+	if err != nil {
+		t.Fatalf("tab1 Attach: %v", err)
+	}
+	tab2, err := reg.Attach(context.Background(), "shared-sid", "fake", "")
+	if err != nil {
+		t.Fatalf("tab2 Attach: %v", err)
+	}
+	if n := p.Spawns(); n != 1 {
+		t.Fatalf("spawns after both attaches = %d, want 1: both tabs must REUSE the seed", n)
+	}
+
+	// First death. tab2 recovers it and spends its budget doing so; tab1 is untouched
+	// and still points at the seed, so its own budget is intact for the second death.
+	seed.kill()
+	if err := tab2.SendPrompt(context.Background(), "tab2 spends its budget"); err != nil {
+		t.Fatalf("tab2's first prompt: %v", err)
+	}
+	tab2.mu.Lock()
+	spent := tab2.reopenSpent
+	tab2.mu.Unlock()
+	if !spent {
+		t.Fatal("tab2's budget is not spent: this staging proves nothing about the spent path")
+	}
+	if n := p.Spawns(); n != 2 {
+		t.Fatalf("spawns after tab2's recovery = %d, want 2 (the seed, then tab2's re-open)", n)
+	}
+
+	// Second death, with the scheduling that makes it the residual: tab2 is held inside
+	// its own sibling check for as long as it takes tab1 to spawn, register and release.
+	first.kill()
+	first.aliveEntered = make(chan struct{}, 1)
+	first.aliveHold = make(chan struct{})
+
+	late := make(chan error, 1)
+	go func() { late <- tab2.SendPrompt(context.Background(), "tab2 after the second death") }()
+	select {
+	case <-first.aliveEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("tab2 never reached reopen's sibling check; the fixture never opened the window")
+	}
+
+	if err := tab1.SendPrompt(context.Background(), "tab1 recovers the second death"); err != nil {
+		t.Fatalf("tab1's prompt: %v", err)
+	}
+	reg.mu.RLock()
+	inFlight := len(reg.spawning)
+	reg.mu.RUnlock()
+	if inFlight != 0 {
+		t.Fatalf("%d reservation(s) still held: tab2 would WAIT on it, which is tether#60's path "+
+			"and not the residual this stages", inFlight)
+	}
+	return reg, tab1, tab2, late
+}
+
+// TestSendPrompt_ASpentAttachmentHeldInItsSiblingCheckStillAdoptsTheRegistration is
+// tether#82 itself: the reviewer's reproduction, with the same state reached under two
+// schedulings and only one of them refusing the prompt.
+func TestSendPrompt_ASpentAttachmentHeldInItsSiblingCheckStillAdoptsTheRegistration(t *testing.T) {
+	seed := &fakeSession{sid: "shared-sid", events: make(chan agent.Event, 8)}
+	first := &fakeSession{sid: "shared-sid", events: make(chan agent.Event, 8)}
+	second := &fakeSession{sid: "shared-sid", events: make(chan agent.Event, 8)}
+	rival := &fakeSession{sid: "shared-sid", events: make(chan agent.Event, 8)}
+	p := staged(t, seed, first, second, rival)
+
+	reg, tab1, tab2, late := stageSpentReopenRace(t, p, seed, first)
+
+	close(first.aliveHold)
+	select {
+	case err := <-late:
+		if err != nil {
+			t.Fatalf("tab2's prompt was refused: %v\n\ntab2 lost its sibling check to a scheduling "+
+				"delay and its budget was already spent, so it was told the session had stopped "+
+				"accepting prompts — while tab1's replacement was registered under that very sid and "+
+				"ready to answer. The budget bounds SPAWNING; spending it to refuse an ADOPTION "+
+				"charges this connection for a race it never entered.", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("tab2's prompt never completed")
+	}
+
+	if n := p.Spawns(); n != 3 {
+		t.Errorf("provider.Spawn was called %d times, want 3 (the seed, tab2's re-open, tab1's): "+
+			"a spent attachment must ADOPT, never start a rival `cc --resume shared-sid`", n)
+	}
+	if attEntry(tab1) != attEntry(tab2) {
+		t.Error("the two tabs hold different entries after the recovery; every sid-keyed route " +
+			"(DeliverAction, InterruptSession, /wt/events) can only point at one of them")
+	}
+	// Order is deterministic: tab1's prompt is sent before tab2 is released.
+	want := []string{"tab1 recovers the second death", "tab2 after the second death"}
+	got := second.Prompts()
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("the replacement received %v, want %v", got, want)
+	}
+	tab2.mu.Lock()
+	stillSpent := tab2.reopenSpent
+	tab2.mu.Unlock()
+	if !stillSpent {
+		t.Error("tab2's budget came back: adopting is not re-opening, so it must neither spend " +
+			"the budget nor refund it — a refund would let one connection start two agents")
+	}
+	reg.mu.RLock()
+	registered := reg.sessions["shared-sid"]
+	reg.mu.RUnlock()
+	if registered != attEntry(tab1) {
+		t.Error("r.sessions does not hold the replacement tab1 spawned")
+	}
+}
+
+// TestSendPrompt_AnAdoptionThroughTheClaimThatRefusesSaysItAdopted covers the wording of
+// the give-up message on the path tether#82 makes newly reachable.
+//
+// promptsilence_test.go already pins this for reopen's own sibling branch. The same
+// event reached one layer down — through spawnEntry's consult — used to report
+// "re-opened session %s would not take the prompt", which for a SPENT attachment names
+// the single thing it is not allowed to have done. The message is a diagnostic, so
+// getting it wrong costs nobody a prompt; it costs the next person reading a log a wrong
+// account of which recovery was attempted, which in this function is the hardest thing to
+// keep straight.
+func TestSendPrompt_AnAdoptionThroughTheClaimThatRefusesSaysItAdopted(t *testing.T) {
+	seed := &fakeSession{sid: "shared-sid", events: make(chan agent.Event, 8)}
+	first := &fakeSession{sid: "shared-sid", events: make(chan agent.Event, 8)}
+	second := &fakeSession{sid: "shared-sid", events: make(chan agent.Event, 8)}
+	rival := &fakeSession{sid: "shared-sid", events: make(chan agent.Event, 8)}
+	p := staged(t, seed, first, second, rival)
+
+	_, _, _, late := stageSpentReopenRace(t, p, seed, first)
+
+	// The replacement breaks its pipe AFTER tab1 has used it and BEFORE tab2 is released,
+	// so tab2 adopts a session that is registered and alive and then refuses it. Not
+	// kill(): a dead one would not be adopted at all.
+	second.sendFails.Store(true)
+	close(first.aliveHold)
+
+	var err error
+	select {
+	case err = <-late:
+	case <-time.After(5 * time.Second):
+		t.Fatal("tab2's prompt never completed")
+	}
+	wantUndelivered(t, err, errBrokenPipe, "adopted through the claim, then refused")
+	if !strings.Contains(err.Error(), "adopted the live session under") {
+		t.Errorf("error = %q, want it to say the session was ADOPTED: this attachment was out of "+
+			"budget, so \"re-opened\" would name the one thing it could not have done", err)
+	}
+	if n := p.Spawns(); n != 3 {
+		t.Errorf("provider.Spawn was called %d times, want 3: a refused adoption must not spawn", n)
+	}
+}
+
+// TestSendPrompt_ASpentAttachmentsAdoptionCheckDoesNotClaimTheKey pins the one design
+// decision inside the fix that has a failure mode of its own.
+//
+// An adoptOnly call takes NO reservation. It could: the claim is what makes spawnEntry's
+// ordinary consult authoritative. But the release publishes the holder's outcome to every
+// waiter (see spawnReservation), and a call that registers nothing has no outcome worth
+// inheriting — a would-be spawner parked behind it would be handed awaitSpawn's "neither
+// an entry nor an error", a branch documented as unreachable for a call that did not
+// panic. Declining the reservation keeps tether#60's protocol a conversation between
+// callers that actually spawn.
+//
+// Staged by parking tab2 inside the adopt-only consult itself — the replacement's Alive()
+// — and then asking, from the test goroutine, for the same key with budget available. It
+// must be answered while tab2 is still parked.
+func TestSendPrompt_ASpentAttachmentsAdoptionCheckDoesNotClaimTheKey(t *testing.T) {
+	seed := &fakeSession{sid: "shared-sid", events: make(chan agent.Event, 8)}
+	first := &fakeSession{sid: "shared-sid", events: make(chan agent.Event, 8)}
+	second := &fakeSession{sid: "shared-sid", events: make(chan agent.Event, 8)}
+	rival := &fakeSession{sid: "shared-sid", events: make(chan agent.Event, 8)}
+	// Armed before anything runs, because the FIRST Alive() on the replacement is tab2's
+	// adopt-only consult: tab1 spawns it and never polls it, and the sibling check that
+	// runs before the consult asks about `first`, not this one.
+	second.aliveEntered = make(chan struct{}, 1)
+	second.aliveHold = make(chan struct{})
+	p := staged(t, seed, first, second, rival)
+
+	reg, tab1, tab2, late := stageSpentReopenRace(t, p, seed, first)
+	close(first.aliveHold)
+
+	select {
+	case <-second.aliveEntered:
+	case err := <-late:
+		t.Fatalf("tab2 answered (err=%v) without consulting the registration: a spent attachment "+
+			"that stops at its own sibling check is the tether#82 bug", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("tab2 never reached its adopt-only consult")
+	}
+
+	type result struct {
+		outcome spawnOutcome
+		err     error
+	}
+	spawner := make(chan result, 1)
+	go func() {
+		_, outcome, err := reg.spawnEntry(context.Background(), "fake",
+			agent.SpawnConfig{ResumeSessionID: "shared-sid"}, WorkspaceBinding{}, spawnIfAbsent)
+		spawner <- result{outcome, err}
+	}()
+	select {
+	case got := <-spawner:
+		if got.err != nil {
+			t.Fatalf("a caller with budget left was refused while a spent one was consulting: %v", got.err)
+		}
+		if got.outcome != adoptedRegistration {
+			t.Errorf("outcome = %v, want adoptedRegistration", got.outcome)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a caller with budget left is parked behind the spent attachment's adopt-only " +
+			"consult: the consult claimed the key, so this caller is waiting to inherit a verdict " +
+			"from a call that will never register anything")
+	}
+
+	close(second.aliveHold)
+	select {
+	case err := <-late:
+		if err != nil {
+			t.Fatalf("tab2's prompt: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("tab2's prompt never completed")
+	}
+	if n := p.Spawns(); n != 3 {
+		t.Errorf("provider.Spawn was called %d times, want 3: neither the spent attachment nor "+
+			"the caller that adopted behind it may start an agent", n)
+	}
+	if attEntry(tab1) != attEntry(tab2) {
+		t.Error("the two tabs hold different entries after the recovery")
+	}
+}
+
+// stageSpentReopenAgainstAnInFlightSpawn parks a SPENT attachment so that it reaches its
+// adopt-only consult while ANOTHER attachment is inside provider.Spawn holding the key's
+// reservation — the one state in which a replacement exists and is registered nowhere.
+//
+// Two things had to be got right here, and the first version of this staging got neither.
+//
+// ORDER. An earlier version released tab1's spawn on a 300ms timer and had tab2 arrive
+// whenever it arrived. That is reliable in the failing direction — a pre-fix tab2 refuses
+// in the time it takes to take an uncontended mutex — but VACUOUS in the other one:
+// release early and tab2 just finds the replacement registered and adopts it through the
+// consult, which passes on the pre-fix build too. The assertion would have stayed true
+// and the A/B would have silently gone. So tab2 is parked inside its own sibling check
+// (fakeSession.aliveHold on `first`) and released only once tab1 is PROVABLY inside
+// Spawn, and the caller — not a timer — decides when the spawn completes.
+//
+// EVIDENCE. Being released into the right state is not the same as reaching it, and the
+// gap is real: between the release and the reservation tab2 runs a few lock-free steps
+// during which the caller's close(p.release) could overtake it. So the staging ASSERTS
+// that tab2 is still in flight before handing back (see the bottom of this function)
+// rather than assuming it. That assertion is what found this: the coverage test below
+// failed with the "nothing to adopt" verdict, which is what a tab2 that overtook the
+// window gets, and it would have been read as a defect in the code under test.
+//
+// The caller releases the spawn (close(p.release)) and reads both results.
+func stageSpentReopenAgainstAnInFlightSpawn(t *testing.T, p *gatedProvider, seed, first *fakeSession) (*Registry, *Attachment, *Attachment, chan error, chan error) {
+	t.Helper()
+	reg := NewRegistry(p)
+	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
+		t.Fatalf("seed spawn: %v", err)
+	}
+	seed.announceInit()
+	waitForRegistered(t, reg, "shared-sid")
+
+	tab1, err := reg.Attach(context.Background(), "shared-sid", "fake", "")
+	if err != nil {
+		t.Fatalf("tab1 Attach: %v", err)
+	}
+	tab2, err := reg.Attach(context.Background(), "shared-sid", "fake", "")
+	if err != nil {
+		t.Fatalf("tab2 Attach: %v", err)
+	}
+	if n := p.Spawns(); n != 1 {
+		t.Fatalf("spawns after both attaches = %d, want 1: both tabs must REUSE the seed", n)
+	}
+
+	// First death: tab2 recovers it and spends its one re-open doing so.
+	seed.kill()
+	if err := tab2.SendPrompt(context.Background(), "tab2 spends its budget"); err != nil {
+		t.Fatalf("tab2's first prompt: %v", err)
+	}
+	tab2.mu.Lock()
+	spent := tab2.reopenSpent
+	tab2.mu.Unlock()
+	if !spent {
+		t.Fatal("tab2's budget is not spent: this staging proves nothing about the spent path")
+	}
+	if n := p.Spawns(); n != 2 {
+		t.Fatalf("spawns after tab2's recovery = %d, want 2", n)
+	}
+
+	// Second death. tab2 goes FIRST and is parked in its sibling check, so that by the time
+	// it is released tab1 already holds the reservation.
+	first.kill()
+	first.aliveEntered = make(chan struct{}, 1)
+	first.aliveHold = make(chan struct{})
+
+	tab2Err := make(chan error, 1)
+	go func() {
+		tab2Err <- tab2.SendPrompt(context.Background(), "tab2 while the replacement is mid-spawn")
+	}()
+	select {
+	case <-first.aliveEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("tab2 never reached reopen's sibling check; the fixture never opened the window")
+	}
+
+	tab1Err := make(chan error, 1)
+	go func() { tab1Err <- tab1.SendPrompt(context.Background(), "tab1 recovers") }()
+	p.waitEntered(t)
+	reg.mu.RLock()
+	held := len(reg.spawning)
+	reg.mu.RUnlock()
+	if held != 1 {
+		t.Fatalf("%d reservation(s) in flight, want 1: tab1 must be INSIDE its spawn, which is "+
+			"the only state in which a replacement exists and is registered nowhere", held)
+	}
+
+	// Released into exactly that state. What follows is the part that makes the staging
+	// checked rather than hoped for: tab2 now walks a handful of lock-free steps between
+	// its sibling check and the reservation, and the ONLY unbounded wait on that route is
+	// awaitSpawn. So after a margin many orders of magnitude larger than those steps
+	// need, "tab2 has not returned" IS "tab2 is parked on tab1's reservation" — and if it
+	// has returned, this fails loudly instead of letting the caller assert against a
+	// state that never happened. That is the direction the failure has to point: a margin
+	// that turned out to be too short must make the test RED, never quietly green.
+	close(first.aliveHold)
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case err := <-tab2Err:
+		t.Fatalf("tab2 answered (err=%v) instead of waiting for the in-flight spawn: it never "+
+			"reached tab1's reservation, so nothing below is being staged", err)
+	default:
+	}
+	return reg, tab1, tab2, tab1Err, tab2Err
+}
+
+// TestSendPrompt_ASpentAttachmentWaitsForAReplacementThatIsStillSpawning is the half of
+// tether#82 that no pre-check could ever have covered, spent budget or not.
+//
+// A replacement that is still inside provider.Spawn is registered NOWHERE, so
+// liveEntry has nothing to find — yet it is milliseconds away from being exactly the
+// session this attachment wanted to adopt. tether#60's reservation is the only thing
+// that can see it, and reaching the reservation is what the spent budget used to
+// prevent.
+func TestSendPrompt_ASpentAttachmentWaitsForAReplacementThatIsStillSpawning(t *testing.T) {
+	seed := &fakeSession{sid: "shared-sid", events: make(chan agent.Event, 8)}
+	first := &fakeSession{sid: "shared-sid", events: make(chan agent.Event, 8)}
+	second := &fakeSession{sid: "shared-sid", events: make(chan agent.Event, 8)}
+	rival := &fakeSession{sid: "shared-sid", events: make(chan agent.Event, 8)}
+	p := staged(t, seed, first, second, rival)
+	// The seed and tab2's own re-open run straight through; tab1's re-open — the third
+	// spawn — is held INSIDE provider.Spawn, which is where its reservation is live.
+	p.gateFrom = 3
+
+	_, tab1, tab2, tab1Err, tab2Err := stageSpentReopenAgainstAnInFlightSpawn(t, p, seed, first)
+	close(p.release)
+
+	select {
+	case err := <-tab2Err:
+		if err != nil {
+			t.Fatalf("tab2's prompt was refused: %v\n\nits budget was spent, so it never reached the "+
+				"reservation tab1 was holding — and refused a prompt that the replacement being spawned "+
+				"under that very sid was about to be able to answer", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("tab2's prompt never completed")
+	}
+	select {
+	case err := <-tab1Err:
+		if err != nil {
+			t.Fatalf("tab1's prompt: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("tab1's prompt never completed")
+	}
+
+	if n := p.Spawns(); n != 3 {
+		t.Errorf("provider.Spawn was called %d times, want 3: waiting for the replacement must "+
+			"not also start one", n)
+	}
+	if attEntry(tab1) != attEntry(tab2) {
+		t.Error("the two tabs hold different entries after the recovery")
+	}
+	// Order is NOT deterministic here: tab1's reservation is released when its spawnEntry
+	// returns, which is before tab1 delivers, so tab2 can reach the replacement first.
+	got := second.Prompts()
+	seen := map[string]bool{}
+	for _, s := range got {
+		seen[s] = true
+	}
+	if len(got) != 2 || !seen["tab1 recovers"] || !seen["tab2 while the replacement is mid-spawn"] {
+		t.Errorf("the replacement received %v, want both tabs' prompts", got)
+	}
+}
+
+// TestSendPrompt_ASpentAttachmentReportsAReplacementItOnlyWaitedFor covers the one path
+// tether#82 makes newly reachable and that nothing else exercises: adoptOnly reaching
+// reopen's GENERIC error branch.
+//
+// The waiter did not spawn and has no budget to spend, yet what it inherits from
+// awaitSpawn is a spawn FAILURE, not the "nothing to adopt" verdict. The two must not be
+// confused: the verdict says the sid is empty, this says the replacement could not be
+// started — and the second must keep the cause, because it is the only thing that says
+// why. Classified either way, because a bare error out of reopen is dropped by
+// promptErrorEnvelope and the tab goes on looking healthy (tether#77).
+func TestSendPrompt_ASpentAttachmentReportsAReplacementItOnlyWaitedFor(t *testing.T) {
+	seed := &fakeSession{sid: "shared-sid", events: make(chan agent.Event, 8)}
+	first := &fakeSession{sid: "shared-sid", events: make(chan agent.Event, 8)}
+	// Only two sessions are ever built: the third spawn fails instead, which is why
+	// staged's over-count guard is not tripped.
+	p := staged(t, seed, first)
+	p.gateFrom = 3
+	p.errFrom = 3
+	p.err = errors.New(`exec: "cc": executable file not found in $PATH`)
+
+	_, _, tab2, tab1Err, tab2Err := stageSpentReopenAgainstAnInFlightSpawn(t, p, seed, first)
+	close(p.release)
+
+	select {
+	case err := <-tab1Err:
+		wantUndelivered(t, err, p.err, "the attachment whose own re-open failed")
+	case <-time.After(5 * time.Second):
+		t.Fatal("tab1's prompt never completed")
+	}
+
+	var err2 error
+	select {
+	case err2 = <-tab2Err:
+	case <-time.After(5 * time.Second):
+		t.Fatal("tab2's prompt never completed")
+	}
+	wantUndelivered(t, err2, p.err, "the adopt-only waiter")
+	if strings.Contains(err2.Error(), "already used its one re-open") {
+		t.Errorf("error = %q: the waiter was handed the nothing-to-adopt verdict for a spawn that "+
+			"FAILED — two different states, and only one of them says the sid is empty", err2)
+	}
+	if !strings.Contains(err2.Error(), "could not be re-opened") {
+		t.Errorf("error = %q, want the generic re-open failure", err2)
+	}
+	tab2.mu.Lock()
+	stillSpent := tab2.reopenSpent
+	tab2.mu.Unlock()
+	if !stillSpent {
+		t.Error("tab2's budget was refunded by a failure it only waited for")
+	}
+	if n := p.Spawns(); n != 3 {
+		t.Errorf("provider.Spawn was called %d times, want 3: inheriting a failure must not make "+
+			"the waiter retry it", n)
 	}
 }

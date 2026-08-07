@@ -40,7 +40,7 @@ type Config struct {
 	Port           int
 	CertFile       string // empty = use managed cert at ~/.tether/cert.pem
 	KeyFile        string
-	AcmeDomain     string // if set, obtain cert via ACME/Let's Encrypt (port 80 required)
+	AcmeDomain     string // if set, obtain cert via ACME/Let's Encrypt (TLS-ALPN-01 on :443; port 80 unused)
 	AcmeEmail      string // contact email for ACME registration
 	DevMode        bool   // if true, proxy SPA to DevFrontendURL
 	DevFrontendURL string // default http://localhost:5173 when DevMode=true
@@ -274,16 +274,16 @@ func Run(cfg *Config) error {
 	}
 
 	// Step 4b: ACME override — when --acme-domain is set, certmagic obtains and
-	// auto-renews a Let's Encrypt cert (HTTP-01; port 80 must be reachable).
+	// auto-renews a Let's Encrypt cert (TLS-ALPN-01 over :443; port 80 unused).
+	// Running before the listeners bind is what lets certmagic's solver take
+	// :443 for the initial challenge; renewal later relies on the ALPN list in
+	// server.go's makeTLS instead. See SetupACME and applyACME.
 	if cfg.AcmeDomain != "" {
-		slog.Info("obtaining ACME cert", "domain", cfg.AcmeDomain)
-		acmeTLS, acmeBundle, err := SetupACME(context.Background(), cfg.AcmeDomain, cfg.AcmeEmail)
+		acmeBundle, err := applyACME(context.Background(), cfg, SetupACME)
 		if err != nil {
 			return fmt.Errorf("ACME setup: %w", err)
 		}
 		bundle = acmeBundle
-		cfg.acmeTLSBase = acmeTLS
-		slog.Info("ACME cert ready", "domain", cfg.AcmeDomain)
 	}
 
 	// Resolve effective frontend URL for dev mode.

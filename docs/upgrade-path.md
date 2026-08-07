@@ -8,7 +8,8 @@ Initial release. See [CHANGELOG](../CHANGELOG.md#v010--2026-05-09).
 
 ### v0.1 → v0.2.0 (2026-05-10)
 
-- ~~Let's Encrypt integration~~ — shipped: `--acme-domain` / `--acme-email` (HTTP-01).
+- ~~Let's Encrypt integration~~ — shipped: `--acme-domain` / `--acme-email` (TLS-ALPN-01 on
+  :443; port 80 unused — this line said HTTP-01 until tether#79, and it was never true).
 - **opencode provider**: D-17a §5.1 — stream-json compatible, requires opencode ≥0.4.
 - **Basic authentication**: JWT token gate, auto-generated `~/.tether/access-token`.
 - **Multi-tab attach**: `/wt/events` read-only fan-out.

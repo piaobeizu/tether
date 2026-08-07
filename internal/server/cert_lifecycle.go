@@ -161,7 +161,15 @@ const certRotateInterval = time.Hour
 //
 //   - --acme-domain: certmagic renews inside its own tls.Config, which the
 //     listener uses directly (cfg.acmeTLSBase), bypassing the holder entirely.
-//     Genuinely handled.
+//     Genuinely handled — but note what "handled" rests on. Renewal happens
+//     while this process holds :443, so certmagic cannot bind the port for its
+//     own challenge server and hands the TLS-ALPN-01 challenge back to our
+//     listener. That only works because makeTLS in server.go keeps acme-tls/1
+//     in the TCP listener's ALPN list. Until tether#79 it did not, and this
+//     comment asserted the conclusion anyway: the holder was correctly
+//     bypassed, and renewal was correctly reached, and it still failed every
+//     time at ALPN negotiation. Deleting that ALPN entry re-breaks renewal
+//     without touching a line of this file.
 //   - --cert-file/--key-file: NOT handled. The file is read once at startup and
 //     never re-read, so an operator renewing it on disk (certbot at day 60)
 //     changes nothing until tether restarts. Rotating here is not the answer —

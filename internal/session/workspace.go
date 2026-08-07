@@ -130,8 +130,9 @@ func (s *BindingStore) Load(sid string) (WorkspaceBinding, bool) {
 //
 // Written whole via a UNIQUELY-NAMED temp file + rename, so no reader ever sees a
 // partial binding and two concurrent writers cannot interleave into a mixed one.
-// A fixed `<path>.tmp` would allow exactly that (the spawn race tether#60 tracks
-// can put two Saves on one sid), and a torn read here would not cost a transcript
+// A fixed `<path>.tmp` would allow exactly that (the same-sid spawn race — narrowed
+// by tether#60's reservation, residual in Attach's doc — can put two Saves on one
+// sid), and a torn read here would not cost a transcript
 // line — it would put an agent in the wrong directory. Sync before rename so the
 // same holds across a crash rather than only across a concurrent read.
 func (s *BindingStore) Save(sid string, b WorkspaceBinding) error {

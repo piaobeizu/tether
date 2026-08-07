@@ -256,20 +256,30 @@ type Resolution struct {
 // which is what cc's `--fork-session` is for and not something to arrive at by
 // accident.
 //
-// RESIDUAL, stated rather than implied — the window is narrowed, not closed:
+// Since tether#60 the second attach does not merely arrive late, it WAITS.
+// spawnEntry claims the key before the process exists, so a caller that reaches it
+// while another is spawning blocks on that claim and adopts the resulting entry
+// instead of starting a rival — and is handed shared=true so it can decline to be
+// fallback-eligible, exactly as this branch declines. See Registry.spawnEntry.
 //
-//   - It is now the duration of one provider.Spawn call, rather than "until the
-//     user types". For cc that is an exec.Start.
-//   - Inside it, both attaches still spawn, and the second registration
-//     OVERWRITES the first under the same key — so the displaced entry, and the cc
-//     it owns, are exactly as unreachable as before. What changed is how long the
-//     door is open, not what is behind it.
-//   - Closing it needs a reservation: the key claimed before the process exists,
-//     released if the spawn fails, with the loser waiting on the winner's Entry
-//     rather than racing it — plus an answer for the loser's already-started
-//     subprocess, which cannot simply be Closed (see the os/exec note in resolve).
-//     That is a self-contained piece of work, not a line, and it is deliberately
-//     not smuggled in here; tether#60 tracks it.
+// RESIDUAL, stated rather than implied — that narrows the window a great deal but
+// does NOT close it, and the shape of what is left is worth naming precisely,
+// because it is no longer the obvious one:
+//
+//   - The gate above and the claim inside spawnEntry are two separate critical
+//     sections. A caller whose liveEntry check ran before the winner registered, but
+//     which does not reach the claim until after the winner's reservation has been
+//     RELEASED, finds no reservation, spawns, and displaces the registration exactly
+//     as it did before.
+//   - So what remains is not "arrive anywhere inside one provider.Spawn" but "be
+//     preempted for longer than one provider.Spawn between your own check and your
+//     own claim". Reproduced in a harness that stalls the check; in production it
+//     needs a scheduling delay spanning two nearby statements.
+//   - Closing it needs the check and the claim to become ONE critical section, or
+//     spawnEntry to re-consult r.sessions under the same r.mu it claims under — which
+//     in turn needs an out-of-lock liveness re-check, because Alive() must not be
+//     called under r.mu (see liveEntry). That is design work rather than a line, and
+//     it is deliberately not smuggled in here; tether#78 tracks it.
 func (r *Registry) Attach(ctx context.Context, sid, providerName, wsID string) (*Attachment, error) {
 	// FIRST, before any spawn: an unknown workspace id must cost nothing. Returning
 	// here is what makes "the daemon does not start anything in an unintended
@@ -386,12 +396,29 @@ func (r *Registry) Attach(ctx context.Context, sid, providerName, wsID string) (
 	}
 
 	cfg := agent.SpawnConfig{ResumeSessionID: dec.ResumeSID}
-	e, err := r.spawnEntry(ctx, providerName, cfg, dec.Binding)
+	e, shared, err := r.spawnEntry(ctx, providerName, cfg, dec.Binding)
 	if err != nil {
 		return nil, err
 	}
 	a.entry = e
-	a.resuming = dec.ResumeSID != ""
+	// shared means another connection was already spawning this sid and we waited
+	// for it rather than starting a rival (tether#60). Such an attachment is NOT
+	// fallback-eligible, for the same reason the reuse branch above is not: it did
+	// not spawn this session, so a failed resume is the SPAWNER's to recover from.
+	// Two attachments both falling back would spawn two fresh sessions and fork the
+	// conversation in two — which is what cc's --fork-session is for and not
+	// something to arrive at by losing a race. If the resume it adopted never
+	// confirms it is told "agent exited before emitting session id", which is
+	// retryable and which the browser answers with a reconnect — the same trade the
+	// tether#54 note above already states for the reuse branch.
+	//
+	// It is NOT identical to a reuse, and the difference is deliberate rather than an
+	// oversight: the reuse branch arms reopenSID immediately, a waiter only once
+	// Resolve confirms (tether#76), so a waiter has a window in which a failed
+	// SendPrompt returns the bare error. Arming it earlier would break the rule that
+	// nothing is armed before confirmation — a waiter's adopted resume is precisely
+	// an unconfirmed one.
+	a.resuming = !shared && dec.ResumeSID != ""
 	return a, nil
 }
 
@@ -661,24 +688,18 @@ func (a *Attachment) reopen(ctx context.Context, dead *Entry, text string, sendE
 	// Deliberately BEFORE the spent check: adoption spawns nothing, so a spent budget
 	// is no reason to refuse a prompt a live session is right there to answer.
 	//
-	// RESIDUAL, stated rather than implied — this check NARROWS the window, it does
-	// not close it, and tether#76 widened what can enter it:
+	// Two armed attachments whose prompts fail together both reach this check and
+	// both find nothing (liveEntry evicts the corpse and answers no), so before
+	// tether#60 both went on to spawn `cc --resume <sid>` and the second registration
+	// displaced the first — two cc appending to one transcript, each tab holding a
+	// different *Entry. reopenMu is per-ATTACHMENT and serialises none of that.
+	// spawnEntry's reservation is what makes the second one wait instead; it returns
+	// shared=true, which is why the budget below is left unspent for it.
 	//
-	//   - Two armed attachments whose prompts fail together can both pass this check
-	//     before either one's spawnEntry has registered, and then both spawn
-	//     `cc --resume <sid>`. The second registration displaces the first, so the two
-	//     tabs end up on different *Entry values with two cc appending to one
-	//     transcript — the state the paragraph above says this check prevents.
-	//     reopenMu is per-ATTACHMENT and does not serialise across connections.
-	//   - The window is the same one tether#60 tracks for Attach's own liveEntry gate:
-	//     between the check and the registration, i.e. one provider.Spawn (for cc, an
-	//     exec.Start). Same shape, same fix — a registry-level reservation — which is
-	//     why tether#60 now names this call site too rather than a separate wi
-	//     re-implementing the primitive.
-	//   - What tether#76 changed is reachability, not severity. Before it, a two-tab
-	//     session had exactly ONE armed attachment, so reaching this needed three
-	//     tabs; now two suffice, and two tabs sharing a sid through localStorage is
-	//     the ordinary case rather than the exotic one.
+	// RESIDUAL: the same one Attach's doc now states, reached from here. This check
+	// and spawnEntry's claim are separate critical sections, so an attachment
+	// preempted between them for longer than one provider.Spawn still spawns a rival.
+	// tether#78 tracks closing it.
 	if sibling, ok := a.reg.liveEntry(sid); ok && sibling != dead {
 		slog.Info("chat: the reused session was already re-opened by another attachment; adopting it",
 			"sid", sid, "err", sendErr)
@@ -704,7 +725,7 @@ func (a *Attachment) reopen(ctx context.Context, dead *Entry, text string, sendE
 	// a `--resume` in any other directory fails exactly like an unknown sid. The
 	// reuse branch in Attach only reuses an entry whose workdir already IS
 	// workdirFor(a.ws), so this reopens in the directory the dead session lived in.
-	fresh, err := a.reg.spawnEntry(ctx, a.provider, agent.SpawnConfig{ResumeSessionID: sid}, a.ws)
+	fresh, shared, err := a.reg.spawnEntry(ctx, a.provider, agent.SpawnConfig{ResumeSessionID: sid}, a.ws)
 	if err != nil {
 		a.mu.Lock()
 		a.reopenSpent = true
@@ -716,9 +737,16 @@ func (a *Attachment) reopen(ctx context.Context, dead *Entry, text string, sendE
 		return fmt.Errorf("reused session %s stopped accepting prompts (%v) and could not be re-opened: %w", sid, sendErr, err)
 	}
 
-	a.mu.Lock()
-	a.reopenSpent = true
-	a.mu.Unlock()
+	// The budget bounds SPAWNING, so a reservation we merely waited on does not
+	// consume it (tether#60) — the same rule the sibling-adoption branch above
+	// follows, reached one layer down. Both arrive at "a live session exists under
+	// this sid and we did not have to start it", and refusing this attachment a
+	// later recovery because of a race it lost would be a penalty for timing.
+	if !shared {
+		a.mu.Lock()
+		a.reopenSpent = true
+		a.mu.Unlock()
+	}
 
 	// Carry the ownership claim across. The dead entry may already have been claimed
 	// by this connection (serveChat calls SetOwner once, after Resolve), and a
@@ -935,7 +963,10 @@ func (a *Attachment) resolve(ctx context.Context) (Resolution, error) {
 	// would move the user's conversation to a different directory as the price of
 	// recovering it — and every subsequent reconnect would then resume it there,
 	// making the relocation permanent and invisible.
-	fresh, err := a.reg.spawnEntry(ctx, a.provider, agent.SpawnConfig{}, a.ws)
+	// shared is discarded: the fallback is a FRESH spawn, so spawnEntry mints an id
+	// no other goroutine can hold and the tether#60 reservation is uncontended by
+	// construction — the same reason GetOrSpawnEntry discards it.
+	fresh, _, err := a.reg.spawnEntry(ctx, a.provider, agent.SpawnConfig{}, a.ws)
 	if err != nil {
 		return Resolution{}, fmt.Errorf("resume %s failed and fresh spawn failed: %w", a.reqSID, err)
 	}

@@ -52,5 +52,11 @@ jobs:
         run: cd web && pnpm test
 
       # ── Go tests ────────────────────────────────────────────────────────────
+      # -race is the baseline, not an extra: internal/server runs a background
+      # cert-rotation goroutine that shares state with request handlers and the
+      # TLS handshake callback, and internal/session hands entries between
+      # connections. -count=1 because the test cache will happily echo a stale
+      # pass. Spelled out here rather than delegated to `make go-test` so a
+      # local convenience edit to the Makefile can never weaken CI.
       - name: Run Go tests
-        run: go test ./...
+        run: go test -count=1 -race ./...

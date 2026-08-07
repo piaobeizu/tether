@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/caddyserver/certmagic v0.25.3
 	github.com/creack/pty v1.1.24
+	github.com/mholt/acmez/v3 v3.1.6
 	github.com/modelcontextprotocol/go-sdk v1.6.0
 	github.com/quic-go/quic-go v0.59.0
 	github.com/quic-go/webtransport-go v0.10.0
@@ -20,7 +21,6 @@ require (
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/libdns/libdns v1.1.1 // indirect
-	github.com/mholt/acmez/v3 v3.1.6 // indirect
 	github.com/miekg/dns v1.1.72 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/segmentio/asm v1.1.3 // indirect

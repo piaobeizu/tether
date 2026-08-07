@@ -22,19 +22,28 @@ type Registry struct {
 	// before the process existed, so no lookup can miss it for want of a re-key
 	// (tether#54). Two attaches racing to spawn the SAME sid used to be a separate,
 	// much narrower window; tether#60's reservation (see spawning, below) makes the
-	// second one wait, and what is LEFT of it is stated in the RESIDUAL note in Attach.
+	// second one wait, and tether#78 made the claim the point at which THIS map is
+	// consulted, so a caller that arrives after the winner already finished adopts
+	// the registration instead of displacing it. See spawnEntry.
 	//
 	// Not a universal invariant, and the difference matters: a provider that mints
 	// its own id (OpenCodeProvider ignores SpawnConfig.SessionID) is registered
 	// under an id nothing else will ever ask about until it announces its own, at
 	// which point rekey moves it. Such an entry is addressable — evict and
 	// BroadcastAll find it, which the old placeholder also allowed — but NOT by any
-	// sid a client holds. See rekey, and the RESIDUAL note in Attach.
+	// sid a client holds. See rekey, whose write is also the one registration that
+	// happens without holding a reservation (noted as the remaining narrow case in
+	// spawnEntry).
 	sessions map[string]*Entry
 	// spawning holds the reservation for each key a goroutine is currently
 	// spawning under (tether#60): a key is claimed here BEFORE provider.Spawn is
-	// called and released when the entry lands in sessions, so a second caller for
+	// called and released AFTER the entry lands in sessions, so a second caller for
 	// the same key waits for the first instead of starting a rival agent.
+	//
+	// That release-after-register order is load-bearing beyond tidiness: it is what
+	// lets tether#78 treat "no reservation for this key" as "sessions[key] already
+	// reflects the last completed spawn", which is the whole basis for consulting
+	// sessions at claim time rather than trusting the caller's earlier check.
 	//
 	// Keyed by the SESSION KEY spawnEntry computed, not by either of the two config
 	// fields it is derived from — keying on cfg.ResumeSessionID would collapse every
@@ -78,10 +87,64 @@ type Registry struct {
 	Bindings *BindingStore
 }
 
-// spawnReservation is one goroutine's claim on a session key for the duration of
-// its provider.Spawn — the window tether#54 narrowed and tether#60 narrows again.
-// It does not close it; the residual is stated in Attach's doc and tracked as
-// tether#78.
+// spawnOutcome says where the *Entry a spawnEntry call returns came from. The
+// three cases are not interchangeable at the call sites, which is why this is not
+// a bool: two of them mean "no process was started by this call", and the callers
+// need that, but only one of them means "and the session was already answering",
+// which is a different recovery posture (see Attach).
+type spawnOutcome int
+
+const (
+	// spawnNoEntry is the ZERO value, and it deliberately means "there is no entry;
+	// read the error". Ordering it first is what keeps a caller that forgets the
+	// error from reading a failed call as one that started a session: startedProcess
+	// answers false here, so no fallback eligibility and no spent budget can be
+	// derived from a call that produced nothing.
+	spawnNoEntry spawnOutcome = iota
+	// spawnStarted: this call is the one that ran provider.Spawn and registered the
+	// entry. It owns the session, so it is the one that may fall back if the resume
+	// it started never confirms.
+	spawnStarted
+	// adoptedAfterWait: another caller held the key's reservation and this one
+	// waited for it (tether#60). The entry it gets is an UNCONFIRMED spawn — the
+	// winner has only just started it — so this caller must not be armed for
+	// recovery before Resolve confirms it.
+	adoptedAfterWait
+	// adoptedRegistration: the key was already registered to a live session when
+	// this caller claimed it (tether#78). Unlike the case above, that session has
+	// been through Alive() — the same evidence Attach's own reuse gate acts on — so
+	// this caller is in the position of a REUSE, not of a waiter.
+	adoptedRegistration
+)
+
+// startedProcess reports whether this call started the agent behind the entry it
+// returned. It is the question both collidable call sites ask (may I fall back?
+// have I spent my one re-open?), and asking it by name rather than comparing
+// against a constant is what stops a third outcome from silently joining the
+// wrong side of a `!= spawnStarted`.
+func (o spawnOutcome) startedProcess() bool { return o == spawnStarted }
+
+// String makes the constant legible in a test failure or a log line. Worth having
+// rather than reading small integers out of an assertion message: the whole point
+// of the type is that three of its values are easy to confuse.
+func (o spawnOutcome) String() string {
+	switch o {
+	case spawnNoEntry:
+		return "spawnNoEntry"
+	case spawnStarted:
+		return "spawnStarted"
+	case adoptedAfterWait:
+		return "adoptedAfterWait"
+	case adoptedRegistration:
+		return "adoptedRegistration"
+	}
+	return fmt.Sprintf("spawnOutcome(%d)", int(o))
+}
+
+// spawnReservation is one goroutine's claim on a session key, held from before
+// provider.Spawn until after the entry is registered — the window tether#54
+// narrowed, tether#60 made callers wait on, and tether#78 closed by making the
+// claim the point at which the map is consulted (see spawnEntry).
 //
 // # Why a reservation rather than a retry or a bigger lock
 //
@@ -297,10 +360,14 @@ func (r *Registry) GetOrSpawnEntry(ctx context.Context, sid, providerName string
 	// the daemon default. Selecting a workspace requires the validation and the
 	// remembering that only Attach does (tether#52).
 	//
-	// shared is discarded rather than handled: this is a fresh spawn, so spawnEntry
-	// mints an id no other goroutine can be holding, and the reservation is
-	// uncontended by construction. That is a property of the empty SpawnConfig, not
-	// an assumption about callers — see spawnEntry's tether#60 note.
+	// The outcome is discarded rather than handled: this is a fresh spawn, so
+	// spawnEntry mints an id no other goroutine can be holding — the reservation is
+	// uncontended and in practice nothing can already be registered under a just-minted
+	// id, so neither adoption is reachable. "In practice" is deliberate:
+	// agent.NewSessionID falls back to a FIXED uuid if crypto/rand fails, and two fresh
+	// spawns that both took that fallback would collide — unreachable on Linux, latent
+	// since tether#60's waiter path, and cheaper to name than to re-derive. That is a property of the empty SpawnConfig, not
+	// an assumption about callers — see spawnEntry's tether#60/#78 notes.
 	e, _, err := r.spawnEntry(ctx, providerName, agent.SpawnConfig{}, WorkspaceBinding{})
 	return e, err
 }
@@ -367,40 +434,80 @@ func (r *Registry) GetOrSpawnEntry(ctx context.Context, sid, providerName string
 //
 // A key is now claimed in r.spawning before Spawn is called and released when the
 // entry is published, so the second caller blocks on the first's reservation and
-// returns its entry with shared=true. See spawnReservation for why the claim comes
-// FIRST — a design where both spawn and then reconcile has to dispose of the loser's
-// running subprocess, and there is no safe way to do that here.
+// returns its entry with adoptedAfterWait. See spawnReservation for why the claim
+// comes FIRST — a design where both spawn and then reconcile has to dispose of the
+// loser's running subprocess, and there is no safe way to do that here.
 //
-// shared is returned rather than hidden because the two collidable call sites must
-// each decide what it means for them, and a bool the compiler forces them to accept
-// is what makes that decision visible: Attach uses it to keep a waiter
-// non-fallback-eligible (a waiter that fell back would fork the conversation in two,
-// which is what --fork-session is for), and reopen uses it to leave its one-per-
-// attachment reopen budget unspent, since a waiter started no process.
+// The outcome is returned rather than hidden because the two collidable call sites
+// must each decide what it means for them, and a value the compiler forces them to
+// accept is what makes that decision visible: Attach uses it to keep an adopter
+// non-fallback-eligible (two attachments falling back would fork the conversation in
+// two, which is what --fork-session is for), and reopen uses it to leave its
+// one-per-attachment reopen budget unspent, since an adopter started no process.
 // The two fresh-spawn call sites cannot collide at all — they mint a unique id, so
 // no other goroutine can be holding that key.
 //
-// What this does NOT cover, stated rather than implied:
+// # The caller's pre-check is now an optimisation, not the gate (tether#78)
 //
-//   - The caller's own pre-check and this claim are SEPARATE critical sections, so a
-//     caller preempted between them for longer than one provider.Spawn finds the
-//     winner's reservation already released, spawns, and displaces the registration
-//     exactly as before. The window is much narrower than it was — it is no longer
-//     "arrive anywhere inside the spawn" — but it is not gone. Attach's doc states
-//     the shape; tether#78 tracks closing it, which needs the check and the claim to
-//     become one critical section.
+// Waiting on the reservation left a window, and it was not the obvious one. The
+// caller's own pre-check and this claim are separate critical sections, so a caller
+// whose check ran before the winner registered but which did not reach the claim
+// until after the winner's reservation was RELEASED found nothing to wait for,
+// spawned, and displaced the registration exactly as before tether#60. Narrower than
+// "arrive anywhere inside the spawn", but reproducible with no concurrency at all:
+// two sequential calls for one key were enough.
+//
+// What closes it is one read — r.sessions[key], taken in the same critical section as
+// the claim — plus WHERE the liveness question is asked. Note the shape of the
+// argument, because it is not the one the old doc predicted:
+//
+//   - The winner registers its entry BEFORE the deferred release runs. So "there is
+//     no reservation for this key" implies "any registration a completed spawn of this
+//     key made is already visible", and the read under the claim cannot be stale in
+//     the one direction that matters. (A spawn that FAILED registers nothing, which is
+//     why the implication is phrased about registrations rather than about outcomes:
+//     the read then returns nil and this caller spawns, which is correct.)
+//   - Correctness rests on HOLDING the reservation, not on the check and the claim
+//     being atomic. That is what makes the out-of-lock Alive() sound: while this
+//     goroutine holds the key, no rival SPAWN can register under it, so the entry
+//     cannot be replaced between the read and the verdict — and liveEntry's rule
+//     against calling into an agent implementation under r.mu is left intact. Note the
+//     word: rekey registers without holding anything, and is the case named below.
+//
+// So a late caller ADOPTS the live registration (adoptedRegistration) instead of
+// starting a rival, and a registration whose agent has died is un-registered by
+// liveEntry and replaced by the spawn below. The pre-check at each call site still
+// earns its keep — it answers "reuse or resume?" before any of this — but it is no
+// longer load-bearing for "will two agents end up under one sid".
+//
+// What this still does NOT cover, stated rather than implied:
+//
+//   - It only helps a caller that REACHES the claim. Attachment.reopen's spent gate
+//     returns before it does, so an attachment that has already used its one re-open
+//     still depends on winning its own sibling-adoption check: lose that and its
+//     prompt is refused even though a live session is registered under the sid. No
+//     duplicate agent, and not a regression — that ordering predates this — but it is
+//     the one cost of a lost pre-check that consulting r.sessions here cannot remove,
+//     because nothing here runs. tether#82 tracks it; see reopen for the reproduction.
+//   - rekey moves a registration into an arbitrary key WITHOUT holding a reservation,
+//     so it could in principle place an entry under a key someone is spawning under.
+//     It is not reachable for cc (which adopts the id it is given, so rekey is a
+//     no-op) and needs a provider that mints its own id to announce exactly the key in
+//     flight; the fresh-spawn case would additionally need it to collide with a just-
+//     minted uuid. Strictly narrower than what is closed above, and named here rather
+//     than left for the next reader to rediscover.
 //   - A waiter receives the winner's entry even if that entry has since been evicted
 //     (it can die between registration and the waiter's read). That is the same
 //     "adopted a session that then died" shape every other reuse has, and it is
 //     recovered by the same machinery (Attachment.reopen, tether#59/#76) rather than
 //     by a second check here.
-func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agent.SpawnConfig, ws WorkspaceBinding) (entry *Entry, shared bool, err error) {
+func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agent.SpawnConfig, ws WorkspaceBinding) (entry *Entry, outcome spawnOutcome, err error) {
 	if providerName == "" {
 		providerName = "claude-code"
 	}
 	provider, ok := r.providers[providerName]
 	if !ok {
-		return nil, false, refuse(wire.ErrCodeUnknownProvider, "unknown provider: %s", providerName)
+		return nil, spawnNoEntry, refuse(wire.ErrCodeUnknownProvider, "unknown provider: %s", providerName)
 	}
 
 	if r.PermEndpoint != "" {
@@ -429,6 +536,11 @@ func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agen
 	// under r.mu, but NOT held across the Spawn below — the reservation is a map
 	// entry, not a lock, which is the whole point: it excludes a rival spawn for
 	// this one key while leaving every other lookup in the daemon unblocked.
+	//
+	// registered is read in the SAME critical section as the claim, and that is the
+	// whole of tether#78 (see the section in this function's doc). It is what the
+	// caller's own pre-check could not tell it: whether somebody finished spawning
+	// this key while this goroutine was between its check and here.
 	r.mu.Lock()
 	if res, ok := r.spawning[key]; ok {
 		r.mu.Unlock()
@@ -436,12 +548,21 @@ func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agen
 	}
 	res := &spawnReservation{done: make(chan struct{})}
 	r.spawning[key] = res
+	// `key`, not either field it was derived from. Substituting cfg.SessionID here is
+	// caught (it is "" on every resume, so the consult never fires and the residual is
+	// back); substituting cfg.ResumeSessionID is an EQUIVALENT mutant TODAY and no test
+	// can catch it — on a resume the two strings are identical, and on a fresh spawn
+	// r.sessions[""] is always nil because nothing is ever registered under "". It stops
+	// being equivalent the moment a caller sets BOTH fields, which agent.SpawnConfig
+	// currently forbids. Written down because "no test failed" is not why this is right.
+	registered := r.sessions[key]
 	r.mu.Unlock()
 
-	// Release on EVERY path, including the panicking one. Publishing the outcome
-	// before the close is what lets waiters read it with no lock of their own (see
-	// spawnReservation); the named returns are read here rather than threaded
-	// through so that a future early return cannot forget to report itself.
+	// Release on EVERY path, including the panicking one and the adoption below.
+	// Publishing the outcome before the close is what lets waiters read it with no
+	// lock of their own (see spawnReservation); the named returns are read here
+	// rather than threaded through so that a future early return cannot forget to
+	// report itself.
 	defer func() {
 		r.mu.Lock()
 		delete(r.spawning, key)
@@ -450,9 +571,60 @@ func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agen
 		close(res.done)
 	}()
 
+	// Somebody had already finished spawning this key (tether#78). Ask the one
+	// question that decides whether it may be adopted, and note WHERE this happens:
+	// under the reservation, not under r.mu. That is what makes the check
+	// authoritative without breaking liveEntry's rule — the reservation excludes
+	// every rival spawn for this key, so nothing can register here while we are
+	// asking, and Alive() is still called with no lock held.
+	//
+	// A corpse falls through to the spawn below rather than being adopted, which is
+	// the whole reason this cannot be a bare map test: adopting a registered-but-dead
+	// entry is tether#55, and it is the failure this daemon is worst at reporting
+	// (the turn never returns). liveEntry also un-registers it, so the registration
+	// this function performs below replaces it rather than racing it.
+	//
+	// In the ORDINARY case this costs nothing at all — both collidable callers have
+	// already evicted whatever they found dead (Attach's gate through liveEntry,
+	// reopen through its explicit evict), so registered is nil and no Alive() is
+	// asked here. It fires only for the caller that lost the race this closes.
+	if registered != nil {
+		if e, ok := r.liveEntry(key); ok {
+			if e.workdir != cfg.Workdir {
+				// Fail closed, for the reason awaitSpawn states at length: adopting an
+				// entry from another directory silently relocates a conversation. Note
+				// that reopen's sibling-adoption branch does NOT check this and argues it
+				// is unreachable; the argument is about today's callers, and this is the
+				// same assertion awaitSpawn already makes one branch away, so the two
+				// adoption paths agree rather than each trusting a different premise.
+				//
+				// A waiter parked on our reservation inherits this error even if its own
+				// resolved directory would have matched. That is an accepted imprecision
+				// in a case believed unreachable: it costs the waiter a reconnect, and
+				// the alternative is machinery to republish per-waiter verdicts for a
+				// state no call site can currently produce.
+				return nil, spawnNoEntry, fmt.Errorf(
+					"refusing to adopt session %s: it is registered from %q but this connection resolved %q",
+					key, e.workdir, cfg.Workdir)
+			}
+			// Info, not Debug, and the reason is a fact about this daemon rather than a
+			// preference: nothing anywhere calls slog.SetDefault or sets a level, so the
+			// default handler drops Debug and a Debug line here would be unobservable on
+			// a real daemon — which is exactly how live-verifying this change ran into
+			// "the count is right but I cannot see WHICH path produced it". The event
+			// also deserves it: it means two clients contended for one sid, it happens
+			// only when a race is lost, and reopen's sibling-adoption branch — the same
+			// event one layer up — already logs at Info. (awaitSpawn's tether#60 line has
+			// the same invisibility problem; left alone, not this wi's to change.)
+			slog.Info("adopted a session that was already registered under this key",
+				"sid", key, "provider", e.provider)
+			return e, adoptedRegistration, nil
+		}
+	}
+
 	sess, err := provider.Spawn(ctx, cfg)
 	if err != nil {
-		return nil, false, refuse(wire.ErrCodeSpawnFailed, "spawn: %w", err)
+		return nil, spawnNoEntry, refuse(wire.ErrCodeSpawnFailed, "spawn: %w", err)
 	}
 
 	e := &Entry{
@@ -497,7 +669,7 @@ func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agen
 	// background goroutine: fan out events to subscribers
 	go r.fanOut(e)
 
-	return e, false, nil
+	return e, spawnStarted, nil
 }
 
 // awaitSpawn blocks until the goroutine holding key's reservation has published its
@@ -537,14 +709,14 @@ func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agen
 // but that is a fact about cc and about saveBinding's current callers, not about this
 // function. Failing closed costs a reconnect; being wrong costs a conversation moved
 // to another directory without anyone being told.
-func (r *Registry) awaitSpawn(ctx context.Context, key string, res *spawnReservation, wantWorkdir string) (*Entry, bool, error) {
+func (r *Registry) awaitSpawn(ctx context.Context, key string, res *spawnReservation, wantWorkdir string) (*Entry, spawnOutcome, error) {
 	select {
 	case <-res.done:
 	case <-ctx.Done():
-		return nil, false, ctx.Err()
+		return nil, spawnNoEntry, ctx.Err()
 	}
 	if res.err != nil {
-		return nil, false, res.err
+		return nil, spawnNoEntry, res.err
 	}
 	e := res.entry
 	if e == nil {
@@ -552,19 +724,19 @@ func (r *Registry) awaitSpawn(ctx context.Context, key string, res *spawnReserva
 		// publishes the named returns, and every return with a nil entry carries an
 		// error. It IS what a PANIC inside provider.Spawn publishes, because the
 		// deferred release still runs while the named returns are zero, and it is
-		// what a future `return nil, false, nil` would publish. Neither should be
+		// what a future `return nil, spawnNoEntry, nil` would publish. Neither should be
 		// answered by dereferencing nil in the waiter: the winner's panic is the
 		// winner's problem, and a waiter that reports it is far easier to read than
 		// a second goroutine faulting on the same instruction.
-		return nil, false, fmt.Errorf("the spawn of session %s reported neither an entry nor an error", key)
+		return nil, spawnNoEntry, fmt.Errorf("the spawn of session %s reported neither an entry nor an error", key)
 	}
 	if e.workdir != wantWorkdir {
-		return nil, false, fmt.Errorf("refusing to adopt session %s: it was spawned in %q but this connection resolved %q",
+		return nil, spawnNoEntry, fmt.Errorf("refusing to adopt session %s: it was spawned in %q but this connection resolved %q",
 			key, e.workdir, wantWorkdir)
 	}
 	slog.Debug("adopted a session another connection was already spawning",
 		"sid", key, "provider", e.provider)
-	return e, true, nil
+	return e, adoptedAfterWait, nil
 }
 
 // rekey MOVES e's registration to sid. It never creates one, and that is the

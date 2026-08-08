@@ -125,9 +125,8 @@ const (
 	// claimed it did ("the session the browser is attached to is still alive and
 	// usable"). That was wrong, and wrong in the direction that misleads: a
 	// consumer reading it would present this error as a note about the current
-	// turn on a healthy session. Every emit site is in
-	// agent/opencode_provider.go (cc emits none at all), and they span three
-	// materially different situations that arrive on the wire indistinguishable:
+	// turn on a healthy session. The emit sites span four materially different
+	// situations that arrive on the wire indistinguishable:
 	//
 	//   - session.error from opencode's event stream: a complaint about the turn;
 	//     session alive, prompt delivered.
@@ -136,6 +135,14 @@ const (
 	//     user's PROMPT WAS DROPPED, while the session stays alive.
 	//   - watchServeExit: emits and then closes the event stream, so THE SESSION
 	//     IS ALREADY GONE when this is read.
+	//   - agent/claude_provider.go's ccSession.abandon: cc's stdout read ended in
+	//     an error, so the subprocess is killed and the TURN DIED MID-ANSWER.
+	//
+	// That last one also corrects this comment, not just extends it: tether#80
+	// wrote "every emit site is in agent/opencode_provider.go (cc emits none at
+	// all)" here, and tether#83's review found abandon. The claim travelled — the
+	// same sentence had been copied into web/src/lib/store.ts — which is why it is
+	// fixed at the source rather than only where it was read.
 	//
 	// Anything that needs to distinguish those needs a new code, not a reading of
 	// this one. web/src/lib/store.ts's agent_error branch is written to that

@@ -840,11 +840,74 @@ export const useStore = create<AppState>((set, get) => ({
         set((s) => ({ ...finalizeTurn(s), stopped: false }))
         break
       case 'error': {
-        // Clear the thinking/streaming indicator on a daemon-surfaced error so
-        // the UI doesn't get stuck showing "Claude is thinking…" forever. This
-        // clear happens regardless of the payload's classification below —
-        // even a terminal refusal ends whatever turn was in flight.
-        set({ streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null, stopped: false })
+        // Parsed FIRST (tether#83). It used to be parsed after the clear below,
+        // which was only tenable while the clear ignored the classification.
+        // A null parse still means what tether#63's note below says it means.
+        const parsed = parseErrorPayload(env.payload)
+        // tether#83 — "the spinner" and "the turn" are two different pieces of
+        // state and this frame is not the same news about both. What stood here
+        // cleared them together, under an argument ("even a terminal refusal ends
+        // whatever turn was in flight") that is true and that covers only the
+        // TERMINAL case; the non-terminal case it also governed was never argued.
+        //
+        // A non-terminal error does not, on its own, say the turn is over — and
+        // on some of the paths that raise one it demonstrably is not. Captured off
+        // a live daemon + live opencode (the frames are replayed in store.test.ts):
+        // the error envelope lands mid-answer and KindMessage deltas for the SAME
+        // turn keep arriving after it, for another three seconds. That is visible
+        // in the provider too — opencode_provider.go's session.error branch emits
+        // from the SSE reader and keeps reading, and its SendPrompt busy branch
+        // emits, returns nil, and never touches the run already in flight.
+        //
+        // Nulling curTurnId there routes the next delta down the "no bubble open"
+        // path above, which opens a SECOND assistant bubble; the first keeps the
+        // text it had and never gets its answerMs, because finalizeTurn only ever
+        // stamps the turn pointer it finds. Nothing merges two bubbles afterwards,
+        // so unlike the spinner this one does not come back.
+        //
+        // `streaming` is cleared EITHER WAY, and that asymmetry is the decision
+        // here rather than a leftover:
+        //
+        //   - The browser cannot tell "the turn is still running" from "the prompt
+        //     never started". Both arrive as ErrCodeAgent carrying only free text
+        //     — no agent-sourced code is finer than that one — and on three of the
+        //     sites that raise it (opencode_provider.go's resume-serve failure and
+        //     its two `opencode run` start failures) this frame is the only
+        //     turn-closer that will ever be sent: they return without emitting an
+        //     EventResult and without a run in flight to emit one later.
+        //   - "Is a turn open?" is not the missing discriminator either, and the
+        //     busy case is where that shows: sendMessage (panes/chat/index.tsx)
+        //     calls addMessage first, which nulls curTurnId, so by the time the
+        //     daemon's rejection of the SECOND prompt arrives the browser has
+        //     already ended the first one itself. A branch on curTurnId would not
+        //     even engage there — which is also why this fix does not repair that
+        //     particular split; the earlier cause is the local reset, not this.
+        //   - The two ways of being wrong are not equally bad. A spinner cleared
+        //     while the agent is still working repairs itself on the next delta:
+        //     the text and thinking branches above set `streaming: true` on every
+        //     one they handle. A spinner left running when nothing is coming does
+        //     not repair itself, and it is not cosmetic — shouldSendOnEnter
+        //     (panes/chat/index.tsx) requires !streaming, so Enter silently stops
+        //     sending until the user works out that the button now says Stop.
+        //
+        // Where the turn really is over, something else already closes it:
+        // 'result' above, the payload-less KindResult registry.go's fanOut sends
+        // when an init'd session's stream ends (tether#59), and setConnected(false)
+        // all run finalizeTurn or the same reset — and addMessage nulls curTurnId
+        // the moment the user sends anything.
+        //
+        // What the surviving pointers change before then is small and deliberate.
+        // The answer cursor and the waiting dots are gated on `streaming`, which
+        // this frame clears; ThinkingBlock's `live` flag is gated on it too since
+        // tether#83, for the invariant its own prop doc states. What DOES change:
+        // a 'usage' envelope (gated on curTurnId, not on streaming) now lands its
+        // token counts on the turn's bubble instead of being dropped, and the
+        // turn's eventual 'result' stamps answerMs on the bubble that holds the
+        // answer rather than on a fragment of it. Both are the tether#36/#48
+        // badges going to the right place.
+        set(parsed && !parsed.terminal
+          ? { streaming: false, stopped: false }
+          : { streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null, answerStartTs: null, stopped: false })
         // tether#63 — record a TERMINAL refusal so ChatPane's onClose can tell
         // "the daemon just refused this connection for good" apart from an
         // ordinary transient drop and stop the reconnect ladder instead of
@@ -853,7 +916,6 @@ export const useStore = create<AppState>((set, get) => ({
         // (including the pre-tether#63 bare-string shape a stale daemon build
         // might still send) leaves `fatal` untouched — there is nothing new to
         // act on, not a reason to clear a refusal that may already be set.
-        const parsed = parseErrorPayload(env.payload)
         if (parsed && parsed.terminal) {
           set({ fatal: { code: parsed.code, message: parsed.message } })
           break
@@ -922,13 +984,12 @@ export const useStore = create<AppState>((set, get) => ({
         // told the daemon something went wrong, the daemon classified it and sent
         // a frame, and until now the browser answered by clearing the spinner and
         // saying nothing: the turn just stopped, and whatever the agent said about
-        // why died here. (Only opencode is affected: claude_provider.go never
-        // emits agent.EventError at all.)
+        // why died here.
         //
         // WHY THIS WORDING claims so little. ErrCodeAgent covers a wide range of
         // conditions and the wire says nothing about WHICH one — established by
-        // reading all eight emit sites in internal/agent/opencode_provider.go, not
-        // from the code's own description of itself:
+        // reading every emit site, not from the code's own description of itself.
+        // Eight are in internal/agent/opencode_provider.go:
         //
         //   - session.error from opencode's event stream: a complaint about the
         //     turn, session alive, prompt delivered.
@@ -937,6 +998,14 @@ export const useStore = create<AppState>((set, get) => ({
         //     PROMPT IS GONE while the session stays alive and usable.
         //   - watchServeExit: emits and then calls closeEvents, i.e. THE SESSION
         //     IS ALREADY DEAD by the time this frame is read.
+        //
+        // The ninth is claude_provider.go's ccSession.abandon, which tether#83's
+        // review found: cc's stdout read ending in an error kills the subprocess
+        // and emits here, on a turn that WAS mid-answer. tether#80 recorded that
+        // "claude_provider.go never emits agent.EventError at all" — from the same
+        // sentence in wire/errors.go, which was wrong and is corrected there too.
+        // It changes nothing about the wording below, which is the point: it is
+        // one more materially different situation the wire cannot distinguish.
         //
         // So neither "your prompt is gone" (tether#77's sentence) nor "the session
         // is fine, this is just about the turn" is true across that range, and

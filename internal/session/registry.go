@@ -59,7 +59,26 @@ type Registry struct {
 	// unroutable in exactly the cases where the pane is already on screen.
 	// One shell per sid is already the invariant — locks is keyed the same way.
 	shellResize map[string]func(cols, rows uint16) error
-	providers   map[string]agent.AgentProvider
+	// observers holds the READ-ONLY subscribers of each sid — the /wt/events
+	// attaches — and it is keyed by sid rather than hung off the Entry, which is
+	// the whole of tether#75. See Registry.SubscribeObserver for why that difference
+	// is a bug fix and not a refactor.
+	//
+	// Guarded by obsMu, NOT by mu, and the two are never held at the same time:
+	// deliverObservers reads the registration under mu, releases it, and only
+	// then takes obsMu — so there is no lock order for a future caller to get
+	// wrong.
+	//
+	// Separate rather than folded into mu because the mutations here need a WRITE
+	// lock and have nothing in the sessions map to exclude: subscribing and
+	// unsubscribing happen once per read-only connection, and under mu each of
+	// them would be a registry-wide write lock taken on every /wt/events connect
+	// and disconnect, blocking every unrelated lookup in the daemon for its
+	// duration. (Delivery is a read on both, so that half would cost nothing
+	// either way — this is about the mutators.)
+	observers map[string]*observerSet
+	obsMu     sync.RWMutex
+	providers map[string]agent.AgentProvider
 	// mintedIDIgnored records the providers already observed to report a session id
 	// other than the one they were spawned under, so rekey's self-check warns ONCE
 	// per provider instead of once per session. Guarded by mu.
@@ -273,6 +292,7 @@ func NewRegistry(providers ...agent.AgentProvider) *Registry {
 		spawning:        make(map[string]*spawnReservation),
 		locks:           make(map[string]*SessionLock),
 		shellResize:     make(map[string]func(cols, rows uint16) error),
+		observers:       make(map[string]*observerSet),
 		providers:       pm,
 		mintedIDIgnored: make(map[string]bool),
 	}
@@ -932,6 +952,28 @@ func (r *Registry) rekey(e *Entry, sid string) {
 	// this is I/O, and r.mu is registry-wide.
 	r.saveBinding(sid, e.ws)
 
+	// The read-only observers of the OLD key do not follow it, and must be told
+	// (tether#75). This is the third way a sid stops naming the session an
+	// observer asked about, alongside the two Attachment recovery paths — and the
+	// only one where the registration MOVES rather than being replaced or
+	// abandoned, which is why Subscribe's late binding cannot cover it: nothing
+	// will ever be registered under `from` again, so those channels would wait
+	// forever with no signal, which is verbatim the symptom tether#75 exists to
+	// end.
+	//
+	// Reached only past the two early returns above, and that is what makes it
+	// safe: the `e.regKey == sid` return covers cc (its key never moves), and the
+	// "already evicted or displaced" return fires BEFORE the move, so this cannot
+	// retire a sid that a newer session has taken over. retireObservers consults
+	// the registration as well, so a `from` that something re-registers in between
+	// is left alone.
+	//
+	// In practice `from` is usually a daemon-minted uuid no client holds, so this
+	// retires nothing. The case that matters is the one the Warn below exists to
+	// announce: a cc that has stopped adopting `--session-id`, where the id the
+	// client is holding IS `from`.
+	r.retireObservers(from)
+
 	const msg = "agent reported a session id it was not spawned under; re-keying"
 	if firstForProvider {
 		// Both readings are spelled out because this line cannot tell them apart —
@@ -949,7 +991,7 @@ func (r *Registry) rekey(e *Entry, sid string) {
 // GetOrSpawn is a thin wrapper that hides the Entry behind the Session.
 //
 // It currently has NO production caller — /wt/events attaches read-only via
-// Registry.Subscribe, not through here — so this is API surface kept for callers
+// Registry.SubscribeObserver, not through here — so this is API surface kept for callers
 // that don't need pre-init subscription, not a path anything exercises. Worth
 // knowing before treating it as a constraint on the two spawn paths.
 func (r *Registry) GetOrSpawn(ctx context.Context, sid, providerName string) (agent.Session, error) {
@@ -979,8 +1021,10 @@ func (r *Registry) GetOrSpawn(ctx context.Context, sid, providerName string) (ag
 // e.regKey. Since tether#54 an entry is registered under its sid from before its
 // process existed and only Registry.rekey ever moves it, so the two agree — the
 // by-value scan is kept because it is what makes this idempotent and
-// order-independent for its three callers (teardown, from fanOut's defer;
-// liveEntry dropping a corpse; Attachment.resolve dropping a failed resume), and
+// order-independent for its FOUR callers (teardown, from fanOut's defer;
+// liveEntry dropping a corpse; Attachment.resolve dropping a failed resume;
+// Attachment.reopen dropping the corpse it is recovering from — the fourth
+// arrived with tether#59 and this count went stale until tether#75), and
 // because it cannot
 // take out a DIFFERENT entry that has since been registered under the same key.
 // Deleting during range is safe per the Go spec, and this runs once per session
@@ -998,6 +1042,22 @@ func (r *Registry) evict(e *Entry) {
 			delete(r.sessions, k)
 		}
 	}
+}
+
+// regKeyOf reads the key e is (or was) registered under. regKey is guarded by
+// mu rather than by the entry's own lock — see the field — so every reader
+// outside the registry's own critical sections goes through here.
+//
+// It answers for an EVICTED entry too, and that is what its one caller wants:
+// evict deletes map keys and leaves regKey alone, so a corpse still knows which
+// sid it was the session for, and Attachment.resolve asks exactly that about an
+// entry it evicted moments earlier. (deliverObservers asks the same question but
+// reads the field inline, because it needs the registration in the same critical
+// section and would otherwise take mu twice per envelope.)
+func (r *Registry) regKeyOf(e *Entry) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return e.regKey
 }
 
 // teardown ends a session for good: it un-registers the entry, then reaps the
@@ -1024,10 +1084,11 @@ func (r *Registry) evict(e *Entry) {
 //     Holding the registry-wide lock across a wait on a child process is how one
 //     agent that is slow to die stops every OTHER session from being looked up —
 //     the same objection liveEntry states for calling Alive() under the lock.
-//   - evict has three callers and is deliberately idempotent, and only this one
-//     can prove the os/exec precondition below. liveEntry and Attachment.resolve
-//     evict a session they know is DEAD; dead is not the same as "nothing is
-//     reading its stdout any more".
+//   - evict has four callers and is deliberately idempotent, and only this one
+//     can prove the os/exec precondition below. liveEntry, Attachment.resolve and
+//     Attachment.reopen evict a session they believe is DEAD; dead is not the same
+//     as "nothing is reading its stdout any more" — and reopen's evidence is
+//     weaker still (one failed write, which is why it deliberately does not reap).
 //
 // # The os/exec precondition, spelled out
 //
@@ -1104,7 +1165,24 @@ func (r *Registry) RecordUserMessage(sid, text string) {
 	}
 }
 
-// BroadcastAll sends env to every subscriber across all sessions.
+// BroadcastAll sends env to every subscriber across all sessions, and to every
+// read-only observer regardless of which sid it is watching.
+//
+// Its three callers in the daemon (the permission-request fan-out in
+// server/mux.go, and the two shell lock events in server/wt_shell.go) address
+// the whole daemon rather than one session, so an observer is included on the
+// strength of being connected, not of the sid it named resolving to a live
+// Entry. Before tether#75 an observer of a sid with no registration was not
+// merely skipped here but had never been subscribed at all (see
+// SubscribeObserver), so
+// this widens the audience by exactly the set that used to be dropped on the
+// floor.
+//
+// Two of the three name their own session in Envelope.SessionID and the third
+// (wt_shell.go's lock_held) names it inside its payload. That matters to the
+// /wt/events route, which stamps the WATCHED sid onto envelopes — it does so
+// only where the producer left the field empty, precisely so that widening this
+// audience does not also widen a mislabelling. See pumpEvents.
 func (r *Registry) BroadcastAll(env wire.Envelope) {
 	r.mu.RLock()
 	entries := make([]*Entry, 0, len(r.sessions))
@@ -1122,33 +1200,228 @@ func (r *Registry) BroadcastAll(env wire.Envelope) {
 		}
 		e.subsMu.RUnlock()
 	}
+
+	r.obsMu.RLock()
+	dropped := 0
+	for _, set := range r.observers {
+		dropped += set.send(env)
+	}
+	r.obsMu.RUnlock()
+	warnDropped(dropped, env)
 }
 
-// Subscribe registers a channel to receive broadcast envelopes for a session.
-// Call Unsubscribe when done.
-func (r *Registry) Subscribe(sid string, ch chan wire.Envelope) {
-	r.mu.RLock()
-	e, ok := r.sessions[sid]
-	r.mu.RUnlock()
+// observerSet is one sid's read-only audience: the /wt/events channels watching
+// it, plus the retirement signal they all share.
+//
+// The signal is per-SID rather than per-channel because retirement is a fact
+// about the sid — every observer of it learns the same thing at the same
+// moment — and because a shared channel makes "closed exactly once" a property
+// of removing the set from the map rather than of remembering which channels
+// have already been told.
+type observerSet struct {
+	chans map[chan wire.Envelope]struct{}
+	// retired is closed by retireObservers and never sent on. Closing rather
+	// than sending is what makes the signal reach an observer that is not
+	// currently in its select — a send would have to find one there.
+	retired chan struct{}
+}
+
+// send delivers env to every channel in the set, dropping on a full one rather
+// than blocking, and returns how many it dropped. Same policy as broadcast, and
+// for the same reason: the caller is a session's fanOut loop (or a daemon-wide
+// notice), and one wedged observer must not be able to stall it.
+//
+// It COUNTS the drops instead of logging them, so the caller can log after
+// releasing obsMu. broadcast's equivalent warns in place, but the lock it holds
+// is one Entry's; obsMu is daemon-wide, so a slow log handler here would block
+// every /wt/events connect and disconnect in the process — the objection
+// liveEntry states for calling Alive() under r.mu, one lock over.
+func (s *observerSet) send(env wire.Envelope) (dropped int) {
+	for ch := range s.chans {
+		select {
+		case ch <- env:
+		default:
+			dropped++
+		}
+	}
+	return dropped
+}
+
+// warnDropped reports envelopes a full observer channel could not take. Called
+// only after obsMu is released; see observerSet.send.
+func warnDropped(dropped int, env wire.Envelope) {
+	if dropped > 0 {
+		slog.Warn("events: slow observer, envelope dropped", "kind", env.Kind, "observers", dropped)
+	}
+}
+
+// SubscribeObserver registers ch to receive the envelopes of the session named
+// by sid, and returns a channel that is CLOSED if that sid is retired (see
+// retireObservers). Call UnsubscribeObserver when done.
+//
+// Named apart from Entry.Subscribe deliberately, because the two now mean
+// materially different things and used to share a name: that one adds a chat
+// client to ONE Entry's audience and is migrated by hand across a replacement,
+// this one adds a read-only watcher to a SID's and is not tied to any Entry at
+// all. Filing an observer on an Entry is exactly the bug tether#75 fixes, and a
+// shared name is how it gets refiled there by someone reaching for the obvious
+// method.
+//
+// # Why this is keyed by sid and not by *Entry (tether#75)
+//
+// It used to resolve sid to an Entry once, at subscribe time, and store ch in
+// that Entry's own subscriber set. But an Entry is REPLACED, not mutated, by
+// both of Attachment's recovery paths, and each of them moves only the chat
+// client's own subscribers (Attachment.subs — see adopt and resolve's
+// fallback). A read-only observer is in neither set, so it was left on the
+// retired Entry and went silent for good:
+//
+//   - Attachment.reopen replaces the Entry and KEEPS the sid, which is the
+//     worse half: nothing about the session the observer named has changed, so
+//     there is not even a sid change to notice. Late binding fixes this one
+//     outright — the replacement registers under the same sid, so the very next
+//     envelope finds these channels.
+//   - Attachment.resolve's fallback replaces the Entry with one under a NEW sid.
+//     Late binding cannot help there, because the sid the observer holds is
+//     genuinely finished; that case is what the returned signal is for.
+//
+// # A sid that names nothing yet is a legitimate subscription
+//
+// The old lookup ALSO meant that subscribing to a sid with no registration was
+// a silent no-op: the caller got no error and no events, forever, for a sid
+// whose session was merely a few milliseconds from being registered. That is
+// this route's analogue of the first-event drop window Entry.Subscribe exists
+// to close on the chat path — not the same window (that one is between init and
+// the lookup) but the same shape of loss, and lost the same way, in silence.
+// Registering the channel against the sid removes it entirely: whichever session
+// is registered under that sid, whenever it arrives, reaches these channels.
+//
+// The cost of that is stated rather than hidden: a subscription to a sid that
+// will NEVER be registered is indistinguishable, here, from one that is early,
+// and it waits quietly. The daemon has no tombstone for retired sids, so the
+// signal below reaches the observers connected AT retirement and not one that
+// arrives afterwards naming the same dead sid. Telling that one apart needs
+// either a tombstone or a wire envelope naming the successor sid, and tether#75
+// parks the wire question deliberately.
+func (r *Registry) SubscribeObserver(sid string, ch chan wire.Envelope) <-chan struct{} {
+	r.obsMu.Lock()
+	defer r.obsMu.Unlock()
+	set, ok := r.observers[sid]
+	if !ok {
+		set = &observerSet{
+			chans:   make(map[chan wire.Envelope]struct{}),
+			retired: make(chan struct{}),
+		}
+		r.observers[sid] = set
+	}
+	set.chans[ch] = struct{}{}
+	return set.retired
+}
+
+// UnsubscribeObserver removes ch from sid's observers, and drops the set once it
+// is empty so a long-lived daemon does not accumulate one map entry per sid ever
+// observed.
+//
+// Dropping an empty set also RETIRES its signal in the only sense that matters:
+// nobody is left holding the channel it would have closed. A later subscribe to
+// the same sid therefore gets a fresh set with a fresh, unclosed signal, which
+// is correct — a sid can legitimately be observed again after its last observer
+// left (a reconnect resumes it under the same id).
+func (r *Registry) UnsubscribeObserver(sid string, ch chan wire.Envelope) {
+	r.obsMu.Lock()
+	defer r.obsMu.Unlock()
+	set, ok := r.observers[sid]
 	if !ok {
 		return
 	}
-	e.subsMu.Lock()
-	e.subs[ch] = struct{}{}
-	e.subsMu.Unlock()
+	delete(set.chans, ch)
+	if len(set.chans) == 0 {
+		delete(r.observers, sid)
+	}
 }
 
-// Unsubscribe removes the channel from broadcast.
-func (r *Registry) Unsubscribe(sid string, ch chan wire.Envelope) {
+// retireObservers tells everyone observing sid that it will never carry another
+// event, by closing the signal Subscribe handed them.
+//
+// # Why a signal here at all, when late binding covers the other path
+//
+// SubscribeObserver's doc explains that an observer now follows whatever session is
+// registered under its sid, which is the whole answer for Attachment.reopen —
+// the replacement lands under the same sid. It is NOT the answer for
+// Attachment.resolve's fallback: there the resume failed, the conversation
+// continues under a different sid, and the one the observer holds is finished.
+// Left alone it would wait for an event that cannot come, which is the silence
+// tether#75 exists to end. So the fallback says so, and the observer's stream
+// ends instead of going quiet.
+//
+// # Why it is called from the abandoning caller and not from evict or teardown
+//
+// Both of those look like better choke points and both are wrong, in the same
+// way. evict is by-value, idempotent, and reached from four places, one of which
+// is Attachment.reopen dropping the corpse a line BEFORE it registers the
+// replacement under that very sid — retiring there would tell every observer the
+// sid is finished microseconds before it starts producing again. teardown has
+// the same defect one step later: the corpse's own fanOut can reach it at any
+// time after its stream closes, including well after the replacement is
+// registered, so it too could retire a sid that is live. What the two callers
+// here have that those do not is INTENT: each of them is in the act of leaving
+// this sid behind for another one.
+//
+// # Intent is not enough on its own — the registration is asked as well
+//
+// Knowing that THIS caller has abandoned the sid is not the same as knowing the
+// sid IS abandoned, and the gap between the two is wide enough to walk through.
+// Attachment.resolve reaches here a long way after it evicted the failed resume:
+// in between it calls Session().Close() (stdin.Close + cmd.Wait, which blocks on
+// a child process) and then spawnEntry (which starts one). Inside that window a
+// second connection attaching with the same sid finds nothing live under it,
+// takes the `--resume` path, and registers a session under it — a supported
+// state, since two clients on one sid is what Attach's reuse branch exists for,
+// and a resume that failed once is expected to be retried by the next reconnect.
+// Retiring on intent alone would then end the streams of observers whose sid had
+// just come back to life.
+//
+// So the map is consulted, and a sid that is registered to a live session is
+// left alone: late binding already covers those observers, which is the whole
+// point of SubscribeObserver being keyed the way it is. This is still a check
+// rather than an exclusion — nothing stops a registration from landing between
+// the read and the close — but it turns an answer that is reliably wrong inside a window
+// measured in process startups into a race measured in instructions.
+//
+// A sid with no observers is the ordinary case and costs two map lookups.
+func (r *Registry) retireObservers(sid string) {
 	r.mu.RLock()
-	e, ok := r.sessions[sid]
+	_, stillRegistered := r.sessions[sid]
 	r.mu.RUnlock()
+	if stillRegistered {
+		return
+	}
+
+	r.obsMu.Lock()
+	set, ok := r.observers[sid]
+	if ok {
+		delete(r.observers, sid)
+	}
+	n := 0
+	if ok {
+		n = len(set.chans)
+	}
+	r.obsMu.Unlock()
 	if !ok {
 		return
 	}
-	e.subsMu.Lock()
-	delete(e.subs, ch)
-	e.subsMu.Unlock()
+	// Closed after the set is out of the map, so it cannot be closed twice: a
+	// second retireObservers for the same sid finds nothing, and a subscribe that
+	// arrives in between builds a new set with its own signal.
+	close(set.retired)
+	// Info, not Debug: nothing in this daemon calls slog.SetDefault, so Debug is
+	// unobservable on a real one, and this line is the only evidence an operator
+	// has that a read-only attach was ended by the daemon rather than by its own
+	// client. The count is read under obsMu above rather than here, because
+	// nothing else in this file lets an *observerSet escape its critical section
+	// and this line is not worth being the first.
+	slog.Info("events: the observed session was replaced by one under a different id; "+
+		"ending its read-only streams", "sid", sid, "observers", n)
 }
 
 // setOwner is the compare-and-set that records ownership. Reached only through
@@ -1601,9 +1874,13 @@ func (r *Registry) fanOut(e *Entry) {
 // broadcast sends env to every current subscriber of e, dropping (with a
 // warning) on any subscriber whose channel is full rather than blocking
 // the whole session's fanOut loop.
+//
+// Two audiences, and they are reached differently on purpose: the chat clients
+// bound to THIS Entry, and (since tether#75) the read-only observers of the sid
+// it is registered under. See deliverObservers for the one question that
+// separates them.
 func (r *Registry) broadcast(e *Entry, env wire.Envelope) {
 	e.subsMu.RLock()
-	defer e.subsMu.RUnlock()
 	slog.Debug("fanOut: broadcasting", "wire_kind", env.Kind, "nsub", len(e.subs))
 	for ch := range e.subs {
 		select {
@@ -1612,6 +1889,73 @@ func (r *Registry) broadcast(e *Entry, env wire.Envelope) {
 			slog.Warn("fanOut: slow subscriber, envelope dropped", "kind", env.Kind)
 		}
 	}
+	e.subsMu.RUnlock()
+
+	r.deliverObservers(e, env)
+}
+
+// deliverObservers sends env to the read-only observers of the sid e is
+// registered under — unless e has already been SUPERSEDED there.
+//
+// # The supersession test, and why it is not simply "is e registered"
+//
+// An Entry outlives its agent, and its stream can still be draining bytes the
+// pipe buffered before the process died (Registry.teardown spells out that
+// window). Attachment.adopt already refuses to leave a chat subscriber on such a
+// corpse, and states why in terms of what the user sees: the dead session's
+// half-sentence interleaved into the live one's answer. A sid-keyed observer
+// would meet exactly that on the reopen path, where the replacement is
+// registered under the same sid while the corpse is still unwinding — so the
+// corpse is cut off here, at the one place that can tell the two apart.
+//
+// "Superseded" and not "un-registered", because an entry can be out of the map
+// while its stream is still producing, and it has things left to say. That is
+// not the ORDINARY end of a session — there fanOut broadcasts its flush and its
+// turn-ending KindResult first and only reaches teardown's evict on the way out
+// (the defer at the top of fanOut runs last), so the map still holds the entry
+// while those go past here. It is the out-of-band drop: liveEntry un-registers a
+// corpse the moment any caller asks about a sid whose agent has exited, and
+// Attachment's two recovery paths evict before their replacement is registered.
+// An entry dropped that way can still be draining buffered events, and
+// suppressing on absence would swallow them — including the turn-ender that
+// stops the browser's spinner, trading this bug for a smaller copy of itself. So
+// an entry that is merely gone still speaks; only one that has been REPLACED is
+// silenced.
+//
+// # What silencing the corpse costs, stated rather than discovered
+//
+// The corpse's turn-ending KindResult is suppressed too, and on the happy path
+// that is right — the replacement answers the prompt and closes the turn itself.
+// It is NOT right on the failure of a failure: when reopen's replacement
+// registers and then refuses the prompt, that refusal is delivered as an error
+// frame on the CHAT connection alone (promptErrorEnvelope, tether#77), so an
+// observer gets no turn-ender, no error, and no answer, and its spinner keeps
+// turning. That is the tether#59 symptom surviving on the read-only surface. It
+// is a narrower silence than the one this wi fixes (a failure inside a recovery,
+// rather than every recovery) and closing it means routing reopen's refusal to
+// observers, which is a wire concern tether#75 parks — but it is a real residual,
+// and the pre-tether#75 code did deliver that turn-ender.
+//
+// The registration is read under mu and released before obsMu is taken. That
+// ordering is the whole of the lock discipline between the two (see the
+// observers field): they are never held together, so no lock-order rule has to
+// be remembered anywhere else.
+func (r *Registry) deliverObservers(e *Entry, env wire.Envelope) {
+	r.mu.RLock()
+	sid := e.regKey
+	cur, registered := r.sessions[sid]
+	r.mu.RUnlock()
+	if registered && cur != e {
+		return
+	}
+
+	r.obsMu.RLock()
+	dropped := 0
+	if set, ok := r.observers[sid]; ok {
+		dropped = set.send(env)
+	}
+	r.obsMu.RUnlock()
+	warnDropped(dropped, env)
 }
 
 // translateEvent converts an agent.Event to a wire.Envelope.

@@ -823,7 +823,13 @@ func TestRegistry_ConcurrentAttachResolveOwnAndEnd_NoRace(t *testing.T) {
 			reg.IsLive(res.SID)
 			reg.IsOwner(res.SID, "client-1")
 			reg.OwnedByOther(res.SID, "client-2")
-			reg.Subscribe(res.SID, ch)
+			// A read-only observer is a DIFFERENT connection with its own channel
+			// (tether#75 gave it its own registry-level set, keyed by sid). Sharing
+			// the attachment's channel here would put one channel in two audiences
+			// and make BroadcastAll deliver to it twice, which is a fixture artefact
+			// rather than anything the daemon does.
+			obsCh := make(chan wire.Envelope, 8)
+			reg.SubscribeObserver(res.SID, obsCh)
 			_ = reg.DeliverAction(res.SID, "approve", "b-0", "planner")
 			reg.BroadcastAll(wire.Envelope{Kind: wire.KindMessage, Payload: "ping"})
 			// Drive liveEntry's out-of-band evict: mark the agent dead, then ask a
@@ -833,7 +839,7 @@ func TestRegistry_ConcurrentAttachResolveOwnAndEnd_NoRace(t *testing.T) {
 				reg.IsLive(res.SID)
 				reg.IsLive("announced-" + res.SID)
 			}
-			reg.Unsubscribe(res.SID, ch)
+			reg.UnsubscribeObserver(res.SID, obsCh)
 			att.Unsubscribe(ch)
 		}(i)
 	}

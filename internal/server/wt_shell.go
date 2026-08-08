@@ -79,7 +79,7 @@ func handleWTShell(reg *session.Registry, wts *webtransport.Server, authState *a
 		// buildPTYCommand). The sid is enough to look it up — the shell needs no
 		// workspace parameter of its own, and giving it one would let the two
 		// disagree.
-		cmd := buildPTYCommand(ctx, resolveClaudePath(), sid, reg.WorkdirForSession(sid))
+		cmd := buildPTYCommand(ctx, ResolveClaudePath(), sid, reg.WorkdirForSession(sid))
 		cmd.Env = buildPTYEnv(reg.PermEndpoint)
 
 		// Start the PTY at the size the browser already knows it will render

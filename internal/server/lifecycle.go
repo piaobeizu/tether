@@ -91,7 +91,7 @@ func Run(cfg *Config) error {
 	defer runCancel()
 
 	// Step 1: resolve cc binary path + build session registry.
-	ccPath := resolveClaudePath()
+	ccPath := ResolveClaudePath()
 	if cfg.Registry == nil {
 		ccProvider := agent.NewClaudeCodeProvider(ccPath)
 		ocProvider := agent.NewOpenCodeProvider()

@@ -4,12 +4,36 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"sync"
+	"time"
 )
+
+// scanBufInitial and scanBufMax size the bufio.Scanner readLoop drives. cc emits
+// one JSON object per line and a single line can carry a whole file (a
+// tool_result), so the cap is deliberately huge; the initial size keeps the
+// ordinary line off the growth path.
+const (
+	scanBufInitial = 1 << 20
+	scanBufMax     = 100 << 20
+)
+
+// defaultStdoutGrace is how long ccSession.guardStdout waits, after the Spawn
+// context is done, before it force-closes cc's stdout read end.
+//
+// Generous on purpose. On every ordinary session the guard never fires at all: a
+// cancelled context SIGKILLs cc, cc's write end closes with the process, and
+// readLoop reaches EOF within microseconds. The grace only has to exceed the
+// time readLoop needs to drain and parse what the pipe still holds — at most one
+// pipe buffer of stream-json — so seconds is orders of magnitude of headroom,
+// and firing early is the one way this guard could do harm (it would truncate a
+// turn's last events). Long is cheap here; short is not.
+const defaultStdoutGrace = 2 * time.Second
 
 // ClaudeCodeProvider implements AgentProvider for `claude` CLI (D-05a §4).
 type ClaudeCodeProvider struct {
@@ -20,6 +44,13 @@ type ClaudeCodeProvider struct {
 	// os.Stderr in stderrSink, i.e. byte-for-byte the pre-seam behaviour.
 	// Redirecting it is a test-only affordance (see withStderr).
 	stderr io.Writer
+	// stdoutGrace overrides defaultStdoutGrace for sessions this provider
+	// spawns; 0 (production's only value) means the default. Test-only, see
+	// withStdoutGrace.
+	stdoutGrace time.Duration
+	// maxLine overrides scanBufMax for sessions this provider spawns; 0
+	// (production's only value) means the default. Test-only, see withMaxLine.
+	maxLine int
 }
 
 // ccOption configures a ClaudeCodeProvider at construction time. The type is
@@ -34,6 +65,22 @@ type ccOption func(*ClaudeCodeProvider)
 // produces, which is otherwise unobservable from inside the process.
 func withStderr(w io.Writer) ccOption {
 	return func(p *ClaudeCodeProvider) { p.stderr = w }
+}
+
+// withStdoutGrace shortens ccSession.guardStdout's grace period. Test-only for
+// the same reason withStderr is: the guard exists for a path measured in seconds
+// of wall clock, and a test that waited defaultStdoutGrace for each case would
+// be too slow to keep. Production never sets it.
+func withStdoutGrace(d time.Duration) ccOption {
+	return func(p *ClaudeCodeProvider) { p.stdoutGrace = d }
+}
+
+// withMaxLine shrinks the per-line scanner cap. Test-only: it is what lets a
+// test reach readLoop's bufio.ErrTooLong path — the one failure the cap can
+// actually produce — without pushing scanBufMax (100MB) through a pipe and
+// allocating that much in a `-race` test binary.
+func withMaxLine(n int) ccOption {
+	return func(p *ClaudeCodeProvider) { p.maxLine = n }
 }
 
 // NewClaudeCodeProvider creates a provider using the given cc binary path.
@@ -124,16 +171,34 @@ func (p *ClaudeCodeProvider) Spawn(ctx context.Context, cfg SpawnConfig) (Sessio
 	enc.SetEscapeHTML(false)
 
 	sess := &ccSession{
-		cmd:      cmd,
-		ctx:      ctx,
-		stdin:    stdin,
-		enc:      enc,
-		events:   make(chan Event, 64),
-		sidReady: make(chan struct{}),
-		done:     make(chan struct{}),
+		cmd:         cmd,
+		ctx:         ctx,
+		stdin:       stdin,
+		stdout:      stdout,
+		enc:         enc,
+		events:      make(chan Event, 64),
+		sidReady:    make(chan struct{}),
+		done:        make(chan struct{}),
+		maxLine:     p.maxLine,
+		stdoutGrace: p.resolveStdoutGrace(),
 	}
 	go sess.readLoop(bufio.NewScanner(stdout))
+	// Started here rather than lazily because the thing it guards against —
+	// readLoop never reaching EOF — is indistinguishable from a healthy idle
+	// session until it is too late to start watching. Costs one parked goroutine
+	// per session, released the moment readLoop returns.
+	go sess.guardStdout()
 	return sess, nil
+}
+
+// resolveStdoutGrace resolves the guard's grace period. An unset (0) override
+// means defaultStdoutGrace, so a ClaudeCodeProvider built the way production
+// builds it — NewClaudeCodeProvider(path) with no options — gets the default.
+func (p *ClaudeCodeProvider) resolveStdoutGrace() time.Duration {
+	if p.stdoutGrace > 0 {
+		return p.stdoutGrace
+	}
+	return defaultStdoutGrace
 }
 
 // buildEnv constructs the subprocess environment. IS_SANDBOX=1 is injected
@@ -148,9 +213,14 @@ func buildEnv(extra []string) []string {
 
 // ccSession is a live ClaudeCode stream-json session.
 type ccSession struct {
-	cmd      *exec.Cmd
-	ctx      context.Context // Spawn ctx; escape for the blocking terminal-event send
-	stdin    interface{ Close() error }
+	cmd   *exec.Cmd
+	ctx   context.Context // Spawn ctx; escape for the blocking terminal-event send
+	stdin interface{ Close() error }
+	// stdout is the PARENT's read end of cc's stdout pipe — the very file
+	// readLoop's scanner reads. Held only so guardStdout can force it closed;
+	// nothing else in this package closes it (cmd.Wait does, at the end of
+	// Close, which is exactly the path guardStdout exists to make reachable).
+	stdout   io.Closer
 	enc      *json.Encoder
 	events   chan Event
 	mu       sync.Mutex
@@ -159,6 +229,11 @@ type ccSession struct {
 	sidOnce  sync.Once
 	done     chan struct{} // closed when readLoop returns (cc process fully exited)
 	reqSeq   int           // control_request id counter (T9 pause/interrupt), guarded by mu
+	// maxLine caps one stream-json line; 0 means scanBufMax. See withMaxLine.
+	maxLine int
+	// stdoutGrace is guardStdout's post-cancellation grace period. Always
+	// resolved (never 0) for a session Spawn built.
+	stdoutGrace time.Duration
 	// closeOnce/closeErr make Close idempotent — see Close for why it has to be.
 	closeOnce sync.Once
 	closeErr  error
@@ -278,6 +353,13 @@ func (s *ccSession) Interrupt() error {
 // that a ctx cancellation does NOT release it on its own; it merely moves it from
 // one park to the next.
 //
+// tether sets no WaitDelay by decision rather than omission, and setting one
+// would not change the sentence above: for a cmd whose stdio is caller-owned
+// pipes, WaitDelay is measurably inert, and even where it fires it still leaves
+// that watchdog goroutine parked on a channel only Wait receives from.
+// guardStdout writes out why, and implements the behaviour WaitDelay would
+// otherwise have provided (tether#62).
+//
 // # Only safe once every read of cc's stdout has finished
 //
 // os/exec documents cmd.Wait as incorrect to call while a read from StdoutPipe
@@ -339,7 +421,12 @@ func (s *ccSession) emit(ev Event) {
 
 // readLoop consumes stream-json lines from cc stdout and emits Events.
 func (s *ccSession) readLoop(scanner *bufio.Scanner) {
-	scanner.Buffer(make([]byte, 1<<20), 100<<20)
+	limit := s.scanMax()
+	initial := scanBufInitial
+	if limit < initial {
+		initial = limit
+	}
+	scanner.Buffer(make([]byte, initial), limit)
 	defer close(s.events)
 	// Unblock any SessionID() waiter when the process exits — critical for a cc
 	// that dies before emitting system/init (tether#49), where sidReady never
@@ -353,6 +440,183 @@ func (s *ccSession) readLoop(scanner *bufio.Scanner) {
 		for _, ev := range s.parseLine(scanner.Bytes()) {
 			s.emit(ev)
 		}
+	}
+	// Straight-line, so it runs BEFORE the two defers above — which is required,
+	// not tidy: close(s.events) is what releases Registry.fanOut into the
+	// teardown that reaps this process, and abandon's whole job is to make that
+	// reap terminate. The defers themselves stay untouched, and so does the order
+	// they run in (Alive() depends on it — see there).
+	if err := scanner.Err(); err != nil {
+		s.abandon(err)
+	}
+}
+
+// scanMax resolves the per-line cap: production's scanBufMax unless a test
+// shrank it with withMaxLine.
+func (s *ccSession) scanMax() int {
+	if s.maxLine > 0 {
+		return s.maxLine
+	}
+	return scanBufMax
+}
+
+// pid reports the subprocess pid for logging, or 0 if there is no process (a
+// hand-built ccSession in a unit test).
+func (s *ccSession) pid() int {
+	if s.cmd == nil || s.cmd.Process == nil {
+		return 0
+	}
+	return s.cmd.Process.Pid
+}
+
+// abandon handles readLoop stopping for a reason OTHER than end-of-stream. Two
+// errors can put it here: bufio.ErrTooLong, when cc emits a single line past the
+// scanBufMax cap, and the "file already closed" from guardStdout pulling the
+// pipe out from under the scan. Either way this session is over — nothing
+// restarts readLoop, which is the fact Alive() already documents — but at this
+// instant readLoop is the only thing that knows.
+//
+// # Why it kills the process
+//
+// The end of this session runs Registry.teardown, whose reap is Close(), which
+// is stdin.Close() followed by cmd.Wait(). On an ErrTooLong the child is still
+// ALIVE and has just lost the only reader of its stdout: it fills the pipe
+// buffer and blocks in write(), while Wait blocks in wait4() waiting for it to
+// exit. Neither can move. That deadlock outlasts the turn — it breaks only when
+// the connection context finally SIGKILLs the child — and because Close carries
+// a sync.Once, a second reaper (Attachment.resolve, on the failed-resume path)
+// RENDEZVOUS with the stuck first one and blocks for exactly as long. Killing
+// here removes the deadlock's precondition instead of waiting it out: by the time
+// anything calls Wait, the child is already on its way out.
+//
+// cmd.WaitDelay does not substitute, and not only for the shape reason
+// guardStdout sets out: WaitDelay's timer does not start until the context is
+// done, and the whole point of this case is that the context is still live.
+//
+// # Ordering
+//
+// Kill first, then emit. Emitting is the step that can block — a terminal event
+// is delivered rather than dropped (see emit) — so emitting first would let a
+// slow consumer delay the very kill that unwedges the reap. Both must precede
+// readLoop's close(s.events), for the reason stated at the call site.
+func (s *ccSession) abandon(err error) {
+	// Warn, not Debug: the daemon wires no log level, so Debug is invisible in
+	// production, and this line is the only evidence a session ended this way
+	// rather than normally.
+	slog.Warn("agent stdout read ended in an error; killing the subprocess so it cannot wedge the reap",
+		"err", err, "too_long", errors.Is(err, bufio.ErrTooLong), "pid", s.pid())
+	if s.cmd != nil && s.cmd.Process != nil {
+		// ErrProcessDone when it already exited (the guardStdout route) — the
+		// only error worth distinguishing, and nothing would act on it.
+		_ = s.cmd.Process.Kill()
+	}
+	// Tell the consumer, so the turn closes instead of leaving a spinner up: the
+	// frontend clears "thinking…" on the error envelope as well as the result one
+	// (see isTerminal). This mirrors what the opencode run path already does with
+	// its own scan error.
+	s.emit(Event{Kind: EventError, Err: fmt.Errorf("agent output stream ended in an error: %w", err)})
+}
+
+// guardStdout force-closes cc's stdout read end once the Spawn context has been
+// done for stdoutGrace and readLoop still has not returned. Spawn starts one per
+// session; it exits as soon as readLoop finishes, which on an ordinary session
+// means before it has done anything at all.
+//
+// # The cycle it breaks
+//
+// readLoop's only exit is scanner.Scan() returning false, and for a pipe that
+// needs EOF, and EOF needs EVERY write end closed — not just cc's. A cc that
+// forks a child which inherits fd 1 and outlives it therefore leaves this
+// session's Scan() parked after cc itself is gone, and the entire teardown chain
+// parks behind it: `done` never closes (so Alive() keeps answering true and
+// SessionID() waiters stay parked), `events` never closes (so Registry.fanOut
+// never returns), so fanOut's deferred teardown never runs — the registry entry
+// is never evicted and the process is never reaped. Permanently: cancelling the
+// context does not break it either, because the only thing that closes this pipe
+// from os/exec's side is cmd.Wait, and Wait is reached only through that same
+// teardown (tether#62).
+//
+// # Why cmd.WaitDelay is not this (measured on go1.26.3)
+//
+// WaitDelay reads like the built-in answer — os/exec offers it for "a child
+// process that exits but leaves its I/O pipes unclosed" — and tether v1 did set
+// one. It does not work for this cmd, and the reason is the cmd's SHAPE rather
+// than the delay's value:
+//
+//   - both places WaitDelay closes pipes (exec.go's watchCtx and
+//     awaitGoroutines) guard the closeDescriptors call behind
+//     `c.goroutineErr != nil`, i.e. behind os/exec owning at least one goroutine
+//     that COPIES a pipe;
+//   - StdinPipe/StdoutPipe hand the pipe to the caller instead — they append to
+//     c.parentIOPipes and add no goroutine — and cmd.Stderr is os.Stderr, already
+//     an *os.File, so it adds none either. c.goroutine is therefore empty for
+//     this cmd, c.goroutineErr stays nil, and neither closeDescriptors call is
+//     reachable at all.
+//
+// Measured on exactly this shape: with an orphan holding the write end and the
+// context cancelled, Scan() stays parked identically at WaitDelay=0 and at
+// WaitDelay=200ms; what frees the reader in that experiment is cmd.Wait's own
+// closing of parentIOPipes on the way out, and Wait is the thing we cannot reach.
+// v1's setting was effective because it sat on a `cmd.Output()` call
+// (v0/internal/cc/version.go), where c.Stdout is a *bytes.Buffer and the copying
+// goroutine WaitDelay needs does exist. Setting WaitDelay on THIS cmd would buy
+// nothing and leave behind a comment that lies, so the delay is implemented here
+// instead, over the pipe this package actually owns.
+//
+// # Why a grace period rather than closing at once
+//
+// A cancelled context SIGKILLs cc, so on the ordinary path the write end closes
+// with the process and readLoop reaches EOF within microseconds — before this
+// goroutine gets its second look at `done`. Closing the pipe the instant ctx
+// fired would instead race readLoop for the bytes the pipe still holds and
+// truncate the turn's last events, trading a rare leak for common data loss.
+//
+// # What this does NOT cover
+//
+// The arming condition is the CONTEXT being done, not cc being gone, so the
+// residual case is a cc that dies (leaving an orphan on fd 1) while the client
+// stays connected: nothing here fires, readLoop is still parked, and the entry
+// is still neither evicted nor reaped until the client eventually disconnects.
+// So this bounds the leak by the connection's lifetime rather than eliminating
+// it — which is the whole of the improvement, since before tether#62 not even
+// disconnecting helped and the leak lasted as long as the daemon.
+//
+// Closing that residual needs an independent "the child has exited" signal, and
+// there is no cheap correct one here: kill(pid,0) succeeds for the unreaped
+// zombie cc becomes, and the obvious alternative — a goroutine that owns Wait
+// from the start — is forbidden, because Wait closes the stdout pipe under
+// readLoop (the precondition Registry.teardown spells out). Left open
+// deliberately: tether#62's own scope review measured the common case (a chat
+// session's MCP servers get socketpairs, not this pipe) and found the orphan
+// topology does not arise there; the unmeasured remainder is subprocesses of
+// cc's own Bash tool.
+func (s *ccSession) guardStdout() {
+	select {
+	case <-s.done:
+		return // readLoop finished on its own — every ordinary session
+	case <-s.ctx.Done():
+	}
+	select {
+	case <-s.done:
+		return // the SIGKILL that cancellation implies got there first
+	case <-time.After(s.stdoutGrace):
+	}
+	// Info, not Debug: Debug is invisible on the real daemon (no log level is
+	// wired anywhere), and this line is the only evidence that a session had to
+	// be forced rather than ending on its own.
+	slog.Info("agent stdout did not reach EOF after the session was cancelled; force-closing "+
+		"the pipe so the session can be evicted and the process reaped",
+		"grace", s.stdoutGrace, "pid", s.pid())
+	// Unblocks the parked Scan with a "file already closed" read error, which
+	// takes readLoop into abandon and then into its two defers. Safe to do
+	// concurrently with that read: this is an os.File over a pipe, so it is
+	// poller-registered and Close evicts the blocked reader rather than racing it.
+	//
+	// Spawn always sets stdout, so the guard is for a hand-built ccSession — the
+	// shape unit tests use — where a panic would land on this goroutine and take
+	// the process down rather than failing a test.
+	if s.stdout != nil {
+		_ = s.stdout.Close()
 	}
 }
 

@@ -10,6 +10,17 @@ jobs:
     permissions:
       contents: write
     strategy:
+      # One broken platform used to cancel every sibling still in flight, so a
+      # windows compile error showed up as four cancelled jobs in run
+      # 28437119947 (v0.4.1) and three in 28776556885 (v0.5.0) — none of which
+      # says anything about whether those platforms build. The publish job needs
+      # every leg either way, so this changes no artifact that reaches a user;
+      # it changes what a failed run can tell you, and lets the legs that did
+      # build be downloaded from it.
+      #
+      # Keep this list in step with scripts/platforms.sh, which is what CI
+      # compiles. Nothing checks that the two agree.
+      fail-fast: false
       matrix:
         include:
           - goos: linux
@@ -81,6 +92,13 @@ jobs:
           mkdir -p "release/${NAME}"
           cp dist/tether${{ matrix.ext }} "release/${NAME}/"
           cp dist/tether-permission-hook${{ matrix.ext }} "release/${NAME}/"
+          # The sidecar cchook.EnsureHookBinary compares against
+          # (internal/permission/cchook/embedded.go). It reads it next to the
+          # hook in ~/.tether/bin, not here — but shipping it means someone who
+          # copies both files there gets the prebuilt hook accepted instead of
+          # recompiled, which is the difference between needing a Go toolchain
+          # on that machine and not. scripts/release.sh already includes it.
+          cp dist/tether-permission-hook${{ matrix.ext }}.hash "release/${NAME}/"
           cp README.md "release/${NAME}/"
           cd release && tar czf "${NAME}.tar.gz" "${NAME}"
 

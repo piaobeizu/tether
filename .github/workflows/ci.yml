@@ -69,6 +69,37 @@ jobs:
       - name: Check binary embeds the SPA just built
         run: bash scripts/spa-bundle.sh check bin/tether
 
+      # ── cross-compile gate (tether#85) ──────────────────────────────────────
+      # Every step above this one builds for the runner's own GOOS; releases go
+      # out for five. So internal/mcp/builtin could use syscall.Setpgid and
+      # syscall.Kill with no build tags from 4ded192 (2026-05-12) onward without
+      # a single CI run noticing — the failure was reachable only by pushing a
+      # tag, in the release workflow's windows matrix leg, which took the whole
+      # release down with it: that matrix had no `fail-fast: false`, so its
+      # siblings were cancelled mid-build (four in run 28437119947, three in
+      # 28776556885 — linux/amd64 had already finished there), and the publish
+      # job needs them all. v0.4.1 and v0.5.0 were tagged and got no GitHub
+      # Release at all.
+      #
+      # `go vet` as well as `go build`, because `go build ./...` does not
+      # compile _test.go files and a windows-hostile test would sail through it.
+      #
+      # Has to stay below "Build web": web/dist is not in git (tether#81), so
+      # higher up this step would fail on `web/embed.go: pattern all:dist` for
+      # every platform, including the ones that are fine. It does not care where
+      # "Stamp SPA bundle" sits.
+      - name: Cross-compile every released platform
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          source scripts/platforms.sh
+          for p in "${PLATFORMS[@]}"; do
+            echo "==> $p"
+            GOOS="${p%/*}" GOARCH="${p#*/}" go build -o /dev/null ./...
+            GOOS="${p%/*}" GOARCH="${p#*/}" go vet ./...
+          done
+
       # ── wire-contract tests (D-22 §6) ───────────────────────────────────────
       - name: Run wire-contract tests
         run: cd web && pnpm test

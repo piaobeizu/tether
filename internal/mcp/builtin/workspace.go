@@ -13,7 +13,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -171,9 +170,11 @@ func (r *Registry) handleRunShell(ctx context.Context, req *mcp.CallToolRequest)
 
 	cmd := exec.Command("sh", "-c", params.Command)
 	cmd.Dir = cwd
-	// Setpgid puts the child in its own process group so we can kill the
-	// entire group (child + any spawned subprocesses) on timeout.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Set up whatever the timeout path below will kill. Both this call and the
+	// killOnTimeout call are per-platform (proc_unix.go, proc_windows.go), and
+	// they do not reach equally far: read the platform file for what actually
+	// dies on a timeout there.
+	setKillScope(cmd)
 
 	var stdoutBuf, stderrBuf bytes.Buffer
 	stdoutLW := &limitWriter{w: &stdoutBuf, remaining: maxOutputBytes}
@@ -193,20 +194,30 @@ func (r *Registry) handleRunShell(ctx context.Context, req *mcp.CallToolRequest)
 	case runErr = <-done:
 		// normal completion
 	case <-ctx.Done():
-		// Kill the entire process group to avoid orphaned children.
-		if cmd.Process != nil {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		}
+		// Kill what setKillScope put in reach, so the timeout does not leave
+		// the command running behind the error we are about to return.
+		_ = killOnTimeout(cmd)
 		<-done
 		return errResult("workspace_run_shell: timed out"), nil
 	}
 
 	exitCode := 0
+	cutShort := false
 	if runErr != nil {
 		var exitErr *exec.ExitError
-		if errors.As(runErr, &exitErr) {
+		switch {
+		case errors.As(runErr, &exitErr):
 			exitCode = exitErr.ExitCode()
-		} else {
+		case errors.Is(runErr, exec.ErrWaitDelay):
+			// Reachable only where setKillScope sets Cmd.WaitDelay
+			// (proc_windows.go); on !windows the field stays zero and os/exec
+			// never produces this. It means Wait stopped reading the pipes
+			// because something the command left behind was still holding
+			// them — and os/exec returns it "instead of nil", i.e. the command
+			// itself exited successfully. Reporting it as a tool error would
+			// turn a command that worked into a failure with no output at all.
+			cutShort = true
+		default:
 			return errResult(fmt.Sprintf("workspace_run_shell: %v", runErr)), nil
 		}
 	}
@@ -215,7 +226,7 @@ func (r *Registry) handleRunShell(ctx context.Context, req *mcp.CallToolRequest)
 		Stdout:    stdoutBuf.String(),
 		Stderr:    stderrBuf.String(),
 		ExitCode:  exitCode,
-		Truncated: stdoutLW.truncated || stderrLW.truncated,
+		Truncated: stdoutLW.truncated || stderrLW.truncated || cutShort,
 	})
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: string(b)}}}, nil
 }

@@ -355,12 +355,13 @@ func Run(cfg *Config) error {
 	certs := newCertHolder(bundle)
 	srv := newServer(cfg, certs, pm, authState, mcpSrv, apiTokens, oauthH)
 
-	// A managed cert lives 14 days and this daemon is meant to stay up for
-	// weeks, but LoadOrGenCert above only runs on the way in — so without this
-	// loop the cert simply expires underneath a running process, and the
-	// symptom (browser refuses the connection) points nowhere near the cause.
-	// See startCertRotation for what it deliberately does not cover.
-	startCertRotation(runCtx, bundle, certs, certRotateInterval, loadOrRotateManaged)
+	// Certificates expire, and LoadOrGenCert above only runs on the way in — so
+	// without this loop the cert lapses underneath a running process and the
+	// symptom (every browser refuses the connection) points nowhere near the
+	// cause. That is true of the 14-day managed cert (tether#72) and of an
+	// operator's --cert-file renewed on disk (tether#73) alike; certRenewalFor
+	// is where the two differ, and what it does NOT cover.
+	startCertRotation(runCtx, cfg, bundle, certs)
 
 	errCh := make(chan error, 2)
 
@@ -389,11 +390,7 @@ func Run(cfg *Config) error {
 	}
 	slog.Info("✓ tether server up", "url", fmt.Sprintf("https://%s%s/", host, cfg.addr()))
 	slog.Info("claude binary", "path", ccPath)
-	if !bundle.External {
-		slog.Info("cert DER hash", "hash", HashHex(bundle.DER))
-	} else if cfg.AcmeDomain != "" {
-		slog.Info("cert mode", "acme", cfg.AcmeDomain)
-	}
+	logCertMode(cfg, bundle)
 
 	// Step 6: block until signal or listener error.
 	sigCh := make(chan os.Signal, 1)

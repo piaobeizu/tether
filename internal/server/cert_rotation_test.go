@@ -383,40 +383,69 @@ func TestNewServerAndBuildMux_AgreeAcrossARotation(t *testing.T) {
 	}
 }
 
-// The one line in Run that decides whether rotation happens at all.
-func TestStartCertRotation_RunsForManagedCertOnly(t *testing.T) {
+// The one line in Run that decides whether the cert is maintained at all.
+//
+// This used to assert "managed only", which was the bug tether#73 fixed: an
+// operator's --cert-file was read once and never again. It now asserts the
+// three-way split, and the negative case is ACME rather than every external
+// cert. The intervals startCertRotation picks are a minute and an hour, so what
+// is checked here is the decision; that the loop it starts really runs is
+// TestCertRenewal_Start* (which can shrink the interval).
+func TestStartCertRotation_StartsARenewalForEveryPathExceptACME(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
+		cfg        func(t *testing.T) *Config
 		external   bool
 		wantsStart bool
 	}{
-		{"managed cert rotates", false, true},
-		{"external cert is left to its owner", true, false},
+		{"managed cert is maintained here", func(t *testing.T) *Config {
+			t.Setenv("HOME", t.TempDir())
+			return &Config{}
+		}, false, true},
+		{"an operator's cert files are re-read here", func(t *testing.T) *Config {
+			certPath, keyPath := seedOperatorPEM(t, mustGenCert(t))
+			return &Config{CertFile: certPath, KeyFile: keyPath}
+		}, true, true},
+		// External=true because that is what SetupACME returns and what Run
+		// therefore holds here. It also means this row is protected twice over —
+		// certRenewalFor's ACME case AND the refusal below — so deleting the
+		// former still leaves it green (measured). What pins the ACME exclusion
+		// itself is TestCertRenewalFor_ACMEGetsNoRenewalEvenAlongsideCertFiles;
+		// this row pins that Run's entry point agrees with it.
+		{"ACME is renewed by certmagic, not here", func(*testing.T) *Config {
+			return &Config{AcmeDomain: "tether.example"}
+		}, true, false},
+		// The refusal, not a real configuration: an External bundle whose flags
+		// say "managed" cannot happen today, because externalPEMSource decides
+		// both. It is the shape a third source of External certs would arrive
+		// in, and the minting reload must not accept it — replacing a
+		// CA-signed cert with a self-signed one is worse than not renewing.
+		{"an external cert the flags do not explain is refused, not minted over", func(t *testing.T) *Config {
+			t.Setenv("HOME", t.TempDir())
+			return &Config{}
+		}, true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bundle := mustGenCert(t)
 			bundle.External = tc.external
 			holder := newCertHolder(bundle)
-			replacement := mustGenCert(t)
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			got := startCertRotation(ctx, bundle, holder, time.Millisecond, func() (CertBundle, error) {
-				return replacement, nil
-			})
-			if got != tc.wantsStart {
+			if got := startCertRotation(ctx, tc.cfg(t), bundle, holder); got != tc.wantsStart {
 				t.Fatalf("startCertRotation = %v, want %v", got, tc.wantsStart)
 			}
-
 			if tc.wantsStart {
-				waitFor(t, func() bool { return holder.Get().DER == replacement.DER }, 5*time.Second,
-					"reported that it started, but nothing ever rotated")
 				return
 			}
-			// Give a loop that should not exist time to prove it does.
+			// Give a loop that should not exist time to prove it does. certmagic
+			// serves ACME certs through its own tls.Config, so anything swapped
+			// into the holder here would be a cert nobody presents — and if the
+			// reload were the managed one, it would mint a self-signed cert on
+			// top of a CA-signed deployment.
 			time.Sleep(50 * time.Millisecond)
 			if holder.Get().DER != bundle.DER {
-				t.Fatal("external cert was rotated — a CA-signed cert would be replaced by a self-signed one")
+				t.Fatal("a path that must not be rotated here swapped the holder anyway")
 			}
 		})
 	}
@@ -702,6 +731,14 @@ func (s *syncBuf) String() string {
 
 // A rotation that keeps failing is only actionable if it says so before the
 // cert lapses. One WARN an hour in a busy log is not that.
+//
+// The escalation window is certRotateThreshold, not 2*every. It used to be the
+// latter, which read as "no retry left can save it" — true enough at the
+// managed interval, but tether#73 added a path polled every minute where no
+// retry can EVER save it (nothing here mints an operator's cert), and there the
+// old rule bought two minutes of notice. The third case below is the one that
+// distinguishes them: at every=10ms, 2*every is 20ms, so a cert with hours left
+// escalated under neither rule and now escalates under this one.
 func TestRotateCertLoop_EscalatesWhenFailureBecomesTerminal(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
@@ -711,6 +748,7 @@ func TestRotateCertLoop_EscalatesWhenFailureBecomesTerminal(t *testing.T) {
 	}{
 		{"far from expiry: warn only", 10 * 24 * time.Hour, "level=WARN", "level=ERROR"},
 		{"retrying can no longer save it: escalate", 30 * time.Millisecond, "level=ERROR", ""},
+		{"inside the rotation threshold: escalate however often we poll", certRotateThreshold / 2, "level=ERROR", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var out syncBuf

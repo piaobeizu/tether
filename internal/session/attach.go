@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -399,7 +400,10 @@ func (r *Registry) Attach(ctx context.Context, sid, providerName, wsID string) (
 	}
 
 	cfg := agent.SpawnConfig{ResumeSessionID: dec.ResumeSID}
-	e, outcome, err := r.spawnEntry(ctx, providerName, cfg, dec.Binding)
+	// spawnIfAbsent: an attach with nowhere to land must be able to start a session —
+	// adoptOnly exists for a caller with a budget to bound, which is reopen's alone
+	// (tether#82).
+	e, outcome, err := r.spawnEntry(ctx, providerName, cfg, dec.Binding, spawnIfAbsent)
 	if err != nil {
 		return nil, err
 	}
@@ -615,7 +619,15 @@ func (a *Attachment) SendPrompt(ctx context.Context, text string) error {
 // and the same refusal became invisible instead of merely stuck. tether#77
 // re-priced it: the bound is unchanged and still one, but spending it is now
 // reported (ErrCodePromptUndelivered) rather than decided behind the user's
-// back. See the `spent` branch in reopen.
+// back.
+//
+// tether#82 then moved WHERE it is charged, without changing the number. A spent
+// attachment used to return before spawnEntry, which made "may not spawn" also mean
+// "may not find out that a live session is already there" — everything spawnEntry does
+// for a late caller sits past the claim. The budget is now handed to spawnEntry as
+// adoptOnly, so a spent attachment walks the same road and stops at the one step it may
+// not take. Read the bound as what it always said: this attachment may start at most
+// one `cc --resume`, and may adopt as often as there is something to adopt.
 //
 // # It is claude-code-only, by the provider's shape rather than by choice
 //
@@ -749,15 +761,25 @@ func (a *Attachment) reopen(ctx context.Context, dead *Entry, text string, sendE
 	// For an attachment with budget left, the two adoptions then differ only in wording
 	// — which log line, and which message a refused prompt carries.
 	//
-	// It does NOT follow that this check has become free, and the paragraph directly
-	// above is why: the spent gate returns BEFORE spawnEntry is ever reached. So an
-	// attachment whose budget is already spent still depends on winning this check —
-	// lose it and the prompt is refused even though a live session is right there to
-	// answer it. That is not a duplicate agent and not new with tether#78 (the same
-	// ordering has always been here), and since tether#77 the user is at least told
-	// rather than left on a spinner. It is nonetheless the one cost of losing this
-	// check that tether#78 does not remove, so it is named here and in spawnEntry's
-	// "still does NOT cover" list rather than papered over. tether#82 tracks it.
+	// Since tether#82 that is true of a SPENT attachment as well, and it took a change
+	// rather than following from tether#78: the budget used to return BEFORE spawnEntry,
+	// so an attachment that had used its one re-open depended entirely on winning THIS
+	// check, and lost it in a way this check cannot avoid — liveEntry reads the map and
+	// only then asks Alive(), so what it reports is the state at the read. Lose it and
+	// the prompt was refused with a live session registered under the sid. The budget is
+	// now passed to spawnEntry as adoptOnly (see below), which is where the same question
+	// gets its authoritative answer, so both callers of this check are in the same
+	// position: losing it costs a slower path to the same entry, never a refusal that a
+	// live session would have answered.
+	//
+	// What this check therefore IS, now that neither caller depends on it: an
+	// optimisation, plus a differently-worded log line and refusal message. Do not read
+	// more into the wording than liveEntry can support — it proves only that something
+	// live and not `dead` is registered under this sid, never WHO put it there, so
+	// "another attachment re-opened it" is this branch's most likely story rather than
+	// its finding. It stays for the same reason Attach's own gate does, and not because
+	// anything downstream is unsound without it: disabling it entirely leaves this
+	// package green, since every caller then arrives at the same entry one layer down.
 	if sibling, ok := a.reg.liveEntry(sid); ok && sibling != dead {
 		slog.Info("chat: the reused session was already re-opened by another attachment; adopting it",
 			"sid", sid, "err", sendErr)
@@ -770,34 +792,62 @@ func (a *Attachment) reopen(ctx context.Context, dead *Entry, text string, sendE
 			"adopted the live session under %s but it would not take the prompt", sid)
 	}
 
+	// The budget is asked as a MODE rather than as a gate on the road below, and that
+	// swap is the whole of tether#82. What it bounds is SPAWNING; expressing it as an
+	// early return meant a spent attachment never reached spawnEntry's claim, so
+	// everything the claim does for a late caller — waiting on a replacement that is
+	// still inside provider.Spawn, consulting the registration once the corpse is out
+	// of the way — was unreachable for precisely the attachment with no second chance
+	// left. It depended entirely on winning the sibling check above, and that check
+	// answers about the entry it FOUND: liveEntry reads the map and only THEN asks
+	// Alive(), so a verdict of "nothing live here" can be a fact about a corpse that
+	// has already been replaced. The cost of losing it was a refused prompt with a
+	// live session registered under the sid — reachable in four steps, no concurrency
+	// beyond a scheduling delay.
+	//
+	// Both modes go through spawnEntry now. adoptOnly stops at the Spawn it may not
+	// perform and reports errNoSessionToAdopt, which is where the bound is paid.
+	mode := spawnIfAbsent
 	if spent {
-		// tether#77. reopen's doc used to accept this silence outright ("a
-		// long-lived connection whose agent dies twice hangs the second time"),
-		// and while that was written the cost was at least legible: with no
-		// turn-ending frame the spinner kept turning, which is ugly but does say
-		// something is wrong. tether#59 added the turn-ender, so the same refusal
-		// now leaves a tab that looks idle and healthy while swallowing every
-		// prompt typed into it. Same silence, strictly worse symptom.
-		//
-		// The budget is not what is being revisited here — it still bounds how
-		// many `cc --resume` this attachment may start, and one is still the
-		// right number. What changes is that spending it is now something the
-		// user is told about instead of a decision made behind their back.
-		// "already used" rather than "died again": reopenSpent is set both by a
-		// replacement that started and by one that failed to (see the spawn-failure
-		// branch below), so this branch is reached in a state where the session may
-		// have died only once and simply never been replaced.
-		return refuse(wire.ErrCodePromptUndelivered,
-			"session %s stopped accepting prompts and this connection has already used its one re-open: %w", sid, sendErr)
+		mode = adoptOnly
+		// Deliberately NOT the "re-opening it" line below: nothing will be re-opened
+		// here, and a log line that says otherwise is worse than none. Info for the
+		// reason spawnEntry's adoption line is — nothing in this daemon calls
+		// slog.SetDefault, so Debug is unobservable on a real one — and it is the only
+		// signal an operator gets that a connection reached its budget at all.
+		slog.Info("chat: the reused session stopped accepting prompts and this connection has "+
+			"already used its one re-open; looking for a live session under the sid to adopt",
+			"sid", sid, "err", sendErr)
+	} else {
+		slog.Info("chat: the reused session stopped accepting prompts; re-opening it",
+			"sid", sid, "err", sendErr)
 	}
-
-	slog.Info("chat: the reused session stopped accepting prompts; re-opening it",
-		"sid", sid, "err", sendErr)
 
 	// Drop the corpse's registration BEFORE spawning, so that if the spawn fails the
 	// dead sid still stops reading as live to the next reconnect. evict is by-value
 	// and idempotent, so the replacement registered under this same key a line later
 	// cannot be taken out by it, nor by the corpse's own teardown.
+	//
+	// It has been load-bearing rather than tidy since tether#78 gave spawnEntry a
+	// post-claim consult: that consult asks liveEntry, which is free to hand `dead` back
+	// — Alive() need not have flipped yet — so without this the caller would "adopt" the
+	// corpse it is recovering FROM and write into the same broken pipe. Deleting it fails
+	// TestSendPrompt_ReopensEvenWhileTheDeadSessionStillReportsItselfAlive,
+	// TestSendPrompt_ReopenSpawnFailureNamesBothCausesAndDropsTheCorpse and
+	// TestResolve_AFailedResolveDoesNotDisarmAReusedAttachment, all of which predate
+	// tether#82.
+	//
+	// What tether#82 changes is only WHO reaches it: a SPENT attachment now does, and
+	// gets the same protection on its adopt-only consult. The evidence is the same as on
+	// the unspent path (one failed write, which is not proof of death — see this
+	// function's no-reap section), so this is the same trade one branch over. One
+	// consequence that IS new and is not stated anywhere else: when the consult then
+	// finds nothing, this attachment refuses and nothing repopulates the key, whereas the
+	// unspent path always registers a replacement a line later. For a session that failed
+	// a write but is genuinely alive, the sid therefore stops resolving for
+	// DeliverAction/InterruptSession/IsLive until the next attach resumes it — which is
+	// what un-registering a session believed dead has always meant, arrived at from a
+	// branch that does not replace it.
 	a.reg.evict(dead)
 
 	// a.ws, not the zero binding — same reason as the fallback in resolve
@@ -805,8 +855,46 @@ func (a *Attachment) reopen(ctx context.Context, dead *Entry, text string, sendE
 	// a `--resume` in any other directory fails exactly like an unknown sid. The
 	// reuse branch in Attach only reuses an entry whose workdir already IS
 	// workdirFor(a.ws), so this reopens in the directory the dead session lived in.
-	fresh, outcome, err := a.reg.spawnEntry(ctx, a.provider, agent.SpawnConfig{ResumeSessionID: sid}, a.ws)
+	fresh, outcome, err := a.reg.spawnEntry(ctx, a.provider, agent.SpawnConfig{ResumeSessionID: sid}, a.ws, mode)
+	if errors.Is(err, errNoSessionToAdopt) {
+		// Reachable only under adoptOnly, i.e. only when the budget is already spent —
+		// and it now means something stronger than the early return it replaces: no live
+		// session is registered under this sid AND none is being spawned under it. This
+		// is where the one-re-open bound is actually paid, against an authoritative
+		// answer rather than against a check this attachment could lose.
+		//
+		// tether#77's wording, kept verbatim so nothing downstream of the refusal has to
+		// change. reopen's doc used to accept this silence outright ("a long-lived
+		// connection whose agent dies twice hangs the second time"), and while that was
+		// written the cost was at least legible: with no turn-ending frame the spinner
+		// kept turning, which is ugly but does say something is wrong. tether#59 added
+		// the turn-ender, so the same refusal now leaves a tab that looks idle and
+		// healthy while swallowing every prompt typed into it. Same silence, strictly
+		// worse symptom.
+		//
+		// The budget is not what tether#77 or tether#82 revisit — it still bounds how
+		// many `cc --resume` this attachment may start, and one is still the right
+		// number. tether#77 made spending it something the user is told about instead of
+		// a decision made behind their back; tether#82 made being told it depend on
+		// there genuinely being nothing to adopt. "already used" rather than "died
+		// again": reopenSpent is set both by a replacement that started and by one that
+		// failed to (see the spawn-failure branch below), so this is reached in a state
+		// where the session may have died only once and simply never been replaced.
+		return refuse(wire.ErrCodePromptUndelivered,
+			"session %s stopped accepting prompts and this connection has already used its one re-open: %w", sid, sendErr)
+	}
 	if err != nil {
+		// Also reached under adoptOnly, for every error that is not the verdict: a
+		// replacement this call waited on and which then failed, the workdir refusal,
+		// awaitSpawn's cancelled wait (ctx.Err(), classified here although reopen's own
+		// ctx branch stays bare — the tether#77 trade, unchanged), and its "neither an
+		// entry nor an error". Not a closed list on purpose: it is whatever spawnEntry
+		// and awaitSpawn can produce, which is exactly why this branch classifies rather
+		// than inspects.
+		//
+		// The assignment below is then a no-op — the budget is already spent, which is
+		// why this mode was chosen — and the message stays accurate either way: nothing
+		// was re-opened.
 		a.mu.Lock()
 		a.reopenSpent = true
 		a.mu.Unlock()
@@ -876,11 +964,21 @@ func (a *Attachment) reopen(ctx context.Context, dead *Entry, text string, sendE
 	// cur != dead branch above.
 	//
 	// Sent outside the lock so a blocked pipe cannot stall SendPrompt/Subscribe.
-	// Classified (tether#77): the budget above has just been spent on this very
-	// replacement, so a refusal here means the next prompt takes the `spent`
-	// branch. There is no recovery left to wait for.
-	return undelivered(fresh.Session().SendPrompt(ctx, text),
-		"re-opened session %s would not take the prompt", sid)
+	// Classified (tether#77): if this call started the replacement its budget has just
+	// been spent on it, so a refusal here means the next prompt gets the adopt-only
+	// treatment above; if it adopted one, the adoption WAS the recovery. Either way there
+	// is nothing left to wait for.
+	//
+	// The verb follows the outcome, which is not decoration: since tether#78 this line is
+	// reached by a caller that adopted rather than spawned, and since tether#82 that
+	// includes a SPENT one — for which "re-opened" would name the single thing it is not
+	// allowed to have done. The sibling branch above already says it the other way for
+	// the same event, so the two now agree.
+	what := "re-opened session %s would not take the prompt"
+	if !outcome.startedProcess() {
+		what = "adopted the live session under %s but it would not take the prompt"
+	}
+	return undelivered(fresh.Session().SendPrompt(ctx, text), what, sid)
 }
 
 // undelivered classifies a failed prompt delivery as ErrCodePromptUndelivered,
@@ -1093,7 +1191,11 @@ func (a *Attachment) resolve(ctx context.Context) (Resolution, error) {
 	// the tether#78 consult cannot in practice find a registration under an id just
 	// minted (same fixed-uuid caveat as GetOrSpawnEntry), so
 	// neither adoption is reachable. Same reason GetOrSpawnEntry discards it.
-	fresh, _, err := a.reg.spawnEntry(ctx, a.provider, agent.SpawnConfig{}, a.ws)
+	//
+	// spawnIfAbsent: this IS the recovery, so a mode that may not spawn would have
+	// nothing to offer it (tether#82). Not the same budget as reopen's either — the
+	// fallback is bounded by resolveOnce, not by reopenSpent.
+	fresh, _, err := a.reg.spawnEntry(ctx, a.provider, agent.SpawnConfig{}, a.ws, spawnIfAbsent)
 	if err != nil {
 		return Resolution{}, fmt.Errorf("resume %s failed and fresh spawn failed: %w", a.reqSID, err)
 	}

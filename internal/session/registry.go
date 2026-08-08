@@ -4,6 +4,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -123,6 +124,38 @@ const (
 // against a constant is what stops a third outcome from silently joining the
 // wrong side of a `!= spawnStarted`.
 func (o spawnOutcome) startedProcess() bool { return o == spawnStarted }
+
+// spawnMode says whether a spawnEntry call is ALLOWED to start an agent. It is a
+// parameter rather than two functions because the decision it gates is one step of a
+// sequence the rest of which is shared: compute the key, wait for whoever holds it,
+// consult the registration — and only then, maybe, Spawn.
+//
+// It exists for one caller (Attachment.reopen's spent path, tether#82) and the shape
+// is the point. reopen's one-re-open budget bounds SPAWNING; expressing it as "may
+// not reach the claim" is what made a spent attachment depend on winning its own
+// racy pre-check, because everything the claim does for it — waiting on an in-flight
+// replacement, consulting the registration — happens past the gate. Expressed as a
+// mode, the budget lands exactly where its meaning is.
+type spawnMode int
+
+const (
+	// spawnIfAbsent is the ordinary mode and the zero value: adopt a live session
+	// registered under the key if there is one, otherwise start an agent.
+	spawnIfAbsent spawnMode = iota
+	// adoptOnly may adopt but must not Spawn. A call in this mode that finds nothing
+	// to adopt returns errNoSessionToAdopt, which is a verdict rather than a failure —
+	// its one caller answers it with a refusal of its own.
+	adoptOnly
+)
+
+// errNoSessionToAdopt is the verdict an adoptOnly call returns when no live session
+// is registered under the key and none is being spawned under it.
+//
+// A sentinel error rather than a fourth spawnOutcome, because spawnNoEntry's job is
+// "there is no entry; read the error" (see its doc) and an outcome that travelled
+// with a nil error would undo exactly that. Only an adoptOnly call can produce it, so
+// no existing caller has to learn about it.
+var errNoSessionToAdopt = errors.New("no live session is registered under this key")
 
 // String makes the constant legible in a test failure or a log line. Worth having
 // rather than reading small integers out of an assertion message: the whole point
@@ -368,7 +401,11 @@ func (r *Registry) GetOrSpawnEntry(ctx context.Context, sid, providerName string
 	// spawns that both took that fallback would collide — unreachable on Linux, latent
 	// since tether#60's waiter path, and cheaper to name than to re-derive. That is a property of the empty SpawnConfig, not
 	// an assumption about callers — see spawnEntry's tether#60/#78 notes.
-	e, _, err := r.spawnEntry(ctx, providerName, agent.SpawnConfig{}, WorkspaceBinding{})
+	//
+	// spawnIfAbsent because this entry point exists to produce a session: it has no
+	// budget to bound and no refusal to fall back on, so adoptOnly would be a mode it
+	// could not answer (tether#82).
+	e, _, err := r.spawnEntry(ctx, providerName, agent.SpawnConfig{}, WorkspaceBinding{}, spawnIfAbsent)
 	return e, err
 }
 
@@ -480,15 +517,40 @@ func (r *Registry) GetOrSpawnEntry(ctx context.Context, sid, providerName string
 // earns its keep — it answers "reuse or resume?" before any of this — but it is no
 // longer load-bearing for "will two agents end up under one sid".
 //
+// # A caller that may adopt but must not Spawn (tether#82)
+//
+// tether#78 left a residual it could not reach from here, and the reason is the sentence
+// directly above: everything this function does for a late caller happens after the
+// claim. Attachment.reopen's spent budget used to return BEFORE it, so an attachment
+// that had already used its one re-open depended entirely on winning its own pre-check —
+// lose it and the prompt was refused with a live session registered under the sid, and
+// with a replacement possibly still mid-Spawn, which no pre-check can see at all.
+//
+// mode is how that is closed. adoptOnly walks the same three steps as anyone else —
+// compute the key, wait for whoever holds it, consult the registration — and stops at
+// the fourth. The budget then bounds Spawn, which is what it always meant, rather than
+// bounding the road to it.
+//
+// An adoptOnly call takes NO reservation, and that is a decision with a reason rather
+// than an omission. A reservation exists to keep a rival from registering under the
+// key while this call has one in flight; a call that will never register has nothing
+// to protect. Taking one anyway would be actively worse: the release publishes this
+// call's outcome to every waiter (see spawnReservation), so an adoptOnly call that
+// found nothing would hand a waiter WITH budget left either "neither an entry nor an
+// error" (awaitSpawn's panic branch, reached for a call that did not panic) or a
+// refusal for a spawn it was entitled to attempt. Declining the reservation keeps
+// tether#60's protocol a conversation between callers that actually spawn.
+//
+// What that costs, stated rather than left to be discovered: an adoptOnly call's
+// verdict is authoritative about the instant it consults and no longer. Nothing stops
+// a replacement from being reserved one instruction after it answered "nothing here",
+// in which case a spent attachment is refused while a session appears just behind it.
+// That is a strictly later instant than the one it asked about, which is as much as
+// any answer short of holding the key across the delivery can promise — and the
+// refusal it produces is the one tether#77 made visible, not a silent drop.
+//
 // What this still does NOT cover, stated rather than implied:
 //
-//   - It only helps a caller that REACHES the claim. Attachment.reopen's spent gate
-//     returns before it does, so an attachment that has already used its one re-open
-//     still depends on winning its own sibling-adoption check: lose that and its
-//     prompt is refused even though a live session is registered under the sid. No
-//     duplicate agent, and not a regression — that ordering predates this — but it is
-//     the one cost of a lost pre-check that consulting r.sessions here cannot remove,
-//     because nothing here runs. tether#82 tracks it; see reopen for the reproduction.
 //   - rekey moves a registration into an arbitrary key WITHOUT holding a reservation,
 //     so it could in principle place an entry under a key someone is spawning under.
 //     It is not reachable for cc (which adopts the id it is given, so rekey is a
@@ -501,7 +563,7 @@ func (r *Registry) GetOrSpawnEntry(ctx context.Context, sid, providerName string
 //     "adopted a session that then died" shape every other reuse has, and it is
 //     recovered by the same machinery (Attachment.reopen, tether#59/#76) rather than
 //     by a second check here.
-func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agent.SpawnConfig, ws WorkspaceBinding) (entry *Entry, outcome spawnOutcome, err error) {
+func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agent.SpawnConfig, ws WorkspaceBinding, mode spawnMode) (entry *Entry, outcome spawnOutcome, err error) {
 	if providerName == "" {
 		providerName = "claude-code"
 	}
@@ -544,10 +606,12 @@ func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agen
 	r.mu.Lock()
 	if res, ok := r.spawning[key]; ok {
 		r.mu.Unlock()
+		// Waiting is shared by both modes, and for adoptOnly it is the half of tether#82
+		// no pre-check could ever have covered: a replacement that is still inside
+		// provider.Spawn is registered nowhere, so liveEntry has nothing to find, yet it
+		// is milliseconds from being exactly what this caller wanted to adopt.
 		return r.awaitSpawn(ctx, key, res, cfg.Workdir)
 	}
-	res := &spawnReservation{done: make(chan struct{})}
-	r.spawning[key] = res
 	// `key`, not either field it was derived from. Substituting cfg.SessionID here is
 	// caught (it is "" on every resume, so the consult never fires and the residual is
 	// back); substituting cfg.ResumeSessionID is an EQUIVALENT mutant TODAY and no test
@@ -556,6 +620,27 @@ func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agen
 	// being equivalent the moment a caller sets BOTH fields, which agent.SpawnConfig
 	// currently forbids. Written down because "no test failed" is not why this is right.
 	registered := r.sessions[key]
+	if mode == adoptOnly {
+		// No reservation, deliberately — see the adoptOnly section in this function's
+		// doc for why taking one would hurt a waiter that is entitled to spawn. Which
+		// also means there is nothing to release and nothing to publish, so this returns
+		// before the defer below is ever installed.
+		r.mu.Unlock()
+		if registered == nil {
+			// Nothing is registered and (per the branch above) nothing is being spawned:
+			// the verdict, not a failure. Returned without a second map read, the same
+			// saving the ordinary path's `registered != nil` guard makes.
+			//
+			// A mutant deleting this guard SURVIVES, and it is equivalent rather than
+			// untested: adoptRegistered asks liveEntry, which answers false for an absent
+			// key without calling Alive() or evicting anything, so the only difference is
+			// one RLock. Written down because "no test failed" is not why this is right.
+			return nil, spawnNoEntry, errNoSessionToAdopt
+		}
+		return r.adoptRegistered(key, cfg.Workdir)
+	}
+	res := &spawnReservation{done: make(chan struct{})}
+	r.spawning[key] = res
 	r.mu.Unlock()
 
 	// Release on EVERY path, including the panicking one and the adoption below.
@@ -576,7 +661,10 @@ func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agen
 	// under the reservation, not under r.mu. That is what makes the check
 	// authoritative without breaking liveEntry's rule — the reservation excludes
 	// every rival spawn for this key, so nothing can register here while we are
-	// asking, and Alive() is still called with no lock held.
+	// asking, and Alive() is still called with no lock held. (adoptOnly asks the SAME
+	// question through the same function without that exclusion, and its doc section
+	// says what it therefore cannot promise; the two must not be allowed to answer
+	// differently, which is why the question has one implementation.)
 	//
 	// A corpse falls through to the spawn below rather than being adopted, which is
 	// the whole reason this cannot be a bare map test: adopting a registered-but-dead
@@ -589,36 +677,12 @@ func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agen
 	// reopen through its explicit evict), so registered is nil and no Alive() is
 	// asked here. It fires only for the caller that lost the race this closes.
 	if registered != nil {
-		if e, ok := r.liveEntry(key); ok {
-			if e.workdir != cfg.Workdir {
-				// Fail closed, for the reason awaitSpawn states at length: adopting an
-				// entry from another directory silently relocates a conversation. Note
-				// that reopen's sibling-adoption branch does NOT check this and argues it
-				// is unreachable; the argument is about today's callers, and this is the
-				// same assertion awaitSpawn already makes one branch away, so the two
-				// adoption paths agree rather than each trusting a different premise.
-				//
-				// A waiter parked on our reservation inherits this error even if its own
-				// resolved directory would have matched. That is an accepted imprecision
-				// in a case believed unreachable: it costs the waiter a reconnect, and
-				// the alternative is machinery to republish per-waiter verdicts for a
-				// state no call site can currently produce.
-				return nil, spawnNoEntry, fmt.Errorf(
-					"refusing to adopt session %s: it is registered from %q but this connection resolved %q",
-					key, e.workdir, cfg.Workdir)
-			}
-			// Info, not Debug, and the reason is a fact about this daemon rather than a
-			// preference: nothing anywhere calls slog.SetDefault or sets a level, so the
-			// default handler drops Debug and a Debug line here would be unobservable on
-			// a real daemon — which is exactly how live-verifying this change ran into
-			// "the count is right but I cannot see WHICH path produced it". The event
-			// also deserves it: it means two clients contended for one sid, it happens
-			// only when a race is lost, and reopen's sibling-adoption branch — the same
-			// event one layer up — already logs at Info. (awaitSpawn's tether#60 line has
-			// the same invisibility problem; left alone, not this wi's to change.)
-			slog.Info("adopted a session that was already registered under this key",
-				"sid", key, "provider", e.provider)
-			return e, adoptedRegistration, nil
+		adopted, adoptedOutcome, adoptErr := r.adoptRegistered(key, cfg.Workdir)
+		if !errors.Is(adoptErr, errNoSessionToAdopt) {
+			// Either an adoption or the workdir refusal, and both are this call's answer.
+			// Only "nothing live under this key" falls through, because only that leaves
+			// something for the spawn below to do.
+			return adopted, adoptedOutcome, adoptErr
 		}
 	}
 
@@ -670,6 +734,59 @@ func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agen
 	go r.fanOut(e)
 
 	return e, spawnStarted, nil
+}
+
+// adoptRegistered answers "is the session registered under key one this caller may
+// adopt?" — once, for both of spawnEntry's adoption doors.
+//
+// Be precise about what the extraction does and does not buy, because the wi it comes
+// from is easy to mis-summarise here. What CURED tether#82 is the spent path reaching
+// the consult at all; reopen's own pre-check does not go through this function and
+// still asks liveEntry directly (see the sibling branch in Attachment.reopen). What
+// this function prevents is a SECOND divergence of the same kind: adoptOnly's door and
+// the post-claim door ask one question, so they cannot answer it differently as the
+// pre-check and the consult once did. The only difference left between the two doors is
+// whether a reservation is held while this runs, and that is documented at each door
+// rather than reproduced inside the answer.
+//
+// Three results, and the caller has to tell them apart:
+//
+//   - an entry with adoptedRegistration: adoptable.
+//   - errNoSessionToAdopt: nothing live under key. liveEntry has already un-registered
+//     whatever corpse it found, so the ordinary door may go straight on to spawning a
+//     replacement, and the adoptOnly door has run out of moves.
+//   - any other error: the workdir refusal, which is fatal to BOTH doors. Adopting an
+//     entry from another directory silently relocates a conversation, which is the
+//     failure resolveWorkspace exists to prevent, so this fails closed exactly as
+//     awaitSpawn does — the two adoption paths agree rather than each trusting a
+//     different premise. (reopen's sibling-adoption branch does not check it and argues
+//     it is unreachable; that argument is about today's callers.) A waiter parked on
+//     the ordinary door's reservation inherits it even if its own resolved directory
+//     would have matched: an accepted imprecision in a case believed unreachable —
+//     it costs the waiter a reconnect, and the alternative is machinery to republish
+//     per-waiter verdicts for a state no call site can currently produce.
+//
+// Info, not Debug, and the reason is a fact about this daemon rather than a preference:
+// nothing anywhere calls slog.SetDefault or sets a level, so the default handler drops
+// Debug and a Debug line here would be unobservable on a real daemon — which is exactly
+// how live-verifying tether#78 ran into "the count is right but I cannot see WHICH path
+// produced it". The event also deserves it: it means two clients contended for one sid,
+// it happens only when a race is lost, and reopen's sibling-adoption branch — the same
+// event one layer up — already logs at Info. (awaitSpawn's tether#60 line has the same
+// invisibility problem; left alone, not this wi's to change.)
+func (r *Registry) adoptRegistered(key, wantWorkdir string) (*Entry, spawnOutcome, error) {
+	e, ok := r.liveEntry(key)
+	if !ok {
+		return nil, spawnNoEntry, errNoSessionToAdopt
+	}
+	if e.workdir != wantWorkdir {
+		return nil, spawnNoEntry, fmt.Errorf(
+			"refusing to adopt session %s: it is registered from %q but this connection resolved %q",
+			key, e.workdir, wantWorkdir)
+	}
+	slog.Info("adopted a session that was already registered under this key",
+		"sid", key, "provider", e.provider)
+	return e, adoptedRegistration, nil
 }
 
 // awaitSpawn blocks until the goroutine holding key's reservation has published its

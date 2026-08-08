@@ -1215,6 +1215,31 @@ func (a *Attachment) resolve(ctx context.Context) (Resolution, error) {
 	}
 	a.mu.Unlock()
 
+	// The chat client is carried across by the loop above; the READ-ONLY
+	// observers of the old sid cannot be, because there is no new sid for them to
+	// be carried to — this is a fresh session under a freshly minted id, and the
+	// one they named is finished. Tell them so (tether#75).
+	//
+	// Since tether#75 an observer follows its SID rather than an Entry, so it
+	// survives the other replacement path (Attachment.reopen, which re-opens the
+	// same sid) with nothing to signal at all. This is the path where late
+	// binding has nothing to offer: the resume failed, so no session will ever be
+	// registered under a.reqSID again by this attachment, and an observer left
+	// waiting on it would wait forever with no way to learn why.
+	//
+	// Read off the entry rather than from a.reqSID, which is the same string
+	// today (resuming is only true when dec.ResumeSID was non-empty, and that is
+	// a.reqSID; a resume that never emitted init cannot have been re-keyed). The
+	// entry's own key is the one deliverObservers routes by, so taking it from
+	// there is what keeps the two from ever disagreeing.
+	//
+	// Placed after the swap rather than before it, and nothing rides on that: the
+	// two touch disjoint state, no observer is woken by the swap, and no reader
+	// can tell the orders apart. Said plainly because the position of a call in
+	// this function usually IS the argument (see adopt, and the replay below),
+	// and a reader is entitled to know when it is not.
+	a.reg.retireObservers(a.reg.regKeyOf(e))
+
 	// Replay every prompt the dead session never got to answer. All of them
 	// failed: cc exited without reading its stdin, so anything "written" went
 	// into a pipe with no reader. Replaying only the first would leave a prompt

@@ -29,6 +29,15 @@ jobs:
       - name: Install tygo
         run: go install github.com/gzuidhof/tygo@v0.2.21
 
+      # ── generated-artifact gate (tether#81) ─────────────────────────────────
+      # web/dist is the SPA that gets compiled into the binary. It used to be
+      # committed, so nothing kept it equal to web/src — one commit changed src
+      # without rebuilding dist, and from then on any build that skipped
+      # `pnpm build` would have embedded the previous SPA with all tests green.
+      # Runs before the web build because it reads the git index, not the tree.
+      - name: Check no generated artifacts committed
+        run: bash scripts/check-artifacts-uncommitted.sh
+
       # ── codegen drift gate (D-22 §2.6, K.7.1) ──────────────────────────────
       - name: Run codegen
         run: bash scripts/codegen.sh
@@ -43,9 +52,22 @@ jobs:
       - name: Build web
         run: cd web && pnpm build
 
+      # Writes web/dist/BUILD-ID from the content of the bundle so the go build
+      # below compiles it in. Has to run between the two.
+      - name: Stamp SPA bundle
+        run: bash scripts/spa-bundle.sh stamp
+
       # ── Go build ────────────────────────────────────────────────────────────
+      # Depends on "Build web" above: web/dist is not in git, so this step is
+      # also the check that the embed target exists at all.
       - name: Build Go binary
         run: go build -o bin/tether ./cmd/tether
+
+      # Pins the embed hop itself: the binary must carry the bundle "Build web"
+      # just produced, not one left over from somewhere else. A finished binary
+      # is otherwise indistinguishable from one built against a stale dist.
+      - name: Check binary embeds the SPA just built
+        run: bash scripts/spa-bundle.sh check bin/tether
 
       # ── wire-contract tests (D-22 §6) ───────────────────────────────────────
       - name: Run wire-contract tests

@@ -4,6 +4,33 @@
 /bin/
 /dist/
 
+# Generated frontend bundle — `vite build` output, embedded into the binary by
+# web/embed.go's `//go:embed all:dist`. Deliberately NOT committed (tether#81):
+# a committed copy has no way to stay in sync with web/src, and any build that
+# skips `pnpm build` (bare `go build`, `go install`) embeds that copy. It did go
+# stale — one commit changed web/src without rebuilding it — with every test and
+# CI job still green; the deploy that would have shipped the stale bundle was
+# caught by hand, not by a gate.
+#
+# Consequence worth knowing before you clone: until web/dist exists, every go
+# command that has to load the package graph — `go build`, `go vet`, `go test`,
+# `go list ./...` — fails with
+#   web/embed.go: pattern all:dist: no matching files found
+# and `go list ./...` failing means gopls/your IDE will not load the module
+# either. (`gofmt`, `go list -e ./...` and `go tool tygo generate` still work.)
+# Run `make build` once. That loud failure is the point — it is what replaced the
+# silent stale-SPA build.
+#
+# Keep scripts/check-artifacts-uncommitted.sh in sync with this block; CI runs
+# it, so deleting these two entries turns CI red rather than quietly re-arming
+# the bug.
+/web/dist/
+
+# `tsc -b` incremental caches — rewritten by every `pnpm build`. Same class as
+# web/dist: build output that used to be tracked, which meant the mandatory
+# build path always left the tree dirty and invited `git add -A` to re-commit it.
+/web/*.tsbuildinfo
+
 # Spike output (per .plans Step 7) — runtime files only.
 # Curated artifacts (the dated spike-report and verification-report from
 # .plans Step 7 + Step 9) ARE checked in as evidence; everything else in

@@ -44,6 +44,11 @@ jobs:
         run: |
           cd web && pnpm install --frozen-lockfile && pnpm build
 
+      # web/dist is not in git (tether#81); the stamp writes web/dist/BUILD-ID so
+      # the artifact people download can be tied to the bundle inside it.
+      - name: Stamp SPA bundle
+        run: bash scripts/spa-bundle.sh stamp
+
       - name: Build tether binary
         env:
           GOOS: ${{ matrix.goos }}
@@ -52,6 +57,11 @@ jobs:
         run: |
           go build -ldflags="-s -w -X main.version=${{ github.ref_name }}" \
             -o dist/tether${{ matrix.ext }} ./cmd/tether
+
+      # Works on cross-compiled, stripped output: -s -w removes symbols and DWARF,
+      # not embedded data.
+      - name: Check binary embeds the SPA just built
+        run: bash scripts/spa-bundle.sh check dist/tether${{ matrix.ext }}
 
       - name: Build permission hook binary (D-05b §4.2)
         env:

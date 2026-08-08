@@ -13,14 +13,31 @@ deliberate action a human takes by following the steps below.
 
 1. **A built `tether` binary.**
    - `make build` (from the repo root) produces `bin/tether` — this is the
-     recommended path for anything you're about to install, because it (via
-     `scripts/build.sh`) does a full codegen + web + go build and links a
-     real version string.
+     **only supported** path, because it (via `scripts/build.sh`) does a full
+     codegen + web + go build, links a real version string, and ends by
+     asserting that the SPA inside the binary is the one it just compiled.
    - Alternatively, `scripts/release.sh [version]` cross-compiles
      `release/*.tar.gz` artifacts for five platforms if you need a
      release-style tarball instead of a local build.
-   - See the version-identification limitation below before using a bare
-     `go build` for something you intend to deploy.
+   - **Do not deploy a bare `go build`/`go install` binary.** `web/dist` (the
+     embedded SPA) is not in git; a bare build either fails outright or embeds
+     whatever an earlier build left on disk — including the bundle from whatever
+     branch you were on last, since `web/dist` no longer moves with
+     `git checkout`. That is how a deploy came within one step of serving a stale
+     frontend against a current backend with every test green (tether#81) — the
+     mismatch was caught by grepping the binary for an asset hash, not by any
+     gate. See also the version-identification limitation below.
+   - To ask a binary you already have which frontend it carries — including one
+     already installed at `/usr/local/bin/tether` — run this from a repo
+     checkout:
+     ```bash
+     scripts/spa-bundle.sh print /usr/local/bin/tether
+     ```
+     Then run `make build` and compare its `build id` line against the one
+     printed above. Different id = the installed binary is not serving this
+     source tree. `(none)` = it was not built by `make build` at all, so nothing
+     ties it to any bundle. A running daemon answers the same question over the
+     wire: `curl -sk https://<host>:<port>/BUILD-ID`.
 2. Copy that binary to `/usr/local/bin/tether` (the path `tether.service`'s
    `ExecStart=` expects):
    ```bash

@@ -121,8 +121,21 @@ When `claude` is started in `--permission-mode bypassPermissions`, cc does not
 fire PreToolUse hooks. tether's permission UI is never shown — tool calls
 auto-approve. This is the intended UX for fully autonomous mode.
 
-**Hook requires Go toolchain at runtime (fallback path)**
-The permission hook binary is pre-compiled in release tarballs. For `go install`
-users the hook is compiled from embedded source on first daemon start, which
-requires `go` on PATH. If `go` is absent, the hook compilation is skipped and a
-warning is logged.
+**Hook requires Go toolchain at runtime — the daemon will not start without it**
+The hook is compiled from embedded source into
+`~/.tether/bin/tether-permission-hook` on first daemon start
+(`cchook.EnsureHookBinary`, called from `internal/server/lifecycle.go`), which
+requires `go` on PATH. If `go` is absent the compile fails and that error is
+returned straight out of `server.Run`, so `tether server` exits rather than
+starting without a permission gate. Set `TETHER_NO_PERMISSION_HOOK=1` to skip
+hook setup deliberately (tool calls then auto-approve).
+
+This applies to **every** install method, not just source builds. Release
+tarballs do ship a pre-built `tether-permission-hook` next to the binary, but the
+daemon never looks for it: `EnsureHookBinary` only ever consults a hash file
+under `~/.tether/bin/` and compiles into that directory. So the tarball copy is
+not the mitigation it reads like.
+
+(This paragraph previously said the failure was "skipped with a warning" and that
+the runtime compile was a `go install` fallback. Both were wrong; the second is
+moot anyway, since `go install` stopped being a supported path in tether#81.)

@@ -2,8 +2,9 @@ import { create } from 'zustand'
 import type { Envelope, ErrorPayload, FencedBlock } from './wire.gen'
 // A value import, not a type: the generated const is the single source of the
 // code string, so a rename on the Go side breaks this at build time instead of
-// silently un-gating the branch below (tether#77).
-import { ErrCodePromptUndelivered } from './wire.gen'
+// silently un-gating the branch below (tether#77, and ErrCodeAgent since
+// tether#80).
+import { ErrCodeAgent, ErrCodePromptUndelivered } from './wire.gen'
 
 /** A single tool_use content block the daemon already extracts and puts on the
  *  wire ({name,input}); tether#37 is where the frontend finally KEEPS it instead
@@ -103,6 +104,173 @@ export interface Notice {
   id: string
   text: string
   ts: number
+  /** Which class of notice this is (tether#80). Every production site sets it,
+   *  because each class has a DIFFERENT repeat policy and none of them may be
+   *  applied to another: an agent error collapses and is capped
+   *  (appendAgentErrorNotice); a tether#77 prompt_undelivered line must never
+   *  collapse, since each one is a separate prompt the user lost; a tether#50
+   *  session banner collapses against the last banner only. Before this field
+   *  those rules were separated by nothing but the text they happened to match,
+   *  which is not a boundary — an agent-error line sitting last silently defeated
+   *  tether#50's collapse.
+   *
+   *  OPTIONAL in the type, and that is a deliberate boundary rather than
+   *  laziness: a required field would force ~10 Notice literals across four
+   *  unrelated test files (session.test.ts, WorkspacePane.test.tsx, …) to be
+   *  rewritten for a type-hygiene change, and none of those cases care which
+   *  class they hold. An absent kind means exactly "no class-specific rule
+   *  applies", which is the correct reading for a bare fixture. */
+  kind?: 'agent_error' | 'prompt_undelivered' | 'session'
+  /** How many arrivals this one line stands for (tether#80) — see
+   *  appendAgentErrorNotice for why the count is information rather than
+   *  decoration. Absent on a line that has not repeated; mergeTranscript only
+   *  renders it above 1, so absent and 1 read identically. */
+  repeats?: number
+}
+
+/** How many DISTINCT agent-error lines a session keeps (tether#80).
+ *
+ * The second of two independent bounds. Collapsing by text (below) already
+ * answers the case we have actually measured — opencode emits the same
+ * "busy: another prompt is running" for every concurrent prompt — but it bounds
+ * the list by the number of distinct texts, and those are not constants:
+ * opencode's session.error carries whatever the provider said, and several
+ * emit sites wrap a varying underlying error. So the collapse alone makes the
+ * list bounded by the traffic, and this makes it bounded by the code.
+ *
+ * The exact number is a judgement call and deliberately not load-bearing: what
+ * this file guarantees is that the list cannot grow without limit, and that
+ * holds for any small N. Three, because these are quiet centred lines inside a
+ * transcript the user is reading for their conversation, and a session on its
+ * fourth DISTINCT agent error is not one that a fourth line explains — the most
+ * recent few are the ones that describe the state it is in now.
+ */
+export const AGENT_ERROR_NOTICE_LIMIT = 3
+
+/**
+ * appendAgentErrorNotice folds one arriving agent error into the notice list,
+ * bounded (tether#80). Pure — the caller supplies the id and the timestamp — so
+ * the bounding rules test without a store and without a clock.
+ *
+ * WHY BOUNDED AT ALL, when tether#77's line right next to it deliberately is
+ * not: the two are bounded by different things. A prompt_undelivered notice
+ * corresponds one-to-one with the user pressing enter, so the list can only be
+ * as long as the user made it. An agent error's arrival rate is decided by the
+ * AGENT: opencode emits one per concurrent prompt (opencode_provider.go
+ * SendPrompt's busy branch) and per session.error event from its stream, on a
+ * connection the daemon does not close, and nothing prunes `notices` except a
+ * deliberate session switch or a page reload. tether#80's own body records a
+ * 200-frame run measured by tether#77's review (that is where the figure comes
+ * from — it is quoted, not re-measured here); appended naively that is 200
+ * permanent system lines.
+ *
+ * WHY A COUNT RATHER THAN JUST SUPPRESSING THE REPEAT: because the repeat is
+ * not redundant. opencode's busy branch emits this error and then returns nil —
+ * the prompt is DROPPED, not queued — so N arrivals of that text mean N prompts
+ * the user typed and lost. That is the very fact tether#77 refuses to collapse
+ * for its own line, and it would be inconsistent to keep it there by printing N
+ * lines and lose it here by printing one. The count is the bounded encoding of
+ * the same information.
+ *
+ * The count is a LOWER BOUND on what the daemon sent, not a census. Registry's
+ * broadcast (internal/session/registry.go) writes to each subscriber channel
+ * with a non-blocking send and logs-and-drops when it is full, and the chat
+ * subscriber's buffer is 32 deep (internal/server/wt_chat.go), so a burst can
+ * lose frames before the browser ever sees them. "At least N" is still the right
+ * thing to show — under-counting a flood does not mislead about its nature — but
+ * nothing here can promise exactness and this comment is where that stops being
+ * a surprise.
+ *
+ * WHY THREE SLOTS AND NOT ONE, since a single slot whose text is replaced would
+ * also be visible and bounded and would delete the cap, the eviction scan and
+ * everything below: because a session's LATEST agent error is not reliably its
+ * most important one. opencode's watchServeExit emits "opencode serve exited
+ * unexpectedly: …" and then closes the event stream, while its busy branch fires
+ * on ordinary user impatience — and a single slot lets the trivial one overwrite
+ * the fatal one. Keeping a few and evicting by recency preserves both. The cost
+ * is this function's second half, and it is a real cost, paid deliberately.
+ *
+ * WHY THE REPEAT ALSO MOVES: the line's position in the transcript is part of
+ * what it says (mergeTranscript orders by ts), so a line explaining the prompt
+ * the user just sent has to sit after that prompt. Refreshing ts moves the
+ * existing line down to the turn that just triggered it instead of leaving a
+ * stale copy far above. It never moves BACKWARDS (Math.max with its own ts), so
+ * it cannot be dragged above a message it already reads below.
+ *
+ * Eviction is least-recently-seen, not first-arrived: a line that keeps
+ * refreshing is the session's live complaint, and dropping it to make room for
+ * a one-off would discard the more useful of the two.
+ *
+ * "Least recently seen" is measured by ts and not by a monotonic counter, so
+ * several DISTINCT errors arriving inside one millisecond tie, and eviction
+ * among them degrades to first-arrived. That is deliberate rather than
+ * overlooked: a same-millisecond burst has no meaningful recency order to
+ * preserve, and what the rule is actually for is not evicting a line that is
+ * still recurring across TURNS, which are milliseconds to seconds apart. Worth
+ * writing down because it also means a test must advance the clock to
+ * distinguish the two rules at all — one that fires everything in a tight loop
+ * cannot, and the mutant that swapped them survived exactly that test.
+ *
+ * THE ARRIVING LINE IS NEVER A CANDIDATE FOR EVICTION, and that exclusion is
+ * load-bearing rather than an optimisation. Recency is read off `ts`, and `ts`
+ * does not come from a monotonic clock: nextNoticeTs derives it from the last
+ * message in the transcript, which carries the DAEMON's clock after a history
+ * refetch and the browser's otherwise. So an EARLIER line can legitimately hold
+ * a LATER ts than the one arriving now — refetch a daemon-ahead transcript, take
+ * a few errors, then have the transcript replaced by loadHistory, and every
+ * subsequent arrival is stamped behind them. Ranked purely by ts the newcomer is
+ * then the least-recently-seen entry and evicts itself: the newest agent error
+ * silently never reaches the user, which is the precise failure this whole change
+ * exists to remove. Found by review (tether#80), pinned by two tests below.
+ */
+export function appendAgentErrorNotice(
+  notices: Notice[],
+  incoming: { id: string; text: string; ts: number },
+): Notice[] {
+  const at = notices.findIndex((n) => n.kind === 'agent_error' && n.text === incoming.text)
+  if (at >= 0) {
+    const prev = notices[at]
+    const next = notices.slice()
+    next[at] = { ...prev, ts: Math.max(prev.ts, incoming.ts), repeats: (prev.repeats ?? 1) + 1 }
+    return next
+  }
+  const added: Notice[] = [...notices, { ...incoming, kind: 'agent_error', repeats: 1 }]
+  const arrivedAt = added.length - 1
+  let kept = 0
+  let evictAt = -1
+  for (let i = 0; i < added.length; i++) {
+    const n = added[i]
+    if (n.kind !== 'agent_error') continue
+    kept++
+    if (i === arrivedAt) continue // never evict what we just appended — see above
+    if (evictAt < 0 || n.ts < added[evictAt].ts) evictAt = i
+  }
+  if (kept <= AGENT_ERROR_NOTICE_LIMIT || evictAt < 0) return added
+  return added.filter((_, i) => i !== evictAt)
+}
+
+/**
+ * nextNoticeTs stamps a notice that must read AFTER everything already in the
+ * transcript (tether#77, shared with tether#80).
+ *
+ * A bare Date.now() is not enough. mergeTranscript inserts a notice before the
+ * first message whose ts is at or AFTER its own, so a tie puts the notice
+ * FIRST — and a prompt and the error explaining it land in the same millisecond
+ * often enough that a test written the obvious way caught it. That tie-break is
+ * right for tether#50's session-level banner, which introduces what follows,
+ * and backwards for a line that explains what preceded it.
+ *
+ * It also absorbs the clock skew mergeTranscript's own doc warns about:
+ * refetched history carries the DAEMON's clock and live bubbles the browser's,
+ * so a transcript can legitimately hold timestamps well ahead of Date.now().
+ * Whatever those stamps say, this lands last.
+ *
+ * Shared by both callers rather than copied, because it is a rule about
+ * mergeTranscript's tie-break — one subtlety with one home, not a coincidence
+ * two branches happen to need.
+ */
+export function nextNoticeTs(messages: Message[]): number {
+  return Math.max(Date.now(), (messages.at(-1)?.ts ?? 0) + 1)
 }
 
 /**
@@ -140,7 +308,18 @@ export interface Notice {
 export function mergeTranscript(messages: Message[], notices: Notice[]): Message[] {
   if (notices.length === 0) return messages
   const pending = [...notices].sort((a, b) => a.ts - b.ts)
-  const asMessage = (n: Notice): Message => ({ id: n.id, role: 'system', text: n.text, ts: n.ts })
+  // tether#80 — a collapsed agent error says how many arrivals it stands for.
+  // Formatted HERE, in the projection, and not baked into Notice.text, so that
+  // the stored text stays the key appendAgentErrorNotice matches repeats on; a
+  // counted text would never match itself again and the collapse would silently
+  // stop collapsing at two. Rendered only above 1, so every other notice class
+  // (which never sets repeats) is byte-identical to before.
+  const asMessage = (n: Notice): Message => ({
+    id: n.id,
+    role: 'system',
+    text: (n.repeats ?? 1) > 1 ? `${n.text} (×${n.repeats})` : n.text,
+    ts: n.ts,
+  })
   const out: Message[] = []
   let i = 0
   for (const m of messages) {
@@ -477,9 +656,21 @@ export const useStore = create<AppState>((set, get) => ({
               // constant in wt_chat.go, so a long-lived tab that falls back
               // several times would otherwise stack identical lines: collapse a
               // repeat of the line already showing.
-              set((s) => (s.notices[s.notices.length - 1]?.text === noticeText ? {} : ({
-                notices: [...s.notices, { id: crypto.randomUUID(), text: noticeText, ts: Date.now() }],
-              })))
+              //
+              // "The line already showing" means the last SESSION banner, not the
+              // last notice of any kind (tether#80). Comparing the last element
+              // outright made an unrelated line an accidental un-gate: a tether#77
+              // or tether#80 line landing in between let the very next identical
+              // banner through. That was already reachable before, and this change
+              // makes it much more so, so the class is now the boundary rather
+              // than whatever happened to arrive most recently.
+              set((s) => {
+                const lastBanner = [...s.notices].reverse().find((n) => n.kind === 'session')
+                if (lastBanner?.text === noticeText) return {}
+                return {
+                  notices: [...s.notices, { id: crypto.randomUUID(), text: noticeText, ts: Date.now(), kind: 'session' as const }],
+                }
+              })
             }
             break
           }
@@ -686,15 +877,12 @@ export const useStore = create<AppState>((set, get) => ({
         //     daemon is closing. The reconnect ladder and its failed card
         //     already speak for those, and each ladder attempt would add
         //     another copy of the same line.
-        //   - agent_error is the important one to leave out. It arrives on a
-        //     LIVE session, does not close the connection, and is not bounded
-        //     by anything: opencode emits one for every concurrent prompt, so
-        //     an ordinary busy session would stack them here for as long as the
-        //     tab lives. That those errors are invisible today is a real gap,
-        //     but it is a different one — the session is fine and the message
-        //     is about the turn's content, not about a prompt being lost — and
-        //     answering it by aliasing it onto this line would be wrong even
-        //     where it is not noisy. Tracked as its own wi.
+        //   - agent_error has its OWN branch below since tether#80. It was left
+        //     out of this one deliberately and that decision stands: the session
+        //     is fine and the message is about the turn's content, not about a
+        //     prompt being lost, so aliasing it onto this sentence would be
+        //     wrong even where it is not noisy — and it is noisy, which is why
+        //     it needed a bounded presentation rather than this unbounded one.
         //
         // It lands in `notices`, not `messages`, for tether#57's reason: a
         // history refetch replaces `messages` wholesale, and an explanation of
@@ -715,23 +903,68 @@ export const useStore = create<AppState>((set, get) => ({
           set((s) => ({
             notices: [...s.notices, {
               id: crypto.randomUUID(),
+              // Classed so no other branch's repeat policy can reach it — in
+              // particular so the tether#80 collapse and cap below cannot fold or
+              // evict a line that stands for one specific lost prompt.
+              kind: 'prompt_undelivered' as const,
               text: `Message not delivered — ${parsed.message}`,
               // Strictly after everything already in the transcript, which is
               // this line's meaning: it explains the last thing the user sent,
-              // so reading above that prompt inverts it. A bare Date.now() is
-              // not enough — mergeTranscript inserts a notice before the first
-              // message whose ts is at or AFTER its own, so a tie puts the
-              // notice first, and the prompt and its failure land in the same
-              // millisecond often enough that a test written the obvious way
-              // caught it. The tie-break itself is right for tether#50's
-              // session-level banner and only wrong for a per-prompt line like
-              // this one, so the fix belongs here.
-              //
-              // This also absorbs the clock skew mergeTranscript's doc warns
-              // about (history carries the DAEMON's clock, live bubbles the
-              // browser's): whatever those stamps say, this lands last.
-              ts: Math.max(Date.now(), (s.messages.at(-1)?.ts ?? 0) + 1),
+              // so reading above that prompt inverts it. nextNoticeTs owns why
+              // a bare Date.now() is not enough (tether#77) — the rule moved
+              // there when tether#80's line needed the same one.
+              ts: nextNoticeTs(s.messages),
             }],
+          }))
+          break
+        }
+        // tether#80 — the gap the comment above named and left open. The agent
+        // told the daemon something went wrong, the daemon classified it and sent
+        // a frame, and until now the browser answered by clearing the spinner and
+        // saying nothing: the turn just stopped, and whatever the agent said about
+        // why died here. (Only opencode is affected: claude_provider.go never
+        // emits agent.EventError at all.)
+        //
+        // WHY THIS WORDING claims so little. ErrCodeAgent covers a wide range of
+        // conditions and the wire says nothing about WHICH one — established by
+        // reading all eight emit sites in internal/agent/opencode_provider.go, not
+        // from the code's own description of itself:
+        //
+        //   - session.error from opencode's event stream: a complaint about the
+        //     turn, session alive, prompt delivered.
+        //   - SendPrompt's busy branch, the resume-serve failure, and the two
+        //     `opencode run` start failures: they emit and then return nil, so the
+        //     PROMPT IS GONE while the session stays alive and usable.
+        //   - watchServeExit: emits and then calls closeEvents, i.e. THE SESSION
+        //     IS ALREADY DEAD by the time this frame is read.
+        //
+        // So neither "your prompt is gone" (tether#77's sentence) nor "the session
+        // is fine, this is just about the turn" is true across that range, and
+        // asserting either would be a guess dressed as a diagnosis. The text
+        // therefore states only what is true at every point in it — who spoke, and
+        // what they said — and lets the message carry the rest. Note that
+        // wire/errors.go's own ErrCodeAgent doc used to over-generalise in exactly
+        // that way ("the session … is still alive and usable"); it is corrected in
+        // this change rather than cited, because it was where the wrong idea came
+        // from.
+        //
+        // Also in `notices` rather than `messages`, and NOT because notices are
+        // the convenient list: because the daemon never persists this text.
+        // registry.go's fanOut writes thinking / tool_use / tool_result / text /
+        // blocks to HistoryStore and forwards agent.EventError without recording
+        // it, so the live frame is the only copy in existence. In `messages` the
+        // history refetch that session_ready triggers would replace it away for
+        // good — tether#57's bug, re-introduced by the code fixing this one.
+        //
+        // Bounded by appendAgentErrorNotice, which is where the collapse, the
+        // count and the cap are explained.
+        if (parsed && parsed.code === ErrCodeAgent) {
+          set((s) => ({
+            notices: appendAgentErrorNotice(s.notices, {
+              id: crypto.randomUUID(),
+              text: `The agent reported an error — ${parsed.message}`,
+              ts: nextNoticeTs(s.messages),
+            }),
           }))
         }
         break

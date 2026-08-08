@@ -127,10 +127,31 @@ export const ErrCodeConnectionClosed: ErrorCode = "connection_closed";
 export const ErrCodeSessionUnconfirmed: ErrorCode = "session_unconfirmed";
 /**
  * ErrCodeAgent means the agent process itself reported an error
- * (agent.EventError, mid-session — session/registry.go translateEvent).
- * Retryable: this is cc/opencode surfacing something about the CURRENT
- * turn, not the daemon refusing the connection, and the session the
- * browser is attached to is still alive and usable.
+ * (agent.EventError — session/registry.go translateEvent). It is the agent
+ * speaking, not the daemon refusing the connection, and that is the whole of
+ * what it says.
+ * It does NOT say the session survived, and until tether#80 this comment
+ * claimed it did ("the session the browser is attached to is still alive and
+ * usable"). That was wrong, and wrong in the direction that misleads: a
+ * consumer reading it would present this error as a note about the current
+ * turn on a healthy session. Every emit site is in
+ * agent/opencode_provider.go (cc emits none at all), and they span three
+ * materially different situations that arrive on the wire indistinguishable:
+ *   - session.error from opencode's event stream: a complaint about the turn;
+ *     session alive, prompt delivered.
+ *   - SendPrompt's busy branch, its resume-serve failure, and the two
+ *     `opencode run` start failures: each emits and then returns nil, so the
+ *     user's PROMPT WAS DROPPED, while the session stays alive.
+ *   - watchServeExit: emits and then closes the event stream, so THE SESSION
+ *     IS ALREADY GONE when this is read.
+ * Anything that needs to distinguish those needs a new code, not a reading of
+ * this one. web/src/lib/store.ts's agent_error branch is written to that
+ * constraint: it shows who spoke and what they said, and asserts nothing about
+ * the session or the prompt.
+ * Retryable, and that verdict is unchanged and right at both ends of the
+ * range: nothing here is a property of the browser's request, so a reconnect
+ * is the correct response whether the agent merely complained or its serve
+ * has exited.
  */
 export const ErrCodeAgent: ErrorCode = "agent_error";
 /**

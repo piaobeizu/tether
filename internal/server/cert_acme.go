@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 
 	"github.com/caddyserver/certmagic"
@@ -63,7 +64,7 @@ func SetupACME(ctx context.Context, domain, email string) (*tls.Config, CertBund
 		return nil, CertBundle{}, err
 	}
 
-	certmagic.Default.Storage = &certmagic.FileStorage{Path: filepath.Join(dir, "acme")}
+	certmagic.Default.Storage = &certmagic.FileStorage{Path: acmeStorageDir(dir)}
 	certmagic.DefaultACME.Email = email
 	certmagic.DefaultACME.Agreed = true
 
@@ -73,6 +74,139 @@ func SetupACME(ctx context.Context, domain, email string) (*tls.Config, CertBund
 	}
 
 	return tlsCfg, CertBundle{External: true}, nil
+}
+
+// acmeStorageDir is the certmagic FileStorage root, under the given ~/.tether.
+// SetupACME configures it and acmeStoredCert reads back from it, so it is one
+// function rather than the same Join written twice.
+func acmeStorageDir(tetherDir string) string {
+	return filepath.Join(tetherDir, "acme")
+}
+
+// acmeStoredCert returns the path of the certificate certmagic has stored for
+// domain, or "" when the store holds none.
+//
+// Layout, read from certmagic v0.25.3 sources on 2026-08-08 rather than
+// recalled:
+//
+//   - FileStorage.Filename joins the storage root with the key verbatim
+//     (filestorage.go:167), so a storage key is a relative path.
+//
+//   - StorageKeys.SiteCert(issuerKey, domain) builds
+//     "certificates/<safe(issuerKey)>/<safe(domain)>/<safe(domain)>.crt"
+//     (storage.go:218-234). Safe is documented idempotent (storage.go:266-269),
+//     which is what lets a directory name read back off disk be passed to it
+//     again below.
+//
+//   - The issuer segment comes from the CA directory URL
+//     (ACMEIssuer.IssuerKey → issuerKey(am.CA), acmeissuer.go:306-325). It is
+//     a value this repo never sets: SetupACME leaves certmagic.DefaultACME.CA
+//     alone, so the name is whichever CA that package variable points at today
+//     (acme-v02.api.letsencrypt.org-directory, acmeissuer.go:649-664). Writing
+//     that string in here would encode a default this code does not own — a
+//     certmagic upgrade that changed it, or a future flag for a private ACME
+//     CA, would move the directory and leave doctor reporting "no cert stored"
+//     against a full store. Enumerating asks the filesystem instead.
+//
+//     What enumeration does NOT do is cope with two issuer directories: the
+//     first match in os.ReadDir order wins, which is alphabetical and therefore
+//     arbitrary. A tether store has exactly one — Default.Issuers is nil, so
+//     newWithCache builds a single ACMEIssuer from DefaultACME (config.go:250-254)
+//     — and a staging retry does not add a second, because IssuerKey reports
+//     am.CA whichever endpoint was dialled (useTestCA only swaps the client's
+//     directory URL, acmeclient.go:178) and a cert obtained from the test CA is
+//     re-issued against production before it is returned (acmeissuer.go:396-405).
+//     An earlier version of this comment had that backwards and offered the
+//     staging CA as the *reason* to enumerate.
+//
+//   - Issuance stores the cert under exactly that key (saveCertResource,
+//     crypto.go:161), keyed by CertificateResource.NamesKey — the SANs joined
+//     with commas (certmagic.go:425). Passing the domain here is right because
+//     SetupACME manages exactly one name (certmagic.TLS([]string{domain})); a
+//     future second name would make the stored key "a.example,b.example" and
+//     this lookup would quietly find nothing.
+//
+// A store with no certificates directory is not an error: FileStorage.Store
+// creates the key's parent directories when it first writes a cert
+// (filestorage.go:82), and SetupACME blocks until that has happened, so an
+// absent directory means "before the first start" and nothing worse.
+//
+// Any other read failure is returned rather than folded into that empty
+// answer. A store that exists but cannot be listed — wrong owner after a
+// container rebuild, say — is a question this function failed to answer, and
+// reporting it as "no cert stored yet" would hand the caller the same
+// I-cannot-check-so-it-must-be-fine confusion in the opposite direction that
+// tether#84 is about.
+func acmeStoredCert(domain string) (string, error) {
+	tetherDir, err := tetherDataDirPath()
+	if err != nil {
+		return "", err
+	}
+	root := acmeStorageDir(tetherDir)
+	issuers, err := os.ReadDir(filepath.Join(root, "certificates"))
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read ACME store: %w", err)
+	}
+	for _, issuer := range issuers {
+		if !issuer.IsDir() {
+			continue
+		}
+		key := certmagic.StorageKeys.SiteCert(issuer.Name(), domain)
+		path := filepath.Join(root, filepath.FromSlash(key))
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		}
+	}
+	return "", nil
+}
+
+// ACMEStoredDomains lists the domains certmagic has certificates for, in
+// whatever order the filesystem yields.
+//
+// It answers a question only a diagnostic asks: run without cert flags, is
+// there any sign this host is an ACME deployment? An empty result is the normal
+// answer, since ~/.tether/acme is only ever created by SetupACME, which only
+// runs under --acme-domain.
+//
+// Layout as in acmeStoredCert — the level below the issuer directory is one
+// directory per certificate, named by the storage key (CertsSitePrefix,
+// storage.go:225). Those names are Safe-encoded, so a returned domain is
+// lower-cased and may have had characters replaced; it is a pointer for an
+// operator, not a value to feed back into a flag verbatim.
+func ACMEStoredDomains() ([]string, error) {
+	tetherDir, err := tetherDataDirPath()
+	if err != nil {
+		return nil, err
+	}
+	certsDir := filepath.Join(acmeStorageDir(tetherDir), "certificates")
+	issuers, err := os.ReadDir(certsDir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read ACME store: %w", err)
+	}
+	seen := map[string]bool{}
+	var domains []string
+	for _, issuer := range issuers {
+		if !issuer.IsDir() {
+			continue
+		}
+		entries, err := os.ReadDir(filepath.Join(certsDir, issuer.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("read ACME store: %w", err)
+		}
+		for _, e := range entries {
+			if e.IsDir() && !seen[e.Name()] {
+				seen[e.Name()] = true
+				domains = append(domains, e.Name())
+			}
+		}
+	}
+	return domains, nil
 }
 
 // warnACMEPortMismatch logs when --acme-domain is combined with a listen port

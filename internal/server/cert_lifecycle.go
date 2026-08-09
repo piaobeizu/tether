@@ -74,8 +74,7 @@ func loadOrRotateManaged() (CertBundle, error) {
 	if err != nil {
 		return CertBundle{}, err
 	}
-	certPath := filepath.Join(dir, "cert.pem")
-	keyPath := filepath.Join(dir, "key.pem")
+	certPath, keyPath := managedCertFiles(dir)
 
 	if bundle, err := loadPEMFiles(certPath, keyPath); err == nil {
 		if certUsable(bundle.TLS.Leaf, time.Now()) {
@@ -218,6 +217,126 @@ type certRenewal struct {
 	mints  bool
 }
 
+// CertSource names which of the three certificate paths a Config selects.
+//
+// It exists because the answer is now needed outside this package: `tether
+// doctor` has to look at the cert that will actually be served, and it used to
+// assume the managed one unconditionally — which reports a healthy
+// --cert-file deployment as "cert not found" (tether#84).
+type CertSource int
+
+const (
+	// CertSourceManaged is the default: the self-signed cert this process
+	// mints and rotates under ~/.tether.
+	CertSourceManaged CertSource = iota
+	// CertSourceOperatorFiles is --cert-file/--key-file: PEM files this
+	// process only ever reads.
+	CertSourceOperatorFiles
+	// CertSourceACME is --acme-domain: a cert certmagic obtains, stores and
+	// renews on its own.
+	CertSourceACME
+)
+
+// String labels the source for a human reading a diagnostic. An unrecognised
+// value is spelled out rather than folded into "managed": the default cert path
+// is the one it is safe to be wrong about last.
+func (s CertSource) String() string {
+	switch s {
+	case CertSourceManaged:
+		return "managed"
+	case CertSourceOperatorFiles:
+		return "operator files"
+	case CertSourceACME:
+		return "acme"
+	default:
+		return fmt.Sprintf("CertSource(%d)", int(s))
+	}
+}
+
+// CertSourceFor reports which cert path cfg selects.
+//
+// The ordering is the same one Run applies and is not cosmetic: Step 4b
+// replaces the bundle with certmagic's when --acme-domain is set even if
+// --cert-file was also passed, so on that combination the operator's files are
+// neither served nor re-read. A reader that tested --cert-file first would name
+// files nobody presents.
+//
+// One deployment reads oddly and is deliberate: --cert-file *without*
+// --key-file (or the reverse) yields CertSourceManaged, because that is what
+// externalPEMSource — and therefore LoadOrGenCert — does with it. The lone flag
+// is ignored, and a diagnostic that disagreed with the loader would describe a
+// deployment that does not exist.
+func CertSourceFor(cfg *Config) CertSource {
+	switch {
+	case cfg.AcmeDomain != "":
+		return CertSourceACME
+	case externalPEMSource(cfg.CertFile, cfg.KeyFile):
+		return CertSourceOperatorFiles
+	default:
+		return CertSourceManaged
+	}
+}
+
+// CertLocation is where the certificate a Config serves lives on disk.
+//
+// Path is empty only for CertSourceACME with nothing issued yet — the managed
+// and operator paths always have a name to report, whether or not a file is
+// there. "Empty" and "missing" are different findings for a caller: the first
+// means the store has not been populated, the second that a named file is gone.
+//
+// KeyPath is the other half of the pair, and is empty for CertSourceACME:
+// certmagic stores the key beside the cert under a name of its own choosing and
+// re-obtains the pair itself, so there is nothing there for an operator to act
+// on. On the other two paths the key is a file someone can lose independently
+// of the cert, and losing it is not survivable — LoadX509KeyPair needs both, so
+// a cert that parses beside a missing key still stops the server at Step 4.
+type CertLocation struct {
+	Source  CertSource
+	Path    string
+	KeyPath string
+}
+
+// LocateCert answers "which file holds the certificate this config serves?".
+//
+// It deliberately does not read or validate that file — whether a missing or
+// expiring cert is a fault depends on the source (certmagic and the managed
+// store both create their own on first start; an operator's file is a
+// precondition), and that judgement belongs to the caller doing the diagnosing.
+// What belongs here is the three locations, next to the code that writes them.
+func LocateCert(cfg *Config) (CertLocation, error) {
+	switch src := CertSourceFor(cfg); src {
+	case CertSourceACME:
+		path, err := acmeStoredCert(cfg.AcmeDomain)
+		if err != nil {
+			return CertLocation{}, err
+		}
+		return CertLocation{Source: src, Path: path}, nil
+	case CertSourceOperatorFiles:
+		return CertLocation{Source: src, Path: cfg.CertFile, KeyPath: cfg.KeyFile}, nil
+	default:
+		dir, err := tetherDataDirPath()
+		if err != nil {
+			return CertLocation{}, err
+		}
+		certPath, keyPath := managedCertFiles(dir)
+		return CertLocation{Source: src, Path: certPath, KeyPath: keyPath}, nil
+	}
+}
+
+// CheckOperatorPEM reports whether the operator's PEM pair would load, using
+// the same call Run's Step 4 makes. It never mints or writes anything — that is
+// why it exists as its own function rather than as a guarded call to
+// LoadOrGenCert, whose other branch does.
+//
+// Worth checking even when the pair is not what gets served. Step 4 loads it
+// before Step 4b hands the listener to certmagic, and it returns the error, so
+// --acme-domain does not exempt a --cert-file this process cannot read: the
+// daemon refuses to start over files it was about to stop using.
+func CheckOperatorPEM(certFile, keyFile string) error {
+	_, err := loadExternalPEM(certFile, keyFile)
+	return err
+}
+
 // certRenewalFor picks the renewal for cfg's cert path. Three paths, three
 // answers:
 //
@@ -247,15 +366,14 @@ type certRenewal struct {
 //     time at ALPN negotiation. Deleting that ALPN entry re-breaks renewal
 //     without touching a line of this file.
 //
-// ACME is tested first because Run is ordered that way: Step 4b replaces the
-// bundle with certmagic's when --acme-domain is set even if --cert-file was
-// also passed, so on that combination the holder is not on the serving path at
-// all and re-reading the files would keep a cert current that nobody presents.
+// The branch order lives in CertSourceFor, not here: what to do about a cert
+// path and where that cert is are two questions with one answer about which
+// path is in play, and doctor now asks the second.
 func certRenewalFor(cfg *Config) certRenewal {
-	switch {
-	case cfg.AcmeDomain != "":
+	switch CertSourceFor(cfg) {
+	case CertSourceACME:
 		return certRenewal{}
-	case externalPEMSource(cfg.CertFile, cfg.KeyFile):
+	case CertSourceOperatorFiles:
 		// Copy the paths instead of closing over cfg. Not a fix for a live
 		// race — every write Run makes to cfg happens before it starts this
 		// loop, and none of them touch these two fields. It is that this
@@ -489,13 +607,34 @@ func atomicWrite(path string, data []byte, mode os.FileMode) error {
 }
 
 func tetherDataDir() (string, error) {
-	home, err := os.UserHomeDir()
+	dir, err := tetherDataDirPath()
 	if err != nil {
-		return "", fmt.Errorf("home dir: %w", err)
+		return "", err
 	}
-	dir := filepath.Join(home, ".tether")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("mkdir ~/.tether: %w", err)
 	}
 	return dir, nil
+}
+
+// tetherDataDirPath names ~/.tether without creating it.
+//
+// Split out for LocateCert, whose caller is `tether doctor`: a diagnostic that
+// creates the directory it is about to report on would turn "~/.tether does not
+// exist" — a real finding on a host where `tether server` has never run — into a
+// pass on the second invocation.
+func tetherDataDirPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("home dir: %w", err)
+	}
+	return filepath.Join(home, ".tether"), nil
+}
+
+// managedCertFiles names the managed store's two files under dir.
+//
+// One site, because two readers now care where they are: loadOrRotateManaged,
+// which writes them, and LocateCert, which reports on them from another package.
+func managedCertFiles(dir string) (certPath, keyPath string) {
+	return filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
 }

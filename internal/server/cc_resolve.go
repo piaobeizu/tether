@@ -6,10 +6,16 @@ import (
 	"path/filepath"
 )
 
-// resolveClaudePath finds the cc binary.
+// ResolveClaudePath finds the cc binary.
 // Priority: TETHER_CC_PATH env → PATH lookup → well-known installer locations.
 // Returns "claude" if nothing is found (exec will produce the original PATH error).
-func resolveClaudePath() string {
+//
+// Exported for `tether doctor`, which reported "not found on PATH" for a host
+// this function resolves fine — TETHER_CC_PATH set, or an installer directory
+// that is not on the PATH of whoever runs doctor. A diagnostic that answers a
+// narrower question than the spawn it predicts is a false alarm generator
+// (tether#84).
+func ResolveClaudePath() string {
 	if env := os.Getenv("TETHER_CC_PATH"); env != "" {
 		return env
 	}

@@ -170,26 +170,32 @@ var pairCmd = &cobra.Command{
 	},
 }
 
+// newDoctorCmd builds `tether doctor`.
+//
+// The cert flags are deliberately spelled the same as `tether server`'s and
+// feed the same struct: which certificate is served is decided by those flags
+// alone, nothing on disk records the choice afterwards, and doctor used to
+// assume the managed one — so a healthy --cert-file deployment was told its
+// cert was missing (tether#84). Run doctor the way you run the server (same
+// unit file, same wrapper script) and it now reports on the cert you serve;
+// run it bare on such a host and the cert check says it cannot tell, rather
+// than inventing a failure.
 func newDoctorCmd() *cobra.Command {
-	var port int
+	cfg := &server.Config{}
 	var verbose bool
 	var asJSON bool
 	cmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Run preflight checks",
 		RunE: func(_ *cobra.Command, _ []string) error {
-			report := doctor.Run(port, verbose)
+			report := doctor.Run(cfg, verbose)
 			if asJSON {
 				enc := json.NewEncoder(os.Stdout)
 				enc.SetIndent("", "  ")
 				return enc.Encode(report)
 			}
 			for _, c := range report.Checks {
-				mark := "✓"
-				if !c.OK {
-					mark = "✗"
-				}
-				fmt.Printf("  %s  %-22s  %s\n", mark, c.Name, c.Message)
+				fmt.Printf("  %s  %-22s  %s\n", mark(c.Status), c.Name, c.Message)
 				if verbose && c.Detail != "" {
 					fmt.Printf("       %s\n", c.Detail)
 				}
@@ -200,8 +206,33 @@ func newDoctorCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().IntVarP(&port, "port", "p", 8898, "port to check bindability for")
+	cmd.Flags().IntVarP(&cfg.Port, "port", "p", 8898, "port to check bindability for")
+	cmd.Flags().StringVar(&cfg.CertFile, "cert-file", "", "check this cert instead of the managed one, as the server would serve it (needs --key-file)")
+	cmd.Flags().StringVar(&cfg.KeyFile, "key-file", "", "key for --cert-file (both are needed; either alone is ignored, exactly as the server ignores it)")
+	cmd.Flags().StringVar(&cfg.AcmeDomain, "acme-domain", "", "check the cert certmagic stored for this domain, as the server would serve it")
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "show extra detail")
 	cmd.Flags().BoolVar(&asJSON, "json", false, "output as JSON")
 	return cmd
+}
+
+// mark renders a check's status. "-" rather than a tick for a skipped check:
+// the whole point of the third state is that the reader can tell "checked, and
+// it is fine" from "could not check", and two symbols for three states puts one
+// of those back under the other's mark.
+//
+// Only StatusOK earns the tick. Anything unrecognised gets "?" rather than
+// falling through to it — a state added to the doctor package later would
+// otherwise ship displayed as healthy, which is the failure mode this whole
+// change is about.
+func mark(s doctor.Status) string {
+	switch s {
+	case doctor.StatusOK:
+		return "✓"
+	case doctor.StatusFail:
+		return "✗"
+	case doctor.StatusSkip:
+		return "-"
+	default:
+		return "?"
+	}
 }

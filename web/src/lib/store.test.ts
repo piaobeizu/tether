@@ -1467,9 +1467,10 @@ describe('a non-terminal error leaves the turn open (tether#83)', () => {
   //
   // Two things this does NOT claim:
   //   - That a browser driven by a user typing twice would have rendered one
-  //     bubble. It would not, and not because of this branch — sendMessage's own
-  //     addMessage ends the turn locally before the rejection gets back (see the
-  //     'error' branch in store.ts).
+  //     bubble. At the time of this capture it would not, and not because of this
+  //     branch — sendMessage's own addMessage ended the turn locally before the
+  //     rejection got back. That was tether#88, fixed since, and the tether#88
+  //     block below replays this same capture WITH the second prompt in it.
   //   - That this exact frame was produced by opencode's session.error. It was
   //     not; "busy: another prompt is running" is verbatim from SendPrompt's busy
   //     branch. session.error emits from an SSE reader that keeps reading, so the
@@ -1499,6 +1500,254 @@ describe('a non-terminal error leaves the turn open (tether#83)', () => {
     expect(assistants[0].text).toBe(' Six is the perfect often7 number.')
     // And the agent's complaint is still shown — tether#80's half of the same
     // frame, which this must not trade away to keep the turn.
+    expect(useStore.getState().notices.map((n) => n.text)).toEqual([
+      'The agent reported an error — busy: another prompt is running',
+    ])
+  })
+})
+
+// ─── tether#88 ────────────────────────────────────────────────────────────────
+//
+// addMessage's user branch used to null curTurnId and both turn clocks, so the
+// browser ENDED the running turn the moment the user sent anything. Everything
+// the daemon went on sending for that turn then found no open bubble and started
+// a second one, and the first never got its answerMs — the damage tether#83
+// describes, arriving through the door tether#83 could not close.
+//
+// These drive addMessage directly rather than through ChatPane, because it is
+// the first thing both send paths do: sendMessage (panes/chat/index.tsx) and
+// doInjectAndSend each run `addMessage(user) → setState({streaming, streamingMsgId})`
+// and only then write to the wire. Mounting the pane would add a WebTransport
+// connection and assert nothing more about this reducer.
+//
+// What that leaves OUT, since the reducer is not the whole story: only the last
+// test here replays the setState half, so nothing below covers what the surviving
+// curTurnId does to the pane — the thinking dots' gate, ThinkingBlock's `live`,
+// and the autoscroll dep, which is the one that needed changing (tether#88; its
+// decision is pinned in ChatPane.test.tsx as transcriptTextLength). Nor is
+// injectAndSend fully modelled: it also gates on connState and can defer the
+// addMessage by up to 5s through pendingInjectRef.
+describe('addMessage no longer ends the turn the daemon is still streaming (tether#88)', () => {
+  beforeEach(reset)
+  afterEach(reset)
+
+  // The core case. Before the fix the two halves land in two bubbles and the
+  // first has no answerMs; nothing merges them afterwards.
+  it('keeps the running turn in one bubble when a second prompt is sent', () => {
+    const h = useStore.getState().handleEnvelope
+    h(textEnv('the first half '))
+    useStore.getState().addMessage({ id: 'u2', role: 'user', text: 'and another thing', ts: 2 })
+    h(textEnv('and the second'))
+    h(resultEnv())
+
+    const assistants = useStore.getState().messages.filter((m) => m.role === 'assistant')
+    expect(assistants).toHaveLength(1)
+    expect(assistants[0].text).toBe('the first half and the second')
+    expect(assistants[0].answerMs).toBeDefined()
+  })
+
+  // The clocks, asserted on the VALUE and not just on definedness — tether#83's
+  // surviving mutant is the reason. The answer branch re-stamps answerStartTs
+  // whenever it finds it null, so a fix that kept curTurnId and still dropped the
+  // clocks produces a badge here too: one that starts at the first delta AFTER
+  // the prompt (t0+3000, i.e. 2000ms) instead of at the answer's first token.
+  it('leaves the turn its answer clock, so the badge still measures the whole answer', () => {
+    const t0 = 1_800_000_000_000
+    const now = vi.spyOn(Date, 'now')
+    try {
+      const h = useStore.getState().handleEnvelope
+      now.mockReturnValue(t0)
+      h(textEnv('half '))
+      now.mockReturnValue(t0 + 1_000)
+      useStore.getState().addMessage({ id: 'u2', role: 'user', text: 'hurry up', ts: t0 + 1_000 })
+      now.mockReturnValue(t0 + 3_000)
+      h(textEnv('an answer'))
+      now.mockReturnValue(t0 + 5_000)
+      h(resultEnv())
+
+      const first = useStore.getState().messages.find((m) => m.role === 'assistant')
+      expect(first?.answerMs).toBe(5_000)
+    } finally {
+      now.mockRestore()
+    }
+  })
+
+  // The thinking clock has no self-repair at all: thinkingMs is stamped once, by
+  // the first answer delta, and only if thinkingStartTs survived until then.
+  // Named apart from tether#83's near-twin above on purpose: they differ only in
+  // what interrupts the turn, and a `-t` run that matches both cannot show which
+  // one a mutant killed.
+  it('leaves the turn its thinking clock across a second prompt', () => {
+    const h = useStore.getState().handleEnvelope
+    h(thinkingEnv('pondering'))
+    useStore.getState().addMessage({ id: 'u2', role: 'user', text: 'well?', ts: 2 })
+    h(textEnv('the answer'))
+
+    const first = useStore.getState().messages.find((m) => m.role === 'assistant')
+    expect(first?.thinking).toBe('pondering')
+    expect(first?.thinkingMs).toBeDefined()
+  })
+
+  // The other side of the fix, and the one an over-broad version breaks: the turn
+  // must still END. cc does not reject a prompt sent mid-turn the way opencode
+  // does — ccSession.SendPrompt has no busy gate and writes it straight to cc's
+  // stdin — it QUEUES it and runs it after the first turn's result (measured
+  // 2026-08-09 against a real cc: first result at 19209ms, the second turn's own
+  // system/init at 19246ms, its result at 21112ms, no delta of the second turn
+  // before the first result). The frames below are a minimal stand-in for that
+  // SHAPE, not a capture of it: a real cc run also carries session_ready, usage,
+  // and far larger text chunks. What is being pinned is that the queued turn owes
+  // its own bubble and its own badge.
+  it('still opens a fresh bubble for the queued turn once the first one ends', () => {
+    const h = useStore.getState().handleEnvelope
+    h(textEnv('answer A'))
+    useStore.getState().addMessage({ id: 'u2', role: 'user', text: 'prompt B', ts: 2 })
+    h(textEnv(' continued'))
+    h(resultEnv())
+    h(textEnv('answer B'))
+    h(resultEnv())
+
+    const roles = useStore.getState().messages.map((m) => m.role)
+    expect(roles).toEqual(['assistant', 'user', 'assistant'])
+    const assistants = useStore.getState().messages.filter((m) => m.role === 'assistant')
+    expect(assistants.map((m) => m.text)).toEqual(['answer A continued', 'answer B'])
+    expect(assistants[0].answerMs).toBeDefined()
+    expect(assistants[1].answerMs).toBeDefined()
+  })
+
+  // NEGATIVE CONTROLS — these two and only these two pass with or without the
+  // tether#88 change, so nobody later reads "7 passed" as seven independent
+  // guards. They cover `stopped`, the one field the reset still touches, and they
+  // are here because the change had to leave it alone: without them, deleting
+  // `stopped: false` along with the rest would have been silent. (The five that do
+  // discriminate are the four tests above and the live replay at the end.)
+  //
+  // tether#42, unchanged: `stopped` has to keep clearing, or every turn after a
+  // manual Stop would have its deltas dropped. It cannot collide with an open turn
+  // — stopTurn runs finalizeTurn first, so stopped === true implies
+  // curTurnId === null, which the middle assertion pins. The pre-existing test of
+  // the same rule ('a new user turn clears the stopped flag so the next turn
+  // streams normally', tether#42's block) does not assert that implication, which
+  // is what this change made worth pinning.
+  it('still re-arms delta handling after a manual stop', () => {
+    const h = useStore.getState().handleEnvelope
+    h(textEnv('a'))
+    useStore.getState().stopTurn()
+    expect(useStore.getState().curTurnId).toBeNull()
+    useStore.getState().addMessage({ id: 'u1', role: 'user', text: 'again', ts: 1 })
+    expect(useStore.getState().stopped).toBe(false)
+    h(textEnv('fresh answer'))
+
+    const assistants = useStore.getState().messages.filter((m) => m.role === 'assistant')
+    expect(assistants.map((m) => m.text)).toEqual(['a', 'fresh answer'])
+    expect(useStore.getState().streaming).toBe(true)
+  })
+
+  // An assistant message must not clear `stopped` — only a user turn does. Pins
+  // the role gate, which a fix that hoisted `stopped: false` out of the ternary
+  // would silently delete while every other test here stayed green.
+  it('does not let an assistant message re-arm a stopped turn', () => {
+    const h = useStore.getState().handleEnvelope
+    h(textEnv('partial'))
+    useStore.getState().stopTurn()
+    useStore.getState().addMessage({ id: 'a1', role: 'assistant', text: 'injected', ts: 1 })
+    expect(useStore.getState().stopped).toBe(true)
+    h(textEnv(' late buffered'))
+    expect(useStore.getState().messages.some((m) => m.text.includes('late buffered'))).toBe(false)
+  })
+
+  // The same thing again, end to end, against frames nobody wrote to suit it.
+  //
+  // Captured 2026-08-09 from a tether daemon built from the Go tree at main
+  // 34b5bfe (`tether version` says v0.1.0-dev; that build carries no ldflags)
+  // talking to a real opencode over the real HTTP/3 + WebTransport stack, driven
+  // by a Go client that sent the second prompt 1526ms after the first token of
+  // the first answer. The client had processed 72 envelopes of the run when it
+  // wrote that prompt; the busy rejection came back, and the SAME turn went on
+  // sending text for another 3.6 seconds — 171 more envelopes, 169 of them
+  // deltas, before its own result.
+  //
+  // The array below is a WINDOW on that run, not the run: it opens on the last
+  // four of those 72 (the 68 before them, session_ready and the answer so far,
+  // are dropped without a marker — there is nothing to mark, the array simply
+  // starts mid-answer), and elides two stretches after the seam, which ARE
+  // marked. So SECOND_PROMPT_AFTER below is 4, an index into this array, and 72
+  // is the count in the run; both describe the same instant.
+  //
+  // The lines are parsed here rather than written as objects because that is the
+  // hop being reproduced: wt.ts reads one uni stream per envelope and hands each
+  // line to JSON.parse before handleEnvelope sees it. They are unedited, which is
+  // why the concatenation reads like nonsense — this is the order the CLIENT saw,
+  // and it is not the order the daemon sent. Everything here after session_ready
+  // came out of serveChat's one sequential drain loop, one OpenUniStreamSync per
+  // envelope (the busy rejection included: opencode's SendPrompt returns nil, so
+  // it travels as an agent event through fanOut, not through the prompt-reader's
+  // own sendEnvelope, which is the other, concurrent sender on this route). Send
+  // order is still not delivery order — wt_chat.go says so itself where it sends
+  // the tether#50 notice — and the same scrambling is visible in tether#83's
+  // capture. Nothing below depends on the order being faithful: what the capture
+  // is for is that a large part of one turn's answer arrives AFTER the user has
+  // sent their next prompt.
+  //
+  // NOT captured here, and named so it is not read as if it were: the cc side.
+  // The same client against the same daemon with `?provider=claude-code` shows a
+  // different shape — no rejection, the first turn's result at 7064ms, then a
+  // SECOND turn's delta at 10644ms and its own result at 10650ms. That is why the
+  // queued-turn test above exists as well as this one, and why neither of them is
+  // a reason to block the second prompt in the composer.
+  const CAPTURED_LIVE = [
+    '{"kind":"message","sessionId":"ses_018e34b7bffeMC27xL0dmB1RvH","payload":"."}',
+    '{"kind":"message","sessionId":"ses_018e34b7bffeMC27xL0dmB1RvH","payload":" cool"}',
+    '{"kind":"message","sessionId":"ses_018e34b7bffeMC27xL0dmB1RvH","payload":"18"}',
+    '{"kind":"message","sessionId":"ses_018e34b7bffeMC27xL0dmB1RvH","payload":"19"}',
+    // ── the user's second prompt was written here (SECOND_PROMPT_AFTER) ──
+    '{"kind":"message","sessionId":"ses_018e34b7bffeMC27xL0dmB1RvH","payload":" steady"}',
+    '{"kind":"message","sessionId":"ses_018e34b7bffeMC27xL0dmB1RvH","payload":"."}',
+    '{"kind":"message","sessionId":"ses_018e34b7bffeMC27xL0dmB1RvH","payload":"\\n"}',
+    '{"kind":"message","sessionId":"ses_018e34b7bffeMC27xL0dmB1RvH","payload":" shy"}',
+    // 7 further deltas of the same answer elided.
+    '{"kind":"message","sessionId":"ses_018e34b7bffeMC27xL0dmB1RvH","payload":" clean"}',
+    '{"kind":"message","sessionId":"ses_018e34b7bffeMC27xL0dmB1RvH","payload":" small"}',
+    '{"kind":"message","sessionId":"ses_018e34b7bffeMC27xL0dmB1RvH","payload":"\\n"}',
+    '{"kind":"message","sessionId":"ses_018e34b7bffeMC27xL0dmB1RvH","payload":"\\n"}',
+    '{"kind":"error","sessionId":"ses_018e34b7bffeMC27xL0dmB1RvH","payload":{"code":"agent_error","message":"busy: another prompt is running","terminal":false}}',
+    '{"kind":"message","sessionId":"ses_018e34b7bffeMC27xL0dmB1RvH","payload":" sharp"}',
+    '{"kind":"message","sessionId":"ses_018e34b7bffeMC27xL0dmB1RvH","payload":"."}',
+    '{"kind":"message","sessionId":"ses_018e34b7bffeMC27xL0dmB1RvH","payload":"\\n"}',
+    '{"kind":"message","sessionId":"ses_018e34b7bffeMC27xL0dmB1RvH","payload":"23"}',
+    // 150 further deltas elided, then the turn's own result.
+    '{"kind":"result","sessionId":"ses_018e34b7bffeMC27xL0dmB1RvH","payload":"stop"}',
+  ]
+
+  // Where the send goes when this WINDOW is replayed: after four of its lines,
+  // which are envelopes 69-72 of the run. Replaying it at any other index would
+  // still be a real sequence of daemon frames, but it would no longer be this run.
+  const SECOND_PROMPT_AFTER = 4
+
+  it('replays a live capture, second prompt and all, into one bubble', () => {
+    const s = useStore.getState()
+    CAPTURED_LIVE.forEach((line, i) => {
+      if (i === SECOND_PROMPT_AFTER) {
+        // Exactly what sendMessage and injectAndSend do, in their order
+        // (panes/chat/index.tsx): the store is updated first, the bytes go on
+        // the wire after. This is the half of the bug that lives on the send
+        // side, so replaying the frames without it would not reproduce it.
+        s.addMessage({ id: 'u2', role: 'user', text: 'Actually, what is 2+2?', ts: Date.now() })
+        useStore.setState({ streaming: true, streamingMsgId: null })
+      }
+      s.handleEnvelope(JSON.parse(line) as Envelope)
+    })
+
+    const assistants = useStore.getState().messages.filter((m) => m.role === 'assistant')
+    expect(assistants).toHaveLength(1)
+    expect(assistants[0].text).toBe('. cool1819 steady.\n shy clean small\n\n sharp.\n23')
+    // The badge the orphaned bubble never got.
+    expect(assistants[0].answerMs).toBeDefined()
+    // The user's prompt is still in the transcript, after the answer bubble that
+    // was already open when they sent it — which is where it happened.
+    expect(useStore.getState().messages.map((m) => m.role)).toEqual(['assistant', 'user'])
+    // And tether#80's line is still shown: keeping the turn must not cost the
+    // agent's own complaint about the prompt it dropped.
     expect(useStore.getState().notices.map((n) => n.text)).toEqual([
       'The agent reported an error — busy: another prompt is running',
     ])

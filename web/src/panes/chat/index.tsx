@@ -166,6 +166,33 @@ export function shouldRefundAttemptBudget(uptimeMs: number): boolean {
   return uptimeMs >= MIN_USABLE_CONN_MS
 }
 
+// transcriptTextLength is the autoscroll effect's "did any answer grow?" signal
+// (tether#88). Pure, and extracted for the same reason as its neighbours above:
+// the effect itself needs a mounted pane and a scrollable element, so the only
+// part that can be pinned by a test is the decision of when to re-run it.
+//
+// It sums EVERY message rather than reading the last one, and that is the whole
+// change. The old dep was `transcript[length-1].text`, which is the same thing
+// while the growing bubble is last — and until tether#88 it always was, because
+// sending a prompt ended the open turn, so whatever streamed next opened a bubble
+// below the user's message. Now the running turn keeps its bubble ABOVE the
+// prompt the user just sent, and text arriving into it changed neither the array
+// length nor the last element: the effect stopped firing, the view stopped
+// following the answer, and the growing bubble pushed the rest down past the
+// viewport. Nothing about the fix is visible if you cannot see it happen.
+//
+// Summing is safe as a change-detector here because `messages` is append-only
+// per turn and a message's text only ever grows; the one in-place replacement
+// (a re-emitted fenced block, store.ts's 'fenced' branch) swaps `block` and
+// leaves `text` at '', so it neither triggers nor suppresses a scroll — exactly
+// as before. It is O(messages) on each render of an already-memoised array,
+// against the markdown render the same commit is doing.
+export function transcriptTextLength(messages: { text: string }[]): number {
+  let n = 0
+  for (const m of messages) n += m.text.length
+  return n
+}
+
 // tether#63 — code→sentence map for the failed-connection card. Only the
 // four codes wire.ErrorCode currently classifies Terminal=true (errors.go's
 // terminalCodes) need an entry; any other code (including one this frontend
@@ -374,7 +401,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   }, [sessionStart])
 
   // Scroll to bottom on new messages AND when streaming text accumulates
-  const lastMsgText = transcript.length > 0 ? transcript[transcript.length - 1].text : ''
+  const grown = transcriptTextLength(transcript)
   useEffect(() => {
     const el = chatRef.current
     if (!el) return
@@ -383,7 +410,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
     if (streaming || nearBottom) {
       el.scrollTop = el.scrollHeight
     }
-  }, [transcript.length, lastMsgText, streaming])
+  }, [transcript.length, grown, streaming])
 
   // tether#46 — auto-grow the composer textarea to fit its content, up to
   // MAX_COMPOSER_LINES then scroll internally. Reset to 'auto' first so the
@@ -1198,7 +1225,16 @@ interface ThinkingBlockProps {
    *  lands on may still be streaming — so curTurnId alone stopped answering this
    *  question on that path, and a cc turn killed mid-thinking (ccSession.abandon)
    *  would have sat on "thinking…" until its stream-end result arrived, or
-   *  forever if that result were dropped as a slow-subscriber envelope. */
+   *  forever if that result were dropped as a slow-subscriber envelope.
+   *
+   *  It is therefore NOT monotonic within a turn, and tether#88 is where that
+   *  became reachable: sending a prompt no longer ends the open turn, and
+   *  sendMessage sets `streaming` back to true, so a thinking-only bubble whose
+   *  block collapsed on a non-terminal error re-animates when the user types
+   *  again. On the path that error actually describes — the turn is still
+   *  running, which is tether#83's whole premise — that is the truth: that turn
+   *  IS still thinking. It reads wrong only where the pointer is stale, which is
+   *  the case store.ts's addMessage enumerates and accepts. */
   live: boolean
   expanded: boolean
   onToggle: () => void

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, fmtTokens, summarizeToolInput, summarizeToolResult, truncateResult, shouldSendOnEnter, growHeight, parseAtQuery, fuzzyRankFiles, shouldDeferFirstConnect, shouldReconnectAfterClose, shouldRefundAttemptBudget, FATAL_CODE_MESSAGES } from './index'
+import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, fmtTokens, summarizeToolInput, summarizeToolResult, truncateResult, shouldSendOnEnter, growHeight, parseAtQuery, fuzzyRankFiles, shouldDeferFirstConnect, shouldReconnectAfterClose, shouldRefundAttemptBudget, transcriptTextLength, FATAL_CODE_MESSAGES } from './index'
 import { PermissionQueue, postDecide } from '../../fenced-blocks/PermissionBlock'
 import {
   ErrCodeUnknownWorkspace, ErrCodeNoWorkspaceRegistry, ErrCodeUnknownProvider, ErrCodeSessionOwned,
@@ -534,6 +534,46 @@ describe('shouldRefundAttemptBudget (tether#63)', () => {
     expect(shouldRefundAttemptBudget(0)).toBe(false)
     expect(shouldRefundAttemptBudget(300)).toBe(false)
     expect(shouldRefundAttemptBudget(1_999)).toBe(false)
+  })
+})
+
+// tether#88 — the autoscroll effect's dep. The effect needs a mounted pane and a
+// scrollable element, so what is pinned here is the only part that can be: the
+// signal that decides whether it re-runs at all.
+// Only the FIRST test here discriminates: replacing the body with the old dep
+// (the last message's text length) kills it and leaves the other three passing,
+// which is what they are for — they pin the behaviour the rewrite had to keep,
+// not the behaviour it added.
+describe('transcriptTextLength (tether#88)', () => {
+  const msg = (text: string) => ({ text })
+
+  // THE case tether#88 created. Since sending a prompt no longer ends the running
+  // turn, that turn's bubble stays ABOVE the user's new message and keeps growing
+  // there. The old dep read only the LAST element, so it did not change and the
+  // view stopped following the answer.
+  it('changes when a message that is not the last one grows', () => {
+    const before = [msg('half an answer'), msg('and another thing')]
+    const after = [msg('half an answer and the rest'), msg('and another thing')]
+    expect(transcriptTextLength(after)).not.toBe(transcriptTextLength(before))
+  })
+
+  // Unchanged behaviour, kept because it is the case that already worked and a
+  // "sum everything" rewrite must not lose it.
+  it('still changes when the last message grows', () => {
+    expect(transcriptTextLength([msg('a'), msg('b')]))
+      .not.toBe(transcriptTextLength([msg('a'), msg('bc')]))
+  })
+
+  // A re-emitted fenced block is replaced IN PLACE (store.ts's 'fenced' branch)
+  // and carries text: '', so it must not read as growth — the same no-op it was
+  // under the old dep, which this must not quietly turn into a scroll.
+  it('does not change when a block message is replaced in place', () => {
+    expect(transcriptTextLength([msg('answer'), msg('')]))
+      .toBe(transcriptTextLength([msg('answer'), msg('')]))
+  })
+
+  it('is 0 for an empty transcript', () => {
+    expect(transcriptTextLength([])).toBe(0)
   })
 })
 

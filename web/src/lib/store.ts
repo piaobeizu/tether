@@ -593,10 +593,108 @@ export const useStore = create<AppState>((set, get) => ({
   // memo) on every session switch whether or not a notice existed.
   clearNotices: () => set((s) => (s.notices.length === 0 ? {} : { notices: [] })),
   clearFatal: () => set((s) => (s.fatal === null ? {} : { fatal: null })),
+  // tether#88 — sending a prompt is a fact about the USER, not about the daemon.
+  // This used to also null curTurnId + both turn clocks, on the reading that "a
+  // new user turn ends the prior assistant turn's accumulation" (tether#34).
+  // That reading is right whenever the prior turn is over, and whether it is over
+  // is not something the user's keystroke reports.
+  //
+  // THE TURN-ENDERS, in full, because the rest of this file argues from the list
+  // and a partial one is how it goes wrong. The daemon says it with a KindResult
+  // — the turn's own, or the payload-less one registry.go's fanOut broadcasts
+  // when an init'd session's stream ends. The browser says it for reasons of its
+  // own on four more paths: stopTurn (the user pressed Stop), an error that is
+  // terminal OR unparsable, setConnected(false), and loadHistory. All five run
+  // finalizeTurn or the same field-for-field reset. A sixth, the 'fenced'
+  // new-block branch, nulls curTurnId and both clocks WITHOUT stamping answerMs —
+  // deliberately, and the 'usage' branch above documents living with it.
+  //
+  // Nulling the pointers HERE ends, locally and unilaterally, a turn whose deltas are still
+  // arriving; those deltas then find no open bubble, open a SECOND one, and the
+  // first is orphaned without its answerMs — nothing merges two bubbles
+  // afterwards. Replayed against frames captured off a live daemon (store.test.ts,
+  // tether#88), the old code produced exactly that: two assistant bubbles for one
+  // answer, the first with no badge.
+  //
+  // It is also upstream of tether#83's fix: by the time the daemon's rejection of
+  // the second prompt gets back, this reset has already run, which is why keeping
+  // curTurnId in case 'error' could not reach it.
+  //
+  // Two paths reach it. injectAndSend (panes/chat/index.tsx, click-to-work) has
+  // no streaming gate at all; and the composer's own gate is `streaming`
+  // (shouldSendOnEnter), which a non-terminal error clears while deliberately
+  // leaving the turn open (tether#83) — so Enter works again mid-turn.
+  //
+  // A SINGLE curTurnId slot is still enough, and that was checked rather than
+  // assumed — the two providers lifecycle.go registers do not agree on what
+  // happens to the second prompt, so "one turn at a time" had to be established
+  // separately for each:
+  //   - opencode rejects it. SendPrompt's busy CompareAndSwap branch
+  //     (internal/agent/opencode_provider.go) emits EventError "busy: another
+  //     prompt is running" and returns nil, leaving the run in flight untouched.
+  //     Read from the source; the resulting frames are captured in store.test.ts.
+  //   - cc accepts it. ccSession.SendPrompt (internal/agent/claude_provider.go)
+  //     has no gate and writes it straight to cc's stdin. What cc then does is
+  //     cc's business and not something this repo can guarantee, so it was
+  //     MEASURED, twice, on 2026-08-09: against a bare cc driven with Spawn's
+  //     stream-json flags, minus the --session-id production pins (second prompt
+  //     written at 7674ms, 2.2s into an answer whose first
+  //     delta came at 5500ms; that turn's `result` at 19209ms; only then a fresh
+  //     system/init at 19246ms and the second turn's result at 21112ms), and
+  //     through the daemon over WebTransport (first result 7064ms, second turn's
+  //     delta 10644ms, its result 10650ms). Neither run put a delta of the second
+  //     turn before the first turn's result.
+  // Both observations, not a law: what the store relies on is that the frames it
+  // is fed never interleave two turns, and if a future provider did interleave
+  // them, one slot would be the wrong shape and this is the comment to come back
+  // to. The measurement is also why the fix is not "block the second prompt in
+  // the composer": for cc the queued prompt really does run, so refusing to send
+  // it would delete working behaviour to paper over a store bug.
+  //
+  // `stopped` still clears, and only it: it is the one piece of this reset that
+  // is genuinely about the user (tether#42 — the next user turn re-arms delta
+  // handling after a manual Stop), and it cannot conflict with an open turn
+  // because stopTurn runs finalizeTurn first, so stopped === true implies
+  // curTurnId === null. The two clocks are dropped rather than kept-conditionally
+  // because neither is ever set unless curTurnId is already set or is being set in
+  // the same update, and every path that nulls curTurnId nulls both — so when
+  // there is no open turn they are already null and this reset was a no-op, and
+  // when there is one it was the bug. (The converse does not hold and does not
+  // need to: a tool_use can open a bubble with both clocks still null.)
+  //
+  // WHAT THIS GIVES UP, stated rather than left to be found. The reset was also,
+  // by accident, a BOUND: whatever state curTurnId was in, the next prompt reset
+  // it, so a stale pointer could never outlive one send. Two things can leave one
+  // stale, and neither is hypothetical:
+  //
+  //   - A turn's closing frame is droppable. registry.go's broadcast does a
+  //     non-blocking send and drops for a subscriber whose channel is full (the
+  //     chat subscriber's is 32 deep, wt_chat.go).
+  //   - Attachment.adopt (internal/session/attach.go) moves this browser's
+  //     subscription off a dead Entry onto its replacement, and its own doc says
+  //     why: otherwise the corpse's buffered tail — "and the turn-ender fanOut
+  //     broadcasts when the corpse's stream ends" — would arrive after the
+  //     replacement has started answering. So on that path the dead turn's
+  //     KindResult is withheld on purpose, and no session_ready or notice follows
+  //     either (serveChat sends session_ready once, before its drain loop, and the
+  //     loop rewrites every env.SessionID to the sid resolved then) — the browser
+  //     cannot see that its session was swapped underneath it.
+  //
+  // With a stale pointer the next turn's text appends to the previous bubble, and
+  // the badges go with it: finalizeTurn stamps answerMs from the OLD turn's
+  // answerStartTs, so it reports the gap between the turns as well, and 'usage'
+  // overwrites the old turn's token counts. A wrong badge, not a missing one.
+  //
+  // Kept anyway, and the adopt case is why the trade is smaller than it reads: the
+  // old reset did not PREVENT that mixing, it only moved the boundary. The corpse
+  // goes on draining until adopt runs, so under the old code the tail opened a
+  // fresh bubble and the replacement's answer then appended into THAT — corpse tail
+  // and new answer in one bubble either way, just a different one. What the old
+  // code bought was the dropped-result case, and it bought it by being wrong on
+  // every ordinary concurrent prompt, which is the trade this wi refuses.
   addMessage: (msg) => set((s) => ({
     messages: [...s.messages, msg],
-    // A new user turn ends the prior assistant turn's accumulation (tether#34).
-    ...(msg.role === 'user' ? { curTurnId: null, thinkingStartTs: null, answerStartTs: null, stopped: false } : {}),
+    ...(msg.role === 'user' ? { stopped: false } : {}),
   })),
   resolvePermission: (id) => set((s) => ({
     pendingPermissions: s.pendingPermissions.filter((p) => p.id !== id),
@@ -875,13 +973,16 @@ export const useStore = create<AppState>((set, get) => ({
         //     its two `opencode run` start failures) this frame is the only
         //     turn-closer that will ever be sent: they return without emitting an
         //     EventResult and without a run in flight to emit one later.
-        //   - "Is a turn open?" is not the missing discriminator either, and the
-        //     busy case is where that shows: sendMessage (panes/chat/index.tsx)
-        //     calls addMessage first, which nulls curTurnId, so by the time the
-        //     daemon's rejection of the SECOND prompt arrives the browser has
-        //     already ended the first one itself. A branch on curTurnId would not
-        //     even engage there — which is also why this fix does not repair that
-        //     particular split; the earlier cause is the local reset, not this.
+        //   - "Is a turn open?" is not the discriminator either, though tether#88
+        //     made it a better one than it was: until then addMessage nulled
+        //     curTurnId the instant the user sent, so on the busy path the browser
+        //     had already ended the first turn itself before the rejection got
+        //     back — which is why THIS fix could not repair that split, and it is
+        //     no longer true. The pointer now survives there and does say "a turn
+        //     is running". What still rules it out is that it can DANGLE (see
+        //     addMessage for the two ways), and a stale one would answer "keep the
+        //     spinner" forever — which the next bullet says is the unrecoverable
+        //     half of this choice.
         //   - The two ways of being wrong are not equally bad. A spinner cleared
         //     while the agent is still working repairs itself on the next delta:
         //     the text and thinking branches above set `streaming: true` on every
@@ -890,11 +991,12 @@ export const useStore = create<AppState>((set, get) => ({
         //     (panes/chat/index.tsx) requires !streaming, so Enter silently stops
         //     sending until the user works out that the button now says Stop.
         //
-        // Where the turn really is over, something else already closes it:
-        // 'result' above, the payload-less KindResult registry.go's fanOut sends
-        // when an init'd session's stream ends (tether#59), and setConnected(false)
-        // all run finalizeTurn or the same reset — and addMessage nulls curTurnId
-        // the moment the user sends anything.
+        // Where the turn really is over, something else already closes it —
+        // addMessage's comment holds the full list of those, kept in one place
+        // since tether#88 found this one and the one there disagreeing. What
+        // tether#88 removed from it is addMessage itself: a user sending a prompt
+        // says nothing about whether the daemon finished the last turn, and
+        // treating it as if it did was that wi.
         //
         // What the surviving pointers change before then is small and deliberate.
         // The answer cursor and the waiting dots are gated on `streaming`, which

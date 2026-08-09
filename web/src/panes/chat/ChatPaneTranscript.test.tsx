@@ -116,4 +116,35 @@ describe('ChatPane renders notices (tether#80, wi N5)', () => {
     expect(container.querySelectorAll('.msg-system')).toHaveLength(0)
     expect(container.querySelectorAll('.msg-user-bubble')).toHaveLength(1)
   })
+
+  // tether#83 — the same wiring hop, one level down, for the pointer the fix
+  // stopped clearing. ThinkingBlock's `live` prop used to be `m.id === curTurnId
+  // && !m.text`, and its doc promises the block cannot get stuck on "thinking…"
+  // because the turn ending on a result OR AN ERROR makes it false. A
+  // non-terminal error no longer ends the turn, so that promise now rests on the
+  // `streaming` conjunct at the call site — which lives in a JSX map that nothing
+  // else in the suite renders, so nothing else can see it disappear.
+  //
+  // The reachable path is cc-only and narrow, which is the argument FOR pinning
+  // it rather than against: cc is the only provider that emits thinking deltas
+  // (claude_provider.go), its stdout dying mid-thinking is an ErrCodeAgent frame
+  // from ccSession.abandon, and the stream-end result that would eventually
+  // collapse the block is a best-effort broadcast the daemon drops on a slow
+  // subscriber.
+  it('collapses a live thinking block when a non-terminal error lands on the turn', () => {
+    const h = useStore.getState().handleEnvelope
+    h({ kind: 'message', payload: { type: 'thinking', text: 'weighing the options' } })
+    // Precondition: the block is live, i.e. this test can tell the difference.
+    expect(useStore.getState().streaming).toBe(true)
+    expect(render(<ChatPane />).container.querySelectorAll('.msg-thinking').length).toBe(1)
+    expect(screen.getByText('thinking…')).toBeTruthy()
+    cleanup()
+
+    h({ kind: 'error', payload: { code: 'agent_error', message: 'stdout died', terminal: false } } as never)
+    render(<ChatPane />)
+    // The turn is kept (tether#83) — the thinking text is still on its bubble…
+    expect(useStore.getState().curTurnId).not.toBeNull()
+    // …but the block no longer claims the agent is still thinking.
+    expect(screen.queryByText('thinking…')).toBeNull()
+  })
 })

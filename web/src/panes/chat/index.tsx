@@ -930,7 +930,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
                 <ThinkingBlock
                   thinking={m.thinking}
                   thinkingMs={m.thinkingMs}
-                  live={m.id === curTurnId && !m.text}
+                  live={streaming && m.id === curTurnId && !m.text}
                   expanded={expandedThinking.has(m.id)}
                   onToggle={() => toggleThinking(m.id)}
                 />
@@ -1188,10 +1188,17 @@ interface ThinkingBlockProps {
   thinking: string
   thinkingMs?: number
   /** True while this message is still actively accumulating thinking deltas
-   *  (it is the store's thinkingBufId). Goes false the moment the answer starts
-   *  OR the turn ends (result/error) — either way the block collapses, so a
+   *  (it is the store's curTurnId). Goes false the moment the answer starts OR
+   *  the turn ends (result/error) — either way the block collapses, so a
    *  thinking-only turn (e.g. thinking → tool_use with no answer text) does not
-   *  get stuck showing "thinking…" forever. */
+   *  get stuck showing "thinking…" forever.
+   *
+   *  "the turn ends (error)" is why the call site conjoins `streaming`
+   *  (tether#83). A non-terminal error no longer clears curTurnId — the turn it
+   *  lands on may still be streaming — so curTurnId alone stopped answering this
+   *  question on that path, and a cc turn killed mid-thinking (ccSession.abandon)
+   *  would have sat on "thinking…" until its stream-end result arrived, or
+   *  forever if that result were dropped as a slow-subscriber envelope. */
   live: boolean
   expanded: boolean
   onToggle: () => void

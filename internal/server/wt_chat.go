@@ -90,9 +90,11 @@ func admitChat(reg *session.Registry, sid, clientID string) bool {
 //
 // Wrong in either direction is a real cost, which is why this is not "always send"
 // or "never send": an envelope on the recoverable path shows an error for a turn
-// that then answers normally (and clears the browser's turn state mid-flight —
-// store.ts's 'error' branch resets streaming), while silence on the unrecoverable
-// path is the tether#59 hang one step further out.
+// that then answers normally (and drops the browser's "thinking…" indicator
+// mid-flight — store.ts's 'error' branch clears `streaming` on every error it
+// handles; since tether#83 it no longer also ends the turn, so the cost is the
+// indicator rather than a split answer bubble), while silence on the
+// unrecoverable path is the tether#59 hang one step further out.
 func promptErrorEnvelope(err error) (wire.Envelope, bool) {
 	var ref *session.Refusal
 	if !errors.As(err, &ref) {

@@ -958,14 +958,18 @@ describe('store retryable error visibility (tether#77)', () => {
 
   // Pre-existing behaviour that must survive: the spinner clear happens for
   // every error, classified or not.
+  //
+  // tether#83 narrowed what "pre-existing behaviour" covers here. This case used
+  // to also assert streamingMsgId/curTurnId null, under this same name — a name
+  // about the SPINNER guarding a claim about the TURN, which is how the defect
+  // #83 fixes stayed pinned. The spinner half is the part that was ever argued
+  // for, and it is the part that stays; see the 'error' branch in store.ts for
+  // why the two are not the same news.
   it('still clears the streaming indicator on a non-terminal error', () => {
     const h = useStore.getState().handleEnvelope
     useStore.setState({ streaming: true, streamingMsgId: 'm1', curTurnId: 'm1' })
     h(errorEnv({ code: 'prompt_undelivered', message: 'gone', terminal: false }))
-    const s = useStore.getState()
-    expect(s.streaming).toBe(false)
-    expect(s.streamingMsgId).toBeNull()
-    expect(s.curTurnId).toBeNull()
+    expect(useStore.getState().streaming).toBe(false)
   })
 })
 
@@ -1137,13 +1141,13 @@ describe('agent errors are visible (tether#80)', () => {
     }
   })
 
+  // Same narrowing as tether#77's copy above, for the same reason: the turn
+  // pointers were never what "clears the streaming indicator" meant, and
+  // tether#83 keeps them. The spinner assertion is unchanged.
   it('still clears the streaming indicator (pre-existing behaviour for every error)', () => {
     useStore.setState({ streaming: true, streamingMsgId: 'm1', curTurnId: 'm1' })
     useStore.getState().handleEnvelope(agentErr('busy: another prompt is running'))
-    const s = useStore.getState()
-    expect(s.streaming).toBe(false)
-    expect(s.streamingMsgId).toBeNull()
-    expect(s.curTurnId).toBeNull()
+    expect(useStore.getState().streaming).toBe(false)
   })
 
   // The self-contradictory payload, same shape as tether#77's: Terminal travels
@@ -1301,6 +1305,203 @@ describe('agent error lines stay bounded (tether#80)', () => {
     const texts = rendered().map((l) => l.text)
     expect(useStore.getState().notices).toHaveLength(AGENT_ERROR_NOTICE_LIMIT)
     expect(texts.some((t) => t.includes('the newest failure'))).toBe(true)
+  })
+})
+
+// ─── tether#83 ────────────────────────────────────────────────────────────────
+//
+// case 'error' opened with one unconditional reset of every turn pointer, whose
+// stated reason ("even a terminal refusal ends whatever turn was in flight")
+// argued only the terminal case. A non-terminal error does not tell the browser
+// the turn is over, and a turn that is still streaming when one lands is not a
+// hypothetical: the daemon goes on sending that turn's deltas afterwards, which
+// is asserted here twice — structurally, and against frames captured off a live
+// daemon (bottom of this block).
+//
+// With curTurnId nulled, the next delta finds no open bubble and starts a second
+// one. That is the damage that does not heal: nothing merges two bubbles, and
+// finalizeTurn can only ever stamp answerMs on the pointer it finds.
+describe('a non-terminal error leaves the turn open (tether#83)', () => {
+  beforeEach(() => { reset(); useStore.setState({ fatal: null }) })
+  afterEach(() => { reset(); useStore.setState({ fatal: null }) })
+
+  const agentErr = (message: string) => errorEnv({ code: 'agent_error', message, terminal: false })
+
+  it('keeps one turn in one bubble when the error arrives mid-answer', () => {
+    const h = useStore.getState().handleEnvelope
+    h(textEnv('the first half '))
+    h(agentErr('busy: another prompt is running'))
+    h(textEnv('and the second'))
+    h(resultEnv())
+
+    const assistants = useStore.getState().messages.filter((m) => m.role === 'assistant')
+    expect(assistants).toHaveLength(1)
+    expect(assistants[0].text).toBe('the first half and the second')
+  })
+
+  // The turn's CLOCKS, asserted separately from its bubble because keeping
+  // curTurnId alone already produces one bubble — so a fix that dropped
+  // answerStartTs would look right and quietly under-report every badge on a turn
+  // an agent error touched.
+  //
+  // The elapsed VALUE is what makes this bite, and it took a surviving mutant to
+  // find that out. `expect(answerMs).toBeDefined()` does not: the answer branch
+  // re-stamps answerStartTs whenever it finds it null (store.ts), so a fix that
+  // kept curTurnId and dropped the clock still produces a badge — one that starts
+  // at the first delta AFTER the error (here t0+3000, so 2000ms) rather than at
+  // the answer's first token.
+  it('leaves the turn its answer clock, so the badge measures the whole answer', () => {
+    const t0 = 1_800_000_000_000
+    const now = vi.spyOn(Date, 'now')
+    try {
+      const h = useStore.getState().handleEnvelope
+      now.mockReturnValue(t0)
+      h(textEnv('half '))
+      now.mockReturnValue(t0 + 1_000)
+      h(agentErr('busy: another prompt is running'))
+      now.mockReturnValue(t0 + 3_000)
+      h(textEnv('an answer'))
+      now.mockReturnValue(t0 + 5_000)
+      h(resultEnv())
+
+      const first = useStore.getState().messages.find((m) => m.role === 'assistant')
+      expect(first?.answerMs).toBe(5_000)
+    } finally {
+      now.mockRestore()
+    }
+  })
+
+  // The thinking clock has no such self-repair, so it is the clock that is lost
+  // outright: thinkingMs is stamped once, by the FIRST answer delta, and only if
+  // thinkingStartTs survived until then. Without it the live "thinking…" block
+  // never collapses to "thought Xs" for the rest of the turn.
+  it('leaves the turn its thinking clock, so the block still collapses', () => {
+    const h = useStore.getState().handleEnvelope
+    h(thinkingEnv('pondering'))
+    h(agentErr('busy: another prompt is running'))
+    h(textEnv('the answer'))
+
+    const first = useStore.getState().messages.find((m) => m.role === 'assistant')
+    expect(first?.thinking).toBe('pondering')
+    expect(first?.thinkingMs).toBeDefined()
+  })
+
+  // NOT a regression test — this passed before the fix too. It pins the deliberate
+  // asymmetry: the turn survives, the spinner does not. The browser cannot tell
+  // this frame apart from the ones where the prompt never started and no result
+  // will ever follow (opencode_provider.go's resume-serve failure and its two
+  // `opencode run` start failures all return before emitting EventResult). A
+  // spinner stuck ON disables Enter (shouldSendOnEnter); a spinner cleared early
+  // costs until the next delta, which is what the last two lines here pin.
+  it('still stops the spinner, and the next delta restarts it', () => {
+    const h = useStore.getState().handleEnvelope
+    h(textEnv('working'))
+    expect(useStore.getState().streaming).toBe(true)
+    h(agentErr('busy: another prompt is running'))
+    expect(useStore.getState().streaming).toBe(false)
+    h(textEnv(' still'))
+    expect(useStore.getState().streaming).toBe(true)
+  })
+
+  // tether#63's case, unchanged and load-bearing: a terminal refusal means the
+  // connection is going away, so nothing will arrive to finish the turn and every
+  // pointer must go. This is the branch the fix must NOT widen over.
+  //
+  // unknown_workspace, not spawn_failed: wire/errors.go's terminalCodes maps
+  // spawn_failed to false and NewErrorEnvelope derives the bit from that table,
+  // so {spawn_failed, terminal:true} is a frame no daemon can send. A fixture
+  // that cannot occur would still exercise the branch and would stop describing
+  // anything.
+  it('a terminal refusal still ends the turn it lands in', () => {
+    const h = useStore.getState().handleEnvelope
+    h(textEnv('half an answer'))
+    h(errorEnv({ code: 'unknown_workspace', message: 'gone for good', terminal: true }))
+    const s = useStore.getState()
+    expect(s.streaming).toBe(false)
+    expect(s.curTurnId).toBeNull()
+    expect(s.streamingMsgId).toBeNull()
+    expect(s.answerStartTs).toBeNull()
+    expect(s.thinkingStartTs).toBeNull()
+    expect(s.fatal).toEqual({ code: 'unknown_workspace', message: 'gone for good' })
+  })
+
+  // The pre-tether#63 bare-string shape a stale daemon might still send carries no
+  // classification at all, so it cannot be read as "non-terminal" — it keeps the
+  // old wipe, which is also the conservative reading (a frame that might have been
+  // terminal leaves nothing dangling).
+  it('an unparsable payload still ends the turn', () => {
+    const h = useStore.getState().handleEnvelope
+    h(textEnv('half an answer'))
+    h(errorEnv('legacy plain-string error'))
+    const s = useStore.getState()
+    expect(s.curTurnId).toBeNull()
+    expect(s.streamingMsgId).toBeNull()
+    expect(s.answerStartTs).toBeNull()
+  })
+
+  // The premise the whole branch rests on — "a non-terminal error can land on a
+  // turn that is still streaming" — is a claim about the DAEMON, so it is
+  // asserted against the daemon's own output rather than against frames written
+  // to suit the fix.
+  //
+  // Captured 2026-08-08 from a tether daemon built at v0.5.0-79-g9bee8d7 talking
+  // to a real opencode over the real HTTP/3 + WebTransport stack: one prompt
+  // answering, a second prompt sent 200ms after the first token of that answer,
+  // and what came back. The busy rejection landed at 15931ms and the SAME turn
+  // went on sending text until its result at 18745ms — 231 more message
+  // envelopes, of which the four that immediately followed are kept below.
+  //
+  // These lines are unedited daemon output, contiguous in the capture. They are
+  // parsed here rather than written as objects because that is precisely the hop
+  // being reproduced: wt.ts reads one uni stream per envelope and hands each line
+  // to JSON.parse before handleEnvelope ever sees it.
+  //
+  // Which is also why the concatenation below reads like nonsense, and why that
+  // is left in rather than tidied: the capturing client observed these envelopes
+  // in an order that is NOT the order wt_chat.go's drain loop sent them (it sends
+  // strictly in sequence). A hand-written fixture would not look like this.
+  // Whether a browser's incomingUnidirectionalStreams reorders the same way was
+  // not established here and nothing below depends on it — what the capture is
+  // for is that an error envelope is interleaved with its own turn's deltas at
+  // all.
+  //
+  // Two things this does NOT claim:
+  //   - That a browser driven by a user typing twice would have rendered one
+  //     bubble. It would not, and not because of this branch — sendMessage's own
+  //     addMessage ends the turn locally before the rejection gets back (see the
+  //     'error' branch in store.ts).
+  //   - That this exact frame was produced by opencode's session.error. It was
+  //     not; "busy: another prompt is running" is verbatim from SendPrompt's busy
+  //     branch. session.error emits from an SSE reader that keeps reading, so the
+  //     same interleaving should arise there with no second prompt involved and
+  //     with the bubble still open — read from the provider, NOT captured.
+  const CAPTURED_LIVE = [
+    // 61 envelopes elided before this window (session_ready + the answer so far).
+    '{"kind":"message","sessionId":"ses_020277165ffe7MEV6MyeiBJp8w","payload":" Six"}',
+    '{"kind":"message","sessionId":"ses_020277165ffe7MEV6MyeiBJp8w","payload":" is"}',
+    '{"kind":"message","sessionId":"ses_020277165ffe7MEV6MyeiBJp8w","payload":" the"}',
+    '{"kind":"message","sessionId":"ses_020277165ffe7MEV6MyeiBJp8w","payload":" perfect"}',
+    '{"kind":"error","sessionId":"ses_020277165ffe7MEV6MyeiBJp8w","payload":{"code":"agent_error","message":"busy: another prompt is running","terminal":false}}',
+    '{"kind":"message","sessionId":"ses_020277165ffe7MEV6MyeiBJp8w","payload":" often"}',
+    '{"kind":"message","sessionId":"ses_020277165ffe7MEV6MyeiBJp8w","payload":"7"}',
+    '{"kind":"message","sessionId":"ses_020277165ffe7MEV6MyeiBJp8w","payload":" number"}',
+    '{"kind":"message","sessionId":"ses_020277165ffe7MEV6MyeiBJp8w","payload":"."}',
+    // 227 further message envelopes elided, then the turn's own result.
+    '{"kind":"result","sessionId":"ses_020277165ffe7MEV6MyeiBJp8w","payload":"stop"}',
+  ]
+
+  it('replays a live capture into one bubble', () => {
+    const h = useStore.getState().handleEnvelope
+    for (const line of CAPTURED_LIVE) h(JSON.parse(line) as Envelope)
+
+    const assistants = useStore.getState().messages.filter((m) => m.role === 'assistant')
+    expect(assistants).toHaveLength(1)
+    expect(assistants[0].text).toBe(' Six is the perfect often7 number.')
+    // And the agent's complaint is still shown — tether#80's half of the same
+    // frame, which this must not trade away to keep the turn.
+    expect(useStore.getState().notices.map((n) => n.text)).toEqual([
+      'The agent reported an error — busy: another prompt is running',
+    ])
   })
 })
 

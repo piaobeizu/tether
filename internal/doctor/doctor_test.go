@@ -1,6 +1,7 @@
 package doctor
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -9,14 +10,19 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/piaobeizu/tether/internal/agent"
 	"github.com/piaobeizu/tether/internal/server"
 )
@@ -50,7 +56,7 @@ func TestCheckMCPSettingsInject_Injected(t *testing.T) {
 	})
 	// Point home to temp dir by temporarily overriding UserHomeDir via env.
 	t.Setenv("HOME", dir)
-	r := checkMCPSettingsInject(false)
+	r := checkMCPSettingsInject(&server.Config{}, false)
 	if r.Status != StatusOK {
 		t.Errorf("expected ok, got %s message=%q", r.Status, r.Message)
 	}
@@ -58,7 +64,7 @@ func TestCheckMCPSettingsInject_Injected(t *testing.T) {
 
 func TestCheckMCPSettingsInject_Missing(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	r := checkMCPSettingsInject(false)
+	r := checkMCPSettingsInject(&server.Config{}, false)
 	if !r.Failed() {
 		t.Errorf("expected fail when settings.json absent, got %s message=%q", r.Status, r.Message)
 	}
@@ -73,7 +79,7 @@ func TestCheckMCPSettingsInject_NotInjected(t *testing.T) {
 		},
 	})
 	t.Setenv("HOME", dir)
-	r := checkMCPSettingsInject(false)
+	r := checkMCPSettingsInject(&server.Config{}, false)
 	if !r.Failed() {
 		t.Errorf("expected fail when no tether entry, got %s message=%q", r.Status, r.Message)
 	}
@@ -123,21 +129,12 @@ func TestCheckMCPLoopback_NotRunning(t *testing.T) {
 	// that port open, and this test would then assert the opposite of what it
 	// is named for. (It passed either way before tether#84 — the check returned
 	// OK=true whether or not it connected — so the dependency was invisible.)
-	dir := t.TempDir()
-	writeJSON(t, filepath.Join(dir, ".claude", "settings.json"), map[string]any{
-		"mcpServers": map[string]any{
-			"tether": map[string]any{
-				agent.TetherManagedKey: true,
-				"url":                  fmt.Sprintf("http://127.0.0.1:%d/mcp", closedPort(t)),
-			},
-		},
-	})
-	t.Setenv("HOME", dir)
+	t.Setenv("HOME", t.TempDir())
 
 	// Unreachable is a skip, not a pass and not a failure: doctor runs before
 	// the server exists, so a refused connection asserts nothing about the
 	// endpoint's health.
-	r := checkMCPLoopback(false)
+	r := checkMCPLoopback(&server.Config{MCPPort: closedPort(t)}, false)
 	if r.Status != StatusSkip {
 		t.Errorf("unreachable loopback should skip, got %s: %q", r.Status, r.Message)
 	}
@@ -159,34 +156,550 @@ func closedPort(t *testing.T) int {
 	return port
 }
 
-func TestCheckMCPLoopback_Running(t *testing.T) {
-	// Start a throwaway TCP listener on an ephemeral port.
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
+// startLoopback runs a real server.MCPLoopback — the production type, so the
+// production bearer gate sits in front of the SDK's streamable handler exactly
+// as it does in a daemon — and returns the port it listens on. A bare
+// net.Listen would not do: the whole subject of tether#89 is the difference
+// between a port being open and an MCP endpoint being this deployment's, and
+// the test that used one could not see that difference either.
+func startLoopback(t *testing.T, token string) int {
+	t.Helper()
+	port := closedPort(t)
+	lb := server.NewMCPLoopback(port, mcp.NewServer(&mcp.Implementation{Name: "tether", Version: "test"}, nil), token)
+	if err := lb.Start(); err != nil {
+		t.Fatalf("start loopback on %d: %v", port, err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = lb.Stop(ctx)
+	})
+	return port
+}
+
+// writeMCPToken plants the bearer token a running daemon leaves in
+// ~/.tether/mcp-token.
+func writeMCPToken(t *testing.T, home, token string) {
+	t.Helper()
+	dir := filepath.Join(home, ".tether")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
-	port := l.Addr().(*net.TCPAddr).Port
+	if err := os.WriteFile(filepath.Join(dir, "mcp-token"), []byte(token+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
 
-	// Inject settings pointing at our listener.
-	dir := t.TempDir()
-	path := filepath.Join(dir, ".claude", "settings.json")
-	writeJSON(t, path, map[string]any{
+func TestCheckMCPLoopback_OurOwnEndpointIsOK(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeMCPToken(t, home, "our-secret")
+	port := startLoopback(t, "our-secret")
+
+	r := checkMCPLoopback(&server.Config{MCPPort: port}, true)
+	if r.Status != StatusOK {
+		t.Fatalf("our own running loopback should be ok, got %s: %q", r.Status, r.Message)
+	}
+	// The handshake really happened: the message carries what initialize said,
+	// which a TCP dial could not have produced.
+	if !contains(r.Message, "tether test") {
+		t.Errorf("expected serverInfo in message, got: %q", r.Message)
+	}
+}
+
+// This is the tether#89 bug, stated as a test: another tether daemon holding
+// the port must not be reported as this deployment's healthy endpoint. The
+// pre-fix check dialled and returned ok here.
+func TestCheckMCPLoopback_AnotherDaemonOnThePortIsNotOK(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeMCPToken(t, home, "our-secret")
+	port := startLoopback(t, "some-other-daemons-secret")
+
+	r := checkMCPLoopback(&server.Config{MCPPort: port}, false)
+	if r.Status != StatusFail {
+		t.Fatalf("a foreign MCP endpoint on our port should fail, got %s: %q", r.Status, r.Message)
+	}
+	if !contains(r.Message, "401") {
+		t.Errorf("message should say the token was rejected with a 401, got: %q", r.Message)
+	}
+}
+
+// The same collision seen from a host that has no token to offer — a fresh
+// $HOME, which is how doctor is run under test harnesses and from a unit file
+// with its own home. Nothing can be concluded, so nothing is: not a tick.
+func TestCheckMCPLoopback_NoTokenOnHostIsSkipNotOK(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	port := startLoopback(t, "some-other-daemons-secret")
+
+	r := checkMCPLoopback(&server.Config{MCPPort: port}, false)
+	if r.Status != StatusSkip {
+		t.Fatalf("no bearer token means no verdict, expected skip, got %s: %q", r.Status, r.Message)
+	}
+	// The status alone would also be satisfied by the dial failing — closedPort
+	// is inherently racy — which would leave this green while asserting nothing
+	// about the branch it is named for.
+	if !contains(r.Message, "no bearer token") {
+		t.Errorf("skipped for the wrong reason: %q", r.Message)
+	}
+}
+
+// The token falls back to the Authorization header cc's settings.json carries,
+// which matters more than it looks: any graceful shutdown under this $HOME
+// removes ~/.tether/mcp-token unconditionally (lifecycle.go), including a
+// sibling daemon's, so a live deployment can find its own token file gone.
+func TestCheckMCPLoopback_FallsBackToTheSettingsJSONToken(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	port := startLoopback(t, "our-secret") // and deliberately no ~/.tether/mcp-token
+	writeJSON(t, filepath.Join(home, ".claude", "settings.json"), map[string]any{
 		"mcpServers": map[string]any{
 			"tether": map[string]any{
 				agent.TetherManagedKey: true,
-				"url": fmt.Sprintf("http://127.0.0.1:%d/mcp", port),
+				"url":                  fmt.Sprintf("http://127.0.0.1:%d/mcp", port),
+				"headers":              map[string]any{"Authorization": "Bearer our-secret"},
 			},
 		},
 	})
-	t.Setenv("HOME", dir)
 
-	r := checkMCPLoopback(false)
+	r := checkMCPLoopback(&server.Config{MCPPort: port}, true)
 	if r.Status != StatusOK {
-		t.Errorf("expected ok with running listener, got %s: %q", r.Status, r.Message)
+		t.Fatalf("expected ok from the settings.json token, got %s: %q", r.Status, r.Message)
 	}
-	if r.Message == "" || contains(r.Message, "not reachable") {
-		t.Errorf("expected reachable message, got: %q", r.Message)
+	if !contains(r.Detail, "settings.json") {
+		t.Errorf("expected the detail to name the fallback token source, got: %q", r.Detail)
+	}
+}
+
+// A stray space in a hand-edited settings.json is not a credential. Untrimmed
+// it survives the non-empty test, gets offered, 401s, and reds a healthy host.
+func TestCheckMCPLoopback_WhitespaceOnlySettingsTokenIsNotOffered(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	port := startLoopback(t, "our-secret")
+	writeJSON(t, filepath.Join(home, ".claude", "settings.json"), map[string]any{
+		"mcpServers": map[string]any{
+			"tether": map[string]any{
+				agent.TetherManagedKey: true,
+				"url":                  fmt.Sprintf("http://127.0.0.1:%d/mcp", port),
+				"headers":              map[string]any{"Authorization": "Bearer  "},
+			},
+		},
+	})
+
+	r := checkMCPLoopback(&server.Config{MCPPort: port}, false)
+	if r.Status == StatusFail {
+		t.Errorf("a blank token is doctor having none, not a fault on the host: %q", r.Message)
+	}
+	if r.Status != StatusSkip {
+		t.Errorf("expected skip, got %s: %q", r.Status, r.Message)
+	}
+}
+
+// The green line has to name where the port came from. The handshake settles
+// whose endpoint answered and never that this deployment serves that port, so
+// on a two-daemon host a bare `tether doctor` can tick the wrong daemon — and
+// Detail does not count, because cmd/tether only prints it under --verbose.
+func TestCheckMCPLoopback_OKMessageNamesThePortSource(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeMCPToken(t, home, "our-secret")
+	port := startLoopback(t, "our-secret")
+	writeJSON(t, filepath.Join(home, ".claude", "settings.json"), map[string]any{
+		"mcpServers": map[string]any{
+			"tether": map[string]any{
+				agent.TetherManagedKey: true,
+				"url":                  fmt.Sprintf("http://127.0.0.1:%d/mcp", port),
+			},
+		},
+	})
+
+	r := checkMCPLoopback(&server.Config{}, false) // no --mcp-port: the port is a guess
+	if r.Status != StatusOK {
+		t.Fatalf("expected ok, got %s: %q", r.Status, r.Message)
+	}
+	if !contains(r.Message, portFromSettings.String()) {
+		t.Errorf("a tick reached via a guessed port must say so in the message, got: %q", r.Message)
+	}
+}
+
+// Anything that is not an MCP endpoint at all. Also not a tick — and this is
+// the case the old dial passed most readily, since a listening socket was the
+// entire test.
+func TestCheckMCPLoopback_NonMCPListenerIsSkipNotOK(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeMCPToken(t, home, "our-secret")
+
+	port := closedPort(t)
+	srv := &http.Server{
+		Addr: fmt.Sprintf("127.0.0.1:%d", port),
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, "hello from something else\n")
+		}),
+	}
+	l, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Serve(l) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	r := checkMCPLoopback(&server.Config{MCPPort: port}, false)
+	if r.Status != StatusSkip {
+		t.Fatalf("a non-MCP listener should not be a verdict either way, expected skip, got %s: %q", r.Status, r.Message)
+	}
+}
+
+// --mcp-port outranks cc's settings.json. Both are live MCP endpoints holding
+// this host's token, so the only thing that can decide which one the check
+// reports on is the precedence rule.
+func TestCheckMCPLoopback_FlagOutranksSettingsJSON(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeMCPToken(t, home, "our-secret")
+	flagPort := startLoopback(t, "our-secret")
+	settingsPort := startLoopback(t, "our-secret")
+	writeJSON(t, filepath.Join(home, ".claude", "settings.json"), map[string]any{
+		"mcpServers": map[string]any{
+			"tether": map[string]any{
+				agent.TetherManagedKey: true,
+				"url":                  fmt.Sprintf("http://127.0.0.1:%d/mcp", settingsPort),
+			},
+		},
+	})
+
+	r := checkMCPLoopback(&server.Config{MCPPort: flagPort}, false)
+	if r.Status != StatusOK {
+		t.Fatalf("expected ok, got %s: %q", r.Status, r.Message)
+	}
+	if !contains(r.Message, fmt.Sprintf("127.0.0.1:%d", flagPort)) {
+		t.Errorf("expected the --mcp-port endpoint %d in the message, got: %q", flagPort, r.Message)
+	}
+}
+
+// ...and without the flag, settings.json is used.
+func TestCheckMCPLoopback_SettingsJSONUsedWhenFlagAbsent(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeMCPToken(t, home, "our-secret")
+	settingsPort := startLoopback(t, "our-secret")
+	writeJSON(t, filepath.Join(home, ".claude", "settings.json"), map[string]any{
+		"mcpServers": map[string]any{
+			"tether": map[string]any{
+				agent.TetherManagedKey: true,
+				"url":                  fmt.Sprintf("http://127.0.0.1:%d/mcp", settingsPort),
+			},
+		},
+	})
+
+	r := checkMCPLoopback(&server.Config{}, false)
+	if r.Status != StatusOK {
+		t.Fatalf("expected ok, got %s: %q", r.Status, r.Message)
+	}
+	if !contains(r.Message, fmt.Sprintf("127.0.0.1:%d", settingsPort)) {
+		t.Errorf("expected the settings.json endpoint %d in the message, got: %q", settingsPort, r.Message)
+	}
+}
+
+// A per-task instance entry ("tether-<slug>", internal/mcp/instance/instance.go)
+// must not be mistaken for the singleton loopback. The pre-fix check scanned
+// every tether-managed entry and kept the last, so with both present it aimed
+// at whichever one Go's map iteration reached last — a different endpoint from
+// run to run.
+//
+// The assertion is the port; the repetition is not asserting anything about the
+// current implementation, which is a single map lookup and cannot vary. It is
+// there so that a regression to the old scan cannot pass by luck: one run of
+// that code picks the right entry about half the time.
+func TestResolveMCPPort_IgnoresPerTaskInstanceEntries(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	singleton, perTask := closedPort(t), closedPort(t)
+	writeJSON(t, filepath.Join(home, ".claude", "settings.json"), map[string]any{
+		"mcpServers": map[string]any{
+			"tether": map[string]any{
+				agent.TetherManagedKey: true,
+				"url":                  fmt.Sprintf("http://127.0.0.1:%d/mcp", singleton),
+			},
+			"tether-some-task": map[string]any{
+				agent.TetherManagedKey: true,
+				"url":                  fmt.Sprintf("http://127.0.0.1:%d/mcp", perTask),
+			},
+		},
+	})
+	for i := range 20 {
+		got, src := resolveMCPPort(&server.Config{})
+		if got != singleton {
+			t.Fatalf("iteration %d: got port %d (%s), want the singleton entry's %d", i, got, src, singleton)
+		}
+	}
+}
+
+// Under --skip-mcp-inject the entry in settings.json was left by some other
+// daemon, so it is evidence about that one. Falling back to the default is the
+// honest answer, and the message has to admit it is a guess.
+func TestResolveMCPPort_SkipMCPInjectIgnoresSettingsJSON(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeJSON(t, filepath.Join(home, ".claude", "settings.json"), map[string]any{
+		"mcpServers": map[string]any{
+			"tether": map[string]any{
+				agent.TetherManagedKey: true,
+				"url":                  "http://127.0.0.1:19999/mcp",
+			},
+		},
+	})
+	got, src := resolveMCPPort(&server.Config{SkipMCPInject: true})
+	if got != 8899 {
+		t.Errorf("expected the default 8899, got %d", got)
+	}
+	if src.hint() == "" {
+		t.Errorf("a guessed port must carry the --mcp-port hint, source was %q", src)
+	}
+}
+
+func TestProbeMCPEndpoint_TerminatesTheSessionItOpened(t *testing.T) {
+	// A recording stand-in rather than the SDK server, because what is being
+	// asserted is what doctor sends: the DELETE that stops a preflight probe
+	// from leaving 30 minutes of session state (MCPLoopback's SessionTimeout)
+	// behind on a live daemon.
+	var mu sync.Mutex // the handler runs on net/http's goroutines, not this one
+	var methods []string
+	var deleteSessionID string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		methods = append(methods, r.Method)
+		mu.Unlock()
+		if r.Method == http.MethodDelete {
+			mu.Lock()
+			deleteSessionID = r.Header.Get("Mcp-Session-Id")
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Mcp-Session-Id", "SESSION-1")
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: message\ndata: "+
+			`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"tether","version":"v9"}}}`+"\n\n")
+	}))
+	defer srv.Close()
+
+	id, err := probeMCPEndpoint(srv.URL+"/mcp", "tok", 5*time.Second)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if id.ServerName != "tether" || id.ServerVersion != "v9" {
+		t.Errorf("unexpected identity: %+v", id)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(methods) != 2 || methods[0] != http.MethodPost || methods[1] != http.MethodDelete {
+		t.Errorf("expected POST then DELETE, got %v", methods)
+	}
+	if deleteSessionID != "SESSION-1" {
+		t.Errorf("DELETE carried session id %q, want SESSION-1", deleteSessionID)
+	}
+}
+
+// The session DELETE carries the same bearer token the handshake did, so it
+// needs the same redirect policy. net/http keeps Authorization across a
+// redirect to the same hostname on another port, so the leak this closes is
+// reachable from anything that can answer on the loopback port.
+func TestProbeMCPEndpoint_TheSessionDeleteDoesNotFollowARedirectEither(t *testing.T) {
+	var mu sync.Mutex
+	var elsewhereSawAuth string
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		elsewhereSawAuth = r.Header.Get("Authorization")
+		mu.Unlock()
+	}))
+	defer elsewhere.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			http.Redirect(w, r, elsewhere.URL+"/mcp", http.StatusTemporaryRedirect)
+			return
+		}
+		w.Header().Set("Mcp-Session-Id", "SESSION-1")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w,
+			`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"tether","version":"v9"}}}`)
+	}))
+	defer srv.Close()
+
+	if _, err := probeMCPEndpoint(srv.URL+"/mcp", "SUPER-SECRET", 5*time.Second); err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if elsewhereSawAuth != "" {
+		t.Errorf("the DELETE's redirect target received the bearer token: %q", elsewhereSawAuth)
+	}
+}
+
+// A priming event — `data:` with nothing after it — must not be mistaken for
+// the reply. The SDK emits one when resumption is configured, which this
+// deployment's loopback does not do today; "first data frame" would have made
+// that a silent skip on every healthy host the day it did.
+func TestProbeMCPEndpoint_SkipsAnEmptyPrimingDataFrame(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "id: 0\ndata: \n\n")
+		_, _ = io.WriteString(w, "event: message\ndata: "+
+			`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"tether","version":"v9"}}}`+"\n\n")
+	}))
+	defer srv.Close()
+
+	id, err := probeMCPEndpoint(srv.URL+"/mcp", "tok", 5*time.Second)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if id.ServerName != "tether" {
+		t.Errorf("unexpected identity: %+v", id)
+	}
+}
+
+func TestProbeMCPEndpoint_DoesNotFollowARedirect(t *testing.T) {
+	// Two things ride on this: the probe must answer about the socket it
+	// dialled and not one a redirect names, and it must not hand this
+	// deployment's bearer token to that target. The hop is to a server that
+	// would happily pass the handshake, so a probe that followed it would
+	// return ok.
+	var elsewhereSawAuth string
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		elsewhereSawAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w,
+			`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"tether","version":"v9"}}}`)
+	}))
+	defer elsewhere.Close()
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, elsewhere.URL+"/mcp", http.StatusTemporaryRedirect)
+	}))
+	defer redirector.Close()
+
+	if _, err := probeMCPEndpoint(redirector.URL+"/mcp", "tok", 5*time.Second); err == nil {
+		t.Error("a redirect should not produce an identity")
+	}
+	if elsewhereSawAuth != "" {
+		t.Errorf("the redirect target received the bearer token: %q", elsewhereSawAuth)
+	}
+}
+
+func TestProbeMCPEndpoint_ReadsADataFrameOverScannersDefaultLineCap(t *testing.T) {
+	// bufio.Scanner refuses lines over 64KiB unless told otherwise, and an
+	// initialize result can exceed that once a server fills in capabilities.
+	big := strings.Repeat("x", 100_000)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: message\ndata: "+
+			`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","instructions":"`+big+
+			`","serverInfo":{"name":"tether","version":"v9"}}}`+"\n\n")
+	}))
+	defer srv.Close()
+
+	id, err := probeMCPEndpoint(srv.URL+"/mcp", "tok", 5*time.Second)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if id.ServerName != "tether" {
+		t.Errorf("unexpected identity: %+v", id)
+	}
+}
+
+func TestProbeMCPEndpoint_AcceptsAPlainJSONReply(t *testing.T) {
+	// The SDK answers initialize as SSE, but the transport permits
+	// application/json and firstJSONRPCMessage has to read both.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w,
+			`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"tether","version":"v9"}}}`)
+	}))
+	defer srv.Close()
+
+	id, err := probeMCPEndpoint(srv.URL+"/mcp", "tok", 5*time.Second)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if id.ServerName != "tether" {
+		t.Errorf("unexpected identity: %+v", id)
+	}
+}
+
+func TestProbeMCPEndpoint_DoesNotWaitOutAnSSEStreamThatStaysOpen(t *testing.T) {
+	// The reason firstJSONRPCMessage scans instead of reading to EOF: a server
+	// that keeps the event stream open after the reply would otherwise stall
+	// the probe until its deadline, and a healthy endpoint would be reported as
+	// a timeout.
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: message\ndata: "+
+			`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"tether","version":"v9"}}}`+"\n\n")
+		w.(http.Flusher).Flush()
+		<-release // hold the stream open
+	}))
+	defer func() { close(release); srv.Close() }()
+
+	start := time.Now()
+	if _, err := probeMCPEndpoint(srv.URL+"/mcp", "tok", 30*time.Second); err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("probe waited %v on an open stream; it should return on the first data frame", elapsed)
+	}
+}
+
+func TestCheckMCPSettingsInject_PortConflictFails(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeJSON(t, filepath.Join(home, ".claude", "settings.json"), map[string]any{
+		"mcpServers": map[string]any{
+			"tether": map[string]any{
+				agent.TetherManagedKey: true,
+				"url":                  "http://127.0.0.1:8899/mcp",
+			},
+		},
+	})
+	r := checkMCPSettingsInject(&server.Config{MCPPort: 9000}, false)
+	if r.Status != StatusFail {
+		t.Fatalf("an entry aimed at another daemon should fail, got %s: %q", r.Status, r.Message)
+	}
+	// Unchanged when the two agree, so the new rule cannot redden a host that
+	// injected its own entry.
+	if r := checkMCPSettingsInject(&server.Config{MCPPort: 8899}, false); r.Status != StatusOK {
+		t.Errorf("matching ports should stay ok, got %s: %q", r.Status, r.Message)
+	}
+}
+
+// With no --mcp-port there is nothing to compare the entry against, so the
+// verdict stays ok — but the port it aims cc at goes in the message, because
+// the reader is then the only one who can notice it is the wrong daemon's.
+func TestCheckMCPSettingsInject_NamesWhereCCWillGo(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeJSON(t, filepath.Join(home, ".claude", "settings.json"), map[string]any{
+		"mcpServers": map[string]any{
+			"tether": map[string]any{
+				agent.TetherManagedKey: true,
+				"url":                  "http://127.0.0.1:8899/mcp",
+			},
+		},
+	})
+	r := checkMCPSettingsInject(&server.Config{}, false)
+	if r.Status != StatusOK {
+		t.Fatalf("expected ok, got %s: %q", r.Status, r.Message)
+	}
+	if !contains(r.Message, "8899") {
+		t.Errorf("the message must name the port cc will use, got: %q", r.Message)
+	}
+}
+
+func TestCheckMCPSettingsInject_SkipMCPInjectIsSkipNotFail(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // no settings.json at all
+	r := checkMCPSettingsInject(&server.Config{SkipMCPInject: true}, false)
+	if r.Status != StatusSkip {
+		t.Errorf("--skip-mcp-inject means there is nothing to check, expected skip, got %s: %q", r.Status, r.Message)
 	}
 }
 

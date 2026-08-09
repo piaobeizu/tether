@@ -230,7 +230,7 @@ func Run(cfg *Config) error {
 	if err != nil {
 		return fmt.Errorf("tether data dir: %w", err)
 	}
-	mcpTokenPath := filepath.Join(tetherDir, "mcp-token")
+	mcpTokenPath := filepath.Join(tetherDir, mcpTokenFile)
 	if err := os.WriteFile(mcpTokenPath, []byte(bearerToken), 0o600); err != nil {
 		slog.Warn("mcp: could not write token file", "path", mcpTokenPath, "err", err)
 	}

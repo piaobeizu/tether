@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"path/filepath"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -21,6 +22,33 @@ type MCPLoopback struct {
 	srv     *http.Server
 	token   string
 	handler http.Handler
+}
+
+// mcpTokenFile is the name, inside ~/.tether, of the file Run drops the
+// per-daemon bearer token into. One constant because two packages now care:
+// Run writes it, and `tether doctor` reads it back to prove that whatever
+// holds the MCP port answers to this deployment's secret (tether#89).
+const mcpTokenFile = "mcp-token"
+
+// MCPTokenPath names ~/.tether/mcp-token without creating anything.
+//
+// Split out for doctor, in the same shape and for the same reason as
+// tetherDataDirPath: a diagnostic that creates what it is about to report on
+// turns a real finding into a pass on the second run.
+//
+// The token is regenerated on every start (generateBearerToken in Run) and
+// written before the settings.json injection, so it is written even under
+// --skip-mcp-inject — which is why it, and not the Authorization header in cc's
+// settings.json, is the primary evidence doctor uses. Two caveats doctor has to
+// live with, and does: the write is best-effort (Run warns and carries on), and
+// a graceful shutdown removes the file again, so its absence is an ordinary
+// state and never a verdict on anything.
+func MCPTokenPath() (string, error) {
+	dir, err := tetherDataDirPath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, mcpTokenFile), nil
 }
 
 // BuildMCPServer constructs the singleton *mcp.Server from gateway proxies and

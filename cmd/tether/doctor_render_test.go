@@ -49,3 +49,22 @@ func TestDoctorFlags_RenderTheirArgumentPlaceholder(t *testing.T) {
 		}
 	}
 }
+
+// --mcp-port defaults to 0 and must keep doing so, which is not the tidy choice:
+// `tether server`'s own --mcp-port defaults to 8899, and matching it here looks
+// like the consistent thing to do. It would delete the distinction the check
+// runs on. server.Config documents 0 as "use the default", so 0 means "nobody
+// told doctor" and any other value means "the operator says this deployment
+// uses that port" — which is what lets checkMCPLoopback know when it is
+// guessing, and what gates the settings.json/port-conflict comparison in
+// checkMCPSettingsInject. Defaulted to 8899, every host that serves MCP
+// somewhere else would be told cc is wired to the wrong tether.
+func TestDoctorFlags_MCPPortDefaultsToZeroMeaningUnspecified(t *testing.T) {
+	f := newDoctorCmd().Flags().Lookup("mcp-port")
+	if f == nil {
+		t.Fatal("doctor has no --mcp-port flag")
+	}
+	if f.DefValue != "0" {
+		t.Errorf("--mcp-port defaults to %q; it must default to 0 so an unspecified port stays distinguishable from a specified 8899", f.DefValue)
+	}
+}

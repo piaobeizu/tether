@@ -210,6 +210,18 @@ func newDoctorCmd() *cobra.Command {
 	cmd.Flags().StringVar(&cfg.CertFile, "cert-file", "", "check this cert instead of the managed one, as the server would serve it (needs --key-file)")
 	cmd.Flags().StringVar(&cfg.KeyFile, "key-file", "", "key for --cert-file (both are needed; either alone is ignored, exactly as the server ignores it)")
 	cmd.Flags().StringVar(&cfg.AcmeDomain, "acme-domain", "", "check the cert certmagic stored for this domain, as the server would serve it")
+	// Default 0, not the server's 8899, and the difference is load-bearing:
+	// server.Config documents 0 as "use the default", which lets the check tell
+	// "the operator says this deployment uses 8899" from "nobody said". On a
+	// host running two daemons those are different questions — the second one
+	// leaves doctor guessing from a host-global record either daemon may have
+	// written, and every verdict reached that way says so.
+	//
+	// Not the cause of tether#89, to be clear: the check it belongs to never
+	// consulted MCPPort at all, and had no identity check to misdirect. This is
+	// the flag that lets an operator settle the question the fix now asks.
+	cmd.Flags().IntVar(&cfg.MCPPort, "mcp-port", 0, "the --mcp-port this deployment serves MCP on (default: read from cc's settings.json, else 8899)")
+	cmd.Flags().BoolVar(&cfg.SkipMCPInject, "skip-mcp-inject", false, "this deployment runs with --skip-mcp-inject, so do not expect (or trust) cc's settings.json entry")
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "show extra detail")
 	cmd.Flags().BoolVar(&asJSON, "json", false, "output as JSON")
 	return cmd

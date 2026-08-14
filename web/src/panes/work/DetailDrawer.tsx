@@ -1,7 +1,7 @@
 // DetailDrawer — bottom slide-up overlay for the selected wi's detail
-// (tether#26). Lives inside the right Work pane, above the Work map: clicking
-// a card selects a wi, which mounts this drawer sliding up from the bottom
-// with the WorkDetail (goal/status/content + scenario step DAG + action bar).
+// (tether#26). Lives inside WorkPane, above the Work map: clicking a card
+// selects a wi, which mounts this drawer sliding up from the bottom with the
+// WorkDetail (goal/status/content + scenario step DAG + action bar).
 // Dismiss via the × button, Esc, the dimmed map backdrop above — or by dragging
 // the grip down (tether#30).
 //
@@ -39,11 +39,11 @@ export default function DetailDrawer({
   id: string
   onClose: () => void
   /** Attach the global Esc-to-close only while the drawer is the visible layer
-   *  (the Work tab is the active right tab). The drawer stays MOUNTED behind
-   *  another tab (App keeps visited tabs alive), so an unguarded document
-   *  listener would swallow Esc from Chat/Shell and silently drop the
-   *  selection. A higher modal (Settings / catch-up) opened over the Work tab
-   *  still shares document Esc — a minor accepted overlap. */
+   *  (Work is the main view on screen). The drawer stays MOUNTED behind another
+   *  surface — App keeps both visited main views and visited right tabs alive —
+   *  so an unguarded document listener would swallow Esc from Chat/Shell and
+   *  silently drop the selection. A higher modal (Settings / catch-up) opened
+   *  over Work still shares document Esc — a minor accepted overlap. */
   escActive?: boolean
 }) {
   const [heightPct, setHeightPct] = useState(readStored)

@@ -302,6 +302,53 @@ body {
 }
 .col-resizer:hover { background: var(--accent); }
 
+/* ── Activity bar (tether#90) ────────────────────────────────────
+   Picks what the MIDDLE column shows. Far left, fixed 48px, icon-only with a
+   hover tooltip; no resizer beside it.
+
+   Three tones, three surfaces: this bar is --bg-tint, the workspace tree beside
+   it stays --bg-sunken, the middle column is --bg-app. In the LIGHT theme that
+   is a depth ladder — bar darkest, then tree, then the middle lightest. In DARK
+   it INVERTS, because --bg-tint (#322D26) is lighter than --bg-sunken (#141210):
+   the bar reads as the brightest of the three. Known and accepted by the owner
+   on 2026-08-14; it has not been looked at on a real screen in dark mode.
+
+   The separator is --line rather than --line-soft: it divides two surfaces, not
+   two rows within one.
+
+   Selection is a 2px --accent rail plus an --accent icon, deliberately NOT a
+   background fill. --bg-tint carries "selected"/"hovered" elsewhere
+   (.tree-row:hover, .icon-btn:hover, .btn-ghost-sm.on) and it is already this
+   bar's background, so a fill would have nothing to contrast against. Do not add
+   --bg-tint-backed elements in here.
+
+   Width 48px is duplicated as ACTIVITY_W in App.tsx, which needs it as a number
+   to keep the middle column's MIN_MID floor honest. Change both. */
+.dt-activity {
+  width: 48px; flex-shrink: 0;
+  display: flex; flex-direction: column;
+  padding-top: 6px;
+  background: var(--bg-tint);
+  border-right: 1px solid var(--line);
+  /* scrolls rather than truncating once this list outgrows a short viewport */
+  overflow-y: auto; overflow-x: hidden;
+}
+.dt-activity-btn {
+  position: relative;
+  height: 44px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: none; border: 0; padding: 0;
+  color: var(--ink-tertiary); cursor: pointer;
+}
+.dt-activity-btn:hover { color: var(--ink-primary); }
+.dt-activity-btn.on { color: var(--accent); }
+.dt-activity-btn.on::before {
+  content: '';
+  position: absolute; left: 0; top: 7px; bottom: 7px;
+  width: 2px; background: var(--accent);
+}
+.dt-activity-btn:focus-visible { outline: 1px solid var(--accent); outline-offset: -4px; }
+
 /* ── Left pane ──────────────────────────────────────────────── */
 .dt-left {
   background: var(--bg-sunken);
@@ -404,7 +451,26 @@ body {
 .crumb-sep   { color: var(--ink-quat); }
 .crumb       { color: var(--ink-primary); font-weight: 500; }
 .dt-mid-actions { display: flex; gap: 6px; }
+/* tether#90 — the two main views share ONE grid cell so the inactive one can be
+   display:none without unmounting (it keeps its filters, search and pan/zoom).
+   Explicit `grid-area: 1/1` on the children rather than auto-placement: with a
+   hidden sibling, auto-placement would give the visible child an `auto` row and
+   the fill-the-column behaviour both views rely on would quietly stop. */
+.dt-mid-stack {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr); grid-template-columns: minmax(0, 1fr);
+  min-height: 0; overflow: hidden;
+}
+.dt-mid-stack > * { grid-area: 1 / 1; min-height: 0; min-width: 0; }
 .dt-mid-body { padding: 16px; overflow: auto; min-height: 0; }
+/* Work in the middle column (tether#90) — .dt-mid-body's sibling, minus the
+   padding. ForceGraph sizes its cards from the measured container width, and
+   16px a side is 32px of graph. With all five status columns present the cards
+   go compact below a MEASURED width of 606px — but ForceGraph buckets what it
+   measures to multiples of CW_BUCKET=20, so the container boundary is 610px in
+   practice. Either way, a middle column in the 610-642px band would be pushed
+   over the line by padding alone. */
+.dt-mid-work { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
 
 /* ── Right pane (tabbed: Chat / Skills / Shell) ─────────────── */
 .dt-right {
@@ -700,17 +766,34 @@ body {
 
 .m-only { display: none !important; }
 
-/* ── Responsive: ≤768px — only right pane ───────────────────── */
+/* ── Responsive: ≤768px — one pane at a time ────────────────────
+   The tree and both resizers go; the phone shows a single column. Which one is
+   now the activity bar's choice, and the bar itself stays visible: before
+   tether#90 Work was a right-pane tab and therefore reachable here, and moving
+   it to the middle would have deleted it from small screens outright. This
+   preserves that reach and nothing more — desktop is untouched, and only one of
+   .dt-mid / .dt-right is ever displayed. */
 @media (max-width: 768px) {
-  .dt-left, .dt-mid, .col-resizer { display: none; }
-  .dt-right { width: 100% !important; }
+  .dt-left, .col-resizer { display: none; }
+  .dt-mid { display: none; }
   .m-only { display: flex !important; }
+
+  /* `flex: 1` rather than the `width: 100%` this replaces. Both .dt-activity and
+     .dt-right are flex-shrink:0, and a percentage width on a flex item resolves
+     against the CONTAINER's content box — so 48px + 100% overflows .dt-grid,
+     which is overflow:hidden, and the right pane loses its last 48px. That was
+     exact while nothing else was visible at this breakpoint; it stopped being
+     exact the moment the bar stayed. */
+  .dt-right { flex: 1 1 0; width: auto !important; min-width: 0; }
+
+  .dt-grid.mv-work .dt-mid   { display: grid; }
+  .dt-grid.mv-work .dt-right { display: none; }
 }
 
 /* ── Legacy: pane-body used by skill/shell content ──────────── */
 .pane-body { flex: 1; overflow: auto; padding: 12px; }
 
-/* ── Work tab (LCRS queue + wi detail + timeline) ───────────── */
+/* ── Work view (LCRS queue + wi detail + timeline) ──────────── */
 .work-pane { display: flex; flex-direction: column; flex: 1 1 0; min-height: 0; }
 .work-head {
   display: flex; align-items: center; gap: 8px;
@@ -961,17 +1044,20 @@ body {
 .fg-status-pending .fg-card-bar { fill: var(--ink-quat); }
 .fg-status-default .fg-card-bar { fill: var(--ink-tertiary); }
 
-/* ── Search / jump overlay (tether#29): find a wi in a large map ─── */
+/* ── Search / jump (tether#29): find a wi in a large map ─────────
+   tether#90 — no longer an overlay. It was `position:absolute; top:8; left:8`
+   over .fg-scroll, which covered the two leftmost status columns at every pane
+   width; it is now an ordinary item in .fg-filter, pushed right by that row's
+   flex spacer. The drop shadow went with the overlay: it existed to lift the box
+   off the map it was sitting on, and there is nothing under it any more. */
 .fg-search {
-  position: absolute; top: 8px; left: 8px; z-index: 5;
   display: flex; align-items: center; gap: 6px;
 }
 .fg-search-input {
   width: 150px; max-width: 42vw;
-  padding: 4px 8px; font-size: 12px;
+  padding: 3px 8px; font-size: 11px;
   color: var(--ink-primary); background: var(--bg-surface);
   border: 1px solid var(--line); border-radius: var(--r-2);
-  box-shadow: 0 1px 4px rgba(0, 0, 0, .12);
 }
 .fg-search-input:focus { outline: none; border-color: var(--accent); }
 .fg-search-input::placeholder { color: var(--ink-quat); }

@@ -204,25 +204,52 @@ describe('ForceGraph', () => {
   })
 })
 
-// Search / jump (tether#29): a floating box finds a wi in a large map by slug or
-// goal substring, highlighting matches, dimming the rest, and centering the
-// viewport on the active match; ↑/↓ walk matches, ↵ opens the drawer, Esc clears.
-describe('ForceGraph search / jump (tether#29)', () => {
-  const input = (c: HTMLElement) => c.querySelector('.fg-search-input') as HTMLInputElement
-  const count = (c: HTMLElement) => c.querySelector('.fg-search-count')?.textContent ?? null
+// Search / jump (tether#29), CONTROLLED as of tether#90: the box itself lives in
+// WorkGraphView's filter row now, so this component takes `query`/`activeIndex`
+// as props and reports the match set back. Highlighting, dimming, the match
+// ORDERING and the viewport centering stay here; the keyboard handling that used
+// to sit on the input is covered in WorkGraphView.test.tsx, against the real pair.
+describe('ForceGraph search / jump (tether#29, controlled in tether#90)', () => {
   const activeSlug = (c: HTMLElement) =>
     c.querySelector('.fg-node-active .fg-card-slug')?.textContent ?? null
+  const lastMatch = (fn: ReturnType<typeof vi.fn>) => fn.mock.calls.at(-1)?.[0]
 
-  it('highlights matches, dims the rest, and shows a count', () => {
-    const { container } = render(<ForceGraph nodes={nodes} edges={edges} />)
-    fireEvent.change(input(container), { target: { value: '#2' } })
+  it('renders no input of its own — the box moved to the filter row (tether#90)', () => {
+    const { container } = render(<ForceGraph nodes={nodes} edges={edges} query="#2" />)
+    expect(container.querySelector('.fg-scroll input')).toBeNull()
+    expect(container.querySelector('.fg-search')).toBeNull()
+  })
+
+  it('highlights matches, dims the rest, and reports the match set', () => {
+    const onMatchesChange = vi.fn()
+    const { container } = render(
+      <ForceGraph nodes={nodes} edges={edges} query="#2" onMatchesChange={onMatchesChange} />,
+    )
     const g = container.querySelectorAll('.fg-node')
     expect(g[1].classList.contains('fg-node-match')).toBe(true) // 'b' tether#2
     expect(g[0].classList.contains('fg-node-dim')).toBe(true) // 'a' tether#1
     expect(g[2].classList.contains('fg-node-dim')).toBe(true) // 'c' tether#3
     expect(g[1].classList.contains('fg-node-dim')).toBe(false)
-    expect(count(container)).toBe('1/1')
+    expect(lastMatch(onMatchesChange)).toEqual({ total: 1, index: 0, id: 'b' })
     expect(activeSlug(container)).toBe('tether#2')
+  })
+
+  it('normalizes the query itself (untrimmed, mixed case still matches)', () => {
+    const gnodes: FGNode[] = [{ id: 'g', label: 'tether#7', status: 'running', title: 'Fix The Parser' }]
+    const onMatchesChange = vi.fn()
+    render(
+      <ForceGraph nodes={gnodes} edges={[]} query="  PARSER  " onMatchesChange={onMatchesChange} />,
+    )
+    expect(lastMatch(onMatchesChange)).toEqual({ total: 1, index: 0, id: 'g' })
+  })
+
+  it('treats a whitespace-only query as no search at all', () => {
+    const onMatchesChange = vi.fn()
+    const { container } = render(
+      <ForceGraph nodes={nodes} edges={edges} query="   " onMatchesChange={onMatchesChange} />,
+    )
+    expect(container.querySelector('.fg-node-dim')).toBeNull()
+    expect(lastMatch(onMatchesChange)).toEqual({ total: 0, index: -1, id: undefined })
   })
 
   it('matches on the goal (title), not just the slug', () => {
@@ -230,69 +257,83 @@ describe('ForceGraph search / jump (tether#29)', () => {
       { id: 'g', label: 'tether#7', status: 'running', title: 'fix the parser' },
       { id: 'h', label: 'tether#8', status: 'running', title: 'add a search box' },
     ]
-    const { container } = render(<ForceGraph nodes={gnodes} edges={[]} />)
-    fireEvent.change(input(container), { target: { value: 'parser' } })
+    const { container } = render(<ForceGraph nodes={gnodes} edges={[]} query="parser" />)
     const g = container.querySelectorAll('.fg-node')
     expect(g[0].classList.contains('fg-node-match')).toBe(true)
     expect(g[1].classList.contains('fg-node-dim')).toBe(true)
-    expect(count(container)).toBe('1/1')
   })
 
-  // Matches walk in visual reading order (left-to-right by column): the running
-  // column packs leftmost, so tether#2 is match #1; ↓ wraps forward, ↑ wraps back.
-  it('walks matches with ArrowDown / ArrowUp, wrapping at both ends', () => {
-    const { container } = render(<ForceGraph nodes={nodes} edges={edges} />)
-    fireEvent.change(input(container), { target: { value: '#' } }) // all 3 match
-    expect(count(container)).toBe('1/3')
+  // The ORDER is this component's contract to the filter row: matches are sorted
+  // by laid-out position (left-to-right by column), so the caller's ↑/↓ walk them
+  // in visual reading order. The running column packs leftmost here.
+  it('orders matches by laid-out position, and the caller indexes into that order', () => {
+    const onMatchesChange = vi.fn()
+    const { container, rerender } = render(
+      <ForceGraph nodes={nodes} edges={edges} query="#" activeIndex={0} onMatchesChange={onMatchesChange} />,
+    )
+    expect(lastMatch(onMatchesChange)).toEqual({ total: 3, index: 0, id: 'b' })
     expect(activeSlug(container)).toBe('tether#2') // running col is leftmost
-    fireEvent.keyDown(input(container), { key: 'ArrowDown' })
-    expect(count(container)).toBe('2/3')
+    rerender(<ForceGraph nodes={nodes} edges={edges} query="#" activeIndex={1} onMatchesChange={onMatchesChange} />)
     expect(activeSlug(container)).toBe('tether#3')
-    fireEvent.keyDown(input(container), { key: 'ArrowDown' })
+    rerender(<ForceGraph nodes={nodes} edges={edges} query="#" activeIndex={2} onMatchesChange={onMatchesChange} />)
     expect(activeSlug(container)).toBe('tether#1')
-    fireEvent.keyDown(input(container), { key: 'ArrowDown' }) // forward wrap
-    expect(count(container)).toBe('1/3')
+  })
+
+  // The caller may hand over an index that no longer fits (the match set shrank
+  // before its reset landed). The clamp is here, and the index it reports is the
+  // clamped one — so a single report never names a position and a card that
+  // disagree. (That is a statement about one report. Whether the caller's RENDER
+  // of the latest report is current is a two-component question and is covered in
+  // WorkGraphView.test.tsx.)
+  it('clamps an out-of-range activeIndex and reports the clamped index', () => {
+    const onMatchesChange = vi.fn()
+    const { container } = render(
+      <ForceGraph nodes={nodes} edges={edges} query="#2" activeIndex={9} onMatchesChange={onMatchesChange} />,
+    )
+    expect(lastMatch(onMatchesChange)).toEqual({ total: 1, index: 0, id: 'b' })
     expect(activeSlug(container)).toBe('tether#2')
-    fireEvent.keyDown(input(container), { key: 'ArrowUp' }) // backward wrap
-    expect(count(container)).toBe('3/3')
-    expect(activeSlug(container)).toBe('tether#1')
   })
 
-  it('opens the active match on Enter (onSelect)', () => {
-    const onSelect = vi.fn()
-    const { container } = render(<ForceGraph nodes={nodes} edges={edges} onSelect={onSelect} />)
-    fireEvent.change(input(container), { target: { value: '#3' } })
-    fireEvent.keyDown(input(container), { key: 'Enter' })
-    expect(onSelect).toHaveBeenCalledWith('c')
-  })
-
-  it('clears the search on Escape', () => {
-    const { container } = render(<ForceGraph nodes={nodes} edges={edges} />)
-    fireEvent.change(input(container), { target: { value: '#2' } })
-    expect(container.querySelector('.fg-node-dim')).not.toBeNull()
-    fireEvent.keyDown(input(container), { key: 'Escape' })
-    expect(input(container).value).toBe('')
-    expect(container.querySelector('.fg-node-dim')).toBeNull()
-    expect(container.querySelector('.fg-search-count')).toBeNull()
+  it('asks the caller to reset activeIndex when the match SET changes', () => {
+    const onActiveIndexReset = vi.fn()
+    const { rerender } = render(
+      <ForceGraph nodes={nodes} edges={edges} query="#" onActiveIndexReset={onActiveIndexReset} />,
+    )
+    const atMount = onActiveIndexReset.mock.calls.length
+    // A poll returning the same graph must NOT reset — that is what kept the
+    // active match stable in tether#29.
+    rerender(
+      <ForceGraph
+        nodes={nodes.map((n) => ({ ...n }))}
+        edges={edges.map((e) => ({ ...e }))}
+        query="#"
+        onActiveIndexReset={onActiveIndexReset}
+      />,
+    )
+    expect(onActiveIndexReset.mock.calls.length).toBe(atMount)
+    // A different query changes the match set → reset.
+    rerender(<ForceGraph nodes={nodes} edges={edges} query="#2" onActiveIndexReset={onActiveIndexReset} />)
+    expect(onActiveIndexReset.mock.calls.length).toBe(atMount + 1)
   })
 
   // Nothing matched → the WHOLE map greys out (matches bright, non-matches dim, no
   // exceptions), so "0 results" reads clearly instead of a full-bright map that
   // looks like search did nothing (tether#29 live-verify feedback).
   it('dims the entire map when the query matches nothing', () => {
-    const { container } = render(<ForceGraph nodes={nodes} edges={edges} />)
-    fireEvent.change(input(container), { target: { value: 'zzz' } })
+    const onMatchesChange = vi.fn()
+    const { container } = render(
+      <ForceGraph nodes={nodes} edges={edges} query="zzz" onMatchesChange={onMatchesChange} />,
+    )
     const g = container.querySelectorAll('.fg-node')
     expect(g.length).toBe(3)
     expect([...g].every((n) => n.classList.contains('fg-node-dim'))).toBe(true)
     expect(container.querySelector('.fg-node-match')).toBeNull()
-    expect(count(container)).toBe('0')
+    expect(lastMatch(onMatchesChange)).toEqual({ total: 0, index: -1, id: undefined })
   })
 
   it('centers the viewport on the active match (viewport center ≈ card center)', () => {
-    const { container } = render(<ForceGraph nodes={nodes} edges={edges} />)
+    const { container } = render(<ForceGraph nodes={nodes} edges={edges} query="#2" />)
     const svg = container.querySelector('svg.fg-svg') as SVGSVGElement
-    fireEvent.change(input(container), { target: { value: '#2' } }) // active = 'b'
     const bNode = container.querySelectorAll('.fg-node')[1]
     const cardW = computePositions(nodes, 0).cardW
     const cardCenterX = txX(bNode) + cardW / 2
@@ -301,83 +342,43 @@ describe('ForceGraph search / jump (tether#29)', () => {
   })
 
   it('preserves the active match across a poll returning a fresh identical array', () => {
-    const { container, rerender } = render(<ForceGraph nodes={nodes} edges={edges} />)
-    fireEvent.change(input(container), { target: { value: '#' } })
-    fireEvent.keyDown(input(container), { key: 'ArrowDown' }) // active idx 1 → '2/3'
-    expect(count(container)).toBe('2/3')
-    rerender(<ForceGraph nodes={nodes.map((n) => ({ ...n }))} edges={edges.map((e) => ({ ...e }))} />)
-    expect(count(container)).toBe('2/3')
+    const onMatchesChange = vi.fn()
+    const { container, rerender } = render(
+      <ForceGraph nodes={nodes} edges={edges} query="#" activeIndex={1} onMatchesChange={onMatchesChange} />,
+    )
+    expect(activeSlug(container)).toBe('tether#3')
+    rerender(
+      <ForceGraph
+        nodes={nodes.map((n) => ({ ...n }))}
+        edges={edges.map((e) => ({ ...e }))}
+        query="#"
+        activeIndex={1}
+        onMatchesChange={onMatchesChange}
+      />,
+    )
+    expect(lastMatch(onMatchesChange)).toEqual({ total: 3, index: 1, id: 'c' })
     expect(activeSlug(container)).toBe('tether#3')
   })
 
-  // ↑/↓ don't just re-highlight — they re-center the viewport on each match.
-  it('re-centers the viewport when navigating to a different match', () => {
-    const { container } = render(<ForceGraph nodes={nodes} edges={edges} />)
+  // Moving the active index doesn't just re-highlight — it re-centers the viewport.
+  it('re-centers the viewport when the active match changes', () => {
+    const { container, rerender } = render(
+      <ForceGraph nodes={nodes} edges={edges} query="#" activeIndex={0} />,
+    )
     const svg = container.querySelector('svg.fg-svg') as SVGSVGElement
     const cardW = computePositions(nodes, 0).cardW
     const centerX = () => vbX(svg) + vbWidth(svg) / 2
-    fireEvent.change(input(container), { target: { value: '#' } }) // active = tether#2 (node b)
     const bCenter = txX(container.querySelectorAll('.fg-node')[1]) + cardW / 2
     expect(Math.abs(centerX() - bCenter)).toBeLessThan(1)
-    fireEvent.keyDown(input(container), { key: 'ArrowDown' }) // active = tether#3 (node c)
+    rerender(<ForceGraph nodes={nodes} edges={edges} query="#" activeIndex={1} />)
     const cCenter = txX(container.querySelectorAll('.fg-node')[2]) + cardW / 2
     expect(cCenter).not.toBe(bCenter) // different column → it actually moved
     expect(Math.abs(centerX() - cCenter)).toBeLessThan(1)
   })
-
-  // Esc clears a non-empty search WITHOUT bubbling — else it would also slam an
-  // open detail drawer shut (#26 DetailDrawer's document-level Esc) in one press.
-  it('consumes Escape (stopPropagation) when clearing a non-empty search', () => {
-    const docEsc = vi.fn()
-    const h = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') docEsc()
-    }
-    document.addEventListener('keydown', h)
-    try {
-      const { container } = render(<ForceGraph nodes={nodes} edges={edges} />)
-      fireEvent.change(input(container), { target: { value: '#2' } })
-      fireEvent.keyDown(input(container), { key: 'Escape' })
-      expect(input(container).value).toBe('')
-      expect(docEsc).not.toHaveBeenCalled()
-    } finally {
-      document.removeEventListener('keydown', h)
-    }
-  })
-
-  // But an EMPTY search box lets Esc bubble, so it can still close a drawer.
-  it('lets Escape bubble when the search box is empty', () => {
-    const docEsc = vi.fn()
-    const h = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') docEsc()
-    }
-    document.addEventListener('keydown', h)
-    try {
-      const { container } = render(<ForceGraph nodes={nodes} edges={edges} />)
-      fireEvent.keyDown(input(container), { key: 'Escape' }) // empty query
-      expect(docEsc).toHaveBeenCalled()
-    } finally {
-      document.removeEventListener('keydown', h)
-    }
-  })
-
-  // The container widens the node set while a search is active (tether#29): the
-  // trimmed/lowercased query is reported up via onQueryChange so WorkGraphView can
-  // bypass the active/done filter and let search span the whole project.
-  it('reports the trimmed query to the parent via onQueryChange', () => {
-    const onQueryChange = vi.fn()
-    const { container } = render(
-      <ForceGraph nodes={nodes} edges={edges} onQueryChange={onQueryChange} />,
-    )
-    expect(onQueryChange).toHaveBeenLastCalledWith('') // mount: no active search
-    fireEvent.change(input(container), { target: { value: '  #2  ' } })
-    expect(onQueryChange).toHaveBeenLastCalledWith('#2') // trimmed + lowercased
-    fireEvent.keyDown(input(container), { key: 'Escape' })
-    expect(onQueryChange).toHaveBeenLastCalledWith('')
-  })
 })
 
 // Responsive sizing (tether#27): cards shrink to fit the container width so the
-// map stays readable in the narrow right Work tab, capped at the natural size.
+// map stays readable in a narrow pane, capped at the natural size.
 // (jsdom has no ResizeObserver, so the component falls back to cw=0 / natural
 // size — the sizing logic itself is unit-tested here on the pure function.)
 describe('computePositions responsive sizing (tether#27)', () => {
@@ -419,5 +420,31 @@ describe('computePositions responsive sizing (tether#27)', () => {
     const five = computePositions(ns, 1200)
     expect(two.cols.length).toBe(2)
     expect(two.box.w).toBeLessThan(five.box.w)
+  })
+
+  // tether#90 pins these three numbers because they are the whole argument for
+  // where the map lives: a pane narrower than this shows compact cards (no wi
+  // type, 22px tall) whatever else is true. They are consequences of the
+  // constants at the top of ForceGraph.tsx, so a change to PAD / COL_MARGIN /
+  // COMPACT_THRESHOLD that shifts the usable width shows up here rather than in
+  // someone's judgement about whether the map "looks cramped".
+  //
+  // Do NOT read these as "the middle column is wide enough". At the DEFAULT
+  // column widths (lib/layout.ts: left 240, right = 0.56 of the rest) the middle
+  // is 478px on a 1440px window and 408px on a 1280px window — both compact with
+  // five columns. Full-size cards need the user to have dragged the right
+  // divider in. tether#90's report says so explicitly.
+  it('pins the container width at which cards stop being compact, per column count', () => {
+    const cols = (n: number) => ns.slice(0, n)
+    const firstFull = (n: number) => {
+      for (let w = 300; w <= 900; w++) if (!computePositions(cols(n), w).compact) return w
+      return -1
+    }
+    expect(firstFull(5)).toBe(606)
+    expect(firstFull(4)).toBe(496)
+    expect(firstFull(3)).toBe(386)
+    // and one either side of the five-column boundary, stated directly
+    expect(computePositions(ns, 605).compact).toBe(true)
+    expect(computePositions(ns, 606).compact).toBe(false)
   })
 })

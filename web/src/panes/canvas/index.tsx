@@ -1,10 +1,16 @@
-// Canvas — middle-pane view.
+// Canvas — one of the middle column's main views, picked from the left activity
+// bar (tether#90). The other is Work.
 //
 // Reads the shared selection slice from the store (lib/store.ts) and renders a
 // workspace file's content when one is selected (from the left WorkspaceTree),
-// otherwise an empty-state hint. The Work relationship map moved OUT of the
-// middle into the right Work tab in tether#26 (owner found the middle map
-// cluttered) — the middle is now the file / main-work area only.
+// otherwise an empty-state hint. Canvas is the ONLY reader of
+// store.selectedFile, which is why App switches the middle column back to this
+// view whenever a file is picked — otherwise a tree click while Work was up
+// would set state nothing renders.
+//
+// The Work relationship map moved OUT of the middle into a right-pane tab in
+// tether#26 (the middle map read as cluttered) and came back to the middle as
+// its own activity-bar view in tether#90 — beside this one, not sharing it.
 //
 // Markdown file rendering (tether#21) stays: `.md` files render via the
 // lazy-loaded <Markdown> component (react-markdown + remark-gfm); non-markdown
@@ -39,9 +45,11 @@ function selectTab(detail: 'chat' | 'work') {
 
 // CanvasHome — the middle-pane empty state (tether#33). Replaces the old lone
 // faint hint with a centered, branded home: the tether mark, the current
-// workspace's name/path, and three quick-action entries. The Work relationship
-// map stays in the right tab (tether#26); this is a welcoming landing surface,
-// not a data dashboard.
+// workspace's name/path, and three quick-action entries. This is a welcoming
+// landing surface, not a data dashboard — "Pick a wi" hands off to the Work
+// view rather than showing the map here. That hand-off is the `selectTab('work')`
+// below: App routes the name to the middle column now, not to a right tab
+// (tether#90), so this file did not have to change with it.
 function CanvasHome() {
   const [ws, setWs] = useState<Workspace[]>([])
 

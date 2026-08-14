@@ -1,8 +1,13 @@
-// WorkPane — right-pane Work tab. Owns the project selector (writes the shared
-// store.workProject) and hosts the Work relationship map (WorkGraphView) that
-// moved here from the middle canvas in tether#26. Clicking a card selects a wi,
-// which slides a DetailDrawer (WorkDetail: detail + step DAG + action bar) up
-// from the bottom over the map; dismissing it clears the selection.
+// WorkPane — the Work main view. Owns the project selector (writes the shared
+// store.workProject) and hosts the Work relationship map (WorkGraphView).
+// Clicking a card selects a wi, which slides a DetailDrawer (WorkDetail: detail
+// + step DAG + action bar) up from the bottom over the map; dismissing it clears
+// the selection.
+//
+// It has moved twice: out of the middle canvas into a right-pane tab (tether#26,
+// the middle map read as cluttered), and back into the middle column behind the
+// left activity bar (tether#90, where it is a main-area surface rather than a
+// fourth tab). The right pane is Chat / Skills / Shell again.
 import { useEffect, useState } from 'react'
 import { useStore } from '../../lib/store'
 import { AihubError, fetchProjects } from '../../lib/aihub'
@@ -11,9 +16,12 @@ import WorkGraphView from './WorkGraphView'
 import DetailDrawer from './DetailDrawer'
 
 interface Props {
-  /** Whether the Work tab is the active right-pane tab. Gates the detail
-   *  drawer's global Esc-to-close so a drawer left mounted behind another tab
-   *  doesn't swallow Esc from Chat/Shell (tether#26 review F1). */
+  /** Whether Work is the main view currently on screen. Gates the detail
+   *  drawer's global Esc-to-close so a drawer left mounted behind another
+   *  surface doesn't swallow Esc from Chat/Shell (tether#26 review F1).
+   *  Still load-bearing after tether#90: App keeps this pane mounted behind
+   *  Canvas rather than tearing its state down, so the drawer really can be
+   *  alive and invisible. */
   active?: boolean
 }
 

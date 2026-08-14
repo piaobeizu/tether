@@ -1,6 +1,6 @@
 import { lazy, Suspense, useEffect, useRef, useState } from 'react'
 import { useStore } from './lib/store'
-import { Icon } from './lib/icons'
+import { Icon, type IconName } from './lib/icons'
 import { Settings, type SettingsTab } from './Settings'
 import { useAppVersion } from './lib/version'
 import { clampRightWidth, loadRightWidth, DEFAULT_LEFT } from './lib/layout'
@@ -14,21 +14,56 @@ import Canvas from './panes/canvas'
 // Shell tab is first opened so it stays out of the initial download.
 const ShellPane = lazy(() => import('./panes/shell'))
 
-type RightTab = 'work' | 'chat' | 'skill' | 'shell'
+// The right pane is a 3-tab surface. 'work' was appended to this type by f29d0a8
+// (2026-07-09), three days after the design freeze recorded the 3-tab rule and
+// without amending it; it went back to the middle column in tether#90. See
+// freeze rule 1 in the design-freeze doc under .claude/ before adding a fourth.
+type RightTab = 'chat' | 'skill' | 'shell'
+
+// What the MIDDLE column shows, chosen from the left activity bar (tether#90).
+type MainView = 'canvas' | 'work'
 
 const STORAGE_KEY_LEFT  = 'tether_col_left'
 const STORAGE_KEY_RIGHT = 'tether_col_right'
 const STORAGE_KEY_TAB   = 'tether_right_tab'
-const RIGHT_TABS: RightTab[] = ['work', 'chat', 'skill', 'shell']
+const STORAGE_KEY_VIEW  = 'tether_main_view'
+const RIGHT_TABS: RightTab[] = ['chat', 'skill', 'shell']
+const MAIN_VIEWS: MainView[] = ['canvas', 'work']
+
+const RIGHT_TAB_LABEL: Record<RightTab, string> = { chat: 'Chat', skill: 'Skills', shell: 'Shell' }
+
+// Activity-bar entries, in order. Icon-only with a hover tooltip; the label is
+// also the accessible name, and `crumb` is what the middle breadcrumb reads.
+// Two on day one — this is the list to extend, not the right-pane tab strip.
+const ACTIVITY_ITEMS: { view: MainView; label: string; crumb: string; icon: IconName }[] = [
+  { view: 'canvas', label: 'Canvas', crumb: 'workspace', icon: 'file' },
+  { view: 'work',   label: 'Work',   crumb: 'work',      icon: 'bolt' },
+]
+
+// Width of the activity bar, mirroring `.dt-activity` in index.css. Duplicated
+// because lib/layout.ts's clamps are arithmetic over the space the middle column
+// is left with, and that arithmetic cannot read a stylesheet. Change both.
+const ACTIVITY_W = 48
 
 // tether#45 — restore the last-active right tab across reloads. Previously
 // rightTab always initialized to 'work', so a hard-refresh dropped you off Chat
-// (half the reload-restore complaint). Guards a missing/garbage value back to
-// 'work' so a corrupted localStorage can't break the initial render. Exported
-// so it unit-tests without mounting App (which opens a WebTransport connection).
+// (half the reload-restore complaint). Exported so it unit-tests without
+// mounting App (which opens a WebTransport connection).
+//
+// tether#90 — this is also the migration for browsers that stored 'work' before
+// Work left the right pane. What makes a stale value safe is the membership test
+// against RIGHT_TABS *plus* a fallback that is itself a member: 'work' now fails
+// membership and lands on Chat, exactly like a corrupted value. It is not that
+// anything rewrites the stored key — nothing does, until the next selectTab.
 export function loadRightTab(): RightTab {
   const saved = localStorage.getItem(STORAGE_KEY_TAB)
-  return saved != null && (RIGHT_TABS as string[]).includes(saved) ? (saved as RightTab) : 'work'
+  return saved != null && (RIGHT_TABS as string[]).includes(saved) ? (saved as RightTab) : 'chat'
+}
+
+/** Restore the last-active middle-column view; same guard shape as loadRightTab. */
+export function loadMainView(): MainView {
+  const saved = localStorage.getItem(STORAGE_KEY_VIEW)
+  return saved != null && (MAIN_VIEWS as string[]).includes(saved) ? (saved as MainView) : 'canvas'
 }
 
 const MIN_LEFT  = 160
@@ -71,13 +106,14 @@ function ColResizer({ onDelta }: { onDelta: (dx: number) => void }) {
 
 export default function App() {
   const [rightTab, setRightTab] = useState<RightTab>(loadRightTab)
+  const [mainView, setMainView] = useState<MainView>(loadMainView)
   // Keep panes mounted after first visit so switching tabs doesn't tear down the
   // PTY (Shell) or refetch (Skills). Chat is always mounted. tether#45: seed the
   // restored tab as already-visited so a reload onto Skills/Shell renders it
   // (those panes are gated behind visitedTabs) instead of a blank body.
   const [visitedTabs, setVisitedTabs] = useState<Record<RightTab, boolean>>(() => {
     const t = loadRightTab()
-    return { work: true, chat: true, skill: t === 'skill', shell: t === 'shell' }
+    return { chat: true, skill: t === 'skill', shell: t === 'shell' }
   })
   const selectTab = (t: RightTab) => {
     setRightTab(t)
@@ -88,14 +124,42 @@ export default function App() {
     // it is flex — fires that observer directly. The synthetic window resize
     // this replaced only ever covered the tab-switch path, never a divider drag.
   }
+  // Same keep-alive rule as the right pane, and for the same reason: WorkPane is
+  // NOT cheap to remount. WorkGraphView holds the status filter, the wi-type
+  // filter, the search query and the fetched graph in local state, and ForceGraph
+  // holds the pan/zoom viewBox; unmounting drops all of it and costs a projects
+  // fetch plus a graph fetch on the way back. Canvas is always mounted (it is the
+  // default), Work once it has been visited.
+  const [visitedViews, setVisitedViews] = useState<Record<MainView, boolean>>(() => {
+    const v = loadMainView()
+    return { canvas: true, work: v === 'work' }
+  })
+  const selectView = (v: MainView) => {
+    setMainView(v)
+    localStorage.setItem(STORAGE_KEY_VIEW, v)
+    setVisitedViews(s => (s[v] ? s : { ...s, [v]: true }))
+  }
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null)
   const [leftW,  setLeftW]  = useState(() => loadWidth(STORAGE_KEY_LEFT, DEFAULT_LEFT))
   // tether#69 — clamped against the window being restored into, not just against
   // constants: a width persisted on a wide monitor would otherwise crush the
   // middle pane every time the app loads on a narrower one.
+  //
+  // tether#90 — the third argument is `leftW + ACTIVITY_W`, not `leftW`. Both of
+  // layout.ts's rules are arithmetic on what is left for the middle column
+  // (`room = window - leftWidth - MIN_MID`, and the default share is taken of
+  // `window - leftWidth`), so the value that argument has to carry is ALL the
+  // chrome to the left of the middle — which is now the bar plus the tree, not
+  // the tree alone. Passing leftW would leave the MIN_MID floor 48px too loose:
+  // on a 1000px window with a 240px tree it would permit a 440px right pane and
+  // a 270px middle, against a floor of 320.
   const [rightW, setRightW] = useState(() =>
-    loadRightWidth(localStorage.getItem(STORAGE_KEY_RIGHT), window.innerWidth, loadWidth(STORAGE_KEY_LEFT, DEFAULT_LEFT)),
+    loadRightWidth(
+      localStorage.getItem(STORAGE_KEY_RIGHT),
+      window.innerWidth,
+      loadWidth(STORAGE_KEY_LEFT, DEFAULT_LEFT) + ACTIVITY_W,
+    ),
   )
   // Local-only UI dismissals; reset whenever the underlying connection state
   // changes so a fresh failure/reconnect re-surfaces the affordance.
@@ -106,6 +170,8 @@ export default function App() {
   // an exhausted reconnect ladder, which is the wrong story when the daemon
   // named a cause. See showBanner / showCatchupFailed.
   const { connection, sessionId, fatal } = useStore()
+  // Read here for one reason: to bring the file view back when a file is picked.
+  const selectedFile = useStore(s => s.selectedFile)
   const appVersion = useAppVersion()
 
   useEffect(() => {
@@ -113,14 +179,38 @@ export default function App() {
     setModalDismissed(false)
   }, [connection.state])
 
-  // T12 click-to-work (tether#20): WorkPane asks the shell to bring Chat to
-  // front before injecting/switching a session — selectTab itself only
-  // depends on stable setState functions, so it's safe to omit from deps.
+  // Picking a file in the left tree shows that file. Canvas is the only reader of
+  // store.selectedFile (panes/canvas/index.tsx), so once the middle column could
+  // show something else, a tree click while Work was up set state that nothing
+  // rendered — a dead click on the primary desktop path. The tree writes a fresh
+  // object per click (store.select spreads a patch), so re-picking the file you
+  // are already on still brings you back. Selecting a WI does NOT come through
+  // here: store.select only touches the fields present in its argument, and the
+  // Work map passes `{ wiId }` alone.
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- selectView only closes over setState + localStorage
+  useEffect(() => {
+    if (selectedFile) selectView('canvas')
+  }, [selectedFile])
+
+  // T12 click-to-work (tether#20): WorkDetail asks the shell to bring Chat to
+  // front before injecting/switching a session — selectTab/selectView only
+  // depend on stable setState functions, so they're safe to omit from deps.
+  //
+  // tether#90 — this listener is now a ROUTER over surface names, not a setter
+  // for the right tab. 'work' names a surface that moved to the middle column,
+  // and panes/canvas still dispatches it from its "Pick a wi" home action; that
+  // file is outside this change, so the name is honoured here instead of being
+  // left to select a tab that no longer exists. Unknown names are ignored rather
+  // than trusted into a cast.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
-    const onSelectTab = (e: Event) => selectTab((e as CustomEvent<RightTab>).detail)
-    window.addEventListener('tether:select-tab', onSelectTab)
-    return () => window.removeEventListener('tether:select-tab', onSelectTab)
+    const onSelectSurface = (e: Event) => {
+      const name = (e as CustomEvent<string>).detail
+      if (name === 'work') { selectView('work'); return }
+      if ((RIGHT_TABS as string[]).includes(name)) selectTab(name as RightTab)
+    }
+    window.addEventListener('tether:select-tab', onSelectSurface)
+    return () => window.removeEventListener('tether:select-tab', onSelectSurface)
   }, [])
 
   const connPillClass =
@@ -191,7 +281,8 @@ export default function App() {
   }
   const resizeRight = (dx: number) => {
     setRightW(w => {
-      const next = clampRightWidth(w - dx, window.innerWidth, leftW)
+      // leftW + ACTIVITY_W — see the rightW initializer for why.
+      const next = clampRightWidth(w - dx, window.innerWidth, leftW + ACTIVITY_W)
       localStorage.setItem(STORAGE_KEY_RIGHT, String(next))
       return next
     })
@@ -250,22 +341,41 @@ export default function App() {
       )}
 
       {/* ── Main columns (flex, resizable) ────────────────────── */}
-      <div className="dt-grid" style={{ gridRow: 3 }}>
+      <div className={`dt-grid mv-${mainView}`} style={{ gridRow: 3 }}>
 
-        {/* Left: Workspace tree */}
+        {/* Far left: activity bar — picks what the MIDDLE column shows (tether#90).
+            Fixed 48px, so no ColResizer beside it. */}
+        <nav className="dt-activity" aria-label="Main views">
+          {ACTIVITY_ITEMS.map(item => (
+            <button
+              key={item.view}
+              className={`dt-activity-btn${mainView === item.view ? ' on' : ''}`}
+              title={item.label}
+              aria-label={item.label}
+              aria-current={mainView === item.view ? 'page' : undefined}
+              onClick={() => selectView(item.view)}
+            >
+              <Icon name={item.icon} size={18} />
+            </button>
+          ))}
+        </nav>
+
+        {/* Left: Workspace tree — unchanged by tether#90, including its background */}
         <aside className="dt-left" style={{ width: leftW }}>
           <WorkspacePane />
         </aside>
 
         <ColResizer onDelta={resizeLeft} />
 
-        {/* Middle: Workspace artifact display */}
+        {/* Middle: whichever main view the activity bar selected */}
         <main className="dt-mid">
           <div className="dt-mid-head">
             <div className="dt-breadcrumb">
               <span className="mono crumb-faint">tether</span>
               <span className="mono crumb-sep">/</span>
-              <span className="mono crumb">workspace</span>
+              <span className="mono crumb">
+                {ACTIVITY_ITEMS.find(i => i.view === mainView)?.crumb ?? mainView}
+              </span>
               {sessionId && (
                 <span className="pill" style={{ marginLeft: 10 }}>
                   <span className="dot live" />
@@ -274,8 +384,29 @@ export default function App() {
               )}
             </div>
           </div>
-          <div className="dt-mid-body scroll-thin">
-            <Canvas />
+          {/* Both views occupy the same grid cell (.dt-mid-stack) and the
+              inactive one is display:none, so switching keeps each view's state
+              instead of tearing it down. */}
+          <div className="dt-mid-stack">
+            <div
+              className="dt-mid-body scroll-thin"
+              style={{ display: mainView === 'canvas' ? 'block' : 'none' }}
+            >
+              <Canvas />
+            </div>
+            {visitedViews.work && (
+              // Deliberately NOT .dt-mid-body: that class pads 16px a side, and
+              // the Work map sizes its cards from the measured container width.
+              // `active` gates DetailDrawer's document-level Esc — load-bearing
+              // again now that WorkPane stays mounted behind Canvas, which is the
+              // exact hazard tether#26 F1 added the prop for.
+              <div
+                className="dt-mid-work"
+                style={{ display: mainView === 'work' ? 'flex' : 'none' }}
+              >
+                <WorkPane active={mainView === 'work'} />
+              </div>
+            )}
           </div>
         </main>
 
@@ -284,13 +415,15 @@ export default function App() {
         {/* Right: Chat / Skills / Shell tabs */}
         <section className="dt-right" style={{ width: rightW }}>
           <div className="dt-right-tabs">
-            {(['work', 'chat', 'skill', 'shell'] as RightTab[]).map(t => (
+            {/* RIGHT_TABS, not a second literal list: the two used to be written
+                out separately and agreed only by hand. */}
+            {RIGHT_TABS.map(t => (
               <button
                 key={t}
                 className={`dt-right-tab${rightTab === t ? ' on' : ''}`}
                 onClick={() => selectTab(t)}
               >
-                {t === 'work' ? 'Work' : t === 'chat' ? 'Chat' : t === 'skill' ? 'Skills' : 'Shell'}
+                {RIGHT_TAB_LABEL[t]}
               </button>
             ))}
           </div>
@@ -308,11 +441,6 @@ export default function App() {
                 <Suspense fallback={<div className="pane-body mono" style={{ color: 'var(--ink-quat)', fontSize: 12 }}>loading shell…</div>}>
                   <ShellPane />
                 </Suspense>
-              </div>
-            )}
-            {visitedTabs.work && (
-              <div style={{ display: rightTab === 'work' ? 'flex' : 'none', flexDirection: 'column', flex: '1 1 0', minHeight: 0 }}>
-                <WorkPane active={rightTab === 'work'} />
               </div>
             )}
           </div>

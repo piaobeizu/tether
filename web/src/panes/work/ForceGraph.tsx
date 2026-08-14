@@ -9,13 +9,22 @@
 // done. Within a column, cards sort by priority (urgent first) then seq (newest
 // first) and stack top-to-bottom under the column header.
 //
-// RESPONSIVE (tether#27): the map lives in the narrow right Work tab (tether#26),
-// so column/card sizes are computed from the measured container WIDTH — present
-// columns pack left-to-right and shrink to fit, capped at the natural size, and
-// below a threshold cards drop to a compact form (slug + status bar only). The
-// initial viewBox is a width-fit window (scale ≈ 1, readable) with vertical PAN
-// for tall columns — NOT a shrink-everything-to-fit meet, which is what made the
-// map illegible in the narrow pane.
+// RESPONSIVE (tether#27): column/card sizes are computed from the measured
+// container WIDTH — present columns pack left-to-right and shrink to fit, capped
+// at the natural size, and below a threshold cards drop to a compact form (slug +
+// status bar only). The initial viewBox is a width-fit window (scale ≈ 1,
+// readable) with vertical PAN for tall columns — NOT a shrink-everything-to-fit
+// meet, which is what made the map illegible in a narrow pane.
+//
+// The map moved from the right Work tab into the MIDDLE column in tether#90, so
+// the width it gets is whatever is left between the workspace tree and the right
+// pane. Cards stop being compact at a container width of 606px with all five
+// status columns present, 496px with four, 386px with three (ForceGraph.test.tsx
+// pins those three numbers against this file's constants).
+//
+// SEARCH is controlled from WorkGraphView as of tether#90 — see the `query` /
+// `activeIndex` / `onMatchesChange` props. This file still owns the match
+// ORDERING, because that ordering is "reading order" and only the layout knows it.
 //
 // Positions are memoized on a CONTENT key (sorted ids + status column +
 // priority/seq order + structural edges + container-width bucket), NOT array
@@ -49,10 +58,36 @@ export interface ForceGraphProps {
   edges: FGEdge[]
   selectedId?: string
   onSelect?: (id: string) => void
-  /** Reports the trimmed/lowercased search query as it changes, so the container
-   *  can widen the node set while a search is active — search spans the whole
-   *  project, not just the filtered view (tether#29). '' means no active search. */
-  onQueryChange?: (q: string) => void
+  /** Raw search term. Normalized (trim + lowercase) HERE, not by the caller —
+   *  see the note beside `const q` for why the derivation is duplicated rather
+   *  than passed in. '' / whitespace-only means no active search. The input
+   *  itself lives in WorkGraphView's filter row as of tether#90; this component
+   *  only highlights, dims and centers. */
+  query?: string
+  /** Which match is active. Clamped here against the current match count, so the
+   *  caller can advance it freely (mod arithmetic on the reported total) without
+   *  tracking the match set itself. */
+  activeIndex?: number
+  /** Reports the match set to the caller after every change.
+   *
+   *  `index` is the CLAMPED position actually being highlighted, not the caller's
+   *  raw `activeIndex`, and `id` is the card at that position — one clamp, one
+   *  report, so the two can never name different cards and the clamping rule is
+   *  not restated in two files. Note what that does NOT say: this is an effect,
+   *  so the caller's copy is one commit behind this component's render. Both
+   *  values trail together; they do not disagree with each other.
+   *
+   *  The ordering that gives `index` its meaning belongs here: matches are sorted
+   *  by laid-out position (reading order), and the layout lives in this file. */
+  onMatchesChange?: (m: { total: number; index: number; id: string | undefined }) => void
+  /** Asks the caller to reset its activeIndex to 0 because the match SET changed.
+   *  Kept here rather than in the caller because the reset trigger is the ordered
+   *  match list, which only this file computes.
+   *
+   *  Fires once on mount as well (with an empty match set), where it is a no-op.
+   *  The caller resets synchronously on its own query edits, so in practice this
+   *  covers the set changing UNDER a stable query — a poll, a project switch. */
+  onActiveIndexReset?: () => void
 }
 
 const MAX_CARD_W = 132 // natural card width (cap in a wide pane)
@@ -248,16 +283,20 @@ function edgePath(s: Pt, t: Pt, cardW: number): string {
   return `M ${sx} ${s.y} Q ${cx} ${cy} ${tx} ${t.y}`
 }
 
-export default function ForceGraph({ nodes, edges, selectedId, onSelect, onQueryChange }: ForceGraphProps) {
+export default function ForceGraph({
+  nodes,
+  edges,
+  selectedId,
+  onSelect,
+  query = '',
+  activeIndex = 0,
+  onMatchesChange,
+  onActiveIndexReset,
+}: ForceGraphProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   // Measured container size (bucketed). {0,0} until the ResizeObserver fires
   // (or forever under jsdom, which has no ResizeObserver) → natural-size fallback.
   const [size, setSize] = useState<{ cw: number; ch: number }>({ cw: 0, ch: 0 })
-  // Search (tether#29): find a wi in a large map. `query` filters nothing out —
-  // it highlights matches and dims the rest; `activeIndex` picks the match the
-  // viewport centers on.
-  const [query, setQuery] = useState('')
-  const [activeIndex, setActiveIndex] = useState(0)
 
   useEffect(() => {
     const el = containerRef.current
@@ -310,6 +349,17 @@ export default function ForceGraph({ nodes, edges, selectedId, onSelect, onQuery
   // deliberately NOT part of structureKey/layoutKey — searching never re-fits the
   // viewport (keeps the #24/#27 pan/zoom stability); centering is a separate
   // effect keyed on the active id only, so an 8s poll can't jitter the view.
+  //
+  // tether#90: `query` is now a PROP (the input lives in WorkGraphView's filter
+  // row), but the normalization stays here and is deliberately duplicated rather
+  // than passed in pre-normalized. WorkGraphView derives its own "is a search
+  // active" flag from the SAME raw string — `query.trim() !== ''`, which is equal
+  // to `q !== ''` for every input because lowercasing cannot empty a non-empty
+  // string. That equality is the property that has to hold: if the parent thought
+  // "not searching" while this dimmed the map, the parent would keep filtering wi
+  // out from under an active search, which is the tether#29 bug. Two derivations
+  // from one piece of state stay equal on their own; a normalize-once-and-pass
+  // contract only holds while every caller honours it.
   const q = query.trim().toLowerCase()
   const matches = useMemo(() => {
     if (!q) return [] as string[]
@@ -325,17 +375,39 @@ export default function ForceGraph({ nodes, edges, selectedId, onSelect, onQuery
   }, [q, nodes, layout])
   const matchSet = useMemo(() => new Set(matches), [matches])
 
-  // Reset the active match to the top whenever the match SET changes (mirrors the
-  // structureKey/resetKey in-render reset below). A poll returning the same ids in
-  // the same order keeps matchesKey stable → activeIndex is preserved.
+  // Reset the active match to the top whenever the match SET changes. A poll
+  // returning the same ids in the same order keeps matchesKey stable → the
+  // active match is preserved (asserted in ForceGraph.test.tsx).
+  //
+  // tether#90: activeIndex is the caller's state now, so the reset is REPORTED
+  // instead of applied — in an effect, not during render, because a child may not
+  // set a parent's state while rendering. That is a real weakening, and worth
+  // being exact about: the old in-render reset produced a render React DISCARDED,
+  // so nothing was ever committed with a stale index. An effect commits first and
+  // corrects after. The clamp below keeps the RING in range meanwhile, but the
+  // frame is still committed, and the centering effect will have panned to the
+  // clamped card before panning again to the reset one.
+  //
+  // The caller closes the gap where it can: WorkGraphView resets in the same
+  // update that changes the query, so the common path (typing) never renders a
+  // stale index at all. What is left is the set changing under a stable query —
+  // a poll or a project switch — where one corrected frame is the cost.
   const matchesKey = matches.join('|')
-  const [matchReset, setMatchReset] = useState(matchesKey)
-  if (matchReset !== matchesKey) {
-    setMatchReset(matchesKey)
-    setActiveIndex(0)
-  }
+  useEffect(() => {
+    onActiveIndexReset?.()
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- fires on match-SET change only; the callback identity must not retrigger it
+  }, [matchesKey])
+
   const activeIdx = matches.length ? Math.min(activeIndex, matches.length - 1) : -1
   const activeId = activeIdx >= 0 ? matches[activeIdx] : undefined
+
+  // Report the match set up so the filter row can render its "2/7" counter and
+  // open the active match on ↵. Keyed on the three reported values, so a poll
+  // that changes nothing reports nothing.
+  useEffect(() => {
+    onMatchesChange?.({ total: matches.length, index: activeIdx, id: activeId })
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- report on value change, not on callback identity
+  }, [matches.length, activeIdx, activeId])
 
   // Initial viewport = a width-fit window: viewBox width = box width so meet-fit
   // renders at ~1:1 (readable); its height matches the container aspect so tall
@@ -369,13 +441,10 @@ export default function ForceGraph({ nodes, edges, selectedId, onSelect, onQuery
     // eslint-disable-next-line react-hooks/exhaustive-deps -- center on active-id / structure change only; layout+zoom read fresh
   }, [activeId, structureKey])
 
-  // Report the active query up so the container can widen the node set: an active
-  // search spans the WHOLE project, not just the filtered view (tether#29 live-
-  // verify — the default 'active' filter otherwise hides most wi, so a search for
-  // any wrapped wi found nothing). '' = no active search → filter applies normally.
-  useEffect(() => {
-    onQueryChange?.(q)
-  }, [q, onQueryChange])
+  // (tether#29's onQueryChange report is gone as of tether#90: the query is no
+  // longer born here, so there is nothing to report back. WorkGraphView holds the
+  // single copy and derives BOTH its own "search spans the whole project" widening
+  // and the `query` prop from it — the old mirror is deleted, not relocated.)
 
   const svgRef = useRef<SVGSVGElement>(null)
   const drag = useRef<{ startX: number; startY: number; lastX: number; lastY: number } | null>(null)
@@ -447,45 +516,11 @@ export default function ForceGraph({ nodes, edges, selectedId, onSelect, onQuery
 
   return (
     <div className="fg-scroll" ref={containerRef}>
-      <div className="fg-search">
-        <input
-          className="fg-search-input"
-          type="text"
-          value={query}
-          placeholder="find wi…"
-          aria-label="search work items"
-          spellCheck={false}
-          onChange={(e) => setQuery(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'ArrowDown') {
-              e.preventDefault()
-              setActiveIndex(matches.length ? (activeIdx + 1) % matches.length : 0)
-            } else if (e.key === 'ArrowUp') {
-              e.preventDefault()
-              setActiveIndex(matches.length ? (activeIdx - 1 + matches.length) % matches.length : 0)
-            } else if (e.key === 'Enter') {
-              e.preventDefault()
-              if (activeId) onSelect?.(activeId)
-            } else if (e.key === 'Escape') {
-              // clear the search on Esc, but only CONSUME the event when there is
-              // a query to clear — an empty box lets Esc bubble so it can still
-              // close an open detail drawer (#26 DetailDrawer's document-level Esc
-              // listener); without stopPropagation, clearing a search would also
-              // slam the drawer shut in one press.
-              if (query) {
-                e.preventDefault()
-                e.stopPropagation()
-                setQuery('')
-              }
-            }
-          }}
-        />
-        {q !== '' && (
-          <span className="fg-search-count">
-            {matches.length ? `${activeIdx + 1}/${matches.length}` : '0'}
-          </span>
-        )}
-      </div>
+      {/* The search box used to float here as an absolutely-positioned overlay
+          (tether#29). It sat at top:8/left:8 unconditionally and covered the two
+          leftmost status columns whatever the pane width, so it moved into
+          WorkGraphView's filter row in tether#90. Nothing renders over the map
+          any more — keep it that way. */}
       <svg
         ref={svgRef}
         className="fg-svg"

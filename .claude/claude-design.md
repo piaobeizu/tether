@@ -13,11 +13,30 @@ handoff: tether-handoff.zip (2026-07-06) — 6-screen design (desktop main, mobi
   `<style id="tokens">` is authoritative and already matches index.css verbatim.
 
 freeze_rules:   # shipped v2 decisions the design must respect unless explicitly revisited
-  - Right pane is a 3-tab surface (Chat / Skills / Shell). The design's dedicated middle
-    "SkillStage" column is NOT adopted. [CONFIRMED 2026-07-06 by owner xiaokang.w — Shell
-    (PTY) is a v2 first-class surface the design never accounted for; a 3-col layout needs
-    ≥1200px and a large rebuild. Instead pull the design's SkillStage DAG/skill-progress
-    *visuals* into the existing Skills tab — but see backend-gated note in scope_notes.]
+  - The shell is: a 48px vertical ACTIVITY BAR on the far left, then the workspace tree,
+    then the MIDDLE column, then a 3-TAB right pane (Chat / Skills / Shell). The activity
+    bar chooses what the middle column shows — Canvas and Work on day one — and it is the
+    list to extend when a new main-area surface arrives. The right pane's tab strip is NOT.
+    The design's dedicated middle "SkillStage" column is still NOT adopted.
+    [CONFIRMED 2026-07-06 by owner xiaokang.w — Shell (PTY) is a v2 first-class surface the
+    design never accounted for; a 3-col layout needs ≥1200px and a large rebuild. Instead
+    pull the design's SkillStage DAG/skill-progress *visuals* into the existing Skills tab —
+    but see backend-gated note in scope_notes.]
+    [AMENDED 2026-08-14 by owner xiaokang.w (tether#90) — the activity bar is the added
+    half; the 3-tab right pane is the RESTORED half. History, because this entry exists to
+    record it and getting it wrong twice is how the drift happened: the 3-tab rule was
+    confirmed 2026-07-06; `f29d0a8` (PR #101, workbench MVP) appended 'work' to RightTab on
+    2026-07-09, THREE DAYS later, without amending this rule; `096dfa5` (tether#20,
+    2026-07-11) only reordered it. It then ran as a 4th tab for five weeks. So: a surface
+    that belongs to the middle column goes in ACTIVITY_ITEMS in web/src/App.tsx, never in
+    RIGHT_TABS — and whichever way a surface moves, it is amended HERE in the same change.
+    Visuals: bar on --bg-tint (tree stays --bg-sunken, middle --bg-app), separator --line,
+    selection = 2px --accent rail + --accent icon, no background fill. In the dark theme
+    that three-tone ladder inverts (--bg-tint is lighter than --bg-sunken); known and
+    accepted, not yet seen on a real screen. No new tokens — see rule 4.
+    One deviation, recorded rather than left to be rediscovered: at ≤768px there is room
+    for one column, so selecting Work DOES hide Chat there. The "Chat never disappears"
+    half of this rule is a desktop guarantee.]
   - Settings ships as a right-slide overlay panel, not the design's full-page 240px+1fr nav.
     [CONFIRMED 2026-07-06 — keep the overlay; add an internal mini sub-page nav. The overlay
     + internal tab nav already exists in web/src/Settings.tsx (connection/appearance/about);

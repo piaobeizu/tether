@@ -2,8 +2,14 @@ import { useStore, historyEntryToMessage, type HistoryEntry } from './store'
 
 /**
  * openSession — THE operation for "the user deliberately opened a different
- * session" (tether#61). Both call sites import it: the WorkspacePane session
- * list and WorkDetail's click-to-work "resume".
+ * session" (tether#61). Every call site imports it: WorkDetail's click-to-work
+ * "resume", and lib/SessionRow, which is the one row rendered by both the chat
+ * pane's session list and the wi detail's list of that wi's sessions.
+ *
+ * (Before tether#91 the list lived at the bottom of the WorkspacePane file tree,
+ * which is what the previous version of this sentence named. Keeping the pointer
+ * accurate matters more here than usual, because this comment is the record of
+ * WHY there is only one of these.)
  *
  * WHY it exists. Those call sites used to each implement the switch inline, and
  * they had drifted apart in ways that are invisible at a glance:

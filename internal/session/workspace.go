@@ -29,11 +29,7 @@ package session
 // being able to relocate a live conversation.
 
 import (
-	"encoding/json"
-	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
 
 	"github.com/piaobeizu/tether/internal/wire"
 )
@@ -93,29 +89,25 @@ func NewBindingStore(baseDir string) *BindingStore {
 	return &BindingStore{baseDir: baseDir}
 }
 
+// workspaceBindingFile is the sidecar name, and bindingLabel is how this store
+// names itself in the shared helpers' log lines and errors.
+const (
+	workspaceBindingFile  = "workspace.json"
+	workspaceBindingLabel = "workspace binding"
+)
+
 // Load returns the binding recorded for sid, and whether there was one. A
 // missing file is the common case (any session created before tether#52, and
 // every session that never selected a workspace), so it is not logged.
+//
+// The sid guard, the missing-file case and the corrupt-file case are
+// readSessionJSON's (sessionfile.go) — shared with wi.json since tether#91, for
+// the reason ValidSessionID gives about the sid check it replaced: a rule that
+// exists twice is a rule one of whose copies is wrong. What stays HERE is the
+// part that is about workspaces specifically, below.
 func (s *BindingStore) Load(sid string) (WorkspaceBinding, bool) {
-	// The sid on the reconnect path comes from the client, and this joins it into a
-	// filesystem path. Without the guard a `..`-shaped id would read a
-	// workspace.json from somewhere unintended and that file's `path` would become
-	// an agent's cwd — the caller-supplied-path hole this whole file exists to
-	// close, reintroduced through the store. See ValidSessionID (history.go) for
-	// why it is one shared allowlist rather than a local `..` check.
-	if !ValidSessionID(sid) {
-		return WorkspaceBinding{}, false
-	}
-	data, err := os.ReadFile(s.path(sid))
-	if err != nil {
-		if !os.IsNotExist(err) {
-			slog.Warn("workspace binding: read failed", "sid", sid, "err", err)
-		}
-		return WorkspaceBinding{}, false
-	}
-	var b WorkspaceBinding
-	if err := json.Unmarshal(data, &b); err != nil {
-		slog.Warn("workspace binding: corrupt file, ignoring", "sid", sid, "err", err)
+	b, ok := readSessionJSON[WorkspaceBinding](s.baseDir, sid, workspaceBindingFile, workspaceBindingLabel)
+	if !ok {
 		return WorkspaceBinding{}, false
 	}
 	if b.Path == "" {
@@ -128,60 +120,25 @@ func (s *BindingStore) Load(sid string) (WorkspaceBinding, bool) {
 
 // Save records b as sid's workspace, overwriting any previous record.
 //
-// Written whole via a UNIQUELY-NAMED temp file + rename, so no reader ever sees a
-// partial binding and two concurrent writers cannot interleave into a mixed one.
-// A fixed `<path>.tmp` would allow exactly that (two Saves can land on one sid: the
-// same-sid spawn race was narrowed by tether#60's reservation and closed by
-// tether#78's post-claim consult — an adopting caller returns before saveBinding — so
-// what remains is rekey, which re-records a binding without holding a reservation; see
-// Registry.spawnEntry), and a torn read here would not cost a transcript
-// line — it would put an agent in the wrong directory. Sync before rename so the
-// same holds across a crash rather than only across a concurrent read.
+// The atomicity is writeSessionJSON's (sessionfile.go): a uniquely-named temp
+// file, synced, then renamed, so no reader sees a partial binding and two
+// concurrent writers cannot interleave into a mixed one. Two Saves genuinely can
+// land on one sid — the same-sid spawn race was narrowed by tether#60's
+// reservation and closed by tether#78's post-claim consult (an adopting caller
+// returns before saveBinding), so what remains is rekey, which re-records a
+// binding without holding a reservation; see Registry.spawnEntry. A torn read
+// here would not cost a transcript line, it would put an agent in the wrong
+// directory.
 func (s *BindingStore) Save(sid string, b WorkspaceBinding) error {
-	if !ValidSessionID(sid) {
-		return fmt.Errorf("workspace binding: refusing to write under sid %q", sid)
-	}
-	path := s.path(sid)
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("workspace binding: mkdir: %w", err)
-	}
-	data, err := json.Marshal(b)
-	if err != nil {
-		return fmt.Errorf("workspace binding: marshal: %w", err)
-	}
-	f, err := os.CreateTemp(dir, "workspace-*.json.tmp")
-	if err != nil {
-		return fmt.Errorf("workspace binding: create temp: %w", err)
-	}
-	tmp := f.Name()
-	// Remove the temp file on every failure path. A no-op once Rename succeeded,
-	// because the name no longer exists.
-	defer func() { _ = os.Remove(tmp) }()
-	if err := f.Chmod(0o600); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("workspace binding: chmod temp: %w", err)
-	}
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("workspace binding: write: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("workspace binding: sync: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("workspace binding: close temp: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return fmt.Errorf("workspace binding: rename: %w", err)
-	}
-	return nil
+	return writeSessionJSON(s.baseDir, sid, workspaceBindingFile, workspaceBindingLabel, b)
 }
 
-func (s *BindingStore) path(sid string) string {
-	return filepath.Join(s.baseDir, sid, "workspace.json")
-}
+// (There is no BindingStore.path. There was one until tether#91 moved the file
+// handling into sessionfile.go, at which point it became a second, UNGUARDED way
+// to turn a client-supplied sid into a path — with no callers, sitting next to a
+// comment promising that no such thing existed. Deleted rather than left dead:
+// the next person to need a path has to go through readSessionJSON /
+// writeSessionJSON, which is the whole point of that file.)
 
 // workspaceDecision is the outcome of resolving one chat connection's requested
 // workspace against the session it brought.

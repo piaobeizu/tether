@@ -510,6 +510,26 @@ body {
   display: flex; flex-direction: column; gap: 20px; min-height: 0;
 }
 
+/* ── Session list (tether#91) ─────────────────────────────────
+   The list moved here from the bottom of the file tree, so it reuses that
+   column's vocabulary — .section-label, .tree-row, .ws-dot, .tree-label — and
+   adds only what is about sitting above a transcript instead of below a tree:
+   four rules for the chat pane's section, plus one for the shared row. No new
+   tokens (design freeze rule 4). */
+.chat-sessions { flex-shrink: 0; border-bottom: 1px solid var(--line-soft); }
+.chat-sessions-head {
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px 14px; cursor: pointer; user-select: none;
+}
+.chat-sessions-count { font-size: 10.5px; color: var(--ink-quat); margin-left: auto; }
+/* Capped so the list can never crowd out the transcript, whatever the session
+   count. The chat pane is a flex column and this is the shrink-proof member. */
+.chat-sessions-list { max-height: 200px; overflow: auto; padding-bottom: 4px; }
+/* Belongs to lib/SessionRow, which both the chat list and the wi detail render —
+   hence the neutral prefix. It was `.chat-sessions-when` for one draft, while
+   already being used outside the chat pane. */
+.session-row-when { font-size: 10px; color: var(--ink-quat); margin-left: auto; flex-shrink: 0; }
+
 /* ── Chat messages ──────────────────────────────────────────── */
 .msg-user { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
 .msg-user-bubble {

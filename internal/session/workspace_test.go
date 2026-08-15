@@ -837,10 +837,14 @@ func TestValidSessionID(t *testing.T) {
 
 // TestListSessions_IgnoresABindingWithoutATranscript — BindingStore shares
 // HistoryStore's directory and creates <baseDir>/<sid>/ at SPAWN time to record the
-// workspace, i.e. before any message exists. GET /api/v1/sessions is backed by
-// ListSessions, so enumerating directories would list every session that ever
-// connected and closed without saying anything — each rendering in the workspace
-// pane as a clickable entry with an empty transcript.
+// workspace, i.e. before any message exists. So enumerating directories would list
+// every session that ever connected and closed without saying anything — each
+// rendering as a clickable entry with an empty transcript.
+//
+// Kept, and repointed, when tether#91 replaced HistoryStore.ListSessions with
+// SessionIndex.List: the rule this pins belongs to the ANSWER, not to whichever
+// function is currently giving it, and a rule whose only test was deleted along
+// with its old implementation is a rule that comes back as a bug.
 func TestListSessions_IgnoresABindingWithoutATranscript(t *testing.T) {
 	dir := t.TempDir()
 	h := NewHistoryStore(dir)
@@ -857,9 +861,9 @@ func TestListSessions_IgnoresABindingWithoutATranscript(t *testing.T) {
 	}
 	h.RecordUser(spoke, "hello")
 
-	got := h.ListSessions()
+	got := sids((&SessionIndex{History: h, Bindings: b}).List())
 	if len(got) != 1 || got[0] != spoke {
-		t.Errorf("ListSessions = %v, want exactly [%s] — a binding is not a conversation", got, spoke)
+		t.Errorf("List = %v, want exactly [%s] — a binding is not a conversation", got, spoke)
 	}
 }
 

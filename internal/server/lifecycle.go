@@ -70,6 +70,21 @@ type Config struct {
 	// v0.4: per-task MCP lifecycle manager.
 	// If nil, Run() initialises one and stores it here.
 	MCPLifecycle *mcplifecycle.LifecycleManager
+
+	// WIBindings records which work item each session belongs to (tether#91).
+	// Populated by Run() alongside the history store and the workspace bindings,
+	// which share its directory.
+	//
+	// It hangs off Config rather than off session.Registry — where the other two
+	// per-session stores live — because nothing in the session machinery consults
+	// it. A work item does not change how a session is spawned, resumed, or where
+	// it runs; the binding exists purely so an HTTP client can label a list. Put
+	// on the Registry it would read as an input to session behaviour, and the next
+	// person would go looking for the code that acts on it.
+	//
+	// Nil is a supported state: the routes that need it answer 503, and the
+	// session list simply carries no work items.
+	WIBindings *session.WIBindingStore
 }
 
 func (c *Config) addr() string { return fmt.Sprintf(":%d", c.Port) }
@@ -103,11 +118,14 @@ func Run(cfg *Config) error {
 		return err
 	}
 
-	// Step 2a: wire up session history store + the per-session workspace bindings
-	// that share its directory (tether#52). The bindings are what let a reconnect
-	// carrying only a sid land back in that session's own workspace — including
-	// after a daemon restart, which is the whole reason they are on disk.
-	if cfg.Registry.History == nil || cfg.Registry.Bindings == nil {
+	// Step 2a: wire up session history store + the two per-session sidecar stores
+	// that share its directory — workspace bindings (tether#52) and work-item
+	// bindings (tether#91). The workspace binding is what lets a reconnect
+	// carrying only a sid land back in that session's own workspace; the wi
+	// binding is what lets a session list say what a session is about. Both are on
+	// disk for the same reason: after a restart, the file is the only thing that
+	// still knows.
+	if cfg.Registry.History == nil || cfg.Registry.Bindings == nil || cfg.WIBindings == nil {
 		home, err := os.UserHomeDir()
 		if err == nil {
 			sessDir := filepath.Join(home, ".tether", "sessions")
@@ -116,6 +134,9 @@ func Run(cfg *Config) error {
 			}
 			if cfg.Registry.Bindings == nil {
 				cfg.Registry.Bindings = session.NewBindingStore(sessDir)
+			}
+			if cfg.WIBindings == nil {
+				cfg.WIBindings = session.NewWIBindingStore(sessDir)
 			}
 		}
 	}

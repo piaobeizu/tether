@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Icon } from '../../lib/icons'
 import { rememberedWorkspaceId, useStore } from '../../lib/store'
-import { openSession } from '../../lib/session'
 import WorkspaceTree from './WorkspaceTree'
 
 interface Workspace {
@@ -81,9 +80,6 @@ export default function WorkspacePane() {
   // --workspace-root with nothing on screen saying so.
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [expandedId, setExpandedId] = useState<string | null>(null)
-  const [sessions, setSessions] = useState<string[]>([])
-  const [sessionsOpen, setSessionsOpen] = useState(false)
-  const currentSid = useStore(s => s.sessionId)
 
   // tether#47 — publish the selected workspace (id + abspath) to the store so
   // chat's @-mention picker knows which workspace's files to offer, and so a
@@ -98,13 +94,6 @@ export default function WorkspacePane() {
   const [adding, setAdding] = useState(false)
   const [newPath, setNewPath] = useState('')
   const [newName, setNewName] = useState('')
-
-  const loadSessions = async () => {
-    try {
-      const res = await fetch('/api/v1/sessions')
-      if (res.ok) setSessions(await res.json() as string[])
-    } catch { /* ignore */ }
-  }
 
   const load = async () => {
     try {
@@ -156,7 +145,7 @@ export default function WorkspacePane() {
     }
   }
 
-  useEffect(() => { void load(); void loadSessions() }, [])
+  useEffect(() => { void load() }, [])
 
   // ⌘P / Ctrl+P focuses the workspace filter.
   useEffect(() => {
@@ -328,44 +317,11 @@ export default function WorkspacePane() {
         ))}
       </div>
 
-      {/* Session history list */}
-      {sessions.length > 0 && (
-        <div style={{ borderTop: '1px solid var(--line-soft)', flexShrink: 0 }}>
-          <div
-            className="dt-left-head"
-            style={{ cursor: 'pointer', paddingTop: 8, paddingBottom: 8 }}
-            onClick={() => setSessionsOpen(o => !o)}
-          >
-            <span className="section-label">Sessions</span>
-            <span style={{ fontSize: 10, color: 'var(--ink-quat)', fontFamily: 'var(--font-mono)' }}>
-              {sessions.length}
-            </span>
-          </div>
-          {sessionsOpen && (
-            <div style={{ maxHeight: 180, overflow: 'auto' }} className="scroll-thin">
-              {[...sessions].reverse().map(sid => (
-                <div
-                  key={sid}
-                  className={`tree-row${sid === currentSid ? ' active' : ''}`}
-                  style={{ paddingLeft: 12, fontSize: 11 }}
-                  // tether#61 — opening a session is ONE operation, and it lives
-                  // in lib/session.ts. This list used to inline its own version
-                  // that never reconnected the WebTransport channel (so the live
-                  // stream, and the next prompt sent, stayed on the session the
-                  // user had just left) and that hid setSessionId — hence
-                  // tether_last_sid — behind a non-empty history.
-                  onClick={() => openSession(sid)}
-                >
-                  <span className="ws-dot" style={{ background: sid === currentSid ? 'var(--success)' : undefined }} />
-                  <span className="tree-label" style={{ fontFamily: 'var(--font-mono)', fontSize: 10 }}>
-                    {sid.slice(0, 16)}…
-                  </span>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
+      {/* tether#91 — the session list used to be here, under the file tree. It
+          moved to the chat pane (panes/chat/SessionList.tsx), which is where a
+          session is a first-class thing; this column is about files. It is not
+          duplicated here: two lists over one endpoint is how the two "open a
+          session" implementations lib/session.ts had to consolidate came about. */}
 
       <div className="dt-left-foot">
         {workspaces.length} workspace{workspaces.length !== 1 ? 's' : ''}

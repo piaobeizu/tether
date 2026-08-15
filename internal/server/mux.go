@@ -179,11 +179,20 @@ func buildMux(cfg *Config, certs *certHolder, wts *webtransport.Server, reg *ses
 	// and issues a short-lived JWT for WebTransport connections.
 	mux.HandleFunc("/api/v1/auth/wt-ticket", authState.WtTicketHandler)
 
-	// Session history API.
+	// Session API: the list, each session's transcript, and each session's work
+	// item. Still gated on reg.History because a session with no transcript is not
+	// listable and has no messages — the wi store alone would have nothing to
+	// enumerate. The index carries the other two stores as optional extras, so a
+	// daemon without them serves a thinner list rather than none.
 	if reg.History != nil {
-		listSessions, getMessages := sessionAPIHandlers(reg.History)
+		idx := &session.SessionIndex{
+			History:  reg.History,
+			WI:       cfg.WIBindings,
+			Bindings: reg.Bindings,
+		}
+		listSessions, sessionSub := sessionAPIHandlers(idx, cfg.WIBindings)
 		mux.HandleFunc("/api/v1/sessions", listSessions)
-		mux.HandleFunc("/api/v1/sessions/", getMessages)
+		mux.HandleFunc("/api/v1/sessions/", sessionSub)
 	}
 
 	mux.Handle("/", newStaticHandler(cfg.DevFrontendURL))

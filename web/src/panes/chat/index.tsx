@@ -14,6 +14,7 @@ import { CandidatesBlock } from '../../fenced-blocks/CandidatesBlock'
 import { MediaBlock } from '../../fenced-blocks/MediaBlock'
 import { PermissionQueue, postDecide } from '../../fenced-blocks/PermissionBlock'
 import Markdown from '../canvas/Markdown'
+import SessionList from './SessionList'
 
 type ConnState = 'connecting' | 'connected' | 'reconnecting' | 'failed'
 
@@ -884,6 +885,13 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
 
   return (
     <>
+      {/* ── Session list (tether#91) ──────────────────────────
+          Moved here from the bottom of the file tree, where it was a category
+          error: the left column is about files. Collapsed by default so it costs
+          the transcript no height until asked for. Its own component because this
+          file is long enough. */}
+      <SessionList />
+
       {/* ── Message list ──────────────────────────────────── */}
       <div className="dt-chat scroll-thin" ref={chatRef}>
 

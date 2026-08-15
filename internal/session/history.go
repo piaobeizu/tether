@@ -376,33 +376,18 @@ func (h *HistoryStore) HasHistory(sid string) bool {
 	return fi.Size() > 0
 }
 
-// ListSessions returns all session IDs that have history on disk. It backs
-// GET /api/v1/sessions, i.e. the session list the workspace pane renders.
+// (ListSessions used to live here, returning []string and backing
+// GET /api/v1/sessions. tether#91 replaced it with SessionIndex.List
+// (sessionlist.go), which answers the same question plus the two things a list a
+// human reads has to carry — a label and a time. It was deleted rather than kept:
+// an exported method returning a DIFFERENT shape for "which sessions exist", with
+// a doc comment still claiming to back the route, is the second implementation
+// that whole slice exists to prevent, and it had no callers left outside tests.
 //
-// "have history" is checked, not inferred from the directory existing, and that
-// distinction became load-bearing in tether#52: BindingStore shares this
-// baseDir and creates <baseDir>/<sid>/ at SPAWN time to record the session's
-// workspace — before any message exists. Enumerating directories would therefore
-// list every session that ever connected and closed without saying anything, each
-// rendering as a clickable entry whose transcript is empty. Filtering on the
-// transcript keeps this function's answer the one its name promises, and keeps the
-// two stores' shared directory an implementation detail rather than an API change.
-func (h *HistoryStore) ListSessions() []string {
-	entries, err := os.ReadDir(h.baseDir)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			slog.Warn("history: list sessions failed", "base_dir", h.baseDir, "err", err)
-		}
-		return nil
-	}
-	var sids []string
-	for _, e := range entries {
-		if e.IsDir() && h.HasHistory(e.Name()) {
-			sids = append(sids, e.Name())
-		}
-	}
-	return sids
-}
+// The rule it enforced is not lost — see SessionIndex.List, which restates it:
+// a session is listable when it has a NON-EMPTY transcript, never merely when its
+// directory exists, because BindingStore and WIBindingStore both create <sid>/
+// before any message does.)
 
 func (h *HistoryStore) append(sid string, msg HistoryMessage) {
 	path := h.historyPath(sid)

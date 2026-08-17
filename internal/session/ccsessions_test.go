@@ -75,13 +75,58 @@ func ccUser(t *testing.T, text string) string {
 // ccAssistant builds an assistant turn with one text block and one tool call, so
 // every conversion test also exercises the block filter.
 func ccAssistant(t *testing.T, text string) string {
+	return ccAssistantAt(t, text, "2026-08-17T03:00:01.000Z")
+}
+
+// ccAssistantAt is ccAssistant with a caller-chosen stamp, so a test can tell
+// WHICH fragment of a merged turn supplied the message's timestamp. ccAssistant
+// delegates here rather than repeating the record, so a fixture change cannot
+// apply to one of them and not the other.
+func ccAssistantAt(t *testing.T, text, ts string) string {
 	return ccLine(t, map[string]any{
 		"type":      "assistant",
-		"timestamp": "2026-08-17T03:00:01.000Z",
+		"timestamp": ts,
 		"message": map[string]any{"role": "assistant", "content": []any{
 			map[string]any{"type": "text", "text": text},
 			map[string]any{"type": "tool_use", "id": "t1", "name": "Bash", "input": map[string]any{"command": "ls"}},
 		}},
+	})
+}
+
+// ccToolResult builds the record cc writes when a tool comes back: type "user",
+// content a tool_result block. It is the record that sits BETWEEN two fragments
+// of one assistant turn, and the one that makes isUserTurn the wrong boundary —
+// see ccMessagesFrom. Every merge fixture in this file contains one.
+func ccToolResult(t *testing.T, content string) string {
+	return ccLine(t, map[string]any{
+		"type":      "user",
+		"timestamp": "2026-08-17T03:00:00.000Z",
+		"message": map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "tool_result", "tool_use_id": "t1", "content": content},
+		}},
+	})
+}
+
+// ccSidechain builds a sub-agent record of either role. A sub-agent speaking in
+// the middle of a turn must neither appear nor split the turn around it.
+func ccSidechain(t *testing.T, role, text string) string {
+	return ccLine(t, map[string]any{
+		"type":        role,
+		"isSidechain": true,
+		"timestamp":   "2026-08-17T03:00:00.000Z",
+		"message":     map[string]any{"role": role, "content": text},
+	})
+}
+
+// ccCommandStdout builds the record cc writes when it feeds a slash command's
+// OUTPUT back in as if the user had said it: type "user", no isMeta, plain
+// string content. Dropped by shape (ccCommandStdoutPrefix), so like a tool
+// result it must not close an assistant run.
+func ccCommandStdout(t *testing.T, text string) string {
+	return ccLine(t, map[string]any{
+		"type":      "user",
+		"timestamp": "2026-08-17T03:00:00.000Z",
+		"message":   map[string]any{"role": "user", "content": ccCommandStdoutPrefix + text + "</local-command-stdout>"},
 	})
 }
 
@@ -578,6 +623,246 @@ func TestMessagesDropsToolActivity(t *testing.T) {
 	for _, m := range msgs {
 		if strings.Contains(m.Text, "SECRET-TOOL-OUTPUT") || strings.Contains(m.Text, "\"tool_use\"") {
 			t.Errorf("tool activity leaked into a turn: %q", m.Text)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// One bubble per turn (tether#94)
+// ---------------------------------------------------------------------------
+
+// TestMessagesMergesATurnSplitByToolCalls is the bug, in the shape it was
+// reported: one turn, no user message anywhere inside it, arriving as a row of
+// separate timestamped bubbles each ending on a colon because that is where the
+// agent stopped to call a tool.
+//
+// The fixture carries every record type that sits BETWEEN two fragments of a
+// real turn, because the failure mode of this change is a boundary detector that
+// is itself fooled by them. A fixture of bare assistant records would merge
+// under both the right rule and the wrong one and prove nothing:
+//
+//   - tool results — type:"user", so isUserTurn() is TRUE of them. Using that as
+//     the boundary ends the turn at every tool call, i.e. at exactly the seams
+//     this merge exists to remove.
+//   - <local-command-stdout> — also type:"user", also not isMeta, dropped only
+//     by shape.
+//   - sub-agent chatter (isSidechain), in both roles.
+func TestMessagesMergesATurnSplitByToolCalls(t *testing.T) {
+	body := ccUser(t, "把这个查清楚") +
+		ccAssistantAt(t, "查清楚:", "2026-08-17T04:57:00.000Z") +
+		ccToolResult(t, "SECRET-TOOL-OUTPUT") +
+		ccAssistantAt(t, "先看进度:", "2026-08-17T05:01:00.000Z") +
+		ccSidechain(t, "user", "a sub-agent's prompt") +
+		ccSidechain(t, "assistant", "a sub-agent's answer") +
+		ccToolResult(t, "MORE-TOOL-OUTPUT") +
+		ccCommandStdout(t, "\x1b[1mtotal 48\x1b[0m") +
+		ccAssistantAt(t, "读 baseline 脚本剩余部分:", "2026-08-17T05:06:00.000Z")
+
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", body)
+
+	msgs, ok := f.store().Messages("cc-session-0001")
+	if !ok {
+		t.Fatal("Messages reported the transcript missing")
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("got %d messages, want 2 (one user turn, one answer): %+v", len(msgs), msgs)
+	}
+	if msgs[0].Role != "user" || msgs[0].Text != "把这个查清楚" {
+		t.Errorf("msgs[0] = %s/%q, want the user's turn", msgs[0].Role, msgs[0].Text)
+	}
+	want := "查清楚:" + ccTurnJoin + "先看进度:" + ccTurnJoin + "读 baseline 脚本剩余部分:"
+	if msgs[1].Role != "assistant" || msgs[1].Text != want {
+		t.Errorf("msgs[1] = %s/%q,\nwant assistant/%q", msgs[1].Role, msgs[1].Text, want)
+	}
+	// The separator asserted LITERALLY as well as through the constant. A lone
+	// "\n" would satisfy every assertion written in terms of ccTurnJoin while
+	// rendering as a space: the pane runs this through react-markdown with no
+	// remark-breaks, so a soft break joins two lines. "查清楚: 先看进度:" on one
+	// line is a worse answer than the split bubbles this replaces, and nothing
+	// else in the suite would notice.
+	if !strings.Contains(msgs[1].Text, "查清楚:\n\n先看进度:") {
+		t.Errorf("fragments are not separated by a BLANK line — markdown would run them "+
+			"together on one line: %q", msgs[1].Text)
+	}
+	// The stamp is the turn's START — when the response began — which is also
+	// what tether's own path records (history.go stamps the accumulator on
+	// creation). Taking the last fragment's instead would label a nine-minute
+	// turn with the moment it ended.
+	if wantTs := time.Date(2026, 8, 17, 4, 57, 0, 0, time.UTC).UnixMilli(); msgs[1].Ts != wantTs {
+		t.Errorf("Ts = %d, want %d (the FIRST fragment's stamp)", msgs[1].Ts, wantTs)
+	}
+	for _, m := range msgs {
+		for _, forbidden := range []string{"SECRET-TOOL-OUTPUT", "MORE-TOOL-OUTPUT", "sub-agent", "local-command-stdout", "\x1b["} {
+			if strings.Contains(m.Text, forbidden) {
+				t.Errorf("a dropped record reached the merged turn (%q): %q", forbidden, m.Text)
+			}
+		}
+	}
+}
+
+// TestMessagesDoesNotMergeAcrossAUserTurn — the other half of the boundary. The
+// merge must join what cc split and nothing else: two real turns stay two turns,
+// and two things the user said in a row stay two bubbles, because that is what
+// the terminal shows.
+func TestMessagesDoesNotMergeAcrossAUserTurn(t *testing.T) {
+	body := ccUser(t, "first question") +
+		ccAssistantAt(t, "first-a", "2026-08-17T03:00:01.000Z") +
+		ccToolResult(t, "x") +
+		ccAssistantAt(t, "first-b", "2026-08-17T03:00:02.000Z") +
+		ccUser(t, "second question") +
+		ccAssistantAt(t, "second-a", "2026-08-17T03:00:03.000Z") +
+		ccToolResult(t, "y") +
+		ccAssistantAt(t, "second-b", "2026-08-17T03:00:04.000Z") +
+		// Two things the user said back to back, with nothing between them: a
+		// queued prompt, or simply typing twice. These are two bubbles in the
+		// terminal and must stay two here — a merge written as "collapse adjacent
+		// same-role messages" would swallow one of them.
+		ccUser(t, "and another thing") +
+		ccUser(t, "one more")
+
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", body)
+
+	msgs, _ := f.store().Messages("cc-session-0001")
+	want := []struct{ role, text string }{
+		{"user", "first question"},
+		{"assistant", "first-a" + ccTurnJoin + "first-b"},
+		{"user", "second question"},
+		{"assistant", "second-a" + ccTurnJoin + "second-b"},
+		{"user", "and another thing"},
+		{"user", "one more"},
+	}
+	if len(msgs) != len(want) {
+		t.Fatalf("got %d messages, want %d: %+v", len(msgs), len(want), msgs)
+	}
+	for i, w := range want {
+		if msgs[i].Role != w.role || msgs[i].Text != w.text {
+			t.Errorf("msgs[%d] = %s/%q, want %s/%q", i, msgs[i].Role, msgs[i].Text, w.role, w.text)
+		}
+	}
+}
+
+// TestMessagesCapCountsTurnsNotRecords pins the UNIT of ccMessagesMax.
+//
+// It exists because that constant's doc comment claimed to cap "turns" while the
+// trim 400-odd lines below it counted one element per converted cc record — two
+// things that differ by a factor of 7.07 on the real store, with nothing in the
+// build to notice. A doc comment is what let them drift apart, so the unit is
+// asserted here instead.
+//
+// The fixture reads far more RECORDS than the cap and exactly the cap's worth of
+// MESSAGES, so the front is trimmed under the old unit and kept under the new
+// one. The very first thing the user said is the assertion.
+func TestMessagesCapCountsTurnsNotRecords(t *testing.T) {
+	const fragments = 5
+	turns := ccMessagesMax / 2 // one user + one merged assistant message each
+	records := turns * (1 + fragments)
+	if records <= ccMessagesMax {
+		t.Fatalf("fixture reads %d records, which the %d cap would not bind on — "+
+			"it cannot tell the two units apart", records, ccMessagesMax)
+	}
+
+	var b strings.Builder
+	for i := 0; i < turns; i++ {
+		b.WriteString(ccUser(t, fmt.Sprintf("turn-%04d asks", i)))
+		for j := 0; j < fragments; j++ {
+			b.WriteString(ccAssistantAt(t, fmt.Sprintf("turn-%04d frag-%d", i, j), "2026-08-17T03:00:01.000Z"))
+			b.WriteString(ccToolResult(t, "tool output"))
+		}
+	}
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", b.String())
+
+	msgs, _ := f.store().Messages("cc-session-0001")
+	if len(msgs) != ccMessagesMax {
+		t.Fatalf("got %d messages from %d records, want %d — the cap's unit is messages, not records",
+			len(msgs), records, ccMessagesMax)
+	}
+	if msgs[0].Role != "user" || msgs[0].Text != "turn-0000 asks" {
+		t.Errorf("msgs[0] = %s/%q, want the FIRST turn — %d records fit under a cap of %d "+
+			"messages, so nothing should have been trimmed", msgs[0].Role, msgs[0].Text, records, ccMessagesMax)
+	}
+	// And every fragment of every turn is present: merging is what makes the
+	// record count fit, so a merge that dropped fragments would also pass the
+	// count assertion above.
+	for i := 0; i < turns; i++ {
+		got := msgs[i*2+1].Text
+		for j := 0; j < fragments; j++ {
+			if frag := fmt.Sprintf("turn-%04d frag-%d", i, j); !strings.Contains(got, frag) {
+				t.Fatalf("turn %d lost %q: %q", i, frag, got)
+			}
+		}
+	}
+}
+
+// TestMessagesCapDoesNotShrinkTheScrollback guards the VALUE of ccMessagesMax,
+// which the tests above deliberately do not.
+//
+// Same shape as TestCCTitlePrefixCoversTheMeasuredWorstCase, and for the same
+// reason: every mechanism test here sizes its fixture FROM the constant, so it
+// scales with any change to it and stays green — 200, 400 and 20 all pass them.
+// A constant that encodes a measurement has to be checked against the world it
+// was measured in, not against itself.
+//
+// The specific regression: tether#94 HALVED this number while making each
+// message ~3.9x larger, and the entire argument for that was that 200 messages
+// is MORE scrollback than 400 records was delivering. Someone later reading only
+// the number could lower it further, inverting the argument and truncating
+// people's history with no error and no failing test.
+//
+// The arithmetic, over 39 real transcripts measured 2026-08-17: 400 records
+// delivered ~57 turns (3,350 user + 20,325 assistant messages = 7.07 records per
+// turn). Post-merge the same store averages 1.81 messages per turn (23,675 ->
+// 6,072), so ~57 turns is ~104 messages. Below that, this change stops being a
+// fix and becomes a quiet reduction in what the user can scroll back to.
+func TestMessagesCapDoesNotShrinkTheScrollback(t *testing.T) {
+	// Messages needed to hold the ~57 turns the pre-tether#94 cap delivered.
+	const equivalentOfTheOldCap = 104
+	if ccMessagesMax < equivalentOfTheOldCap {
+		t.Fatalf("ccMessagesMax = %d, below the %d messages that the OLD cap of 400 "+
+			"records was delivering (~57 turns at 1.81 messages/turn). Lowering it does not "+
+			"fail anything loudly — it silently serves less history than before the merge, "+
+			"which is the opposite of what tether#94 claimed. If the store's shape has "+
+			"genuinely changed, re-measure and update BOTH the constant and this number.",
+			ccMessagesMax, equivalentOfTheOldCap)
+	}
+}
+
+// TestMessagesCapKeepsTheNewestTurnsInOrder — both directions of the trim, on a
+// merged transcript.
+//
+// "Keeps the newest" and "keeps the oldest" produce the same LENGTH, and a test
+// that only checks the tail passes against a slice that was reversed as well as
+// trimmed. So this asserts the first surviving turn, the last one, and strictly
+// increasing turn numbers through the middle.
+func TestMessagesCapKeepsTheNewestTurnsInOrder(t *testing.T) {
+	turns := ccMessagesMax // twice as many messages as the cap allows
+	var b strings.Builder
+	for i := 0; i < turns; i++ {
+		b.WriteString(ccUser(t, fmt.Sprintf("turn-%04d", i)))
+		b.WriteString(ccAssistantAt(t, fmt.Sprintf("answer-%04d a", i), "2026-08-17T03:00:01.000Z"))
+		b.WriteString(ccToolResult(t, "tool output"))
+		b.WriteString(ccAssistantAt(t, fmt.Sprintf("answer-%04d b", i), "2026-08-17T03:00:02.000Z"))
+	}
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", b.String())
+
+	msgs, _ := f.store().Messages("cc-session-0001")
+	if len(msgs) != ccMessagesMax {
+		t.Fatalf("got %d messages, want the cap of %d", len(msgs), ccMessagesMax)
+	}
+	firstKept := turns - ccMessagesMax/2
+	for i := 0; i < ccMessagesMax/2; i++ {
+		u, a := msgs[i*2], msgs[i*2+1]
+		wantU := fmt.Sprintf("turn-%04d", firstKept+i)
+		if u.Role != "user" || u.Text != wantU {
+			t.Fatalf("msgs[%d] = %s/%q, want user/%q — the surviving turns must be the "+
+				"NEWEST %d, in order", i*2, u.Role, u.Text, wantU, ccMessagesMax/2)
+		}
+		wantA := fmt.Sprintf("answer-%04d a", firstKept+i) + ccTurnJoin + fmt.Sprintf("answer-%04d b", firstKept+i)
+		if a.Role != "assistant" || a.Text != wantA {
+			t.Fatalf("msgs[%d] = %s/%q, want assistant/%q", i*2+1, a.Role, a.Text, wantA)
 		}
 	}
 }

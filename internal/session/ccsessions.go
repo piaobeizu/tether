@@ -124,10 +124,72 @@ const (
 	ccMessagesWideTailBytes = 16 << 20
 )
 
-// ccMessagesMax caps the number of turns returned even when they fit in the byte
-// window, so a transcript of very short lines cannot produce a JSON response with
-// tens of thousands of elements in it.
-const ccMessagesMax = 400
+// ccMessagesMax caps how many messages a transcript can produce even when they
+// fit in the byte window, so a transcript of very short lines cannot produce a
+// JSON response with tens of thousands of elements in it.
+//
+// # It counts MESSAGES, and since tether#94 a message is a whole turn's text
+//
+// The value here used to be 400, and the sentence above it used to say "turns"
+// while the trim that applies it — at the far end of ccMessagesFrom, some 400
+// lines below — counted one element per cc record that converted. Those differ
+// by a factor of 7.07: across the 39 top-level transcripts of one workspace
+// (measured 2026-08-17) 3,350 records became user messages and 20,325 became
+// assistant messages, because cc opens a new record at every tool call. So "400
+// turns" was really about 57.
+//
+// That denominator is the population this reader EMITS, and it has to be: a
+// further 941 records wear type:"user", pass isUserTurn, and are dropped anyway
+// — 746 isMeta and 195 <local-command-stdout>, exactly accounted for. Counting
+// them gives a flattering 4.74 assistant records per turn instead of 6.07, and
+// every figure derived from it lands ~30% out. An earlier draft of this comment
+// used precisely that number; a ratio used to size a cap must be measured over
+// the things the cap counts. (Found by review, which is the second time in this
+// file that a confidently stated measurement was taken over the wrong
+// population — see EncodeProjectDir.)
+//
+// Merging makes the unit real: on the same store the conversation goes from
+// 23,675 messages to 6,072 — one merged assistant message per turn that says
+// anything (628 turns say nothing but tool calls), plus one message per thing
+// the user actually said. Two consecutive user turns therefore stay TWO
+// messages, which TestMessagesDoesNotMergeAcrossAUserTurn pins, so "two per
+// turn" is the common case and not an invariant. 200 works out at ~110 turns of
+// scrollback against the ~57 that 400 was delivering.
+// TestMessagesCapCountsTurnsNotRecords pins the unit, because a doc comment
+// asserting it is exactly what let the two drift apart.
+//
+// # The payload consequence: a ceiling this data never reaches
+//
+// Halving the number does not halve the response, because a surviving assistant
+// message carries 3.9 records' worth of text on average instead of one. As an
+// upper bound, 200 messages can hold ~780 source records' worth against the old
+// 400 — call it 2x. Leaving it at 400 would have been ~4x.
+//
+// Measured, it is 1.00x. Replaying all 39 transcripts through the real
+// ccMessagesTailBytes window, old and new both serve 0.77 MB, and the COUNT cap
+// binds on 0 of 39 either way: the byte window binds first. So the ratio above
+// is a ceiling for the transcript of very short lines this cap has always been
+// for, not a change anyone will observe. What does change is the element count
+// the JSON encoder walks — 1,039 messages become 380.
+//
+// What this cap no longer bounds is a SINGLE message: the longest merged
+// assistant message in that store is 34 KB, from a run of 114 fragments. Only
+// the byte window bounds that — the same bound as before, now spread across
+// fewer elements.
+const ccMessagesMax = 200
+
+// ccTurnJoin separates the fragments of one merged assistant turn.
+//
+// It is a BLANK line rather than a newline, and that is a requirement rather
+// than a preference: the pane renders an assistant message through
+// react-markdown with remark-gfm and NO remark-breaks
+// (web/src/panes/canvas/Markdown.tsx), so a lone "\n" is a CommonMark soft break
+// and renders as a SPACE. The fragments this joins end exactly where cc stopped
+// to call a tool — in the transcript that prompted this change, on "查清楚:" and
+// "先看进度:" — so a soft break would run two of them onto one line and read
+// worse than the split bubbles it replaces. A blank line is a paragraph break,
+// which is the shape the terminal shows, where a tool card sat between them.
+const ccTurnJoin = "\n\n"
 
 // CCStore reads cc's project store. The zero value is not usable; see NewCCStore.
 type CCStore struct {
@@ -517,6 +579,39 @@ func ccUserTextFromLine(line []byte) string {
 // them faithfully into ToolCallRecord is a separate piece of work with its own
 // fidelity questions. The row that renders this is labelled accordingly, so the
 // user is told what they are looking at rather than left to notice.
+//
+// # One bubble per turn (tether#94)
+//
+// Consecutive assistant records are merged into one message. cc opens a NEW
+// assistant record at every tool call, so a single nine-minute turn arrives as a
+// row of fragments, each ending exactly where the agent stopped to call
+// something. Measured over 39 transcripts: 6.07 assistant records per emitted
+// turn, median run of 4, worst 114, 41% of runs at 5 or more. tether's own path
+// feeding the SAME pane was reported at 0.94 — one interface, two renderings of
+// one conversation, six-fold apart. One record one bubble showed the reporter
+// six timestamped bubbles in a row with no user message between them, every one
+// of them ending on a colon.
+//
+// # The boundary is an EMITTED user message, not isUserTurn
+//
+// A run of fragments is closed by a user message this function actually
+// appended — read off out[n-1].Role. It is deliberately NOT isUserTurn, which is
+// Type=="user" && !IsMeta && !IsSidechain and is therefore TRUE of every tool
+// result: cc returns those as type:"user" records, one measured session carrying
+// 11 of them against 3 real inputs. Closing a run on isUserTurn would end the
+// turn at every tool call — the exact boundary this merge exists to erase — and
+// ship a change that fragments the transcript rather than joining it.
+//
+// Reading the boundary off `out` is what makes that automatic rather than
+// remembered: the impostors (tool results, isMeta preambles, isSidechain
+// chatter, <local-command-stdout>) already produce no message at all, so there
+// is nothing to exclude a second time and no second list to keep in sync with
+// isUserTurn's. Sidechain ASSISTANT records are dropped by the same existing
+// rule, so a sub-agent speaking between two fragments does not split them
+// either.
+//
+// Merging happens as records are read, so the cap below trims MESSAGES — see
+// ccMessagesMax, whose unit this is the other half of.
 func ccMessagesFrom(r io.Reader) []HistoryMessage {
 	br, ok := r.(*bufio.Reader)
 	if !ok {
@@ -533,7 +628,17 @@ func ccMessagesFrom(r io.Reader) []HistoryMessage {
 		// the user. One rule, both readers.
 		if bytes.HasSuffix(line, []byte("\n")) {
 			if m, ok := ccMessageFromLine(line); ok {
-				out = append(out, m)
+				// Still the same turn: cc opened a new record to call a tool, not
+				// because the agent stopped talking. Append rather than emit, and
+				// keep the FIRST fragment's stamp — that is when the response
+				// began, which is also what tether's own path records for an
+				// assistant message (history.go stamps the accumulator when it is
+				// created, not when it is flushed).
+				if n := len(out); n > 0 && m.Role == "assistant" && out[n-1].Role == "assistant" {
+					out[n-1].Text += ccTurnJoin + m.Text
+				} else {
+					out = append(out, m)
+				}
 			}
 		}
 		if err != nil {

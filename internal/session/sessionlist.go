@@ -54,6 +54,25 @@ type SessionSummary struct {
 	// UpdatedAt is the transcript's mtime in Unix milliseconds — see SessionIndex.List
 	// for why mtime and not a message timestamp.
 	UpdatedAt int64 `json:"updatedAt"`
+	// Source names the store this row's transcript came from: SourceTether for
+	// tether's own, SourceCC for a conversation cc recorded that tether never saw.
+	//
+	// Always populated, never omitempty. An absent field would make "tether" and
+	// "this daemon predates the field" the same value, and the one consumer that
+	// matters — a log line added in the same change to end exactly that kind of
+	// blindness — would print `source=`. There is no compatibility argument
+	// against spending the bytes: the daemon and the SPA ship as one binary
+	// (web/embed.go), so no frontend can be talking to a daemon that disagrees.
+	//
+	// It is a FACT about where the row came from, and that is why it is the only
+	// new field. The question the UI actually wants answered is "can I carry on
+	// with this one", and tether cannot answer it: cc's `--resume` reports failure
+	// only after a prompt has been delivered (Attachment's doc), so a resumability
+	// flag computed here would be a guess that goes stale whenever
+	// --workspace-root or the workspace registry moves. A row that is right most
+	// of the time is the lying list this feature exists to avoid; source never
+	// goes stale, and the UI states the limit rather than predicting it.
+	Source string `json:"source"`
 }
 
 // SessionIndex answers "what sessions are there, and what is each one about?".
@@ -67,6 +86,10 @@ type SessionIndex struct {
 	History  *HistoryStore
 	WI       *WIBindingStore
 	Bindings *BindingStore
+	// CC is the reader over cc's own store (tether#92). nil = this daemon lists
+	// only the sessions it recorded itself, which is what every daemon did before
+	// that slice — the field is optional for the same reason the two above are.
+	CC *CCStore
 }
 
 // titlePrefixBytes bounds how much of a transcript List reads looking for the
@@ -93,6 +116,25 @@ const maxTitleLen = 80
 //
 // # Which sessions
 //
+// Two stores, ONE list (tether#92). tether's own transcripts, plus the
+// conversations cc recorded in the directories this daemon knows about. They are
+// merged rather than grouped or served from a second endpoint because the sid
+// space is shared — 55 of one profile's 90 tether sids had a byte-identical cc
+// file — so two rows for one sid would be two rows for one conversation, and the
+// "current session" highlight would land on one of them arbitrarily.
+//
+// Where both stores have a sid, TETHER WINS and the row is labelled
+// SourceTether. That is the conservative half of the merge: it leaves the
+// daemon's daily path — the
+// transcript the owner's live session reads — byte-for-byte what it was. The cost
+// is stated rather than hidden: for those overlapping sessions tether shows its
+// own shorter record (137 lines against cc's 919, over one measured profile).
+// Preferring the fuller transcript there is a real question and a separate one;
+// it is not this change's to decide, because getting it wrong regresses the path
+// that already works.
+//
+// # Which sessions (tether's own)
+//
 // The same rule ListSessions uses — a directory with a NON-EMPTY history.jsonl —
 // and for the same reason its doc gives: BindingStore (and now WIBindingStore)
 // create <sid>/ before any message exists, so enumerating directories would list
@@ -116,39 +158,67 @@ const maxTitleLen = 80
 // would perturb it. The field is therefore named UpdatedAt (when this file last
 // changed) rather than LastMessageAt.
 func (x *SessionIndex) List() []SessionSummary {
-	if x == nil || x.History == nil {
+	if x == nil {
 		return nil
 	}
-	entries, err := os.ReadDir(x.History.baseDir)
-	if err != nil {
-		if !os.IsNotExist(err) {
+	var out []SessionSummary
+	// Which sids tether has already answered for. Consulted by the cc pass below,
+	// which is why the tether pass runs first and not merely by habit.
+	seen := make(map[string]bool)
+
+	if x.History != nil {
+		entries, err := os.ReadDir(x.History.baseDir)
+		if err != nil && !os.IsNotExist(err) {
 			slog.Warn("session list: read base dir failed", "base_dir", x.History.baseDir, "err", err)
 		}
-		return nil
+		out = make([]SessionSummary, 0, len(entries))
+		for _, e := range entries {
+			sid := e.Name()
+			if !e.IsDir() || !ValidSessionID(sid) {
+				continue
+			}
+			// One stat answers both questions — "is there a conversation here" and
+			// "when was it last written". HasHistory would ask the first one with a
+			// stat of its own; calling it here and then stat-ing again for the mtime
+			// would double the syscalls in the hot loop for no extra information.
+			fi, err := os.Stat(x.History.historyPath(sid))
+			if err != nil || fi.Size() == 0 {
+				continue
+			}
+			seen[sid] = true
+			s := SessionSummary{Sid: sid, UpdatedAt: fi.ModTime().UnixMilli(), Source: SourceTether}
+			s.Title = x.title(sid)
+			out = append(out, s)
+		}
 	}
 
-	out := make([]SessionSummary, 0, len(entries))
-	for _, e := range entries {
-		sid := e.Name()
-		if !e.IsDir() || !ValidSessionID(sid) {
-			continue
+	// The cc pass. Rows tether already has are dropped here rather than merged
+	// field-by-field, which is the "tether wins" rule stated once — see this
+	// function's doc for what that costs and why it is the safe half.
+	if x.CC != nil {
+		for _, s := range x.CC.List() {
+			if seen[s.Sid] {
+				continue
+			}
+			seen[s.Sid] = true
+			out = append(out, s)
 		}
-		// One stat answers both questions — "is there a conversation here" and
-		// "when was it last written". HasHistory would ask the first one with a
-		// stat of its own; calling it here and then stat-ing again for the mtime
-		// would double the syscalls in the hot loop for no extra information.
-		fi, err := os.Stat(x.History.historyPath(sid))
-		if err != nil || fi.Size() == 0 {
-			continue
-		}
-		s := SessionSummary{Sid: sid, UpdatedAt: fi.ModTime().UnixMilli()}
-		if x.WI != nil {
-			if b, ok := x.WI.Load(sid); ok {
-				s.WorkItem = b.WorkItem
+	}
+
+	// The work item is attached AFTER both passes, over every row, because a
+	// binding is a note a human attached to a SESSION and knows nothing about
+	// which store the transcript ended up in. Doing it inside the tether loop
+	// (where it used to live) would have made "bind a wi to a session, see the
+	// label" work for half the list and silently not the other half.
+	if x.WI != nil {
+		for i := range out {
+			if b, ok := x.WI.Load(out[i].Sid); ok {
+				out[i].WorkItem = b.WorkItem
 			}
 		}
-		s.Title = x.title(sid)
-		out = append(out, s)
+	}
+	if len(out) == 0 {
+		return out
 	}
 
 	// Newest first, sid as the tie-break. The tie-break is not cosmetic: two
@@ -164,6 +234,51 @@ func (x *SessionIndex) List() []SessionSummary {
 	return out
 }
 
+// Messages returns one session's transcript and names the store it came from.
+//
+// # Why this is a method on the index and not two calls in the HTTP handler
+//
+// "Which store answers for this sid" is ONE rule, and List above is the other
+// place that applies it. Written twice — once here, once as a route that reaches
+// for HistoryStore first and falls back — the two would be free to drift, and the
+// symptom of drift is a row that says it came from one store while its transcript
+// comes from the other. That is not a hypothetical failure mode in this
+// repository; lib/session.ts and lib/SessionRow.tsx both exist because a rule
+// stated at three call sites had already become three rules. So the rule is
+// stated once, and List and this function are the two readings of it.
+//
+// The predicate is HasHistory — a non-empty history.jsonl — because that is
+// almost exactly the predicate List uses to decide a session is tether's.
+// Anything weaker (e.g. "LoadHistory returned something") would let a session
+// appear as tether's in the list and be served from cc here.
+//
+// "Almost", and the gap is named rather than hidden: List additionally requires
+// the session's directory entry to satisfy DirEntry.IsDir, which is false for a
+// SYMLINK to a directory, while HasHistory stats through it. So a symlinked
+// session directory whose sid cc also has is listed as cc's and served from
+// tether's. Narrow enough to leave alone — changing List's rule would change
+// pre-existing behaviour for a case nothing creates — but it is a real exception
+// to "these two cannot disagree", and an absolute claim with a known exception is
+// worse than a precise one.
+//
+// SourceNone with a nil slice means neither store has it. That is not an error:
+// openSession fetches this route for a session that was created moments ago and
+// has not spoken yet, and the answer is an empty transcript.
+func (x *SessionIndex) Messages(sid string) ([]HistoryMessage, string) {
+	if x == nil {
+		return nil, SourceNone
+	}
+	if x.History != nil && x.History.HasHistory(sid) {
+		return x.History.LoadHistory(sid), SourceTether
+	}
+	if x.CC != nil {
+		if msgs, ok := x.CC.Messages(sid); ok {
+			return msgs, SourceCC
+		}
+	}
+	return nil, SourceNone
+}
+
 // title derives a human-readable description of a session from the session
 // itself: what the user opened with, else where the session runs.
 //
@@ -171,6 +286,13 @@ func (x *SessionIndex) List() []SessionSummary {
 // there. Keeping them apart means a session that later loses its binding still
 // has something to show, and means this function has one input (the session) and
 // no opinion about the UI's preference order.
+//
+// Applies to TETHER's sessions only. A cc row's title comes from CCStore, which
+// has no workspace binding to fall back on, so a cc session whose opening turn is
+// past ccTitlePrefixBytes renders as a bare sid rather than as a directory. That
+// is correct — the fallback describes where a session tether SPAWNED is running,
+// and tether did not spawn these — but it does mean this function no longer
+// describes every row in the list.
 func (x *SessionIndex) title(sid string) string {
 	if t := x.firstUserText(sid); t != "" {
 		return t

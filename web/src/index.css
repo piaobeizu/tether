@@ -529,6 +529,29 @@ body {
    hence the neutral prefix. It was `.chat-sessions-when` for one draft, while
    already being used outside the chat pane. */
 .session-row-when { font-size: 10px; color: var(--ink-quat); margin-left: auto; flex-shrink: 0; }
+/* tether#92 — the marker on a session tether did not record, and the line that
+   says what that means. Built from variables already in this file (--ink-quat,
+   --line-soft, --bg-tint); no new token (design freeze rule 4).
+
+   The marker takes the `margin-left: auto` so it sits with the timestamp rather
+   than against the label; the adjacent rule then CLEARS the timestamp's own auto
+   margin, because two `auto` margins in one flex row split the free space and
+   park the marker mid-row. It is 0 and not 6px: .tree-row already sets
+   `gap: 6px`, and a margin adds to the gap rather than replacing it. */
+.session-row-src {
+  font-size: 9.5px; color: var(--ink-quat);
+  border: 1px solid var(--line-soft); border-radius: 3px;
+  padding: 0 3px; margin-left: auto; flex-shrink: 0;
+}
+.session-row-src + .session-row-when { margin-left: 0; }
+/* Sits ABOVE .chat-sessions-head so collapsing the list — the default — cannot
+   hide it. Wraps rather than truncates: it is three clauses and every one of
+   them is a limit the user needs before they type. */
+.chat-sessions-note {
+  padding: 6px 14px; font-size: 10.5px; line-height: 1.45;
+  color: var(--ink-tertiary); background: var(--bg-tint);
+  border-bottom: 1px solid var(--line-soft);
+}
 
 /* ── Chat messages ──────────────────────────────────────────── */
 .msg-user { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }

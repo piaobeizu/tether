@@ -3,8 +3,10 @@ import { Icon } from '../../lib/icons'
 import { SessionRow } from '../../lib/SessionRow'
 import { useStore } from '../../lib/store'
 import {
+  EXTERNAL_SESSION_PROMISE,
   WI_BOUND_EVENT,
   fetchSessions,
+  isExternalSession,
   migrateLegacyWiSessions,
   type SessionSummary,
 } from '../../lib/wiSession'
@@ -112,10 +114,29 @@ export default function SessionList() {
     return () => { ok = false; window.removeEventListener(WI_BOUND_EVENT, onBound) }
   }, [load])
 
+  // tether#92 — is the conversation on screen RIGHT NOW one tether did not
+  // record? Derived from the list the daemon just sent plus the current sid, and
+  // therefore true again on the next load rather than only after a click.
+  //
+  // That is the whole point. The first version of this said its piece from
+  // SessionRow's click handler, into `notices` — which reset to [] on every load
+  // while `tether_last_sid` persisted, so a reload restored the session, restored
+  // its transcript, and silently dropped the one thing that said tether could not
+  // continue it. A promise about a session has to be a function of the session.
+  //
+  // Unknown (the current session is not in the list, e.g. the fetch failed) shows
+  // nothing: this can say what the daemon told it and no more.
+  const currentIsExternal = rows.some(r => r.sid === currentSid && isExternalSession(r))
+
   if (rows.length === 0) return null
 
   return (
     <div className="chat-sessions">
+      {/* Above the collapsible list, so collapsing the list — the default state —
+          cannot hide it, and directly above the transcript the user is reading. */}
+      {currentIsExternal && (
+        <div className="chat-sessions-note" role="note">{EXTERNAL_SESSION_PROMISE}</div>
+      )}
       <div
         className="chat-sessions-head"
         onClick={() => setOpen(o => !o)}

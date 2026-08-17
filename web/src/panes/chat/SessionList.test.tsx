@@ -13,7 +13,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import SessionList from './SessionList'
 import { useStore } from '../../lib/store'
-import { putWiBinding, resetArmedBinding, resetMigrationForTests, type SessionSummary } from '../../lib/wiSession'
+import {
+  EXTERNAL_SESSION_PROMISE,
+  putWiBinding,
+  resetArmedBinding,
+  resetMigrationForTests,
+  type SessionSummary,
+} from '../../lib/wiSession'
 
 const SID_WITH_HISTORY = 'sid-has-history-1'
 const SID_EMPTY = 'sid-no-history-2'
@@ -255,6 +261,128 @@ describe('SessionList only refetches when it might have missed a session', () =>
     // What a brand-new session looks like from here.
     useStore.setState({ sessionId: 'sid-brand-new-9999' })
     await waitFor(() => expect(listCalls(fetchMock)).toHaveLength(2))
+  })
+})
+
+// tether#92 — the other wiring hop, and the one this whole slice is about: a
+// conversation the coding agent recorded, which the daemon now enumerates, has to
+// travel daemon JSON -> fetchSessions -> this list -> the shared row -> the DOM,
+// and clicking it has to go through openSession like everything else.
+//
+// Driven through the real DOM and asserted on openSession's EFFECTS rather than
+// on a spy, so a list that grew its own switch for read-only rows fails here.
+describe('SessionList shows sessions tether never recorded (tether#92)', () => {
+  const CC_SID = 'sid-cc-terminal-01'
+
+  function mockMixedDaemon() {
+    const fn = vi.fn(async (url: string) => {
+      if (url === '/api/v1/sessions') {
+        return {
+          ok: true, status: 200, json: async () => [
+            { sid: SID_WITH_HISTORY, title: 'B-only prompt', updatedAt: HOUR_AGO + 1000, source: 'tether' },
+            { sid: CC_SID, title: 'typed in a terminal', updatedAt: HOUR_AGO, source: 'cc' },
+          ] as SessionSummary[],
+        }
+      }
+      if (url === `/api/v1/sessions/${CC_SID}/messages`) {
+        // What the daemon now serves for one of these: the coding agent's own
+        // transcript, converted. Before this slice the answer was 200 [], which
+        // is what made a listed session open as an empty chat.
+        return { ok: true, status: 200, json: async () => [{ role: 'user', text: 'typed in a terminal', ts: 20 }] }
+      }
+      if (url === `/api/v1/sessions/${SID_WITH_HISTORY}/messages`) {
+        return { ok: true, status: 200, json: async () => [{ role: 'user', text: 'B-only prompt', ts: 10 }] }
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+    vi.stubGlobal('fetch', fn)
+    return fn
+  }
+
+  it('renders the row, marks it external, and leaves tether rows unmarked', async () => {
+    mockMixedDaemon()
+    const { container } = render(<SessionList />)
+
+    await waitFor(() => screen.getByText('Sessions'))
+    fireEvent.click(screen.getByText('Sessions'))
+    await waitFor(() => screen.getByText('typed in a terminal'))
+
+    const rows = [...container.querySelectorAll('.chat-sessions-list .tree-row')]
+    expect(rows).toHaveLength(2)
+    const marked = rows.filter(r => r.querySelector('.session-row-src'))
+    expect(marked).toHaveLength(1)
+    expect(marked[0].textContent).toContain('typed in a terminal')
+  })
+
+  it('opens one through openSession and loads its transcript', async () => {
+    mockMixedDaemon()
+    const reconnects = watchReconnects()
+    render(<SessionList />)
+
+    await clickSession('typed in a terminal')
+
+    // openSession's effects, not a mock: the sid persisted, the channel rebound,
+    // the transcript loaded.
+    expect(reconnects()).toBe(1)
+    await waitFor(() => expect(useStore.getState().sessionId).toBe(CC_SID))
+    expect(localStorage.getItem('tether_last_sid')).toBe(CC_SID)
+    await waitFor(() =>
+      expect(useStore.getState().messages.map(m => m.text)).toEqual(['typed in a terminal']))
+  })
+
+  it('tells the user what it does and does not promise, once one is open', async () => {
+    mockMixedDaemon()
+    render(<SessionList />)
+
+    await clickSession('typed in a terminal')
+
+    const note = await waitFor(() => screen.getByRole('note'))
+    expect(note.textContent).toBe(EXTERNAL_SESSION_PROMISE)
+  })
+
+  // THE regression this design exists for, and the one the first version failed.
+  //
+  // A fresh mount with the sid already set is what a page reload IS: ChatPane
+  // restores tether_last_sid on mount, so the session comes back — and the first
+  // version's warning did not, because it was posted from a click handler into
+  // `notices`, which resets to [] on every load. The user returned to an external
+  // conversation, with an enabled composer, and nothing on screen said so.
+  //
+  // No click here on purpose: if the promise still needs one, this fails.
+  it('still says it after a reload, with no click at all', async () => {
+    mockMixedDaemon()
+    useStore.setState({ sessionId: CC_SID, notices: [] })
+
+    render(<SessionList />)
+
+    const note = await waitFor(() => screen.getByRole('note'))
+    expect(note.textContent).toBe(EXTERNAL_SESSION_PROMISE)
+    // And it is visible while the list is COLLAPSED, which is its default state
+    // and therefore the state a reload lands in.
+    expect(document.querySelector('.chat-sessions-list')).toBeNull()
+  })
+
+  it('says nothing while the open session is one tether recorded', async () => {
+    mockMixedDaemon()
+    useStore.setState({ sessionId: SID_WITH_HISTORY })
+
+    render(<SessionList />)
+
+    await waitFor(() => screen.getByText('Sessions'))
+    expect(screen.queryByRole('note')).toBeNull()
+  })
+
+  it('withdraws it when the user moves back to a session tether recorded', async () => {
+    mockMixedDaemon()
+    useStore.setState({ sessionId: CC_SID })
+    render(<SessionList />)
+    await waitFor(() => screen.getByRole('note'))
+
+    // What session_ready does when a resume forks, and what clicking another row
+    // does. Either way the promise must stop applying.
+    useStore.setState({ sessionId: SID_WITH_HISTORY })
+
+    await waitFor(() => expect(screen.queryByRole('note')).toBeNull())
   })
 })
 

@@ -222,12 +222,43 @@ export function resetMigrationForTests(): void {
   migrated = false
 }
 
-/** One row of GET /api/v1/sessions — mirrors session.SessionSummary (Go). */
+/**
+ * Which store a session's transcript came from (tether#92).
+ *
+ * 'tether' — this daemon recorded the conversation itself, because it travelled
+ * through its own chat channel.
+ * 'cc'     — the coding agent recorded it and tether never saw it: a conversation
+ *            held in a terminal. tether can READ these; it does not promise to
+ *            continue them, and SessionRow is where that promise is stated.
+ *
+ * There is deliberately no 'resumable' here. Whether `--resume` will work is not
+ * knowable before the fact — the agent reports the failure only after a prompt
+ * has been delivered — so a flag would be a prediction, and a list that predicts
+ * wrong is worse than one that says what it knows. See session.SessionSummary
+ * (Go) for the long form.
+ */
+export type SessionSource = 'tether' | 'cc'
+
+/**
+ * One row of GET /api/v1/sessions — mirrors session.SessionSummary (Go).
+ *
+ * Hand-written rather than generated: the codegen gate covers internal/wire →
+ * wire.gen.ts, and this type is not in it. It is THE declaration — a component
+ * that needs a field adds it here rather than widening the type at its own call
+ * site, which is the same rule sessionLabel below is an instance of.
+ */
 export interface SessionSummary {
   sid: string
   workItem?: string
   title?: string
   updatedAt: number
+  /**
+   * Optional in the TYPE although the daemon always sends it, because the
+   * fixtures in four test files build rows by hand and none of them is about
+   * provenance. An absent source reads as 'tether', which is what every row was
+   * before tether#92.
+   */
+  source?: SessionSource
 }
 
 /**
@@ -265,6 +296,62 @@ export function sessionLabel(s: SessionSummary, o?: { omitWorkItem?: boolean }):
   const wi = o?.omitWorkItem ? '' : s.workItem
   return wi || s.title || `${s.sid.slice(0, 16)}…`
 }
+
+/**
+ * isExternalSession — "tether did not record this conversation" (tether#92).
+ *
+ * Not `source === 'cc'`. An UNRECOGNISED value must read as external, not as
+ * tether's own: if the daemon ever grows a third store, a row from it would
+ * otherwise render as a fully trusted tether row, silently. Absent still reads as
+ * tether, because four test files build rows by hand and none of them is about
+ * provenance — absent means "this fixture has no opinion", a value means the
+ * daemon does.
+ *
+ * One definition, because three places ask the question (the row's badge, the
+ * row's hover text, and the chat banner) and a fourth will.
+ */
+export function isExternalSession(s: SessionSummary): boolean {
+  return s.source !== undefined && s.source !== 'tether'
+}
+
+/**
+ * What the row shows for such a session. "external", NOT "read-only": tether
+ * already uses "read-only" for a `/wt/events` observer attach (wire/errors.go),
+ * where it means "you may watch but not send" — and here the composer is very
+ * much enabled and a prompt IS delivered. Only the DISPLAY is read-only, which
+ * the banner can say and a one-word badge cannot.
+ */
+export const EXTERNAL_SESSION_BADGE = 'external'
+
+/** Why the badge is there. Written once; the row's hover text and the banner
+ *  both use it rather than each hand-rolling the sentence. */
+export const EXTERNAL_SESSION_PROVENANCE =
+  'Recorded by the coding agent — tether has no record of this conversation.'
+
+/**
+ * EXTERNAL_SESSION_PROMISE is what tether commits to for such a session, and it
+ * is deliberately a statement about STATE rather than about an event.
+ *
+ * The first version of this feature posted it as a one-shot notice on click. That
+ * was wrong in a way the tests did not show: `notices` is page-lifetime
+ * (store.ts) while `tether_last_sid` is PERSISTED, so a reload restored the
+ * session, re-fetched its transcript, rendered it identically to a tether one —
+ * and dropped every trace of the promise. The user then typed into a conversation
+ * the daemon could not continue, with nothing on screen to say so. Found by
+ * review.
+ *
+ * Every clause is checkable against the daemon:
+ *   - "no record of it"      — the row exists because tether has no transcript.
+ *   - "recent messages only, without tool activity" — session.CCStore.Messages
+ *     serves a bounded tail and converts only user and assistant text.
+ *   - "MAY start a new"      — cc reports a failed `--resume` only after the
+ *     first prompt has been delivered, so tether genuinely does not know which
+ *     will happen. "will not continue" would be false whenever the resume
+ *     succeeds; "will continue" would be false whenever it does not.
+ */
+export const EXTERNAL_SESSION_PROMISE =
+  `${EXTERNAL_SESSION_PROVENANCE} You are reading it: recent messages only, without tool activity. ` +
+  'A prompt sent here may start a new conversation instead of continuing this one.'
 
 /** The sessions bound to one work item, newest first (the daemon's order). */
 export function sessionsForWorkItem(rows: SessionSummary[], workItem: string): SessionSummary[] {

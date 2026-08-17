@@ -180,15 +180,23 @@ func buildMux(cfg *Config, certs *certHolder, wts *webtransport.Server, reg *ses
 	mux.HandleFunc("/api/v1/auth/wt-ticket", authState.WtTicketHandler)
 
 	// Session API: the list, each session's transcript, and each session's work
-	// item. Still gated on reg.History because a session with no transcript is not
-	// listable and has no messages — the wi store alone would have nothing to
-	// enumerate. The index carries the other two stores as optional extras, so a
-	// daemon without them serves a thinner list rather than none.
+	// item. Gated on reg.History, which since tether#92 is a stricter condition
+	// than the reason originally given for it: a daemon with history disabled
+	// could now serve a perfectly good list out of cc's store alone. Left as is
+	// deliberately — "history disabled" is not a configuration this daemon
+	// actually offers (lifecycle.go always builds one), so relaxing it would add
+	// an untested path to buy nothing. The index carries the other stores as
+	// optional extras, so a daemon without them serves a thinner list rather than
+	// none.
 	if reg.History != nil {
 		idx := &session.SessionIndex{
 			History:  reg.History,
 			WI:       cfg.WIBindings,
 			Bindings: reg.Bindings,
+			// The store built in lifecycle.go, not a second one. Registry.hadConversation
+			// is the other consumer and it has to see the same directories, or a
+			// session can be listed here and unknown there (tether#92).
+			CC: reg.CC,
 		}
 		listSessions, sessionSub := sessionAPIHandlers(idx, cfg.WIBindings)
 		mux.HandleFunc("/api/v1/sessions", listSessions)
@@ -199,6 +207,45 @@ func buildMux(cfg *Config, certs *certHolder, wts *webtransport.Server, reg *ses
 
 	// Wrap all routes: origin guard first, then auth middleware outermost.
 	return authState.Middleware(WithOriginGuard(cfg.Port, mux))
+}
+
+// ccWorkdirs reports the directories tether has positive evidence the user works
+// in, which is the whitelist session.CCStore looks for cc transcripts under
+// (tether#92).
+//
+// # Why a whitelist and not "everything cc has"
+//
+// cc files a transcript under a directory named for the cwd it ran in, and on a
+// working machine most of those directories are not workspaces: the reference
+// profile had 37 of them, of which 21 were throwaway job and probe directories
+// and 2 were the user's actual working trees. Listing all of them would replace
+// an almost-empty list with an unreadable one.
+//
+// # Why a closure and not a slice
+//
+// Workspaces can be added and removed while the daemon runs. A slice captured
+// here would answer from startup's snapshot forever, and the symptom — a
+// workspace you just added has no sessions until you restart — is the kind that
+// gets reported as "the list is broken" months later.
+//
+// Registry.Workdir comes first because it is where a session that selected no
+// workspace actually runs (the resolved --workspace-root), and that is the
+// majority case for sessions started from a terminal.
+func ccWorkdirs(cfg *Config, reg *session.Registry) func() []string {
+	return func() []string {
+		var out []string
+		if reg.Workdir != "" {
+			out = append(out, reg.Workdir)
+		}
+		if cfg.WsRegistry != nil {
+			for _, ws := range cfg.WsRegistry.List() {
+				if ws.Path != "" {
+					out = append(out, ws.Path)
+				}
+			}
+		}
+		return out
+	}
 }
 
 // WithOriginGuard rejects non-safe-method requests (POST/PUT/PATCH/DELETE) whose

@@ -1114,9 +1114,11 @@ func (a *Attachment) resolve(ctx context.Context) (Resolution, error) {
 		// it is the same thing from the user's side: they reconnected and their
 		// context did not come with them. Saying so is what stops the fresh session
 		// from arriving as an unexplained empty transcript. The notice is still gated
-		// on there having BEEN a conversation to lose (see HistoryStore.HasHistory).
+		// on there having BEEN a conversation to lose (see Registry.hadConversation,
+		// which since tether#92 asks cc's store as well as tether's — a session
+		// tether never recorded still had a conversation).
 		if rebound {
-			notice := a.reg.History != nil && a.reg.History.HasHistory(a.reqSID)
+			notice := a.reg.hadConversation(a.reqSID)
 			return Resolution{SID: sid, Recovered: true, Notice: notice, Rebound: true}, nil
 		}
 		return Resolution{SID: sid}, nil
@@ -1149,10 +1151,15 @@ func (a *Attachment) resolve(ctx context.Context) (Resolution, error) {
 	}
 
 	// The resume failed. Decide about the notice BEFORE spawning, while reqSID is
-	// unambiguously the session that just died. A daemon running without a
-	// HistoryStore can never notify — it has no way to know a conversation ever
-	// existed, so it stays quiet rather than guessing.
-	notice := a.reg.History != nil && a.reg.History.HasHistory(a.reqSID)
+	// unambiguously the session that just died. A daemon with no store to ask can
+	// never notify — it has no way to know a conversation ever existed, so it stays
+	// quiet rather than guessing.
+	//
+	// tether#92 — hadConversation, not HistoryStore.HasHistory. The session list
+	// now also offers conversations cc recorded and tether never saw; for those the
+	// old gate was false BY CONSTRUCTION, so the sessions most likely to reach this
+	// line were the ones guaranteed to reach it silently.
+	notice := a.reg.hadConversation(a.reqSID)
 	slog.Info("chat resume failed, starting a fresh session",
 		"requested_sid", a.reqSID, "had_history", notice)
 

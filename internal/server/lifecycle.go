@@ -64,6 +64,22 @@ type Config struct {
 	WorkspaceRoot string // builtin tools workspace root; "" = ~/.tether/workspace
 	SkipMCPInject bool   // skip ~/.claude/settings.json injection (CI/test)
 
+	// CCProjectsDir is cc's own transcript store, which the session list reads
+	// so that conversations held in a terminal are listable too (tether#92).
+	//
+	// READ ONLY, everywhere, always: it is the user's real work and on a typical
+	// install it is a host mount. Resolved by Run() from the home directory when
+	// empty; set it explicitly to point somewhere else, and set it to a path that
+	// does not exist to switch the feature off. It is resolved HERE rather than
+	// inside internal/session so that package never calls os.UserHomeDir — which
+	// is what makes "no test can read the real store by accident" a property of
+	// the API instead of a rule someone has to remember.
+	//
+	// Deliberately NOT shared with agent.ccSettingsPath: that helper MkdirAll's
+	// what it returns, which is correct for a settings file tether writes and
+	// wrong for a directory tether is only allowed to look at.
+	CCProjectsDir string
+
 	// v0.3.2: external client API token store
 	APITokensPath string // path to api-tokens.json; "" = ~/.tether/api-tokens.json
 
@@ -226,6 +242,35 @@ func Run(cfg *Config) error {
 	// cfg.Registry / cfg.Registry.History above).
 	if cfg.Registry.Workdir == "" {
 		cfg.Registry.Workdir = wsRoot
+	}
+	// tether#92 — where cc keeps its own transcripts. Same directory
+	// agent.ccSettingsPath targets, reached without its MkdirAll: this one is read,
+	// never written, and a daemon whose home cannot be determined simply lists no
+	// cc sessions rather than failing to start.
+	//
+	// CLAUDE_CONFIG_DIR is honoured because cc honours it (read from the installed
+	// binary: `env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude")`). Ignoring it
+	// would make this whole feature a silent no-op for anyone who sets it — and a
+	// silent no-op is the exact class of defect this change exists to remove.
+	if cfg.CCProjectsDir == "" {
+		ccHome := os.Getenv("CLAUDE_CONFIG_DIR")
+		if ccHome == "" {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				slog.Warn("cc sessions: no home directory; the session list will show only tether's own sessions", "err", err)
+			} else {
+				ccHome = filepath.Join(home, ".claude")
+			}
+		}
+		cfg.CCProjectsDir = session.CCProjectsDir(ccHome)
+	}
+	// Built ONCE, here, and hung on the Registry. Two consumers need it and they
+	// need the same answers: the session list (mux.go reads cfg.Registry.CC) and
+	// Registry.hadConversation, which decides whether a user is told that their
+	// resume failed. A second instance would be two opinions about which
+	// directories the user works in — the drift this repo keeps paying for.
+	if cfg.Registry.CC == nil {
+		cfg.Registry.CC = session.NewCCStore(cfg.CCProjectsDir, ccWorkdirs(cfg, cfg.Registry))
 	}
 	mcpCfg, err := loadMCPConfig(cfg.MCPConfigPath)
 	if err != nil {

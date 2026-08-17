@@ -4,7 +4,9 @@
 // invariant worth guarding: whatever the user drags to, and whatever a previous
 // session persisted, the middle pane must stay usable.
 
-/** Right pane (Chat / Work / Skills / Shell) — the narrowest useful width. */
+/** Right pane — the narrowest useful width. Its tabs are App.tsx `RIGHT_TABS`
+ *  ('chat' | 'skill' | 'shell'; display names in `RIGHT_TAB_LABEL`). Work is not
+ *  among them: it moved to the middle column in tether#90. */
 export const MIN_RIGHT = 260
 
 /**
@@ -19,8 +21,9 @@ export const MIN_RIGHT = 260
 export const MAX_RIGHT = 1000
 
 /**
- * Middle pane (canvas / file view) — below this it stops being readable, and
- * since the right width is persisted, a bad value would come back on reload.
+ * Middle pane — App.tsx `MainView`, which is the canvas (itself the file view
+ * once a file is selected) or the Work graph. Below this it stops being readable,
+ * and since the right width is persisted, a bad value would come back on reload.
  */
 export const MIN_MID = 320
 
@@ -39,9 +42,10 @@ export const DEFAULT_RIGHT = 640
 /**
  * Share of the space beside the left pane that the right pane takes by default.
  *
- * The right pane is where the work happens — Work, Chat, Skills, Shell — so it
- * is the primary column, and "primary" is a RATIO, not a number of pixels. That
- * distinction is the whole reason this is a share:
+ * Chat is the primary interaction and it lives in the right pane — it is that
+ * pane's default tab (App.tsx `loadRightTab` falls back to 'chat') — so the
+ * right pane is the primary column, and "primary" is a RATIO, not a number of
+ * pixels. That distinction is the whole reason this is a share:
  *
  *   right > middle  <=>  DEFAULT_RIGHT_ish > (windowWidth - leftWidth) / 2
  *
@@ -52,6 +56,29 @@ export const DEFAULT_RIGHT = 640
  * clamps leave room, and hands the decision back to the clamps where they do
  * not. Anything above 0.5 makes the right pane the widest; 0.56 does it with a
  * visible margin without squeezing the canvas.
+ *
+ * The premise above used to read "the right pane is where the work happens —
+ * Work, Chat, Skills, Shell". tether#90 ended that: Work is a MIDDLE-column view
+ * (App.tsx `MainView`, chosen from the activity bar), and the right pane is three
+ * tabs (`RIGHT_TABS = ['chat', 'skill', 'shell']`). Only the premise changed —
+ * 0.56 did not, and why it did not is worth writing down, because "Work moved to
+ * the middle" reads like a reason to shrink the right pane. It is not:
+ *
+ *   panes/work/ForceGraph.tsx's computePositions sizes cards on `presentCols` —
+ *   the status columns that actually HOLD nodes — not on all five statuses. With
+ *   two present columns its arithmetic leaves the compact card form at exactly
+ *   276px of graph width and reaches the 132px card cap at exactly 348px — the
+ *   thresholds are `110 * nCols + 56` and `146 * nCols + 56`, and
+ *   ForceGraph.test.tsx pins the first of those at three, four and five columns.
+ *   The middle keeps the other 0.44 of the space beside the left pane —
+ *   507px at a 1440 window, 436px at 1280 (windowWidth - DEFAULT_LEFT -
+ *   ACTIVITY_W, less this share), before divider chrome — so at two present
+ *   columns the graph is at its cap either way.
+ *
+ * Whether some larger number of PRESENT columns wants a wider middle is a fair
+ * question, but it is a measurement against presentCols — not against the
+ * five-status enum, which is what makes the middle look starved on paper when it
+ * is not. Re-measure before touching this number, and do it in its own change.
  */
 export const DEFAULT_RIGHT_SHARE = 0.56
 

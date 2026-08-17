@@ -14,10 +14,31 @@ export interface ToolCall {
   name: string
   input: unknown
   /** The tool's output, hung under the call (matched by tool_use_id) once the
-   *  daemon forwards the tool_result (tether#38). Absent until then; live-only. */
+   *  daemon forwards the tool_result (tether#38). Absent until then — but NOT
+   *  live-only, which is what this said until tether#98: on tether's own sessions
+   *  it rides along in `HistoryMessage.Tools` as `ToolCallRecord.Result`
+   *  (internal/session/history.go) since tether#44, so it survives a reload with
+   *  the call it hangs on. A cc session keeps only FAILED results — see `tools` on
+   *  Message below. */
   result?: { content: string; isError: boolean }
 }
 
+/**
+ * One chat message as rendered.
+ *
+ * Several fields below document whether they survive a page reload. That claim
+ * is CHECKABLE in two places, and checking it beats inheriting it:
+ *
+ *   1. does `HistoryMessage` (internal/session/history.go) declare the field, and
+ *   2. does historyEntryToMessage (below) copy it onto the Message?
+ *
+ * Both must hold for "survives a reload"; neither alone is enough. tether#44 made
+ * `thinking` and `tools` persist, and these comments went on claiming "live-only"
+ * from then until tether#98 — which is the failure the two-place check is cheap
+ * enough to prevent. Do not take another field's word for it: tether#98 found
+ * `tools` citing `thinking` as its authority while `thinking` was also wrong, so
+ * following the citation CONFIRMED the error instead of catching it.
+ */
 export interface Message {
   id: string
   role: 'user' | 'assistant' | 'system'
@@ -26,8 +47,14 @@ export interface Message {
   /** Optional D-19 fenced block rendered inline in this message bubble. */
   block?: FencedBlock
   /** Accumulated extended-thinking text for this assistant turn (tether#34).
-   *  Ephemeral / live-only — the daemon never persists it to history, so it is
-   *  absent after a page reload (spec D3). */
+   *  PERSISTED since tether#44 — `HistoryMessage.Thinking` in
+   *  internal/session/history.go, restored by historyEntryToMessage below — so it
+   *  DOES survive a page reload. (Until tether#98 this said the opposite:
+   *  "ephemeral / live-only … absent after a page reload (spec D3)", which
+   *  described the pre-#44 daemon.) Still absent on history lines written before
+   *  #44, because the Go field did not exist when they were written — not because
+   *  of its `omitempty`, which only governs the write side. "Absent on old lines"
+   *  is not the same claim as "never persisted". */
   thinking?: string
   /** Wall-clock ms spent thinking before the answer began (tether#34); set when
    *  the first answer delta arrives. Undefined while thinking is still live. */
@@ -37,13 +64,28 @@ export interface Message {
    *  persisted), so absent after a page reload. */
   answerMs?: number
   /** Tool calls (Read/Bash/Edit/…) the agent made during this turn (tether#37),
-   *  in arrival order. Live-only — the daemon never persists tool_use to history,
-   *  so absent after a page reload (same as thinking/answerMs). */
+   *  in arrival order. PERSISTED since tether#44 — `HistoryMessage.Tools`
+   *  ([]ToolCallRecord, internal/session/history.go), restored by
+   *  historyEntryToMessage below — so it DOES survive a page reload. On tether's
+   *  own sessions HistoryStore bounds it by MaxToolsPerTurn and MaxToolResultBytes.
+   *
+   *  A cc session reaches this same field by a DIFFERENT route since tether#96:
+   *  CCStore.Messages (internal/session/ccsessions.go) reads tool activity out of
+   *  cc's transcript, under its own caps and with no per-turn count cap, and it
+   *  keeps only FAILED tool results. So do not read the two paths as one — on a cc
+   *  session the call survives a reload but `result` is usually absent.
+   *
+   *  Until tether#98 this said "the daemon never persists tool_use to history, so
+   *  absent after a page reload (same as thinking/answerMs)". Nothing replaces
+   *  that cross-reference on purpose — `thinking` was wrong in the same way, so
+   *  the citation confirmed the claim instead of testing it. Check the two places
+   *  named above the interface instead. */
   tools?: ToolCall[]
   /** The turn's token usage (tether#48): input/output token counts from cc's
    *  result event, attached to the turn bubble for the "⇅ in↑/out↓" badge.
    *  Live-only — the daemon does not persist usage to history, so absent after
-   *  a page reload (same as thinking/answerMs). */
+   *  a page reload (same as answerMs; `thinking` was dropped from this list in
+   *  tether#98 because it is persisted, not because usage changed). */
   usage?: { input: number; output: number }
 }
 

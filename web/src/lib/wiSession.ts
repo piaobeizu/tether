@@ -342,15 +342,36 @@ export const EXTERNAL_SESSION_PROVENANCE =
  *
  * Every clause is checkable against the daemon:
  *   - "no record of it"      — the row exists because tether has no transcript.
- *   - "recent messages only, without tool activity" — session.CCStore.Messages
- *     serves a bounded tail and converts only user and assistant text.
+ *   - "recent messages only" — session.CCStore.Messages converts a bounded tail
+ *     of the transcript (ccReadTail), then trims to ccMessagesMax messages that
+ *     CARRY WORDS (ccTrimFront), tool-only bubbles riding along exempt.
+ *   - "with the calls it made; their output only where a call failed" — since
+ *     tether#96 that same reader attaches each turn's tool calls
+ *     (ccMessage.toolCalls: name, id, and a bounded projection of the call's
+ *     arguments — only STRING values survive it at all). Results are the
+ *     asymmetric half and the clause has to say so: ccMessage.errorResults serves
+ *     a result ONLY when `is_error` is set, capped at 2 KiB plus a visible
+ *     truncation marker. Both of the shorter wordings are false, in opposite
+ *     directions: "without tool activity" (the calls are on screen — that was the
+ *     bug tether#97 fixed) and any unqualified promise of "tool output" or "what
+ *     it did" (a successful call carries no output at all, and even a failure's is
+ *     a bounded prefix).
+ *
+ *     Two things this clause deliberately does NOT say. "only where", not
+ *     "wherever": it is an upper bound, so a failure whose record carries no
+ *     tool_use_id being dropped does not falsify it. And it is scoped by "you are
+ *     reading IT" — the RECORDED conversation. A prompt sent into one of these
+ *     streams live turns into the same pane WITH successful tool output, until the
+ *     next list refresh reclassifies the session as tether's own; the sentence is
+ *     about the transcript above that point, not about everything in the pane.
  *   - "MAY start a new"      — cc reports a failed `--resume` only after the
  *     first prompt has been delivered, so tether genuinely does not know which
  *     will happen. "will not continue" would be false whenever the resume
  *     succeeds; "will continue" would be false whenever it does not.
  */
 export const EXTERNAL_SESSION_PROMISE =
-  `${EXTERNAL_SESSION_PROVENANCE} You are reading it: recent messages only, without tool activity. ` +
+  `${EXTERNAL_SESSION_PROVENANCE} You are reading it: recent messages only, ` +
+  'with the calls it made; their output only where a call failed. ' +
   'A prompt sent here may start a new conversation instead of continuing this one.'
 
 /** The sessions bound to one work item, newest first (the daemon's order). */

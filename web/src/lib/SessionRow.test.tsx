@@ -150,9 +150,53 @@ describe('SessionRow marks a session tether did not record', () => {
     // rewording cannot pass by dodging one literal.
     expect(EXTERNAL_SESSION_PROMISE).toMatch(/coding agent/i)
     expect(EXTERNAL_SESSION_PROMISE).toMatch(/recent messages only/i)
-    expect(EXTERNAL_SESSION_PROMISE).toMatch(/without tool activity/i)
     expect(EXTERNAL_SESSION_PROMISE).toMatch(/\bmay\b[^.]*new conversation/i)
     expect(EXTERNAL_SESSION_PROMISE).not.toMatch(/will (not )?(be )?continu/i)
+  })
+
+  // tether#97 — this banner told the user the transcript came "without tool
+  // activity", and tether#96 put tool cards on the screen directly underneath it.
+  //
+  // These assert the SHAPE of the claim rather than its words, because a test
+  // that swaps one exact sentence for another goes stale the same way the first
+  // one did: it was pinning /without tool activity/, so it stayed green while the
+  // string it protected turned into a lie about a change in another package.
+  it('says the tool activity the daemon now serves is THERE', () => {
+    // Asserted in the POSITIVE form deliberately. Enumerating the ways a sentence
+    // can deny the calls is a losing game — "without tool activity", "without the
+    // calls it made" and "the calls it made are omitted" are three different lies
+    // and a blocklist catches whichever one it happened to be written against.
+    // Requiring INCLUSION catches all three at once: the noun has to arrive
+    // attached to a word that puts it on the screen. (`\bwith\b` does not match
+    // "without" — the boundary fails on the following letter.) Either noun and
+    // three inclusion words pass, so this pins the CLAIM, not the voice.
+    expect(EXTERNAL_SESSION_PROMISE).toMatch(/\b(with|including|plus)\b[^.;]{0,24}\b(calls?|tools?)\b/i)
+    // Belt and braces for the exact sentence this wi deleted, which is the one a
+    // revert or a bad merge would put back.
+    expect(EXTERNAL_SESSION_PROMISE).not.toMatch(/without tool|no tool activity/i)
+  })
+
+  it('does not over-correct into promising output the daemon drops', () => {
+    // The opposite failure, and the likelier one for whoever rewords this next: a
+    // SUCCESSFUL call carries no result at all (ccMessage.errorResults serves only
+    // is_error), and a call's arguments are a bounded string-only projection. So
+    // "the full output", "everything it did", "the complete record" are fresh lies.
+    //
+    // Word-bounded and negation-aware, because both matter: without \b this
+    // rejects "incomplete", and without the lookbehind it rejects "not the full
+    // output" — and those two are honest wordings, so failing them would make this
+    // guard an obstacle to fixing the very thing it is guarding.
+    expect(EXTERNAL_SESSION_PROMISE)
+      .not.toMatch(/(?<!\b(?:not|never|no)\s(?:the\s)?)\b(full|complete|everything|all of)\b/i)
+  })
+
+  it('states the output limit together with the exception that makes it true', () => {
+    // The two halves are only true as a pair, so they are matched as a pair — one
+    // clause, no sentence boundary between them. "no tool output" alone is false
+    // (a failure's message IS served, capped at 2 KiB); "shows what it did" alone
+    // over-promises the successes it drops. A co-occurrence match passes any
+    // rewording that keeps both facts and fails one that keeps only one.
+    expect(EXTERNAL_SESSION_PROMISE).toMatch(/output[^.]*fail|fail[^.]*output/i)
   })
 
   it('still opens the session through the one shared operation', () => {

@@ -1290,8 +1290,9 @@ export function AnswerBody({ text, streaming }: { text: string; streaming: boole
 // bubble; this renders them as a compact activity log above the answer — one
 // line per call: icon + name + a best-effort one-line arg summary. A turn can
 // fire 10+ tools, so beyond TOOL_FOLD_THRESHOLD they collapse behind a
-// "used N tools" toggle. No tool result (that needs daemon tool_result parsing —
-// a later slice).
+// "used N tools" toggle. Results arrived in tether#38 — this paragraph said "no tool
+// result (that needs daemon tool_result parsing — a later slice)" until tether#97,
+// in the same file as the code that has been rendering them since.
 const TOOL_FOLD_THRESHOLD = 5
 
 // The input field worth showing per known tool; unknown tools show name only.
@@ -1385,10 +1386,28 @@ export function ToolCallList({ tools }: { tools: ToolCall[] }) {
         const arg = summarizeToolInput(t.name, t.input)
         const preview = t.result ? summarizeToolResult(t.name, t.result) : ''
         const isOpen = expanded.has(key)
-        // Only clickable/expandable when the result has something to show — a
-        // present-but-empty result (e.g. a command with no stdout) would be a
-        // dead click with a blank block otherwise (review MINOR).
-        const hasResult = !!t.result && (t.result.content.length > 0 || t.result.isError)
+        // Expandability is a question about the CONTENT and nothing else: there
+        // is a block to open only if there are words to put in it. A
+        // present-but-empty result (a command with no stdout) would otherwise be
+        // a dead click onto a blank block (review MINOR).
+        //
+        // `.trim()` and not `.length`, because whitespace is not words and the
+        // rendered block would be just as blank. The daemon can serve it: for a cc
+        // transcript, session.ccMessage.text keeps a `text` sub-block whenever it
+        // is not the EMPTY string, so a result of "   " arrives with length 3.
+        //
+        // The condition used to be `|| t.result.isError`, which reopened that same
+        // dead click for the one result that can be flagged AND empty: cc writes
+        // `is_error` with content that flattens to nothing (an empty array, or only
+        // image / tool_reference sub-blocks), and the daemon serves it on purpose —
+        // dropping it would make a failed call read as a successful one
+        // (session.ccMessage.errorResults). So the failure still has to reach the
+        // screen, and it does, on the lines below: `preview` and the `err` class are
+        // derived from t.result.isError independently of this flag, and
+        // summarizeToolResult returns 'error' from the FLAG rather than from the
+        // text. The row still says error; it no longer offers to expand into
+        // nothing. tether#97.
+        const hasResult = !!t.result && t.result.content.trim().length > 0
         return (
           <div key={key}>
             <div

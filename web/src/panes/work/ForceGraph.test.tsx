@@ -429,22 +429,81 @@ describe('computePositions responsive sizing (tether#27)', () => {
   // COMPACT_THRESHOLD that shifts the usable width shows up here rather than in
   // someone's judgement about whether the map "looks cramped".
   //
-  // Do NOT read these as "the middle column is wide enough". At the DEFAULT
-  // column widths (lib/layout.ts: left 240, right = 0.56 of the rest) the middle
-  // is 478px on a 1440px window and 408px on a 1280px window — both compact with
-  // five columns. Full-size cards need the user to have dragged the right
-  // divider in. tether#90's report says so explicitly.
+  // Do NOT read them as "the default middle column is too narrow for full-size
+  // cards". Five present columns is the MAXIMUM, not the default case:
+  // computePositions sizes cards on `presentCols` — the status buckets that
+  // actually hold nodes — so the count that selects a threshold is the number of
+  // NON-EMPTY columns. That is a property of the data, and of WorkGraphView's
+  // mode filter (which hides terminal wi by default), not of the five-status
+  // enum. The test immediately above this block — 'packs present columns
+  // adjacently' — already proves it: two statuses in, cols.length === 2 out. The
+  // two belong together; read this block on its own and it becomes a
+  // five-column claim about every project.
+  //
+  // The rule those numbers are instances of: cards leave the compact form at
+  // 110 * nCols + 56 and reach the card-width cap at 146 * nCols + 56 — that is
+  // COMPACT_THRESHOLD + COL_MARGIN, MAX_CARD_W + COL_MARGIN, and PAD * 2, all
+  // from the top of ForceGraph.tsx. Two present columns: 276 and 348, both
+  // pinned below.
+  //
+  // And the width the middle column actually gets by DEFAULT, so that comparison
+  // gets made instead of assumed: App.tsx's `rightW` initializer hands
+  // loadRightWidth `leftW + ACTIVITY_W` (240 + 48 = 288 — all of the chrome left
+  // of the middle, which is the arithmetic layout.ts does), so defaultRightWidth
+  // takes DEFAULT_RIGHT_SHARE = 0.56 of the 1152 / 992 beside it: 645 at a 1440px
+  // window, 556 at 1280, clampRightWidth binding at neither. The middle keeps the
+  // rest, less the two 1px .col-resizer dividers: 505px and 434px. Two other
+  // "default width at 1440" numbers are in the repo and neither contradicts this
+  // one — layout.ts's note on DEFAULT_RIGHT_SHARE says 507, the same quantity
+  // BEFORE those dividers, and 672 is defaultRightWidth given leftWidth 240, i.e.
+  // the variant that omits ACTIVITY_W. Nothing between .dt-mid-work and the
+  // measured .fg-scroll adds horizontal padding, so 505 / 434 is also what
+  // ForceGraph measures (bucketed to 500 / 440 by CW_BUCKET). Both are past 348:
+  // at two present columns the default layout is already at the 132px cap, with
+  // no divider drag. Five present columns in a 505px middle WOULD be compact —
+  // but that is a statement about a five-column project, and telling the two
+  // apart is what the per-column-count numbers below are for.
+  //
+  // Every number above is arithmetic over named constants — in ForceGraph.tsx,
+  // lib/layout.ts and App.tsx — given a viewport width and index.css's 1px
+  // divider. Recompute them from there; do not carry them over from a wi report,
+  // including one that cites this file.
   it('pins the container width at which cards stop being compact, per column count', () => {
     const cols = (n: number) => ns.slice(0, n)
+    // The scan floor must stay below every threshold this helper gets asked for:
+    // 276 below, and 166 if a one-column row is ever added. Above a threshold
+    // firstFull returns the FLOOR — a number that says nothing about the
+    // constants. Against an expectation derived FROM the constants that fails
+    // loudly (with the old floor of 300, `firstFull(2)` returns 300 and the 276
+    // below goes red); the quiet failure is reading the value off a run and
+    // pinning the artifact instead. Scanning is sound for w > 0, where every step
+    // of the sizing arithmetic is monotone in w, so `compact` flips at most once
+    // and the first non-compact width IS the threshold — but not at cw <= 0,
+    // which short-circuits to the natural, non-compact size, so the scan must
+    // never start there.
     const firstFull = (n: number) => {
-      for (let w = 300; w <= 900; w++) if (!computePositions(cols(n), w).compact) return w
+      for (let w = 100; w <= 900; w++) if (!computePositions(cols(n), w).compact) return w
       return -1
     }
     expect(firstFull(5)).toBe(606)
     expect(firstFull(4)).toBe(496)
     expect(firstFull(3)).toBe(386)
+    // Two present columns was the row missing from this table, and it is the one
+    // the note above compares the default middle column against.
+    expect(firstFull(2)).toBe(276)
     // and one either side of the five-column boundary, stated directly
     expect(computePositions(ns, 605).compact).toBe(true)
     expect(computePositions(ns, 606).compact).toBe(false)
+  })
+
+  // Reaching the cap is a different property from leaving `compact` — cardW
+  // saturating at MAX_CARD_W rather than the flag flipping — so it gets its own
+  // name, and a failure says which of the two moved. Two present columns is the
+  // count pinned here because 348 is the number that makes the note above's
+  // "already at the 132px cap" true.
+  it('pins where two present columns reach the natural card cap', () => {
+    const two = (w: number) => computePositions(ns.slice(0, 2), w)
+    expect(two(347).cardW).toBeLessThan(132)
+    expect(two(348).cardW).toBe(132)
   })
 })

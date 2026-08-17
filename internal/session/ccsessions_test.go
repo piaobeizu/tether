@@ -1,6 +1,8 @@
 package session
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -9,15 +11,27 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 )
 
-// Every fixture in this file is SYNTHETIC and built under t.TempDir(). Nothing
-// here reads, copies or points at a real cc store — see CCStore's doc for why
-// that is a safety property and not a preference, and TestCCStoreNeverWrites for
-// the assertion that backs it up.
+// Every fixture in this file is SYNTHETIC and built under t.TempDir() — see
+// CCStore's doc for why that is a safety property and not a preference, and
+// TestCCStoreNeverWrites for the assertion that backs it up.
+//
+// ONE test reads a real store, and only when told to: TestEnumerateUserRecordShapes
+// takes a census when TETHER_CC_CENSUS_DIR is set, skips otherwise, and opens files
+// for reading and nothing else. This paragraph exists because the sentence above it
+// used to end "…nothing here reads or points at a real cc store", and tether#95 made
+// that false. A file header that is 95% true is how a reader ends up trusting the
+// wrong half.
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
 
 // ccFixture writes one cc transcript and returns the store that can see it.
 type ccFixture struct {
@@ -127,6 +141,93 @@ func ccCommandStdout(t *testing.T, text string) string {
 		"type":      "user",
 		"timestamp": "2026-08-17T03:00:00.000Z",
 		"message":   map[string]any{"role": "user", "content": ccCommandStdoutPrefix + text + "</local-command-stdout>"},
+	})
+}
+
+// ---------------------------------------------------------------------------
+// The four shapes tether#95 found. One builder each, so a test that omits one
+// omits it visibly.
+// ---------------------------------------------------------------------------
+
+// ccTaskNotification builds the record the harness writes when a background task
+// finishes and the completion is fed back to cc as a user turn: type "user", no
+// isMeta, plain string content. 364 of these in the census — 84% of all the noise
+// — and 355 of them sat between two assistant fragments, so this is also the
+// record the merge seam is tested with.
+//
+// The body carries the fields a real one carries, including the enormous <result>
+// that made these the biggest of the four by bytes as well as by count.
+func ccTaskNotification(t *testing.T, summary, result string) string {
+	return ccLine(t, map[string]any{
+		"type":      "user",
+		"timestamp": "2026-08-17T03:00:00.000Z",
+		"message": map[string]any{"role": "user", "content": ccTaskNotificationPrefix + "\n" +
+			"<task-id>a3d641c4201f0866a</task-id>\n" +
+			"<tool-use-id>toolu_01JYfrdErMDTRUQG8P62d91c</tool-use-id>\n" +
+			"<output-file>/tmp/cc/tasks/a3d641c4201f0866a.output</output-file>\n" +
+			"<status>completed</status>\n" +
+			"<summary>" + summary + "</summary>\n" +
+			"<result>" + result + "</result>\n</task-notification>"},
+	})
+}
+
+// ccBashInput builds the record cc writes when the user runs a shell command with
+// the `!` prefix. Real records carry a leading space inside the tag, which is why
+// every one of them is written that way here: a fixture without it would not
+// notice a renderer that forgot to trim.
+func ccBashInput(t *testing.T, cmd string) string {
+	return ccLine(t, map[string]any{
+		"type":      "user",
+		"timestamp": "2026-08-17T03:00:00.000Z",
+		"message":   map[string]any{"role": "user", "content": ccBashInputPrefix + " " + cmd + ccBashInputSuffix},
+	})
+}
+
+// ccBashOutput builds that command's output. Real records carry stdout and stderr
+// in one record, stderr always second and often empty — 22 of 22 — so the fixture
+// does too.
+func ccBashOutput(t *testing.T, stdout, stderr string) string {
+	return ccLine(t, map[string]any{
+		"type":      "user",
+		"timestamp": "2026-08-17T03:00:00.000Z",
+		"message": map[string]any{"role": "user", "content": ccBashStdoutPrefix + stdout + "</bash-stdout>" +
+			ccBashStderrPrefix + stderr + "</bash-stderr>"},
+	})
+}
+
+// ccInterrupt builds cc's interrupt marker. qualifier is "" for the common form
+// and "for tool use" for the one the census saw twice.
+//
+// The content is a text-block ARRAY, not a plain string, and that is measured
+// rather than stylistic: of the six shapes ccUserShapes knows, this is the only
+// one cc writes that way — 25 of 25 — while the other five and 2,713 genuine
+// human turns all arrive as plain strings. This builder had it as a string until
+// that count was taken, which would have left the array path for this shape
+// unexercised by any fixture.
+func ccInterrupt(t *testing.T, qualifier string) string {
+	body := ccInterruptPrefix
+	if qualifier != "" {
+		body += " " + qualifier
+	}
+	return ccLine(t, map[string]any{
+		"type":      "user",
+		"timestamp": "2026-08-17T03:00:00.000Z",
+		"message": map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "text", "text": body + "]"},
+		}},
+	})
+}
+
+// ccSlashCommandRecord builds a slash command the user typed — the NEGATIVE
+// CONTROL for every drop above. It is markup too, and it is a real user turn:
+// #95's first enumeration counted 221 of these as defects before it re-measured
+// through userText.
+func ccSlashCommandRecord(t *testing.T, name, args string) string {
+	return ccLine(t, map[string]any{
+		"type":      "user",
+		"timestamp": "2026-08-17T03:00:00.000Z",
+		"message": map[string]any{"role": "user", "content": "<command-message>" + strings.TrimPrefix(name, "/") +
+			"</command-message>\n" + ccCommandNameTag + name + "</command-name>\n<command-args>" + args + "</command-args>"},
 	})
 }
 
@@ -743,6 +844,389 @@ func TestMessagesDoesNotMergeAcrossAUserTurn(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// The shape axis (tether#95)
+// ---------------------------------------------------------------------------
+
+// TestUserRecordShapesAreClassifiedOneWayEach walks every row of ccUserShapes
+// through ccClassifyUserText, one case per row, and asserts BOTH halves of the
+// answer: the shape it was recognised as, and the text a human ends up reading.
+//
+// Two of the four shapes #95 found are KEPT, and that is the whole reason this is
+// a table of expected texts rather than a list of things that vanish. A blanket
+// "drop the records that look like markup" rule would satisfy a test that only
+// checked the drops, and would be silently deleting 47 real user actions per 39
+// transcripts: the commands the user ran with `!`, and the moments they hit
+// interrupt.
+//
+// The two negative controls at the end are what make the drops mean anything. A
+// slash command is markup AND a user turn; a pasted <div> is a user turn that
+// merely looks like markup. #95's first enumeration counted 221 of the former as
+// defects, and re-measuring through this function is what corrected it.
+//
+// The final check closes the loop the table exists for: every row of
+// ccUserShapes has to appear here. Add a row for batch five without a case and
+// this fails, which is the only thing standing between "the table is the one
+// place" and a table with an untested row in it.
+func TestUserRecordShapesAreClassifiedOneWayEach(t *testing.T) {
+	cases := []struct{ name, shape, in, want string }{
+		{
+			name:  "task notification is dropped",
+			shape: ccTaskNotificationPrefix,
+			in: ccTaskNotificationPrefix + "\n<task-id>a3d</task-id>\n<status>completed</status>\n" +
+				"<summary>Agent \"L1\" finished</summary>\n<result>a whole report</result>\n</task-notification>",
+			want: "",
+		},
+		{
+			name:  "command stdout is dropped",
+			shape: ccCommandStdoutPrefix,
+			in:    ccCommandStdoutPrefix + "\x1b[1mtotal 48\x1b[0m\ndrwxr-xr-x 3 root root</local-command-stdout>",
+			want:  "",
+		},
+		{
+			name:  "bash output is dropped",
+			shape: ccBashStdoutPrefix,
+			in:    ccBashStdoutPrefix + "daemonset.apps/gw restarted</bash-stdout>" + ccBashStderrPrefix + "</bash-stderr>",
+			want:  "",
+		},
+		{
+			// Registered on the mechanism rather than on an observation — 0 of the
+			// 22 real records led with stderr. Asserted anyway, because "we also
+			// handle the stderr-first form" is otherwise a claim with nothing
+			// behind it.
+			name:  "bash output leading with stderr is dropped too",
+			shape: ccBashStdoutPrefix,
+			in:    ccBashStderrPrefix + "no such context</bash-stderr>",
+			want:  "",
+		},
+		{
+			// KEPT. The user typed `!` and ran this.
+			name:  "bash input keeps the command the user ran",
+			shape: ccBashInputPrefix,
+			in:    ccBashInputPrefix + " kubectl -n ieops-system rollout restart ds/gw" + ccBashInputSuffix,
+			want:  "! kubectl -n ieops-system rollout restart ds/gw",
+		},
+		{
+			// Plain text, no backticks: a user bubble renders as {m.text}, not
+			// through <Markdown> (web/src/panes/chat/index.tsx).
+			name:  "bash input renders without markdown",
+			shape: ccBashInputPrefix,
+			in:    ccBashInputPrefix + "ls -la" + ccBashInputSuffix,
+			want:  "! ls -la",
+		},
+		{
+			name:  "an empty bash input has no action to show",
+			shape: ccBashInputPrefix,
+			in:    ccBashInputPrefix + "   " + ccBashInputSuffix,
+			want:  "",
+		},
+		{
+			// The two KEPT shapes match the WHOLE record, so a record carrying the
+			// user's own words after the markup is NOT the shape and survives
+			// intact. Before this was anchored, the renderer cut at the closing tag
+			// and " and then I typed this" was deleted — the same defect as the four
+			// shapes this table exists for, one level down, and invisible to the
+			// census because a matched shape is never reported as a candidate.
+			name:  "a bash input with anything after it is not the shape and is kept whole",
+			shape: ccShapeHumanText,
+			in:    ccBashInputPrefix + " ls" + ccBashInputSuffix + " and then I typed this",
+			want:  ccBashInputPrefix + " ls" + ccBashInputSuffix + " and then I typed this",
+		},
+		{
+			// KEPT. 19 of the 25 sit between the answer the user cut off and what
+			// they typed next, so this record is the only thing that says why that
+			// answer stops mid-sentence.
+			name:  "interrupt becomes an action a human reads",
+			shape: ccInterruptPrefix,
+			in:    "[Request interrupted by user]",
+			want:  "(interrupted)",
+		},
+		{
+			// The qualifier is carried VERBATIM — what cc means by it has not been
+			// read out of cc.
+			name:  "the interrupt qualifier is carried through, not interpreted",
+			shape: ccInterruptPrefix,
+			in:    "[Request interrupted by user for tool use]",
+			want:  "(interrupted for tool use)",
+		},
+		{
+			// Interrupts are the one shape cc writes as a text-block array, and
+			// ccMessage.text joins blocks with "\n" — so this is the structurally
+			// reachable way for a real message to arrive attached to a marker. It
+			// must survive whole rather than becoming a bare "(interrupted)".
+			name:  "an interrupt with a message after it is not the shape and is kept whole",
+			shape: ccShapeHumanText,
+			in:    "[Request interrupted by user]\ndo the other thing instead",
+			want:  "[Request interrupted by user]\ndo the other thing instead",
+		},
+		{
+			// NEGATIVE CONTROL. Markup, and a real user turn: this is what #95's
+			// first enumeration got wrong by measuring before this function ran.
+			name:  "a slash command still renders as the command",
+			shape: ccCommandNameTag,
+			in: "<command-message>polyforge:pf-work</command-message>\n" +
+				ccCommandNameTag + "/polyforge:pf-work</command-name>\n<command-args>tether#95</command-args>",
+			want: "/polyforge:pf-work tether#95",
+		},
+		{
+			name:  "a slash command with no args renders as the bare command",
+			shape: ccCommandNameTag,
+			in:    ccCommandNameTag + "/clear</command-name><command-message>clear</command-message><command-args></command-args>",
+			want:  "/clear",
+		},
+		{
+			// NEGATIVE CONTROL. People paste code, and genuine human messages in
+			// the census contain <svg>, <div> and <style>, so a rule about angle
+			// brackets in general would eat them.
+			name:  "a human pasting markup is left alone",
+			shape: ccShapeHumanText,
+			in:    "compare <div> and <span> for me",
+			want:  "compare <div> and <span> for me",
+		},
+		{
+			// The slash-command row is anchored for the same reason the others are.
+			// Until tether#95 it matched <command-name> ANYWHERE, so this sentence
+			// was replaced wholesale by "/foo" — the row held up as proof that the
+			// table is not a blanket rule was itself deleting user text.
+			name:  "a human quoting command markup keeps their sentence",
+			shape: ccShapeHumanText,
+			in:    "please add " + ccCommandNameTag + "/foo</command-name> to the docs",
+			want:  "please add " + ccCommandNameTag + "/foo</command-name> to the docs",
+		},
+		{
+			// ccIsSlashCommand requires a command to be EXTRACTABLE, not just the
+			// tag to be present. Without this the row would claim a shape that
+			// ccRenderCommand declines to render, and the census — which reports
+			// only records matching NO row — could never surface it.
+			name:  "an empty command name is not a shape at all",
+			shape: ccShapeHumanText,
+			in:    ccCommandNameTag + "</command-name>",
+			want:  ccCommandNameTag + "</command-name>",
+		},
+		{
+			// The promise that unmatched text comes back UNCHANGED includes its
+			// whitespace: this function is not the place that reformats what a
+			// human typed.
+			name:  "unmatched text keeps its own whitespace",
+			shape: ccShapeHumanText,
+			in:    "  leading and trailing  ",
+			want:  "  leading and trailing  ",
+		},
+		{
+			// The safety margin of every drop above is that they match a PREFIX. A
+			// Contains rule would delete this sentence.
+			name:  "a human writing a tag name mid-sentence is left alone",
+			shape: ccShapeHumanText,
+			in:    "why is <task-notification> showing up as a bubble?",
+			want:  "why is <task-notification> showing up as a bubble?",
+		},
+		{
+			name:  "ordinary words are left exactly alone",
+			shape: ccShapeHumanText,
+			in:    "把这个查清楚",
+			want:  "把这个查清楚",
+		},
+	}
+
+	covered := make(map[string]bool)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			shape, got := ccClassifyUserText(tc.in)
+			if shape != tc.shape {
+				t.Errorf("shape = %q, want %q", shape, tc.shape)
+			}
+			if got != tc.want {
+				t.Errorf("text = %q, want %q", got, tc.want)
+			}
+		})
+		covered[tc.shape] = true
+	}
+	for _, s := range ccUserShapes {
+		if !covered[s.name] {
+			t.Errorf("ccUserShapes has a row for %q that no case in this table exercises. "+
+				"A row without a case is a filter that can be broken silently — which is "+
+				"how the four shapes of tether#95 got shipped in the first place.", s.name)
+		}
+	}
+}
+
+// TestMessagesDropsMachineNoiseAndKeepsRealUserActions runs all six shapes
+// through the REAL chain — isUserTurn, userText, ccClassifyUserText, and the
+// `text != ""` gate — in one transcript, and asserts the exact message list.
+//
+// End to end rather than on ccClassifyUserText alone, because #95's whole
+// measurement lesson is that a claim about "what this reader produces" has to be
+// taken over what it produces. The unit table above can pass while the classifier
+// is wired into nothing.
+func TestMessagesDropsMachineNoiseAndKeepsRealUserActions(t *testing.T) {
+	body := ccUser(t, "把这个查清楚") +
+		ccAssistantAt(t, "查清楚:", "2026-08-17T04:57:00.000Z") +
+		ccTaskNotification(t, `Agent "L1: survey" finished`, "SECRET-AGENT-REPORT") +
+		ccAssistantAt(t, "先看进度:", "2026-08-17T05:01:00.000Z") +
+		ccBashInput(t, "kubectl get pods") +
+		ccBashOutput(t, "SECRET-POD-LIST", "") +
+		ccAssistantAt(t, "that matches", "2026-08-17T05:06:00.000Z") +
+		ccInterrupt(t, "") +
+		ccSlashCommandRecord(t, "/polyforge:pf-work", "tether#95") +
+		ccUser(t, "and compare <div> with <span>")
+
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", body)
+
+	msgs, ok := f.store().Messages("cc-session-0001")
+	if !ok {
+		t.Fatal("Messages reported the transcript missing")
+	}
+	want := []struct{ role, text string }{
+		{"user", "把这个查清楚"},
+		// The two fragments joined: the task notification between them is gone,
+		// so nothing closes the run. That is the tether#94 seam.
+		{"assistant", "查清楚:" + ccTurnJoin + "先看进度:"},
+		// KEPT, and it closes the run — a real user action ends the turn before it.
+		{"user", "! kubectl get pods"},
+		{"assistant", "that matches"},
+		{"user", "(interrupted)"},
+		{"user", "/polyforge:pf-work tether#95"},
+		{"user", "and compare <div> with <span>"},
+	}
+	if len(msgs) != len(want) {
+		t.Fatalf("got %d messages, want %d:\n%+v", len(msgs), len(want), msgs)
+	}
+	for i, w := range want {
+		if msgs[i].Role != w.role || msgs[i].Text != w.text {
+			t.Errorf("msgs[%d] = %s/%q, want %s/%q", i, msgs[i].Role, msgs[i].Text, w.role, w.text)
+		}
+	}
+	// Nothing that was dropped may reach the pane in any form — not the markup,
+	// not the payload it wrapped. Asserted separately from the list above because
+	// an assertion on the whole list can be satisfied by a renderer that leaks
+	// into a message this test does not name.
+	for _, m := range msgs {
+		for _, forbidden := range []string{
+			"task-notification", "SECRET-AGENT-REPORT", "toolu_", "output-file",
+			"bash-stdout", "bash-stderr", "SECRET-POD-LIST",
+			"<bash-input>", "Request interrupted by user",
+			"command-name", "command-args", "command-message",
+		} {
+			if strings.Contains(m.Text, forbidden) {
+				t.Errorf("%q reached the pane in %s/%q", forbidden, m.Role, m.Text)
+			}
+		}
+	}
+}
+
+// TestMessagesMergesAcrossDroppedNoise pins the HOP between tether#95 and #94,
+// which is the easiest thing in either wi to leave untested: the fix lands in
+// userText, and the behaviour the reporter actually sees comes out of
+// ccMessagesFrom.
+//
+// 355 of the 364 task notifications in the census sat between two assistant
+// fragments. Each one was doing double damage — showing up as a bubble of raw
+// markup, AND closing the assistant run, so the reporter got the row of
+// colon-terminated bubbles that #94 was supposed to have removed. Dropping the
+// record is only half a fix if the two fragments do not then join.
+//
+// On the code before #95 the first two subtests report 4 messages instead of 2:
+// the noise arrived as a user bubble in the middle. That is the A/B, and it is why
+// the assertion is on the merged TEXT rather than on the count alone — a count of
+// 2 would also be produced by a merge that lost a fragment.
+//
+// The third subtest is NOT an A/B: main already dropped <local-command-stdout>, so
+// it passes there too and overlaps TestMessagesMergesATurnSplitByToolCalls. It is
+// here anyway, because what this test asserts is a property of the mechanism —
+// anything userText drops stops closing a run — and a case that already held is
+// evidence the mechanism is what changed rather than the four shapes being
+// special-cased somewhere.
+func TestMessagesMergesAcrossDroppedNoise(t *testing.T) {
+	for _, tc := range []struct{ name, noise string }{
+		{"task notification", ccTaskNotification(t, "sub-agent finished", "REPORT-BODY")},
+		{"bash output", ccBashOutput(t, "restarted", "")},
+		{"command stdout", ccCommandStdout(t, "\x1b[1mtotal 48\x1b[0m")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCCFixture(t, "/w")
+			f.write(t, "/w", "cc-session-0001.jsonl",
+				ccUser(t, "go")+
+					ccAssistantAt(t, "第一段:", "2026-08-17T04:57:00.000Z")+
+					tc.noise+
+					ccAssistantAt(t, "第二段:", "2026-08-17T05:01:00.000Z"))
+
+			msgs, ok := f.store().Messages("cc-session-0001")
+			if !ok {
+				t.Fatal("Messages reported the transcript missing")
+			}
+			if len(msgs) != 2 {
+				t.Fatalf("got %d messages, want 2 — the noise record still closed the "+
+					"assistant run, so the reporter still sees two bubbles:\n%+v", len(msgs), msgs)
+			}
+			want := "第一段:" + ccTurnJoin + "第二段:"
+			if msgs[1].Role != "assistant" || msgs[1].Text != want {
+				t.Fatalf("msgs[1] = %s/%q, want assistant/%q", msgs[1].Role, msgs[1].Text, want)
+			}
+			// The separator asserted literally as well as through the constant: a
+			// lone "\n" is a CommonMark soft break and would render the two
+			// fragments on one line. See ccTurnJoin.
+			if !strings.Contains(msgs[1].Text, "第一段:\n\n第二段:") {
+				t.Errorf("fragments are not separated by a BLANK line: %q", msgs[1].Text)
+			}
+			// The stamp is the turn's START, so a merge unlocked by #95 labels the
+			// bubble the same way one unlocked by #94 does.
+			if wantTs := time.Date(2026, 8, 17, 4, 57, 0, 0, time.UTC).UnixMilli(); msgs[1].Ts != wantTs {
+				t.Errorf("Ts = %d, want %d (the FIRST fragment's stamp)", msgs[1].Ts, wantTs)
+			}
+		})
+	}
+}
+
+// TestTitleUsesTheSameClassifierAsTheTranscript — the row label and the
+// transcript have to agree about what the user said. They consume one definition
+// (userText) precisely so they cannot disagree, but they reach it through
+// DIFFERENT scans: a title comes from ccFirstUserText, one bounded pass that
+// stops at the first hit, and the transcript from ccMessagesFrom. So "they share
+// a definition" is a claim worth a fixture rather than an assumption, and
+// tether#95 gave that definition four new answers.
+//
+// Two halves, and the second is the one that would be missed. A dropped shape
+// must not become the title — otherwise the list goes back to showing markup,
+// which is what tether#92 fixed. And a KEPT shape must be ALLOWED to become the
+// title: a session whose first act is `! kubectl …` really did start there, and
+// labelling that row with a bare sid is the defect tether#91 existed to remove.
+func TestTitleUsesTheSameClassifierAsTheTranscript(t *testing.T) {
+	for _, tc := range []struct{ name, body, want string }{
+		{
+			name: "noise ahead of the first real turn does not become the title",
+			body: ccPreamble(t, 512) +
+				ccTaskNotification(t, "sub-agent finished", "REPORT-BODY") +
+				ccBashOutput(t, "NOISE-OUTPUT", "") +
+				ccCommandStdout(t, "total 48") +
+				ccUser(t, "what the human actually asked"),
+			want: "what the human actually asked",
+		},
+		{
+			name: "a command the user ran is a real first turn",
+			body: ccPreamble(t, 512) + ccBashInput(t, "kubectl get pods"),
+			want: "! kubectl get pods",
+		},
+		{
+			name: "so is an interrupt, rendered the same way as in the transcript",
+			body: ccPreamble(t, 512) + ccInterrupt(t, ""),
+			want: "(interrupted)",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCCFixture(t, "/w")
+			f.write(t, "/w", "cc-session-0001.jsonl", tc.body)
+			rows := f.store().List()
+			if len(rows) != 1 {
+				t.Fatalf("List() = %d rows, want 1: %+v", len(rows), rows)
+			}
+			if rows[0].Title != tc.want {
+				t.Errorf("Title = %q, want %q", rows[0].Title, tc.want)
+			}
+		})
+	}
+}
+
 // TestMessagesCapCountsTurnsNotRecords pins the UNIT of ccMessagesMax.
 //
 // It exists because that constant's doc comment claimed to cap "turns" while the
@@ -969,6 +1453,364 @@ func TestMessagesDistinguishesMissingFromEmpty(t *testing.T) {
 	}
 	if msgs, ok := f.store().Messages("cc-session-9999"); ok || msgs != nil {
 		t.Errorf("Messages(absent) = %+v, %v; want nil, false", msgs, ok)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The census — the enumeration method itself (tether#95)
+// ---------------------------------------------------------------------------
+
+// ccCensusEnv points the census at a real cc store. Absent, it skips.
+const ccCensusEnv = "TETHER_CC_CENSUS_DIR"
+
+// ccCompleteTagRe matches text that OPENS with a complete tag — the signal that
+// found batch four. Machine-injected records always lead with their tag; a human
+// pasting markup usually leads with a sentence.
+//
+// Deliberately wider than the four shapes cc writes today. The first version was
+// `^<[a-zA-Z][-a-zA-Z0-9]*>`, which matches every current shape and therefore
+// looked sufficient — but a census is only worth running if it catches forms
+// nobody has seen, and review demonstrated three plausible ones sailing past it:
+// `<hook-result status="ok">` (an attribute), `<task_notification_v2>` (an
+// underscore) and `<x:thing>` (a namespace). Tuning a detector to the examples
+// that prompted it is how it ends up detecting only them.
+//
+// Still blind to a shape that is PROSE rather than markup, which is what cc's
+// interrupt marker is — see ccShortBracketRe for the weaker signal that covers
+// the bracketed family, and accept that a batch five in plain English would be
+// caught by neither. Stated because the alternative is a reader assuming
+// otherwise.
+var ccCompleteTagRe = regexp.MustCompile(`^<[a-zA-Z][-_.:a-zA-Z0-9]*(\s[^>\n]*)?>`)
+
+// ccShortBracketRe matches text that opens with a short bracketed marker — the
+// family cc's interrupt marker belongs to. Weaker than the tag signal and it has
+// known false positives (a user pasting `[wt] recv message` from a browser
+// console, 3 records in the first census), so it reports rather than fails.
+var ccShortBracketRe = regexp.MustCompile(`^\[[^\]\n]{1,60}\]`)
+
+// TestEnumerateUserRecordShapes is the CENSUS: a re-runnable count of what a real
+// cc store actually contains, run through the real classifier, reporting anything
+// this reader does not recognise.
+//
+// # Why this ships instead of a sentence claiming the list is complete
+//
+// Four batches of records that merely wear type:"user" have been found so far, and
+// every one of them was found the same way: a user saw markup in a bubble and
+// said so. The list in ccUserShapes was complete when it was written, and so was
+// each of the three before it. So the deliverable of tether#95 is not only the
+// four rows, it is this: batch five should be found by RUNNING something.
+//
+//	export GOWORK=off
+//	go test ./internal/session/ -run TestEnumerateUserRecordShapes -v \
+//	  -timeout 20m -count=1 \
+//	  TETHER_CC_CENSUS_DIR=$HOME/<the coding agent's data dir>/projects
+//
+// (as an env assignment before `go test`, or exported — either way). Point it at
+// the store's `projects` directory to census everything, or at one project
+// directory inside it. Skipped when unset, because CI has no real store and the
+// owner's transcripts must never be copied into this repo — see the file header.
+//
+// # It is READ ONLY
+//
+// os.Open and nothing else, on a directory that is the user's actual work and a
+// host mount. TestCCStoreNeverWrites guards the production reader the same way;
+// this test walks the store directly, so it says so here.
+//
+// # The measurement rule this encodes, which is the part that is easy to get wrong
+//
+// Every count here is taken AFTER ccClassifyUserText, over what the reader
+// EMITS. #95's first enumeration regex-matched the raw record text instead and
+// reported 6 shapes, 654 records and 19.5% — of which 221 were slash commands
+// that ccRenderCommand had already turned into `/pf-work tether#95`, i.e. real
+// user turns being scored as defects. Measured through the chain, the same store
+// gave 4 shapes, 433 records, 12.9%. A statistic about what a pipeline produces
+// has to be taken at the end of the pipeline.
+//
+// # What it fails on
+//
+// An unrecognised COMPLETE TAG at the start of an emitted message. That is the
+// signal that found batch four, and the fix for it is one row in ccUserShapes.
+// The weaker bracket signal reports without failing, because it has known false
+// positives; read the report, then judge.
+func TestEnumerateUserRecordShapes(t *testing.T) {
+	root := os.Getenv(ccCensusEnv)
+	if root == "" {
+		t.Skipf("set %s to a cc projects directory (or one project directory in it) to take a census", ccCensusEnv)
+	}
+	files, err := ccCensusFiles(root)
+	if err != nil {
+		t.Fatalf("walking %s: %v", root, err)
+	}
+	if len(files) == 0 {
+		t.Fatalf("no top-level .jsonl transcripts under %s", root)
+	}
+
+	var (
+		lines, userRecords, structuralDrops, emitted int
+		byShape                                      = map[string]int{}
+		droppedByShape                               = map[string]int{}
+		tagCandidates                                = map[string]int{}
+		bracketCandidates                            = map[string]int{}
+		sample                                       = map[string]string{}
+	)
+	for _, path := range files {
+		f, err := os.Open(path) // READ ONLY. See the doc above.
+		if err != nil {
+			t.Fatalf("opening %s: %v", path, err)
+		}
+		br := bufio.NewReader(f)
+		for {
+			line, rerr := br.ReadBytes('\n')
+			if bytes.HasSuffix(line, []byte("\n")) {
+				lines++
+				// The same cheap reject the production readers use, so the census
+				// walks the same records they do.
+				if bytes.Contains(line, []byte(`"user"`)) {
+					var e ccEntry
+					if json.Unmarshal(line, &e) == nil && e.Type == "user" {
+						userRecords++
+						if !e.isUserTurn() {
+							structuralDrops++
+						} else {
+							shape, text := ccClassifyUserText(e.Message.text())
+							byShape[shape]++
+							if text == "" {
+								droppedByShape[shape]++
+								continue
+							}
+							emitted++
+							if shape != ccShapeHumanText {
+								continue
+							}
+							// Emitted as a human's own words. Does it still look
+							// like something a machine wrote?
+							trimmed := strings.TrimSpace(text)
+							if tag := ccCompleteTagRe.FindString(trimmed); tag != "" {
+								tagCandidates[tag]++
+								ccCensusSample(sample, tag, path, trimmed)
+							} else if mk := ccShortBracketRe.FindString(trimmed); mk != "" {
+								bracketCandidates[mk]++
+								ccCensusSample(sample, mk, path, trimmed)
+							}
+						}
+					}
+				}
+			}
+			if rerr != nil {
+				break
+			}
+		}
+		f.Close()
+	}
+
+	t.Logf("census of %d transcripts under %s", len(files), root)
+	t.Logf("  %d lines, %d type:\"user\" records", lines, userRecords)
+	t.Logf("  %d dropped structurally (isMeta / isSidechain)", structuralDrops)
+	// The population every percentage below is taken over: records that got past
+	// the structural filter AND had text to classify. Named and computed once,
+	// because "% of the user messages" is the exact phrase that made #95's first
+	// enumeration wrong — a percentage of "what the reader emits" is relative to
+	// whichever shapes were already being dropped when it was taken, so it cannot
+	// be compared across versions. This denominator can.
+	noise := 0
+	for _, s := range ccUserShapes {
+		noise += droppedByShape[s.name]
+	}
+	classified := emitted + noise
+	t.Logf("  %d EMITTED user messages; %d dropped by shape; %d classified with text (the denominator below)",
+		emitted, noise, classified)
+	t.Logf("  %d had no text at all — tool results, images, thinking (ccMessage.text returned \"\")",
+		droppedByShape[ccShapeHumanText])
+	t.Logf("  recognised shapes, in ccUserShapes order:")
+	for _, s := range ccUserShapes {
+		pct := 0.0
+		if classified > 0 {
+			pct = 100 * float64(byShape[s.name]) / float64(classified)
+		}
+		t.Logf("    %-28s seen %5d (%5.2f%%), dropped %5d, rendered %5d",
+			s.name, byShape[s.name], pct, droppedByShape[s.name], byShape[s.name]-droppedByShape[s.name])
+		if byShape[s.name] == 0 {
+			t.Logf("      ^ this row matched NOTHING. Either this store has none, or cc changed "+
+				"the literal and the row is now dead. Check %q against the store by hand.", s.name)
+		}
+	}
+	t.Logf("    %-28s      %5d (the user's own words, emitted unchanged)",
+		"(no shape)", byShape[ccShapeHumanText]-droppedByShape[ccShapeHumanText])
+	if classified > 0 {
+		t.Logf("  noise dropped by shape: %d of %d classified, %.2f%%", noise, classified,
+			100*float64(noise)/float64(classified))
+	}
+
+	if len(bracketCandidates) > 0 {
+		t.Logf("  UNRECOGNISED bracketed markers — judge these by hand, some are real pastes:")
+		for _, k := range ccCensusSorted(bracketCandidates) {
+			t.Logf("    %5d  %s\n           e.g. %s", bracketCandidates[k], k, sample[k])
+		}
+	}
+	for _, k := range ccCensusSorted(tagCandidates) {
+		t.Errorf("%d emitted user messages OPEN with %s, which ccUserShapes does not know about.\n"+
+			"  This is what batch five looks like. THREE possible verdicts, and the third is a real\n"+
+			"  one that needs no code:\n"+
+			"    - the harness wrote it   -> add a row that drops it\n"+
+			"    - the user did it        -> add a row that renders it into something a human reads\n"+
+			"    - a human PASTED markup  -> nothing to do; angle brackets are not by themselves a\n"+
+			"                                defect, and this detector is deliberately wide enough to\n"+
+			"                                catch pastes (see ccCompleteTagRe)\n"+
+			"  For the first two, that is ONE row in ccUserShapes plus one case in\n"+
+			"  TestUserRecordShapesAreClassifiedOneWayEach, which will not let you add the row alone.\n"+
+			"  e.g. %s", tagCandidates[k], k, sample[k])
+	}
+
+	ccCensusCapReport(t, files)
+}
+
+// ccCensusFiles lists the transcripts a census should read, using List's rule:
+// only files directly inside a project directory, never one level deeper.
+//
+// That exclusion is not cosmetic — 888 of 926 .jsonl files under one real project
+// directory were sub-agent transcripts, so a naive walk censuses mostly sub-agents
+// and reports percentages for a population the reader never serves.
+//
+// root may be the `projects` directory or a single project directory inside it,
+// because both are things someone taking a census reaches for. Which one it is is
+// inferred from whether root holds transcripts directly — and an ambiguous root,
+// holding both, is an ERROR rather than a guess: one stray .jsonl beside the
+// project directories would otherwise silently census that one file and report a
+// clean bill of health for a population of one. A census that quietly measures the
+// wrong population is the failure this file documents twice already.
+func ccCensusFiles(root string) ([]string, error) {
+	direct, err := ccCensusJSONL(root)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	subdirs := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		sub, err := ccCensusJSONL(filepath.Join(root, e.Name()))
+		if err != nil {
+			return nil, err
+		}
+		if len(sub) > 0 {
+			subdirs++
+		}
+		out = append(out, sub...)
+	}
+	switch {
+	case len(direct) > 0 && subdirs > 0:
+		return nil, fmt.Errorf("ambiguous census root %s: it holds %d transcript(s) directly AND "+
+			"%d subdirectories that hold transcripts, so 'is this one project or all of them' has "+
+			"no answer. Point at a single project directory, or at a projects directory with no "+
+			"stray .jsonl in it", root, len(direct), subdirs)
+	case len(direct) > 0:
+		return direct, nil
+	default:
+		return out, nil
+	}
+}
+
+func ccCensusJSONL(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		out = append(out, filepath.Join(dir, e.Name()))
+	}
+	return out, nil
+}
+
+func ccCensusSample(into map[string]string, key, path, text string) {
+	if _, ok := into[key]; ok {
+		return
+	}
+	if len(text) > 160 {
+		text = text[:160] + "…"
+	}
+	into[key] = fmt.Sprintf("%s: %q", filepath.Base(path), text)
+}
+
+// ccCensusSorted orders a candidate report by count, descending, breaking ties on
+// the key so two runs over the same store produce the same report — a diffable
+// report is the point of taking a census twice.
+func ccCensusSorted(m map[string]int) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if m[out[i]] != m[out[j]] {
+			return m[out[i]] > m[out[j]]
+		}
+		return out[i] < out[j]
+	})
+	return out
+}
+
+// ccCensusCapReport re-checks ccMessagesMax against the store, because dropping
+// records changes how many messages a transcript produces and therefore what that
+// cap MEANS.
+//
+// It exists because the same constant's doc once claimed a unit the code two lines
+// away did not implement (see ccMessagesMax), and #95 changes the emitted count
+// again. A number in a comment cannot notice that; this can.
+//
+// It reads each transcript through the real ccMessagesTailBytes window — the same
+// window Messages serves from — but not the widen retry, so a transcript whose
+// tail is all tool payload shows up here as 0 rather than as what the user sees.
+func ccCensusCapReport(t *testing.T, files []string) {
+	t.Helper()
+	var total, maxMsgs, atCap, empty, bytesServed int
+	for _, path := range files {
+		f, err := os.Open(path)
+		if err != nil {
+			t.Fatalf("opening %s: %v", path, err)
+		}
+		fi, err := f.Stat()
+		if err != nil {
+			t.Fatalf("stat %s: %v", path, err)
+		}
+		msgs, err := ccReadTail(f, fi.Size(), ccMessagesTailBytes)
+		f.Close()
+		if err != nil {
+			t.Fatalf("reading %s: %v", path, err)
+		}
+		total += len(msgs)
+		if len(msgs) > maxMsgs {
+			maxMsgs = len(msgs)
+		}
+		if len(msgs) == ccMessagesMax {
+			atCap++
+		}
+		if len(msgs) == 0 {
+			empty++
+		}
+		for _, m := range msgs {
+			bytesServed += len(m.Text)
+		}
+	}
+	t.Logf("ccMessagesMax = %d, re-checked against the same store:", ccMessagesMax)
+	t.Logf("  %d messages across %d transcripts through the real %d-byte window, %.2f MB of text",
+		total, len(files), ccMessagesTailBytes, float64(bytesServed)/(1<<20))
+	// "reached the cap" rather than "was trimmed": a transcript that produces
+	// exactly ccMessagesMax messages is indistinguishable from one that produced
+	// more and lost the front, and claiming to tell them apart would be a
+	// measurement this cannot make.
+	t.Logf("  largest transcript: %d messages; %d of %d reached the cap; %d serve nothing "+
+		"from the primary window (Messages widens for those)", maxMsgs, atCap, len(files), empty)
+	if atCap == 0 {
+		t.Logf("  nothing reached the cap, so the BYTE window is what bounds the response — "+
+			"%d is still only a bound on a transcript of very short lines, which is what it is for", ccMessagesMax)
 	}
 }
 

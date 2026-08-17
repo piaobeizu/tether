@@ -278,6 +278,81 @@ describe('ToolCallList results (tether#38)', () => {
   })
 })
 
+// tether#97 — a FAILED result with no message.
+//
+// cc can write `is_error` with content that flattens to nothing (an empty array, or
+// only image / tool_reference sub-blocks) and the daemon serves it on purpose:
+// dropping it would make a failed call read as a successful one
+// (session.ccMessage.errorResults). The row therefore has to keep saying "error"
+// while no longer offering to expand into a blank block — `hasResult` asks about
+// content, the preview asks about the flag.
+//
+// Both directions are asserted. Only pinning the empty case would leave the
+// regression that produced this wi unguarded: reinstating `|| isError` in hasResult
+// makes the empty row clickable again, and REMOVING the preview's isError branch
+// silently turns a failure into a blank row — the more dangerous of the two, and
+// invisible to a one-sided test.
+//
+// Measured on a real store the day this landed: 41 failures served across 39
+// transcript windows, 0 of them empty. So this shape is one cc CAN write, not one it
+// currently does, and these fixtures are the only place it exists.
+describe('ToolCallList and a failure with no message (tether#97)', () => {
+  const failure = (content: string): ToolCall[] => [
+    { id: 'f1', name: 'Bash', input: { command: 'false' }, result: { content, isError: true } },
+  ]
+
+  // The positive CONTROL, not a new guard: it passes on the old code too. It is
+  // here because a one-sided test would let "nothing is ever expandable" through.
+  it('is expandable when the failure HAS a message', () => {
+    const { container } = render(<ToolCallList tools={failure('boom\nstack')} />)
+    expect(container.querySelector('.msg-tool-row.clickable')).toBeTruthy()
+    expect(container.querySelector('.msg-tool-caret')).toBeTruthy()
+    expect(container.querySelector('.msg-tool-preview.err')?.textContent).toBe('error')
+    fireEvent.click(container.querySelector('.msg-tool-row.clickable')!)
+    expect(container.querySelector('.msg-tool-result.err')?.textContent).toContain('boom')
+  })
+
+  it('is NOT expandable when the failure has no message', () => {
+    const { container } = render(<ToolCallList tools={failure('')} />)
+    expect(container.querySelector('.msg-tool-row.clickable')).toBeNull()
+    expect(container.querySelector('.msg-tool-caret')).toBeNull()
+    // Not merely unexpanded — there is nothing to expand INTO. A click on the row
+    // must not produce the empty block that made this a dead click.
+    fireEvent.click(container.querySelector('.msg-tool-row')!)
+    expect(container.querySelector('.msg-tool-result')).toBeNull()
+  })
+
+  // Whitespace is not a message. Found by review, and reachable rather than
+  // theoretical: session.ccMessage.text keeps a `text` sub-block whenever it is not
+  // the EMPTY string, so a result of "   " is served with length 3 and a
+  // length-only check would expand into a blank <pre> — the same dead click one
+  // shape over. Asserted for a success as well as a failure: the length-only check
+  // had it on both.
+  it('is NOT expandable when the message is only whitespace', () => {
+    for (const isError of [true, false]) {
+      const { container, unmount } = render(<ToolCallList
+        tools={[{ id: 'w1', name: 'Bash', input: { command: 'true' }, result: { content: '  \n\t ', isError } }]}
+      />)
+      expect(container.querySelector('.msg-tool-row.clickable')).toBeNull()
+      expect(container.querySelector('.msg-tool-caret')).toBeNull()
+      fireEvent.click(container.querySelector('.msg-tool-row')!)
+      expect(container.querySelector('.msg-tool-result')).toBeNull()
+      unmount()
+    }
+  })
+
+  it('still says error in BOTH cases — that is what may not regress', () => {
+    // The whole reason the daemon serves an empty failure. summarizeToolResult
+    // reads the flag, not the text, so losing the message must not lose the fact.
+    for (const content of ['boom', '']) {
+      const { container, unmount } = render(<ToolCallList tools={failure(content)} />)
+      expect(container.querySelector('.msg-tool-preview.err')?.textContent).toBe('error')
+      unmount()
+    }
+    expect(summarizeToolResult('Bash', { content: '', isError: true })).toBe('error')
+  })
+})
+
 // tether#40 — parallel permission requests. PermissionQueue is exported + pure
 // (the parent owns the POST + queue removal via onDecide/onDecideAll), so it
 // tests without mounting ChatPane (which opens a WebTransport connection).

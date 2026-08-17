@@ -1260,23 +1260,27 @@ type ccToolError struct {
 // to hang it on, and hanging it on the most recent call would attach a failure to a
 // call that may well have succeeded.
 //
-// # A failure with no MESSAGE is still served, and that costs a dead click
+// # A failure with no MESSAGE is still served
 //
 // cc can write `is_error` with content that flattens to nothing — an empty array, or
-// only `image` / `tool_reference` sub-blocks. The row then renders its "error"
-// preview (summarizeToolResult keys on the flag, not the text) and is ALSO clickable,
-// expanding to an empty block, because ToolCallList's `hasResult` admits
-// `|| isError`. That dead click is a defect a previous review removed once.
+// only `image` / `tool_reference` sub-blocks. Serving it is deliberate: dropping the
+// result drops the only signal that the call failed, and "the agent tried X and it
+// broke" is the thing that explains what it did next. A failed call that reads as a
+// successful one is the worse outcome.
 //
-// Kept anyway, because the alternative is worse: dropping the result drops the only
-// signal that the call failed, and "the agent tried X and it broke" is the thing that
-// explains what it did next. The cost is one empty expander; the cost of the other
-// choice is a failed call that reads as a successful one. Fixing the expander is a
-// one-line frontend change, outside this change's locks, and it is written down
-// rather than left for someone to find. TestFailureWithNoMessageStillReportsTheError
-// pins the choice. Measured: 41 failures served across the 39 windows of one store
-// and 0 of them empty, so this is a decision about a shape cc CAN write rather than
-// one it does — and the census counts them, so the day it starts, the report says so.
+// It reaches the reader as the row's "error" preview, which summarizeToolResult
+// derives from the FLAG rather than from the text (web/src/panes/chat/index.tsx). So
+// an empty message costs the REASON the call failed but not the fact of it, which is
+// the half this decision is about.
+//
+// tether#96 shipped it at the price of a dead click, because ToolCallList's
+// `hasResult` then admitted `|| isError` and offered to expand into a blank block;
+// tether#97 narrowed that flag to non-whitespace content, which keeps the preview and
+// drops the empty expander. TestFailureWithNoMessageStillReportsTheError pins the
+// choice on this side. Measured: 41 failures served across the 39 windows of one
+// store and 0 of them empty, so this is a decision about a shape cc CAN write rather
+// than one it does — and the census counts them, so the day it starts, the report
+// says so.
 func (m *ccMessage) errorResults() []ccToolError {
 	var out []ccToolError
 	for _, b := range m.blocks() {

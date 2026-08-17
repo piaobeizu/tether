@@ -1497,9 +1497,14 @@ func TestServedFailureIsBoundedByItsCap(t *testing.T) {
 
 // TestFailureWithNoMessageStillReportsTheError pins a judgement rather than a
 // mechanism, which is why it exists: cc can write `is_error` with content that
-// flattens to nothing, and this reader serves the failure anyway. The row then has a
-// dead click (ToolCallList expands on `isError` alone). That is accepted, because the
+// flattens to nothing, and this reader serves the failure anyway, because the
 // alternative — dropping the result — makes a failed call read as a successful one.
+// The row still says so: summarizeToolResult keys on the flag, not on the text.
+//
+// tether#96 shipped this at the price of a dead click, ToolCallList's `hasResult`
+// having admitted `|| isError`; tether#97 narrowed that flag to non-whitespace
+// content, so the price is no longer paid and nothing HERE had to change to stop
+// paying it — which is the point of pinning the judgement rather than the symptom.
 // See ccMessage.errorResults.
 func TestFailureWithNoMessageStillReportsTheError(t *testing.T) {
 	for _, content := range []any{

@@ -473,14 +473,14 @@ describe('computePositions responsive sizing (tether#27)', () => {
     // The scan floor must stay below every threshold this helper gets asked for:
     // 276 below, and 166 if a one-column row is ever added. Above a threshold
     // firstFull returns the FLOOR — a number that says nothing about the
-    // constants. Against an expectation derived FROM the constants that fails
-    // loudly (with the old floor of 300, `firstFull(2)` returns 300 and the 276
-    // below goes red); the quiet failure is reading the value off a run and
-    // pinning the artifact instead. Scanning is sound for w > 0, where every step
-    // of the sizing arithmetic is monotone in w, so `compact` flips at most once
-    // and the first non-compact width IS the threshold — but not at cw <= 0,
-    // which short-circuits to the natural, non-compact size, so the scan must
-    // never start there.
+    // constants. Against an expectation derived from the constants, that fails
+    // loudly: with the old floor of 300, `firstFull(2)` returns 300 and the 276
+    // below goes red. The quiet failure is the other order — reading the value
+    // off a run and pinning the artifact. Scanning is sound for w > 0, where
+    // every step of the sizing arithmetic is monotone in w, so `compact` flips
+    // at most once and the first non-compact width IS the threshold — but not
+    // at cw <= 0, which short-circuits to the natural, non-compact size, so the
+    // scan must never start there.
     const firstFull = (n: number) => {
       for (let w = 100; w <= 900; w++) if (!computePositions(cols(n), w).compact) return w
       return -1

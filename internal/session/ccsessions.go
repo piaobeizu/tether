@@ -50,8 +50,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // The stores a transcript can come from. One vocabulary, shared by
@@ -106,10 +108,17 @@ const ccTitlePrefixBytes = 128 << 10
 // # Why there is a second, wider window
 //
 // The bound is on RAW JSONL BYTES, and cc's bytes are dominated by tool payloads
-// that this reader then drops. So the last 1 MiB of a tool-heavy transcript can
-// contain no conversation at all — and the result would be a row that has a
-// title, is listed, and opens an EMPTY chat. That is the original symptom this
-// whole change exists to remove, reappearing one layer down. Found by review.
+// that this reader reduces to a summary a fraction of their size — 4.85 MB of raw tool
+// payload inside the 39 windows of one store becomes 0.37 MB served. So the last 1 MiB of a
+// tool-heavy transcript can contain no conversation at all — and the result would
+// be a row that has a title, is listed, and opens a chat with nothing to READ in
+// it. That is the original symptom this whole change exists to remove, reappearing
+// one layer down. Found by review.
+//
+// (Until tether#96 that sentence read "tool payloads that this reader then drops",
+// and the retry fired on `len(msgs) == 0`. Now a tool-only tail produces bubbles, so
+// the trigger is "no message carrying words" — see Messages. The two have to move
+// together: the wording here IS the trigger's specification.)
 //
 // The retry is a wider window rather than a fall back to the HEAD, so that "you
 // are reading the most recent messages" stays true; and it is one retry rather
@@ -218,7 +227,103 @@ const (
 // assistant message in that store is 34 KB, from a run of 114 fragments. Only the
 // byte window bounds that — the same bound as before, now spread across fewer
 // elements.
+//
+// # Re-checked again after tether#96, which hangs tool activity on those messages
+//
+// A merged turn now also carries its tool calls, so a message is bigger than it was
+// and there are marginally more of them: a turn that says nothing but calls things
+// used to produce no message at all. Measured on one frozen snapshot of the same
+// store, before and after, on the SAME bytes:
+//
+//	                    messages   carrying words   text served   RESPONSE bytes
+//	before #96               393              393       0.73 MB          0.76 MB
+//	after  #96               394              393       0.73 MB          1.13 MB
+//
+// So the cap's meaning is unchanged — the conversation is byte-for-byte the same and
+// one bubble was ADDED — and it still binds on 0 of 39 transcripts, largest
+// transcript 27 messages against 200. The response grows 1.49x store-wide and 1.59x
+// on the worst single transcript, which is the figure a page load pays: 44.0 KB to
+// 70.1 KB.
+//
+// The right-hand column is the bytes the route WRITES, encoder and all, because a sum
+// of field lengths would have missed what that encoder does to `<`, `>` and `&` — the
+// mistake in the paragraph this one replaces, which reported a 0.51x quantity as
+// 1.51x. Found by review.
+//
+// Which is the answer this re-check exists to produce rather than assume. What the cap
+// counts had to change for it to stay true, though — see ccTrimFront.
 const ccMessagesMax = 200
+
+// The bound on the tool activity a cc turn carries (tether#96). These are
+// CC-SPECIFIC and deliberately not history.go's MaxToolsPerTurn /
+// MaxToolResultBytes: those govern the live native path, where a turn is a handful
+// of calls and there is no read window to bound anything. Changing them would
+// change tether's own transcripts.
+//
+// # There is deliberately no per-turn COUNT cap. What bounds this instead:
+//
+// Every value served is a PREFIX of a value inside the ccMessagesTailBytes window,
+// so the CHARACTERS served are a subset of the characters read, and the window
+// bounds them. A per-turn count cap would add nothing to that and would delete
+// activity the user asked to see.
+//
+// An earlier version of this paragraph said "strictly smaller in BYTES", which is
+// false and was caught by review. Go's encoder escapes `<`, `>` and `&` to
+// six-byte `\uXXXX` forms; cc's JavaScript writer does not. So a value of `&&&&`
+// costs one byte on disk and six on the wire, and a record can serve more bytes
+// than it was read from — measured, 4.57 MiB of tool JSON out of a 1 MiB window of
+// adversarially escaped records. That expansion is a property of the RESPONSE
+// FORMAT, not of this change: the same encoder has always applied it to the
+// conversation text this route serves (writeJSON in internal/server). What tether#96
+// adds is bounded by the window in exactly the way the text already was.
+//
+// Measured on the real store the expansion is 1.11x, not 6x — 0.33 MB of served
+// characters becomes 0.37 MB of JSON — so the per-call cost stays what the caps below
+// say it is. TestToolPayloadIsBoundedByItsCaps pins the ceiling on adversarial input,
+// and TestServedValuesArePrefixesOfTheSource pins the subset property; the byte
+// inequality is NOT asserted anywhere, because it is not true.
+//
+// Measured in that window across the 39 transcripts of one store (frozen snapshot,
+// 2026-08-17): 1,319 tool calls, largest single transcript 95, largest single merged
+// TURN 61. The 11,398-call session that motivated a cap is a WHOLE-FILE count — the
+// daemon never reads a whole file.
+const (
+	// ccToolInputValueRunes bounds each string argument of a call.
+	//
+	// The renderer shows ONE top-level string field per known tool, whitespace
+	// collapsed, truncated at 60 chars (summarizeToolInput, web/src/panes/chat).
+	// 128 runes is a bit over 2x that, so the visible summary line is identical to
+	// what an untruncated input would produce unless more than half of a value's
+	// first 128 characters are whitespace — in which case the summary line is
+	// shorter than it would have been. Cosmetic, on a summary line, and no
+	// occurrence in the census. Measured: 35.9% of string values exceed this, so
+	// the cap binds often and is where most of the saving comes from.
+	ccToolInputValueRunes = 128
+	// ccToolInputMaxKeys bounds how many string arguments survive, alphabetically.
+	//
+	// Headroom rather than a filter: the most string-valued input in the census has
+	// 7 (pf_remember), so this binds on nothing measured. It is here because a
+	// projection with no key bound has no bound at all. When it DOES bind it keeps
+	// the alphabetically first, which can in principle drop the one field the
+	// renderer would have shown; said plainly rather than solved on a guess about
+	// which key matters.
+	ccToolInputMaxKeys = 12
+	// ccToolErrorBytes bounds a FAILED tool result's message. Only failures are
+	// served at all — see ccMessage.errorResults.
+	ccToolErrorBytes = 2 << 10
+)
+
+// ccMaxEscapeBytesPerRune is the worst the response encoder can do to one character:
+// `<`, `>` and `&` become six-byte `\uXXXX` escapes. Named so the ceiling the caps
+// above imply can be WRITTEN DOWN and asserted rather than assumed — see
+// TestToolPayloadIsBoundedByItsCaps. Nothing multiplies by it at runtime; it exists
+// because the paragraph that used to claim "served is smaller than source" needed a
+// true statement in its place.
+const ccMaxEscapeBytesPerRune = 6
+
+// ccTruncated marks a value this reader cut. Same wording as history.go's marker
+// so a truncated result reads the same whichever store it came from.
+const ccTruncated = "\n[... truncated ...]"
 
 // ccTurnJoin separates the fragments of one merged assistant turn.
 //
@@ -470,10 +575,18 @@ func (s *CCStore) Messages(sid string) ([]HistoryMessage, bool) {
 		slog.Warn("cc sessions: read transcript failed", "sid", sid, "err", err)
 		return nil, false
 	}
-	// Nothing in the window converted, and the window was not the whole file: the
+	// No CONVERSATION in the window, and the window was not the whole file: the
 	// tail was all tool payload. Widen once — see ccMessagesTailBytes for why an
 	// empty answer here would be the original bug wearing a different hat.
-	if len(msgs) == 0 && fi.Size() > ccMessagesTailBytes {
+	//
+	// The test is "no message carrying words", not "no messages", and tether#96 is
+	// why: once tool activity produces bubbles, a tail that is nothing but tool
+	// records is no longer EMPTY, so a `len(msgs) == 0` trigger would stop firing
+	// and serve tool cards INSTEAD of the conversation widening would have found.
+	// That is this whole change failing in the one way that looks like success in a
+	// screenshot. 0 of 39 real transcripts widen today, so no test that only counts
+	// today's store would have noticed — see TestMessagesWidensPastAWallOfToolCalls.
+	if !ccHasConversation(msgs) && fi.Size() > ccMessagesTailBytes {
 		msgs, err = ccReadTail(f, fi.Size(), ccMessagesWideTailBytes)
 		if err != nil {
 			slog.Warn("cc sessions: wide read failed", "sid", sid, "err", err)
@@ -483,6 +596,20 @@ func (s *CCStore) Messages(sid string) ([]HistoryMessage, bool) {
 			"size", fi.Size(), "found", len(msgs))
 	}
 	return msgs, true
+}
+
+// ccHasConversation reports whether any of these messages carries words.
+//
+// A message with tools and no text is real output — it is what a turn that did
+// nothing but call things looks like — but it is not something to READ, so it must
+// not satisfy the widen retry. See Messages.
+func ccHasConversation(msgs []HistoryMessage) bool {
+	for _, m := range msgs {
+		if m.Text != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // ccReadTail converts the last `window` bytes of f.
@@ -613,14 +740,29 @@ func ccUserTextFromLine(line []byte) string {
 
 // ccMessagesFrom converts a cc transcript window into tether history messages.
 //
-// # What is dropped, and why the UI says so
+// # What survives: the conversation, plus a SUMMARY of what the agent did
 //
-// Only the CONVERSATION survives: user turns and the assistant's text. tool_use,
-// tool_result and thinking blocks are not converted. That is not an oversight —
-// tool payloads are the reason a transcript reaches 138 MB, and reconstructing
-// them faithfully into ToolCallRecord is a separate piece of work with its own
-// fidelity questions. The row that renders this is labelled accordingly, so the
-// user is told what they are looking at rather than left to notice.
+// User turns, the assistant's text, and — since tether#96 — the tool calls made
+// during a turn, as ToolCallRecord on the turn they belong to. What survives of a
+// call is its name, its id, a bounded projection of its string arguments, and, for
+// a call that FAILED, a bounded message. See ccToolInputValueRunes for the bound
+// and ccMessage.errorResults for why successes carry no output.
+//
+// Two things are still dropped, both deliberately:
+//
+//   - Successful tool_result content — 3.33 MB of the 4.85 MB of raw tool payload
+//     inside those windows, and serving it truncated would make the UI LIE:
+//     summarizeToolResult derives "N lines" / "N matches" by counting the content
+//     it was handed, so a capped result renders a confidently wrong number. An
+//     honest partial result needs a fidelity design of its own.
+//   - thinking blocks. Not for payload reasons: measured across all 93 top-level
+//     transcripts of one real store (2026-08-17, cc 2.1.233), 22,350 of 22,350
+//     thinking blocks carry `"thinking": ""` — the reasoning is encrypted into the
+//     block's `signature` and there is no text to serve. Converting them would give
+//     every turn a "thought" toggle that expands to nothing. This is a fact about
+//     that store on that day, not about cc in general; if cc starts writing
+//     plaintext thinking the decision needs re-taking, and
+//     TestThinkingIsNotServedFromCC records the measurement next to the assertion.
 //
 // # One bubble per turn (tether#94)
 //
@@ -675,12 +817,51 @@ func ccUserTextFromLine(line []byte) string {
 //
 // Merging happens as records are read, so the cap below trims MESSAGES — see
 // ccMessagesMax, whose unit this is the other half of.
+//
+// # Tool activity attaches to the MERGED turn, which is what keeps the turn count
+// fixed
+//
+// cc never puts text and tool_use in one record — measured over a real store, the
+// block combinations are `text`, `tool_use` and `thinking`, each alone, never
+// mixed. So a tool call always arrives in a record that has no words in it, and
+// before tether#96 such a record produced nothing at all.
+//
+// It now produces a message, and the merge rule above absorbs it: a tool record
+// following assistant text merges into that text's bubble, and assistant text
+// following a tool record merges into the tool record's bubble. Either way ONE
+// bubble per turn, and the number of messages a window yields is unchanged — except
+// for a turn that says nothing but calls things (628 of them in one real store),
+// which gains a bubble it never had. That direction is the point; the direction
+// that would matter is losing one, which
+// TestToolsDoNotShrinkTheVisibleTranscript pins by converting the same fixture
+// twice and comparing counts.
+//
+// A result reported in a LATER record is hung on its call by id, through a map of
+// where each call landed. Positions, not pointers: append reallocates. The map is
+// only read while the loop runs — the trim at the end reslices `out` and would
+// invalidate every position in it.
+//
+// # A turn's TIMESTAMP can now be earlier, and that is the correct direction
+//
+// The bubble keeps the first fragment's stamp, and since a turn's first record is
+// usually a tool call rather than words, that stamp is now the moment the agent
+// started WORKING rather than the moment it started typing. Measured on a real
+// daemon before and after this change, one turn's stamp moved from 10:00:04 to
+// 10:00:02 — the two leading tool calls it had always made but never shown.
+//
+// Worth stating because it is a visible change nobody asked for. It is kept because
+// it is what tether's own path does: history.go stamps the accumulator when the turn
+// is CREATED, which is the first event of the turn whatever kind it is, so leaving cc
+// stamped at first-words would have made the two paths disagree about when a turn
+// began. TestToolsMergeWithoutALeadingBlankLine asserts the stamp explicitly, so this
+// is a decision rather than a side effect.
 func ccMessagesFrom(r io.Reader) []HistoryMessage {
 	br, ok := r.(*bufio.Reader)
 	if !ok {
 		br = bufio.NewReader(r)
 	}
 	var out []HistoryMessage
+	at := make(map[string]ccToolPos)
 	for {
 		line, err := br.ReadBytes('\n')
 		// Only a terminated line is a line — the same rule ccFirstUserText uses,
@@ -690,18 +871,41 @@ func ccMessagesFrom(r io.Reader) []HistoryMessage {
 		// where a half-written record that happens to parse would be surfaced to
 		// the user. One rule, both readers.
 		if bytes.HasSuffix(line, []byte("\n")) {
-			if m, ok := ccMessageFromLine(line); ok {
+			m, failures, ok := ccMessageFromLine(line)
+			if ok {
 				// Still the same turn: cc opened a new record to call a tool, not
 				// because the agent stopped talking. Append rather than emit, and
 				// keep the FIRST fragment's stamp — that is when the response
 				// began, which is also what tether's own path records for an
 				// assistant message (history.go stamps the accumulator when it is
 				// created, not when it is flushed).
+				idx, fresh := len(out), 0
 				if n := len(out); n > 0 && m.Role == "assistant" && out[n-1].Role == "assistant" {
-					out[n-1].Text += ccTurnJoin + m.Text
+					idx = n - 1
+					fresh = len(out[idx].Tools)
+					out[idx].Text = ccJoinTurn(out[idx].Text, m.Text)
+					out[idx].Tools = append(out[idx].Tools, m.Tools...)
 				} else {
 					out = append(out, m)
 				}
+				// Index only the calls this line contributed. Re-indexing the whole
+				// message would be quadratic in a turn that calls 61 things.
+				for j := fresh; j < len(out[idx].Tools); j++ {
+					if id := out[idx].Tools[j].ID; id != "" {
+						at[id] = ccToolPos{msg: idx, tool: j}
+					}
+				}
+			}
+			// Reported even when the line produced no message, because that is
+			// exactly the shape of the record carrying them: cc returns a tool
+			// result as a type:"user" record with no text in it.
+			for _, f := range failures {
+				if p, found := at[f.toolUseID]; found {
+					out[p.msg].Tools[p.tool].Result = &ToolResultRecord{Content: f.content, IsError: true}
+				}
+				// Not found: the call it belongs to fell outside the window. Dropped
+				// rather than surfaced as a call with no name — an orphan result is
+				// the ordinary consequence of reading a tail, not a defect.
 			}
 		}
 		if err != nil {
@@ -711,21 +915,107 @@ func ccMessagesFrom(r io.Reader) []HistoryMessage {
 	// Newest turns win when there are more than the cap: the tail is what the
 	// window was chosen to preserve, so trimming from the front keeps that
 	// decision consistent instead of silently reversing it.
-	if len(out) > ccMessagesMax {
-		out = out[len(out)-ccMessagesMax:]
-	}
-	return out
+	return out[ccTrimFront(out, ccMessagesMax):]
 }
 
-func ccMessageFromLine(line []byte) (HistoryMessage, bool) {
+// ccTrimFront returns how many messages to drop from the front so that at most max
+// of them CARRY WORDS.
+//
+// # Counting words rather than messages is what stops tether#96 costing a turn
+//
+// The cap used to count messages, and while every message was a turn's text the two
+// were the same thing. They stopped being the same when a turn that says nothing but
+// calls things started producing a bubble: a transcript at the cap would then lose
+// one text bubble off the FRONT for every tool-only bubble gained at the back. Not
+// reachable on today's store — the largest transcript produces 27 messages against a
+// cap of 200 — but "unreachable" is a measurement, and this is the one place where
+// showing MORE tool activity could show LESS conversation. Found by review, which
+// broke it at 180 text bubbles in, 150 out.
+//
+// # The element count stays bounded, which is what the cap is for
+//
+// Exempting tool-only bubbles sounds like removing the bound. It is not: a new
+// assistant bubble only starts when the previous message was not an assistant one
+// (everything else merges), so assistant bubbles are bounded by the user messages
+// between them, and a user message with no words is never emitted. Hence at most
+// 2*max+1 messages, all told, for a cap of max turns of conversation.
+// TestMessagesCapBoundsTheElementCount pins that ceiling, because "bounded" was the
+// entire reason this cap exists and an argument in a comment is not a bound.
+func ccTrimFront(msgs []HistoryMessage, max int) int {
+	words := 0
+	for _, m := range msgs {
+		if m.Text != "" {
+			words++
+		}
+	}
+	if words <= max {
+		return 0
+	}
+	// Drop up to and including the (words-max)'th message with words in it. Any
+	// tool-only bubble that follows it is kept, which is why the answer is an index
+	// rather than a count of messages to remove from either end.
+	drop := words - max
+	for i, m := range msgs {
+		if m.Text == "" {
+			continue
+		}
+		if drop--; drop == 0 {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+// ccToolPos is where one call ended up: which message, and which slot in its
+// Tools. See ccMessagesFrom for why this is a position and not a pointer.
+type ccToolPos struct {
+	msg  int
+	tool int
+}
+
+// ccJoinTurn appends one fragment of an assistant turn to the ones before it.
+//
+// The join is only inserted BETWEEN two pieces of text. Without that check a turn
+// whose first record was a tool call — the ordinary shape, since cc never puts
+// text and tool_use in the same record — would open with a blank paragraph,
+// because its bubble starts life with an empty Text.
+func ccJoinTurn(prev, next string) string {
+	switch {
+	case prev == "":
+		return next
+	case next == "":
+		return prev
+	default:
+		return prev + ccTurnJoin + next
+	}
+}
+
+// ccMessageFromLine converts one transcript line into the message it becomes and
+// the failed tool results it reports.
+//
+// The failures come back INDEPENDENTLY of the bool, and that is not a wart: the
+// record carrying a tool result is a type:"user" record with no text in it, so the
+// line that reports a failure is precisely a line that emits nothing. A caller that
+// only looked at the message would silently serve every failed call as if it had
+// succeeded.
+func ccMessageFromLine(line []byte) (HistoryMessage, []ccToolError, bool) {
 	if !bytes.Contains(line, []byte(`"user"`)) && !bytes.Contains(line, []byte(`"assistant"`)) {
-		return HistoryMessage{}, false
+		return HistoryMessage{}, nil, false
 	}
 	var e ccEntry
 	if err := json.Unmarshal(line, &e); err != nil {
-		return HistoryMessage{}, false
+		return HistoryMessage{}, nil, false
 	}
-	var role, text string
+	// Cheap reject before decoding the content array a SECOND time: most records
+	// have no tool block in them at all (measured: 2,674 text-only assistant
+	// records against 3,897 tool_use ones), and the block decode for tool activity
+	// carries the input and result payloads that make this file's bytes.
+	hasTool := bytes.Contains(line, []byte(`"tool_`))
+	var (
+		role, text string
+		tools      []ToolCallRecord
+		failures   []ccToolError
+	)
 	switch {
 	// Type only — every other reason a type:"user" record is not a user turn
 	// (isMeta, isSidechain, a tool result, machine output wearing a tag) is
@@ -733,15 +1023,32 @@ func ccMessageFromLine(line []byte) (HistoryMessage, bool) {
 	// already turns into "emit nothing".
 	case e.Type == "user":
 		role, text = "user", e.userText()
+		// isSidechain explicitly, even though a sub-agent's calls are never in the
+		// id map to match against (its assistant records are excluded below, and
+		// List never opens a sub-agent file). Two independent filters rather than
+		// one, for the same reason ccEntry.IsSidechain exists at all.
+		if hasTool && !e.IsSidechain {
+			failures = e.Message.errorResults()
+		}
 	case e.Type == "assistant" && !e.IsSidechain:
 		role, text = "assistant", e.Message.text()
+		if hasTool {
+			tools = e.Message.toolCalls()
+		}
 	default:
-		return HistoryMessage{}, false
+		return HistoryMessage{}, nil, false
 	}
-	if text == "" {
-		return HistoryMessage{}, false
+	// A record with tools and no words is a message: it is what a turn that only
+	// called things looks like, and dropping it is what made those turns invisible.
+	if text == "" && len(tools) == 0 {
+		return HistoryMessage{}, failures, false
 	}
-	return HistoryMessage{Role: role, Text: text, Ts: ccTimestampMillis(e.Timestamp)}, true
+	return HistoryMessage{
+		Role:  role,
+		Text:  text,
+		Ts:    ccTimestampMillis(e.Timestamp),
+		Tools: tools,
+	}, failures, true
 }
 
 // ccTimestampMillis converts cc's ISO-8601 stamp to the Unix milliseconds the
@@ -872,6 +1179,220 @@ func (m *ccMessage) text() string {
 		b.WriteString(bl.Text)
 	}
 	return b.String()
+}
+
+// ---------------------------------------------------------------------------
+// Tool activity (tether#96)
+// ---------------------------------------------------------------------------
+
+// ccContentBlock is one content block, decoded for the tool activity in it.
+//
+// Separate from the anonymous struct text() uses, and deliberately so: text() is
+// on the TITLE path, where it runs over every record of a 128 KiB preamble, and
+// widening it would make it copy every tool input and result it walks past just to
+// discover there are no words in them. This one is only decoded for a line that
+// already tested positive for a tool block.
+type ccContentBlock struct {
+	Type string `json:"type"`
+	// tool_use
+	ID    string          `json:"id"`
+	Name  string          `json:"name"`
+	Input json.RawMessage `json:"input"`
+	// tool_result
+	ToolUseID string          `json:"tool_use_id"`
+	Content   json.RawMessage `json:"content"`
+	IsError   bool            `json:"is_error"`
+}
+
+// blocks decodes a message's content as an array of blocks, or nil when it is a
+// plain string — which is a shape a tool block never arrives in, so nil is the
+// right answer rather than a case to handle.
+func (m *ccMessage) blocks() []ccContentBlock {
+	if m == nil || len(m.Content) == 0 {
+		return nil
+	}
+	var blocks []ccContentBlock
+	if err := json.Unmarshal(m.Content, &blocks); err != nil {
+		return nil
+	}
+	return blocks
+}
+
+// toolCalls is the tool activity in one assistant record.
+//
+// A block with no name is skipped: the row renders `{name}` and an icon looked up
+// by it, so a nameless call is a blank line with a 🔧 next to it.
+//
+// Several blocks in one record is the parallel-call shape and is normal — cc emits
+// one record per batch, not per call.
+func (m *ccMessage) toolCalls() []ToolCallRecord {
+	var out []ToolCallRecord
+	for _, b := range m.blocks() {
+		if b.Type != "tool_use" || b.Name == "" {
+			continue
+		}
+		out = append(out, ToolCallRecord{
+			ID:    b.ID,
+			Name:  b.Name,
+			Input: ccProjectToolInput(b.Input),
+		})
+	}
+	return out
+}
+
+// ccToolError is a call that FAILED: which call, and what it said.
+//
+// The type names the decision. A successful result is not carried at all — see
+// ccMessagesFrom for the two reasons (bytes, and a truncated result making
+// summarizeToolResult report a wrong line count), and note the consequence: a call
+// with no Result covers both "it succeeded" and "the run was interrupted before it
+// came back". The renderer draws those identically anyway — an absent result and an
+// empty successful one both leave the row unexpandable — so nothing is lost that
+// could have been shown.
+type ccToolError struct {
+	toolUseID string
+	content   string
+}
+
+// errorResults is the FAILED results reported by one record.
+//
+// A result with no tool_use_id is skipped rather than guessed at: there is nothing
+// to hang it on, and hanging it on the most recent call would attach a failure to a
+// call that may well have succeeded.
+//
+// # A failure with no MESSAGE is still served, and that costs a dead click
+//
+// cc can write `is_error` with content that flattens to nothing — an empty array, or
+// only `image` / `tool_reference` sub-blocks. The row then renders its "error"
+// preview (summarizeToolResult keys on the flag, not the text) and is ALSO clickable,
+// expanding to an empty block, because ToolCallList's `hasResult` admits
+// `|| isError`. That dead click is a defect a previous review removed once.
+//
+// Kept anyway, because the alternative is worse: dropping the result drops the only
+// signal that the call failed, and "the agent tried X and it broke" is the thing that
+// explains what it did next. The cost is one empty expander; the cost of the other
+// choice is a failed call that reads as a successful one. Fixing the expander is a
+// one-line frontend change, outside this change's locks, and it is written down
+// rather than left for someone to find. TestFailureWithNoMessageStillReportsTheError
+// pins the choice. Measured: 41 failures served across the 39 windows of one store
+// and 0 of them empty, so this is a decision about a shape cc CAN write rather than
+// one it does — and the census counts them, so the day it starts, the report says so.
+func (m *ccMessage) errorResults() []ccToolError {
+	var out []ccToolError
+	for _, b := range m.blocks() {
+		if b.Type != "tool_result" || !b.IsError || b.ToolUseID == "" {
+			continue
+		}
+		out = append(out, ccToolError{
+			toolUseID: b.ToolUseID,
+			content:   ccCapBytes(ccResultText(b.Content), ccToolErrorBytes),
+		})
+	}
+	return out
+}
+
+// ccResultText flattens a tool result's content to the words in it.
+//
+// cc writes it in exactly the two encodings a MESSAGE's content uses — a plain
+// string (2,650 of 3,887 measured) or an array of blocks (1,237, carrying `text`,
+// `tool_reference` and `image` sub-blocks) — so this is ccMessage.text's rule, not
+// a second one. Reusing it rather than restating it is deliberate: a copy is how
+// the two drift and one of them ends up serving a JSON array as if it were prose.
+func ccResultText(raw json.RawMessage) string {
+	return (&ccMessage{Content: raw}).text()
+}
+
+// ccProjectToolInput reduces a call's arguments to a bounded summary of them.
+//
+// # What survives, and why the rule is generic
+//
+// Every top-level value that IS a string, truncated to ccToolInputValueRunes, at
+// most ccToolInputMaxKeys of them. Objects, arrays and numbers are dropped
+// entirely; Write's whole-file `content` and Edit's old/new strings become
+// prefixes.
+//
+// The renderer reads exactly ONE top-level string field per known tool
+// (TOOL_ARG_FIELD in web/src/panes/chat/index.tsx), so copying that map into Go
+// would be cheaper still. It is deliberately NOT copied: that would couple the
+// daemon to a display choice and rot the first time a tool is added on one side
+// only. "A bounded prefix of each string argument" is a contract this file can keep
+// on its own, and it costs 5 KB per transcript more than the copied map would.
+//
+// nil for a non-object input, an input with no string values, or anything that
+// fails to decode. nil is right rather than lossy: ToolCallRecord.Input is
+// omitempty and the renderer already shows the tool name alone when there is no arg
+// to show.
+//
+// The keys are sorted before the count cap is applied, so WHICH keys survive is
+// deterministic rather than a function of Go's map iteration order. (The marshal
+// would sort them anyway; that sorts the output, not the choice.)
+func ccProjectToolInput(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return nil
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil
+	}
+	keys := make([]string, 0, len(fields))
+	for k := range fields {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	kept := make(map[string]string, len(keys))
+	for _, k := range keys {
+		if len(kept) == ccToolInputMaxKeys {
+			break
+		}
+		var s string
+		if json.Unmarshal(fields[k], &s) != nil {
+			continue
+		}
+		kept[k] = ccCapRunes(s, ccToolInputValueRunes)
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	b, err := json.Marshal(kept)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// ccCapRunes truncates to at most max runes, marking the cut with an ellipsis.
+//
+// Runes rather than bytes because the bound exists to preserve a 60-CHARACTER
+// summary line: a byte bound would cut a CJK argument at a third of the characters
+// an ASCII one keeps, i.e. it would bind hardest exactly where the transcript that
+// prompted this change is written.
+func ccCapRunes(s string, max int) string {
+	n := 0
+	for i := range s {
+		if n == max {
+			return s[:i] + "…"
+		}
+		n++
+	}
+	return s
+}
+
+// ccCapBytes truncates to at most max bytes, never mid-rune.
+//
+// A byte bound here rather than a rune one because this one exists to bound the
+// RESPONSE, and bytes are what a response is measured in. Cutting back to a rune
+// boundary matters because the result goes out as JSON: a half-encoded rune would
+// be re-encoded as U+FFFD and the user would read a replacement character where
+// their error message was cut.
+func ccCapBytes(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + ccTruncated
 }
 
 // ---------------------------------------------------------------------------

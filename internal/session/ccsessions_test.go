@@ -16,6 +16,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // Every fixture in this file is SYNTHETIC and built under t.TempDir() — see
@@ -103,6 +104,25 @@ func ccAssistantAt(t *testing.T, text, ts string) string {
 		"message": map[string]any{"role": "assistant", "content": []any{
 			map[string]any{"type": "text", "text": text},
 			map[string]any{"type": "tool_use", "id": "t1", "name": "Bash", "input": map[string]any{"command": "ls"}},
+		}},
+	})
+}
+
+// ccAssistantWords builds a text-ONLY assistant record — the shape cc actually
+// writes, measured: a record's blocks are `text`, `tool_use` or `thinking`, each
+// alone, never mixed.
+//
+// ccAssistant above is deliberately the mixed shape instead, so that the block
+// filter is exercised by every conversion test. This one exists because a fixture
+// that mixes them cannot be split into a text-only control arm — see
+// ccStripToolCalls — and because tether#96's merge rule is about records that hold
+// one kind or the other.
+func ccAssistantWords(t *testing.T, text, ts string) string {
+	return ccLine(t, map[string]any{
+		"type":      "assistant",
+		"timestamp": ts,
+		"message": map[string]any{"role": "assistant", "content": []any{
+			map[string]any{"type": "text", "text": text},
 		}},
 	})
 }
@@ -229,6 +249,115 @@ func ccSlashCommandRecord(t *testing.T, name, args string) string {
 		"message": map[string]any{"role": "user", "content": "<command-message>" + strings.TrimPrefix(name, "/") +
 			"</command-message>\n" + ccCommandNameTag + name + "</command-name>\n<command-args>" + args + "</command-args>"},
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Tool activity (tether#96). One builder per real shape, including the BROKEN
+// pairings — a fixture of well-formed pairs exercises none of the failure modes
+// this reader actually meets.
+// ---------------------------------------------------------------------------
+
+// ccToolUse builds the record cc writes when the agent calls something: an
+// assistant record whose content is tool_use blocks and NOTHING ELSE.
+//
+// That is measured, not simplified. Across a real store the block combinations on
+// a record are `text`, `tool_use` and `thinking`, each of them alone — cc never
+// mixes text and a call in one record. It is the reason a tool record produced no
+// message at all before tether#96, and the reason the merge has to absorb one.
+//
+// Several blocks in one record is the parallel-call shape, so the signature takes
+// as many as the caller wants.
+func ccToolUse(t *testing.T, ts string, calls ...map[string]any) string {
+	t.Helper()
+	blocks := make([]any, 0, len(calls))
+	for _, c := range calls {
+		b := map[string]any{"type": "tool_use"}
+		for k, v := range c {
+			b[k] = v
+		}
+		blocks = append(blocks, b)
+	}
+	return ccLine(t, map[string]any{
+		"type":      "assistant",
+		"timestamp": ts,
+		"message":   map[string]any{"role": "assistant", "content": blocks},
+	})
+}
+
+// ccCall is one tool_use block, in the field shape real records carry (`caller` is
+// on 3,603 of 3,897 measured and is ignored by this reader, so it is here to prove
+// that).
+func ccCall(id, name string, input map[string]any) map[string]any {
+	return map[string]any{
+		"id": id, "name": name, "input": input,
+		"caller": map[string]any{"type": "direct"},
+	}
+}
+
+// ccToolFailure builds a FAILED tool result: type:"user", a tool_result block with
+// is_error. 1,699 of 3,887 measured results carry the flag at all, so both the
+// present and absent forms are real and the fixtures use both (ccToolResult is the
+// successful one).
+func ccToolFailure(t *testing.T, toolUseID, content string) string {
+	return ccLine(t, map[string]any{
+		"type":      "user",
+		"timestamp": "2026-08-17T03:00:00.000Z",
+		"message": map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "tool_result", "tool_use_id": toolUseID,
+				"content": content, "is_error": true},
+		}},
+	})
+}
+
+// ccToolResultBlocks builds a result whose content is an ARRAY of blocks rather
+// than a string — 1,237 of 3,887 measured, carrying `text`, `tool_reference` and
+// `image` sub-blocks. A fixture that only used the string form would leave the
+// flattening rule unexercised, and a reader that served the array raw would put a
+// JSON literal in front of the user.
+func ccToolResultBlocks(t *testing.T, toolUseID string, texts ...string) string {
+	blocks := []any{map[string]any{"type": "tool_reference", "tool_name": "Bash"}}
+	for _, s := range texts {
+		blocks = append(blocks, map[string]any{"type": "text", "text": s})
+	}
+	return ccLine(t, map[string]any{
+		"type":      "user",
+		"timestamp": "2026-08-17T03:00:00.000Z",
+		"message": map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "tool_result", "tool_use_id": toolUseID,
+				"content": blocks, "is_error": true},
+		}},
+	})
+}
+
+// ccThinkingRecord builds an extended-thinking record in the shape the real store
+// holds: a `thinking` block whose text is EMPTY, with the reasoning encrypted into
+// `signature`. 22,350 of 22,350 across all 93 top-level transcripts of one store
+// (2026-08-17) are exactly this, which is why nothing here serves thinking.
+func ccThinkingRecord(t *testing.T, thinking string) string {
+	return ccLine(t, map[string]any{
+		"type":      "assistant",
+		"timestamp": "2026-08-17T03:00:00.500Z",
+		"message": map[string]any{"role": "assistant", "content": []any{
+			map[string]any{"type": "thinking", "thinking": thinking,
+				"signature": "CAIStwYKhwEIEBgCKkAtCLIm44jNGjGEr95Lhkbr"},
+		}},
+	})
+}
+
+// ccStripToolCalls removes every record that carries a tool_use block, which
+// reproduces EXACTLY the population the reader served before tether#96: such a
+// record had no text in it, so the old reader dropped it. It is the control arm of
+// the A/B in TestToolsDoNotShrinkTheVisibleTranscript — a text-only baseline taken
+// from the same fixture, so the comparison needs no second build of the daemon.
+func ccStripToolCalls(body string) string {
+	var out strings.Builder
+	for _, line := range strings.SplitAfter(body, "\n") {
+		if strings.Contains(line, `"tool_use"`) {
+			continue
+		}
+		out.WriteString(line)
+	}
+	return out.String()
 }
 
 // ccPreamble is the kind of record a real transcript opens with — several of
@@ -702,29 +831,872 @@ func TestMessagesConvertsTheConversation(t *testing.T) {
 	}
 }
 
-// TestMessagesDropsToolActivity — the assistant fixture carries a tool_use block
-// alongside its text, and a tool_result arrives as a type:"user" record. Neither
-// becomes a turn: tool payloads are what make a transcript 138 MB, and the row
-// that renders this says so.
-func TestMessagesDropsToolActivity(t *testing.T) {
-	toolResult := ccLine(t, map[string]any{
-		"type":      "user",
-		"timestamp": "2026-08-17T03:00:00.000Z",
-		"message": map[string]any{"role": "user", "content": []any{
-			map[string]any{"type": "tool_result", "tool_use_id": "t1", "content": "SECRET-TOOL-OUTPUT"},
-		}},
-	})
+// TestMessagesServesToolActivityWithoutItsPayload (tether#96, replacing
+// TestMessagesDropsToolActivity) — a tool call reaches the turn as a
+// ToolCallRecord, and a SUCCESSFUL result's output does not reach it at all.
+//
+// Both halves matter and they pull opposite ways. The first is the feature. The
+// second is the byte decision: a successful result is 3.33 MB of the 4.85 MB of raw
+// tool payload inside the 39 real 1 MiB windows of one store, and serving it
+// truncated would make summarizeToolResult report a wrong line count. The old test
+// asserted that NEITHER arrived, which is why its name had to go rather than its
+// fixture.
+func TestMessagesServesToolActivityWithoutItsPayload(t *testing.T) {
 	f := newCCFixture(t, "/w")
-	f.write(t, "/w", "cc-session-0001.jsonl", ccUser(t, "run it")+ccAssistant(t, "running")+toolResult)
+	f.write(t, "/w", "cc-session-0001.jsonl",
+		ccUser(t, "run it")+ccAssistant(t, "running")+ccToolResult(t, "SECRET-TOOL-OUTPUT"))
 
 	msgs, _ := f.store().Messages("cc-session-0001")
 	if len(msgs) != 2 {
 		t.Fatalf("got %d messages, want 2 (the tool result is not a turn): %+v", len(msgs), msgs)
 	}
 	for _, m := range msgs {
-		if strings.Contains(m.Text, "SECRET-TOOL-OUTPUT") || strings.Contains(m.Text, "\"tool_use\"") {
-			t.Errorf("tool activity leaked into a turn: %q", m.Text)
+		if strings.Contains(m.Text, "SECRET-TOOL-OUTPUT") || strings.Contains(m.Text, `"tool_use"`) {
+			t.Errorf("tool activity leaked into a turn's TEXT: %q", m.Text)
 		}
+	}
+	if len(msgs[0].Tools) != 0 {
+		t.Errorf("the user's turn carries tools: %+v", msgs[0].Tools)
+	}
+	tools := msgs[1].Tools
+	if len(tools) != 1 {
+		t.Fatalf("the answer carries %d tools, want 1: %+v", len(tools), tools)
+	}
+	if tools[0].Name != "Bash" || tools[0].ID != "t1" {
+		t.Errorf("tool = %q/%q, want Bash/t1", tools[0].Name, tools[0].ID)
+	}
+	if got := string(tools[0].Input); got != `{"command":"ls"}` {
+		t.Errorf("input = %s, want the projected command", got)
+	}
+	// The successful result is on disk and matched this very call by id. It is not
+	// served, and that is the decision under test — not an accident of the fixture.
+	if tools[0].Result != nil {
+		t.Errorf("a SUCCESSFUL result was served: %+v", tools[0].Result)
+	}
+}
+
+// TestToolsDoNotShrinkTheVisibleTranscript is the A/B this change is most able to
+// fool itself on: tool cards appear while the conversation silently gets shorter,
+// which looks like success in a screenshot.
+//
+// The control arm is the SAME fixture with its tool_use records removed, which
+// reproduces exactly what the reader served before tether#96 — such a record had no
+// text in it, so the old reader dropped it. So the comparison needs no second build
+// of the daemon, and it compares the two things that can shrink: how many messages
+// come back, and what words are in them.
+//
+// The fixture is built to contain every case that could add or lose a message: a
+// call BEFORE the turn's first words, a call after them, a turn that is nothing but
+// calls, and a second user turn afterwards so the boundary is exercised too.
+func TestToolsDoNotShrinkTheVisibleTranscript(t *testing.T) {
+	body := ccUser(t, "把这个查清楚") +
+		ccToolUse(t, "2026-08-17T04:57:00.000Z", ccCall("t1", "Read", map[string]any{"file_path": "a.go"})) +
+		ccToolResult(t, "package main") +
+		ccAssistantWords(t, "查清楚:", "2026-08-17T04:57:30.000Z") +
+		ccToolUse(t, "2026-08-17T04:58:00.000Z", ccCall("t2", "Bash", map[string]any{"command": "go test ./..."})) +
+		ccToolResult(t, "ok") +
+		ccAssistantWords(t, "先看进度:", "2026-08-17T04:59:00.000Z") +
+		ccUser(t, "继续") +
+		// A turn that says nothing at all: only calls. This is the one shape that
+		// GAINS a message, which is the direction that is fine.
+		ccToolUse(t, "2026-08-17T05:00:00.000Z", ccCall("t3", "Grep", map[string]any{"pattern": "TODO"})) +
+		ccToolResult(t, "none")
+
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", body)
+	f.write(t, "/w", "cc-session-0002.jsonl", ccStripToolCalls(body))
+
+	after, _ := f.store().Messages("cc-session-0001")
+	before, _ := f.store().Messages("cc-session-0002")
+
+	if len(before) == 0 {
+		t.Fatal("the control arm produced nothing — the stripped fixture is not a baseline")
+	}
+	if len(after) < len(before) {
+		t.Fatalf("VISIBLE HISTORY SHRANK: %d messages with tools, %d without\nwith:    %+v\nwithout: %+v",
+			len(after), len(before), after, before)
+	}
+	// Every message the control produced must still be there, in order, word for
+	// word. Comparing only the counts would pass a change that replaced a turn's
+	// text with a tool card.
+	var withWords []HistoryMessage
+	for _, m := range after {
+		if m.Text != "" {
+			withWords = append(withWords, m)
+		}
+	}
+	if len(withWords) != len(before) {
+		t.Fatalf("%d messages carry words, control had %d\nwith words: %+v\ncontrol:    %+v",
+			len(withWords), len(before), withWords, before)
+	}
+	for i := range before {
+		if withWords[i].Text != before[i].Text {
+			t.Errorf("message %d text = %q, control had %q", i, withWords[i].Text, before[i].Text)
+		}
+		if withWords[i].Role != before[i].Role {
+			t.Errorf("message %d role = %q, control had %q", i, withWords[i].Role, before[i].Role)
+		}
+	}
+	// And the change has to have DONE something, or the assertions above are
+	// satisfied by a no-op.
+	served := 0
+	for _, m := range after {
+		served += len(m.Tools)
+	}
+	if served != 3 {
+		t.Errorf("%d tool calls served, want 3 — the A/B above passes trivially for a no-op", served)
+	}
+	for _, m := range before {
+		if len(m.Tools) != 0 {
+			t.Errorf("the control arm carries tools, so it is not a text-only baseline: %+v", m.Tools)
+		}
+	}
+}
+
+// TestToolsMergeWithoutALeadingBlankLine — a turn's FIRST record is a tool call,
+// because cc never puts text and a call in the same record. So the bubble is
+// created with an empty Text and the words arrive afterwards; joining with
+// ccTurnJoin unconditionally would open every such turn with a blank paragraph.
+func TestToolsMergeWithoutALeadingBlankLine(t *testing.T) {
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", ccUser(t, "go")+
+		ccToolUse(t, "2026-08-17T03:00:01.000Z", ccCall("t1", "Read", map[string]any{"file_path": "a.go"}))+
+		ccToolResult(t, "ok")+
+		ccAssistantWords(t, "done", "2026-08-17T03:00:02.000Z"))
+
+	msgs, _ := f.store().Messages("cc-session-0001")
+	if len(msgs) != 2 {
+		t.Fatalf("got %d messages, want 2: %+v", len(msgs), msgs)
+	}
+	if msgs[1].Text != "done" {
+		t.Errorf("answer text = %q, want %q — a leading join makes the bubble open blank", msgs[1].Text, "done")
+	}
+	// The stamp must still be the FIRST fragment's, which is now the tool record:
+	// that is when the response began. Same rule as tether#94.
+	if want := ccTimestampMillis("2026-08-17T03:00:01.000Z"); msgs[1].Ts != want {
+		t.Errorf("Ts = %d, want %d (the first fragment's, which is the tool call)", msgs[1].Ts, want)
+	}
+}
+
+// TestToolFailureAttachesToItsCall — a failed result is the one result that IS
+// served, because "the agent tried X and it broke" is what explains the next thing
+// it did. It arrives in a LATER record than its call, so this also pins the id
+// lookup across records.
+func TestToolFailureAttachesToItsCall(t *testing.T) {
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", ccUser(t, "build it")+
+		ccToolUse(t, "2026-08-17T03:00:01.000Z",
+			ccCall("ok1", "Read", map[string]any{"file_path": "a.go"}),
+			ccCall("bad1", "Bash", map[string]any{"command": "make"}))+
+		ccToolResult(t, "package main")+
+		ccToolFailure(t, "bad1", "make: *** No rule to make target")+
+		ccAssistantWords(t, "the build is broken", "2026-08-17T03:00:03.000Z"))
+
+	msgs, _ := f.store().Messages("cc-session-0001")
+	if len(msgs) != 2 {
+		t.Fatalf("got %d messages, want 2: %+v", len(msgs), msgs)
+	}
+	tools := msgs[1].Tools
+	if len(tools) != 2 {
+		t.Fatalf("got %d tools, want 2 (both blocks of one parallel record): %+v", len(tools), tools)
+	}
+	if tools[0].Result != nil {
+		t.Errorf("the succeeding call carries a result: %+v", tools[0].Result)
+	}
+	if tools[1].Result == nil {
+		t.Fatal("the FAILING call carries no result — a failure is the one result served")
+	}
+	if !tools[1].Result.IsError {
+		t.Error("Result.IsError = false on a failure")
+	}
+	if !strings.Contains(tools[1].Result.Content, "No rule to make target") {
+		t.Errorf("Result.Content = %q, want the failure message", tools[1].Result.Content)
+	}
+}
+
+// TestToolFailureFromBlockContent — cc writes a result's content as a plain string
+// on 2,650 of 3,887 measured records and as an ARRAY of blocks on the other 1,237,
+// carrying text / tool_reference / image sub-blocks. A reader that only handled the
+// string form would put a JSON literal in front of the user.
+func TestToolFailureFromBlockContent(t *testing.T) {
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", ccUser(t, "go")+
+		ccToolUse(t, "2026-08-17T03:00:01.000Z", ccCall("t1", "Bash", map[string]any{"command": "false"}))+
+		ccToolResultBlocks(t, "t1", "exit status 1", "nothing else worked"))
+
+	msgs, _ := f.store().Messages("cc-session-0001")
+	if len(msgs) != 2 {
+		t.Fatalf("got %d messages, want 2: %+v", len(msgs), msgs)
+	}
+	if len(msgs[1].Tools) != 1 {
+		t.Fatalf("the answer carries %d tools, want 1: %+v", len(msgs[1].Tools), msgs[1].Tools)
+	}
+	got := msgs[1].Tools[0].Result
+	if got == nil {
+		t.Fatal("no result served for a block-shaped failure")
+	}
+	if want := "exit status 1\nnothing else worked"; got.Content != want {
+		t.Errorf("Content = %q, want %q — the blocks are flattened, not serialised", got.Content, want)
+	}
+	if strings.Contains(got.Content, "tool_reference") {
+		t.Errorf("a non-text sub-block reached the user: %q", got.Content)
+	}
+}
+
+// TestBrokenToolPairingsSurviveTheWindow — a tail is cut wherever the window falls,
+// so BOTH halves of a pair go missing in the ordinary case. Measured on one real
+// transcript: 95 calls against 96 results inside the window, i.e. one orphan
+// result, and an interrupted run leaves a call that never came back.
+//
+// Neither is a defect and neither may produce a phantom row.
+func TestBrokenToolPairingsSurviveTheWindow(t *testing.T) {
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", ccUser(t, "go")+
+		// A result whose call is not in this window at all.
+		ccToolFailure(t, "call-from-last-week", "boom")+
+		// A call the run was interrupted before answering.
+		ccToolUse(t, "2026-08-17T03:00:01.000Z", ccCall("t9", "Bash", map[string]any{"command": "sleep 600"}))+
+		ccInterrupt(t, ""))
+
+	msgs, _ := f.store().Messages("cc-session-0001")
+	// user "go", the tool-only assistant turn, the interrupt marker.
+	if len(msgs) != 3 {
+		t.Fatalf("got %d messages, want 3: %+v", len(msgs), msgs)
+	}
+	for _, m := range msgs {
+		if strings.Contains(m.Text, "boom") {
+			t.Errorf("an orphan result reached a turn's text: %q", m.Text)
+		}
+		for _, tc := range m.Tools {
+			if tc.Name == "" {
+				t.Errorf("an orphan result was served as a nameless call: %+v", tc)
+			}
+			if tc.ID == "call-from-last-week" {
+				t.Errorf("an orphan result invented a call: %+v", tc)
+			}
+		}
+	}
+	if len(msgs[1].Tools) != 1 {
+		t.Fatalf("the tool-only turn carries %d tools, want 1: %+v", len(msgs[1].Tools), msgs[1].Tools)
+	}
+	if msgs[1].Tools[0].Result != nil {
+		t.Errorf("the interrupted call has a result: %+v — 'never came back' must stay visible as absent",
+			msgs[1].Tools[0].Result)
+	}
+	if msgs[2].Text != "(interrupted)" {
+		t.Errorf("msgs[2] = %q, want the interrupt marker", msgs[2].Text)
+	}
+}
+
+// TestToolResultRecordsAreStillNotTurns — a tool_result arrives wearing
+// type:"user", so the record that reports a FAILURE is a record that must emit no
+// user bubble. tether#96 made such a record carry information for the first time,
+// which is exactly when "and it also emits nothing" stops being automatic.
+func TestToolResultRecordsAreStillNotTurns(t *testing.T) {
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl",
+		ccToolUse(t, "2026-08-17T03:00:01.000Z", ccCall("t1", "Bash", map[string]any{"command": "false"}))+
+			ccToolFailure(t, "t1", "exit 1")+
+			ccToolResult(t, "and a successful one"))
+
+	msgs, _ := f.store().Messages("cc-session-0001")
+	if len(msgs) != 1 {
+		t.Fatalf("got %d messages, want 1 (the assistant's call): %+v", len(msgs), msgs)
+	}
+	if msgs[0].Role != "assistant" {
+		t.Errorf("a tool result produced a %q message", msgs[0].Role)
+	}
+}
+
+// TestThinkingIsNotServedFromCC pins the decision AND the measurement it rests on.
+//
+// Measured across all 93 top-level transcripts of one real store (2026-08-17, cc
+// 2.1.233): 22,350 of 22,350 thinking blocks carry `"thinking": ""`, with the
+// reasoning encrypted into the block's `signature`. So there is no text to serve
+// and converting the block would give every turn a "thought" toggle that expands to
+// nothing.
+//
+// The fixture also passes a NON-empty thinking block, because a test built only
+// from empty ones would keep passing if the reader started serving thinking
+// verbatim — it would just have nothing to show. This asserts the decision, not the
+// data.
+func TestThinkingIsNotServedFromCC(t *testing.T) {
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", ccUser(t, "go")+
+		ccThinkingRecord(t, "")+
+		ccThinkingRecord(t, "SECRET-REASONING")+
+		ccAssistantWords(t, "answer", "2026-08-17T03:00:02.000Z"))
+
+	msgs, _ := f.store().Messages("cc-session-0001")
+	if len(msgs) != 2 {
+		t.Fatalf("got %d messages, want 2 (a thinking record is not a turn): %+v", len(msgs), msgs)
+	}
+	for i, m := range msgs {
+		if m.Thinking != "" {
+			t.Errorf("msgs[%d].Thinking = %q, want empty — see ccMessagesFrom for the measurement", i, m.Thinking)
+		}
+		if strings.Contains(m.Text, "SECRET-REASONING") {
+			t.Errorf("msgs[%d] served thinking as text: %q", i, m.Text)
+		}
+	}
+}
+
+// TestToolInputIsProjected — the bound on what a call's arguments cost.
+func TestToolInputIsProjected(t *testing.T) {
+	long := strings.Repeat("a", ccToolInputValueRunes+50)
+	cjk := strings.Repeat("查", ccToolInputValueRunes+50)
+	many := map[string]any{}
+	for i := 0; i < ccToolInputMaxKeys+5; i++ {
+		many[fmt.Sprintf("k%02d", i)] = "v"
+	}
+
+	for _, tc := range []struct {
+		name  string
+		input any
+		check func(t *testing.T, got json.RawMessage)
+	}{
+		{
+			name:  "a value past the cap is a prefix of itself",
+			input: map[string]any{"command": long},
+			check: func(t *testing.T, got json.RawMessage) {
+				var m map[string]string
+				mustUnmarshal(t, got, &m)
+				if n := utf8.RuneCountInString(m["command"]); n != ccToolInputValueRunes+1 {
+					t.Errorf("kept %d runes, want %d + the ellipsis", n, ccToolInputValueRunes)
+				}
+				if !strings.HasPrefix(long, strings.TrimSuffix(m["command"], "…")) {
+					t.Error("the kept value is not a prefix of the original")
+				}
+			},
+		},
+		{
+			// A byte cap would keep a third as many characters here as it does for
+			// ASCII — and the transcript that prompted this whole change is in CJK.
+			name:  "the cap counts runes, not bytes",
+			input: map[string]any{"command": cjk},
+			check: func(t *testing.T, got json.RawMessage) {
+				var m map[string]string
+				mustUnmarshal(t, got, &m)
+				if n := utf8.RuneCountInString(m["command"]); n != ccToolInputValueRunes+1 {
+					t.Errorf("kept %d runes of CJK, want %d + the ellipsis", n, ccToolInputValueRunes)
+				}
+				if !utf8.ValidString(m["command"]) {
+					t.Error("the cut landed mid-rune")
+				}
+			},
+		},
+		{
+			name: "non-string values are dropped, whole",
+			input: map[string]any{
+				"file_path": "a.go",
+				"edits":     []any{map[string]any{"old_string": strings.Repeat("z", 4096)}},
+				"limit":     2000,
+				"deep":      map[string]any{"content": strings.Repeat("y", 4096)},
+			},
+			check: func(t *testing.T, got json.RawMessage) {
+				if s := string(got); s != `{"file_path":"a.go"}` {
+					t.Errorf("projection = %s, want only the string argument", s)
+				}
+			},
+		},
+		{
+			name:  "the key cap binds, deterministically",
+			input: many,
+			check: func(t *testing.T, got json.RawMessage) {
+				var m map[string]string
+				mustUnmarshal(t, got, &m)
+				if len(m) != ccToolInputMaxKeys {
+					t.Fatalf("kept %d keys, want %d", len(m), ccToolInputMaxKeys)
+				}
+				// Alphabetical, so two runs over the same record agree.
+				if _, ok := m["k00"]; !ok {
+					t.Error("k00 was dropped, so the surviving keys are not the alphabetically first")
+				}
+				if _, ok := m[fmt.Sprintf("k%02d", ccToolInputMaxKeys)]; ok {
+					t.Error("a key past the cap survived")
+				}
+			},
+		},
+		{
+			name:  "an input with no strings in it is omitted entirely",
+			input: map[string]any{"limit": 10, "offset": 20},
+			check: func(t *testing.T, got json.RawMessage) {
+				if got != nil {
+					t.Errorf("projection = %s, want nil so omitempty drops the field", got)
+				}
+			},
+		},
+		{
+			name:  "a non-object input is omitted rather than passed through",
+			input: []any{"not", "an", "object"},
+			check: func(t *testing.T, got json.RawMessage) {
+				if got != nil {
+					t.Errorf("projection = %s, want nil", got)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(tc.input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := ccProjectToolInput(raw)
+			if got != nil && !json.Valid(got) {
+				t.Fatalf("projection is not valid JSON: %s", got)
+			}
+			tc.check(t, got)
+		})
+	}
+}
+
+// mustUnmarshal fails the test rather than letting a decode error be read as an
+// empty map, which would make every assertion above vacuously true.
+func mustUnmarshal(t *testing.T, raw json.RawMessage, into any) {
+	t.Helper()
+	if err := json.Unmarshal(raw, into); err != nil {
+		t.Fatalf("decoding %s: %v", raw, err)
+	}
+}
+
+// TestToolFailureContentIsCappedOnARuneBoundary — the failure message is bounded in
+// BYTES, because it is bounding a response. Cutting mid-rune would send the user a
+// replacement character where their error message was truncated.
+func TestToolFailureContentIsCappedOnARuneBoundary(t *testing.T) {
+	// 查 is three bytes, so a cap that is not a multiple of three lands inside one.
+	body := strings.Repeat("查", ccToolErrorBytes)
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl",
+		ccToolUse(t, "2026-08-17T03:00:01.000Z", ccCall("t1", "Bash", map[string]any{"command": "false"}))+
+			ccToolFailure(t, "t1", body))
+
+	msgs, _ := f.store().Messages("cc-session-0001")
+	if len(msgs) != 1 || len(msgs[0].Tools) != 1 {
+		t.Fatalf("got %d messages with %v tools, want 1 message with 1 tool: %+v",
+			len(msgs), func() int {
+				if len(msgs) == 0 {
+					return 0
+				}
+				return len(msgs[0].Tools)
+			}(), msgs)
+	}
+	got := msgs[0].Tools[0].Result
+	if got == nil {
+		t.Fatal("no result served")
+	}
+	if !utf8.ValidString(got.Content) {
+		t.Error("the cut landed mid-rune")
+	}
+	if len(got.Content) > ccToolErrorBytes+len(ccTruncated) {
+		t.Errorf("Content is %d bytes, cap is %d + the marker", len(got.Content), ccToolErrorBytes)
+	}
+	if !strings.HasSuffix(got.Content, ccTruncated) {
+		t.Errorf("a truncated result does not say so: %q", got.Content[max(0, len(got.Content)-40):])
+	}
+	if !strings.HasPrefix(body, strings.TrimSuffix(got.Content, ccTruncated)) {
+		t.Error("the kept content is not a prefix of the original")
+	}
+}
+
+// ccServedCallCeiling is the most one call may cost on the wire, derived from the
+// caps rather than observed: at most ccToolInputMaxKeys values, each at most
+// ccToolInputValueRunes characters, each character at worst ccMaxEscapeBytesPerRune
+// bytes once the response encoder has escaped it, plus a generous allowance for
+// keys, the id, the name and the JSON around them.
+//
+// Written down as arithmetic so the ceiling cannot quietly become "whatever the code
+// currently produces".
+const ccServedCallCeiling = ccToolInputMaxKeys*(ccToolInputValueRunes*ccMaxEscapeBytesPerRune+64) + 256
+
+// TestToolPayloadIsBoundedByItsCaps replaces an earlier test that asserted the
+// served record was strictly SMALLER in bytes than the transcript record it came
+// from. That is false, and review proved it: Go's encoder turns `<`, `>` and `&` into
+// six-byte escapes where cc's writer leaves them as one byte, so a call whose
+// arguments are full of ampersands serves more bytes than it was read from.
+//
+// Worse, the test could never have failed for that reason, because it built its
+// "source" with the SAME escaping encoder — the asymmetry cancelled by construction.
+// A test that is immune to the failure mode it names is a claim with a green light
+// next to it.
+//
+// So the property asserted here is the one that is actually true and actually
+// load-bearing: every call fits a ceiling the caps imply, whatever the input. The
+// adversarial rows are the ones that broke the old claim.
+func TestToolPayloadIsBoundedByItsCaps(t *testing.T) {
+	amp := strings.Repeat("&", 4096)    // 1 byte on disk, 6 on the wire
+	tags := strings.Repeat("<x>", 4096) // the shape a human pastes
+	for _, tc := range []struct {
+		name  string
+		block map[string]any
+		// cheap, when non-zero, is a TIGHTER ceiling this case must also meet —
+		// unlike the derived one, it fails if the projection is removed.
+		cheap int
+	}{
+		{name: "a small call", block: ccCall("t1", "Read", map[string]any{"file_path": "a.go"}), cheap: 128},
+		{
+			name: "a call whose input is a whole file",
+			block: ccCall("t2", "Write", map[string]any{
+				"file_path": "a.go", "content": strings.Repeat("line\n", 4096)}),
+			// The renderer shows Write's file_path and nothing else, so a 20 KB
+			// input has to cost about as much as its path.
+			cheap: 512,
+		},
+		{
+			name: "a call with many long arguments",
+			block: ccCall("t3", "mcp__x__y", map[string]any{
+				"a": strings.Repeat("a", 5000), "b": strings.Repeat("b", 5000),
+				"c": strings.Repeat("c", 5000), "d": strings.Repeat("d", 5000)}),
+			cheap: 4 * (ccToolInputValueRunes + 32),
+		},
+		// The two rows that falsify "smaller than its source". No `cheap` ceiling:
+		// escaped, these legitimately cost several bytes per kept character, and the
+		// point is that the DERIVED ceiling still holds.
+		{name: "arguments that the encoder escapes six-fold", block: ccCall("t4", "Bash",
+			map[string]any{"command": amp, "description": amp})},
+		{name: "arguments full of pasted markup", block: ccCall("t5", "Write",
+			map[string]any{"file_path": "a.html", "content": tags})},
+		// Both caps at once, which is the only case the DERIVED ceiling is tight
+		// against: enough keys that the key cap has to bind, each value long enough
+		// and escaped enough that the value cap has to bind too. Added because a
+		// mutation that deleted the key cap SURVIVED the first version of this test —
+		// no row here had more than four arguments, so the ceiling was never
+		// approached and the arithmetic it is built from was never exercised.
+		{name: "more escaped arguments than the key cap allows",
+			block: ccCall("t8", "mcp__x__y", func() map[string]any {
+				in := map[string]any{}
+				for i := 0; i < ccToolInputMaxKeys*3; i++ {
+					in[fmt.Sprintf("a%02d", i)] = amp
+				}
+				return in
+			}())},
+		// No `caller` field: 294 of 3,897 measured records have none, so this is the
+		// record shape with the least slack in it.
+		{name: "a call with no caller field", block: map[string]any{
+			"id": "t6", "name": "Bash", "input": map[string]any{"command": "ls"}}},
+		{name: "a name and id and nothing else", block: ccCall("t7", "Bash", map[string]any{})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.block["type"] = "tool_use"
+			source, err := json.Marshal(tc.block)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m := &ccMessage{Content: json.RawMessage("[" + string(source) + "]")}
+			calls := m.toolCalls()
+			if len(calls) != 1 {
+				t.Fatalf("got %d calls, want 1", len(calls))
+			}
+			// Marshalled the way the route marshals it — writeJSON uses an encoder
+			// with HTML escaping ON, which is exactly the expansion under test.
+			served, err := json.Marshal(calls[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(served) > ccServedCallCeiling {
+				t.Errorf("served %d bytes from a %d-byte source, derived ceiling is %d\n  served: %s",
+					len(served), len(source), ccServedCallCeiling, served)
+			}
+			if tc.cheap > 0 && len(served) > tc.cheap {
+				t.Errorf("served %d bytes from a %d-byte source, this case's ceiling is %d — the"+
+					" projection is not doing its job\n  served: %s",
+					len(served), len(source), tc.cheap, served)
+			}
+		})
+	}
+}
+
+// TestServedValuesArePrefixesOfTheSource is the property the byte inequality was
+// reaching for and getting wrong: nothing is INVENTED. Every character served for a
+// call appears, in order, at the start of a value cc wrote — so the characters served
+// are a subset of the characters inside the read window, whatever the encoder then
+// does to their byte count.
+//
+// Asserted over characters rather than bytes precisely because escaping makes bytes
+// the wrong unit here.
+func TestServedValuesArePrefixesOfTheSource(t *testing.T) {
+	inputs := []map[string]any{
+		{"command": strings.Repeat("&", 4096), "description": "run it"},
+		{"file_path": "a.go", "content": strings.Repeat("查询", 4096)},
+		{"pattern": "<x>", "path": "."},
+		{"command": strings.Repeat("q", ccToolInputValueRunes-1)}, // just under the cap
+		{"command": strings.Repeat("q", ccToolInputValueRunes)},   // exactly at it
+	}
+	for i, in := range inputs {
+		raw, err := json.Marshal(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := ccProjectToolInput(raw)
+		if got == nil {
+			t.Fatalf("input %d: projection is nil", i)
+		}
+		var kept map[string]string
+		mustUnmarshal(t, got, &kept)
+		for k, v := range kept {
+			src, ok := in[k].(string)
+			if !ok {
+				t.Errorf("input %d: served key %q that is not a source string", i, k)
+				continue
+			}
+			// The ellipsis is the one character this reader adds, and only where it
+			// cut. Everything before it must be the source, verbatim.
+			body := strings.TrimSuffix(v, "…")
+			if body != v && !strings.HasPrefix(src, body) {
+				t.Errorf("input %d key %q: %q is not a prefix of the source", i, k, body)
+			}
+			if body == v && v != src {
+				t.Errorf("input %d key %q: served %q but source is %q, and nothing was cut", i, k, v, src)
+			}
+			if n := utf8.RuneCountInString(body); n > ccToolInputValueRunes {
+				t.Errorf("input %d key %q: kept %d runes, cap is %d", i, k, n, ccToolInputValueRunes)
+			}
+		}
+	}
+}
+
+// TestServedFailureIsBoundedByItsCap — the other half of the payload. Bytes, not
+// runes, because ccToolErrorBytes bounds a response; the encoder's expansion on top
+// of it is accounted for the same way as for a call.
+func TestServedFailureIsBoundedByItsCap(t *testing.T) {
+	for _, body := range []string{
+		"",
+		"exit 1",
+		strings.Repeat("e", ccToolErrorBytes-1),
+		strings.Repeat("e", ccToolErrorBytes),
+		strings.Repeat("e", ccToolErrorBytes*4),
+		strings.Repeat("&", ccToolErrorBytes*4), // six bytes each once escaped
+		strings.Repeat("查", ccToolErrorBytes),   // three bytes each on disk
+	} {
+		block := map[string]any{"type": "tool_result", "tool_use_id": "t1",
+			"content": body, "is_error": true}
+		source, err := json.Marshal(block)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := &ccMessage{Content: json.RawMessage("[" + string(source) + "]")}
+		got := m.errorResults()
+		if len(got) != 1 {
+			t.Fatalf("%d-byte failure: got %d results, want 1", len(body), len(got))
+		}
+		if len(got[0].content) > ccToolErrorBytes+len(ccTruncated) {
+			t.Errorf("%d-byte failure: kept %d bytes, cap is %d + the marker",
+				len(body), len(got[0].content), ccToolErrorBytes)
+		}
+		if !utf8.ValidString(got[0].content) {
+			t.Errorf("%d-byte failure: the cut landed mid-rune", len(body))
+		}
+		served, err := json.Marshal(ToolResultRecord{Content: got[0].content, IsError: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ceiling := (ccToolErrorBytes+len(ccTruncated))*ccMaxEscapeBytesPerRune + 64; len(served) > ceiling {
+			t.Errorf("%d-byte failure: served %d bytes, derived ceiling is %d", len(body), len(served), ceiling)
+		}
+	}
+}
+
+// TestFailureWithNoMessageStillReportsTheError pins a judgement rather than a
+// mechanism, which is why it exists: cc can write `is_error` with content that
+// flattens to nothing, and this reader serves the failure anyway. The row then has a
+// dead click (ToolCallList expands on `isError` alone). That is accepted, because the
+// alternative — dropping the result — makes a failed call read as a successful one.
+// See ccMessage.errorResults.
+func TestFailureWithNoMessageStillReportsTheError(t *testing.T) {
+	for _, content := range []any{
+		[]any{},
+		[]any{map[string]any{"type": "tool_reference", "tool_name": "Bash"}},
+		[]any{map[string]any{"type": "image", "source": map[string]any{"data": "iVBOR"}}},
+		"",
+	} {
+		block := map[string]any{"type": "tool_result", "tool_use_id": "t1",
+			"content": content, "is_error": true}
+		raw, err := json.Marshal([]any{block})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := (&ccMessage{Content: raw}).errorResults()
+		if len(got) != 1 {
+			t.Fatalf("content %v: got %d results, want 1 — a failure with no message is still a failure",
+				content, len(got))
+		}
+		if got[0].content != "" {
+			t.Errorf("content %v: flattened to %q, want empty", content, got[0].content)
+		}
+	}
+}
+
+// TestToolBlocksSurviveWhitespaceInTheJSON — the reader rejects a line without a tool
+// block by looking for the literal `"tool_` before parsing it, the same trick the
+// `"user"` reject uses. That is safe against an encoder that puts spaces around
+// punctuation only because the needle sits INSIDE a quoted value; a needle like
+// `"type":"tool_use"` would match nothing and turn every tool call invisible with no
+// error anywhere. TestTitleSurvivesWhitespaceInTheJSON makes the same point for
+// titles; a tool block needs its own, because it is a different needle.
+func TestToolBlocksSurviveWhitespaceInTheJSON(t *testing.T) {
+	spaced := `{ "type" : "assistant" , "timestamp" : "2026-08-17T03:00:01.000Z" , ` +
+		`"message" : { "role" : "assistant" , "content" : [ { "type" : "tool_use" , ` +
+		`"id" : "t1" , "name" : "Bash" , "input" : { "command" : "ls" } } ] } }` + "\n" +
+		`{ "type" : "user" , "timestamp" : "2026-08-17T03:00:02.000Z" , "message" : ` +
+		`{ "role" : "user" , "content" : [ { "type" : "tool_result" , "tool_use_id" : "t1" , ` +
+		`"content" : "boom" , "is_error" : true } ] } }` + "\n"
+
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", spaced)
+
+	msgs, _ := f.store().Messages("cc-session-0001")
+	if len(msgs) != 1 {
+		t.Fatalf("got %d messages, want 1: %+v", len(msgs), msgs)
+	}
+	if len(msgs[0].Tools) != 1 {
+		t.Fatalf("got %d tools from whitespace-formatted JSON, want 1: %+v", len(msgs[0].Tools), msgs[0].Tools)
+	}
+	if msgs[0].Tools[0].Name != "Bash" {
+		t.Errorf("tool name = %q, want Bash", msgs[0].Tools[0].Name)
+	}
+	if r := msgs[0].Tools[0].Result; r == nil || !r.IsError {
+		t.Errorf("the failure did not survive whitespace: %+v", r)
+	}
+}
+
+// TestMessagesCapBoundsTheElementCount — ccMessagesMax now counts messages that
+// carry WORDS (see ccTrimFront), so the question "is the response still bounded"
+// needs an answer that is not an argument in a comment. The bound is 2*max+1: a new
+// assistant bubble only starts after a message that is not an assistant one, and a
+// user message with no words is never emitted.
+//
+// The fixture is the adversarial shape for that bound — every user turn followed by a
+// turn that says nothing but calls things, so every possible tool-only bubble exists.
+func TestMessagesCapBoundsTheElementCount(t *testing.T) {
+	var b strings.Builder
+	for i := 0; i < ccMessagesMax*3; i++ {
+		b.WriteString(ccUser(t, fmt.Sprintf("turn-%04d", i)))
+		b.WriteString(ccToolUse(t, "2026-08-17T03:00:00.000Z",
+			ccCall(fmt.Sprintf("t%04d", i), "Bash", map[string]any{"command": "ls"})))
+	}
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", b.String())
+
+	msgs, _ := f.store().Messages("cc-session-0001")
+	words := 0
+	for _, m := range msgs {
+		if m.Text != "" {
+			words++
+		}
+	}
+	if words != ccMessagesMax {
+		t.Errorf("%d messages carry words, want exactly the cap of %d", words, ccMessagesMax)
+	}
+	if len(msgs) > 2*ccMessagesMax+1 {
+		t.Errorf("%d messages, bound is 2*%d+1 = %d — the cap no longer bounds the response",
+			len(msgs), ccMessagesMax, 2*ccMessagesMax+1)
+	}
+	// And the newest turn is still the last one, which is what the tail is for.
+	if want := fmt.Sprintf("turn-%04d", ccMessagesMax*3-1); msgs[len(msgs)-1].Text != want &&
+		msgs[len(msgs)-2].Text != want {
+		t.Errorf("the newest turn is not at the end: last two = %q / %q, want %q",
+			msgs[len(msgs)-2].Text, msgs[len(msgs)-1].Text, want)
+	}
+}
+
+// TestToolsDoNotShrinkTheVisibleTranscriptAtTheCap is the A/B again, run where the
+// count cap BINDS — which is where review broke the first version of this change:
+// with the cap counting all messages, 180 text bubbles in became 150 out, so ten real
+// exchanges fell off the front in exchange for showing tool cards.
+//
+// Not reachable on today's store (largest transcript: 27 messages against a cap of
+// 200), and that is exactly why it needs a fixture rather than a census.
+func TestToolsDoNotShrinkTheVisibleTranscriptAtTheCap(t *testing.T) {
+	var b strings.Builder
+	// Each group: a user turn, an answer, another user turn, then a turn that says
+	// nothing but calls things. Three text bubbles and one tool-only bubble per group.
+	for i := 0; i < ccMessagesMax; i++ {
+		b.WriteString(ccUser(t, fmt.Sprintf("ask-%04d", i)))
+		b.WriteString(ccAssistantWords(t, fmt.Sprintf("answer-%04d", i), "2026-08-17T03:00:01.000Z"))
+		b.WriteString(ccUser(t, fmt.Sprintf("again-%04d", i)))
+		b.WriteString(ccToolUse(t, "2026-08-17T03:00:02.000Z",
+			ccCall(fmt.Sprintf("t%04d", i), "Bash", map[string]any{"command": "ls"})))
+	}
+	body := b.String()
+
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", body)
+	f.write(t, "/w", "cc-session-0002.jsonl", ccStripToolCalls(body))
+
+	after, _ := f.store().Messages("cc-session-0001")
+	before, _ := f.store().Messages("cc-session-0002")
+
+	if len(before) != ccMessagesMax {
+		t.Fatalf("control produced %d messages, want the cap of %d — the fixture does not reach it",
+			len(before), ccMessagesMax)
+	}
+	var withWords []HistoryMessage
+	for _, m := range after {
+		if m.Text != "" {
+			withWords = append(withWords, m)
+		}
+	}
+	if len(withWords) != len(before) {
+		t.Fatalf("AT THE CAP, visible history shrank: %d messages carry words, control had %d",
+			len(withWords), len(before))
+	}
+	for i := range before {
+		if withWords[i].Text != before[i].Text {
+			t.Fatalf("message %d text = %q, control had %q — the trim kept a different window",
+				i, withWords[i].Text, before[i].Text)
+		}
+	}
+	served := 0
+	for _, m := range after {
+		served += len(m.Tools)
+	}
+	if served == 0 {
+		t.Error("no tools served, so the comparison above is between two identical runs")
+	}
+}
+
+// TestMessagesWidensPastAWallOfToolCalls — the trap this whole wi could ship.
+//
+// The widen retry exists because the byte window is on RAW JSONL and the tail of a
+// tool-heavy transcript can hold no conversation. Its trigger used to be "the window
+// produced no messages". Once tool records produce bubbles that stops being true,
+// the retry stops firing, and the user gets a chat pane full of tool cards INSTEAD
+// of the conversation widening would have found — a change that looks like a success
+// in a screenshot while showing strictly less than before.
+//
+// TestMessagesWidensWhenTheTailIsAllToolPayload does NOT catch this: its wall is
+// made of tool_RESULT records, which still emit nothing. The wall here is made of
+// tool_USE records, which do.
+func TestMessagesWidensPastAWallOfToolCalls(t *testing.T) {
+	call := func(i int) string {
+		return ccToolUse(t, "2026-08-17T03:00:00.000Z",
+			ccCall(fmt.Sprintf("t%06d", i), "Bash", map[string]any{"command": strings.Repeat("z", 16<<10)}))
+	}
+	var b strings.Builder
+	b.WriteString(ccUser(t, "BURIED-BEHIND-THE-CALLS"))
+	b.WriteString(ccAssistantWords(t, "ANSWER-BEHIND-THE-CALLS", "2026-08-17T02:00:00.000Z"))
+	for i := 0; b.Len() < ccMessagesTailBytes+(256<<10); i++ {
+		b.WriteString(call(i))
+	}
+
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", b.String())
+
+	msgs, ok := f.store().Messages("cc-session-0001")
+	if !ok {
+		t.Fatal("Messages reported the transcript missing")
+	}
+	if !ccHasConversation(msgs) {
+		t.Fatalf("the window did not widen past a wall of tool CALLS: %d messages, none with words",
+			len(msgs))
+	}
+	var texts []string
+	for _, m := range msgs {
+		if m.Text != "" {
+			texts = append(texts, m.Text)
+		}
+	}
+	if len(texts) != 2 || texts[0] != "BURIED-BEHIND-THE-CALLS" || texts[1] != "ANSWER-BEHIND-THE-CALLS" {
+		t.Errorf("conversation = %q, want both buried turns", texts)
 	}
 }
 
@@ -1382,10 +2354,17 @@ func TestMessagesReadsTheTail(t *testing.T) {
 }
 
 // TestMessagesWidensWhenTheTailIsAllToolPayload — the byte window is on RAW
-// JSONL, and cc's bytes are mostly tool payloads this reader then drops. So the
-// last 1 MiB of a tool-heavy transcript can hold no conversation at all, and the
-// naive answer is an empty chat for a row that has a title and is listed — the
-// original bug, one layer down. Found by review, not by the first test pass.
+// JSONL, and cc's bytes are mostly tool payload, of which this reader serves only a
+// bounded summary. So the last 1 MiB of a tool-heavy transcript can hold no
+// conversation at all, and the naive answer is an empty chat for a row that has a
+// title and is listed — the original bug, one layer down. Found by review, not by the
+// first test pass.
+//
+// (This sentence said "tool payloads this reader then drops" until tether#96, which is
+// verbatim the claim that change had to falsify elsewhere. A wall of tool RESULTS
+// still emits nothing, which is why this test kept passing and why
+// TestMessagesWidensPastAWallOfToolCalls had to be written: a wall of tool CALLS does
+// emit, and that is the case that breaks the old trigger.)
 //
 // The fixture is built so the FIRST window is guaranteed to yield nothing: over a
 // megabyte of tool results after the last real turn.
@@ -1771,6 +2750,29 @@ func ccCensusSorted(m map[string]int) []string {
 func ccCensusCapReport(t *testing.T, files []string) {
 	t.Helper()
 	var total, maxMsgs, atCap, empty, bytesServed int
+	// tether#96. withWords is the population the reader served BEFORE tool activity
+	// was carried, and that identity is not a guess: the old reader emitted a
+	// message only when it had text, and a tool-only message has role "assistant",
+	// so it never breaks the assistant-to-assistant adjacency the merge runs on.
+	// Two numbers to compare against a run of the old build, plus the tool payload
+	// that is the price of the change.
+	var withWords, toolCalls, maxToolsInATurn, withFailure, emptyFailure, toolBytes int
+	var noConversation int
+	// The WIRE size, both arms, in one run: what the route writes now, and what it
+	// wrote before tether#96. The "before" arm is the same messages with the tool
+	// activity removed and the wordless ones dropped, which is exactly the population
+	// the old reader emitted — so this needs no second build, and unlike a sum of
+	// field lengths it is the bytes the client receives, escaping included.
+	var wireBefore, wireAfter int
+	// Characters versus bytes, so the encoder's `<`/`>`/`&` expansion is a reported
+	// number rather than a footnote. The bound this change relies on is on
+	// CHARACTERS; see ccToolInputValueRunes.
+	var toolChars int
+	// The worst SINGLE transcript, because that is what one page load pays. A
+	// store-wide total answers "how much does the store cost", which nobody waits
+	// for.
+	var worstBefore, worstAfter int
+	var worstName string
 	for _, path := range files {
 		f, err := os.Open(path)
 		if err != nil {
@@ -1795,8 +2797,52 @@ func ccCensusCapReport(t *testing.T, files []string) {
 		if len(msgs) == 0 {
 			empty++
 		}
+		if !ccHasConversation(msgs) {
+			noConversation++
+		}
+		var stripped []HistoryMessage
 		for _, m := range msgs {
 			bytesServed += len(m.Text)
+			if m.Text != "" {
+				withWords++
+				stripped = append(stripped, HistoryMessage{Role: m.Role, Text: m.Text, Ts: m.Ts})
+			}
+			toolCalls += len(m.Tools)
+			if len(m.Tools) > maxToolsInATurn {
+				maxToolsInATurn = len(m.Tools)
+			}
+			for _, tc := range m.Tools {
+				// What the response actually carries for this call, measured by
+				// encoding it — the same escaping encoder the HTTP handler uses,
+				// rather than a sum of field lengths that forgets both the JSON
+				// around them and what the encoder does to `<`, `>` and `&`.
+				enc, err := json.Marshal(tc)
+				if err != nil {
+					t.Fatalf("re-encoding a served call from %s: %v", path, err)
+				}
+				toolBytes += len(enc)
+				toolChars += len(tc.ID) + len(tc.Name) + len(tc.Input)
+				if tc.Result != nil {
+					withFailure++
+					toolChars += len(tc.Result.Content)
+					if tc.Result.Content == "" {
+						emptyFailure++
+					}
+				}
+			}
+		}
+		after, err := json.Marshal(msgs)
+		if err != nil {
+			t.Fatalf("re-encoding the response for %s: %v", path, err)
+		}
+		before, err := json.Marshal(stripped)
+		if err != nil {
+			t.Fatalf("re-encoding the control response for %s: %v", path, err)
+		}
+		wireAfter += len(after)
+		wireBefore += len(before)
+		if len(after) > worstAfter {
+			worstAfter, worstBefore, worstName = len(after), len(before), filepath.Base(path)
 		}
 	}
 	t.Logf("ccMessagesMax = %d, re-checked against the same store:", ccMessagesMax)
@@ -1812,6 +2858,31 @@ func ccCensusCapReport(t *testing.T, files []string) {
 		t.Logf("  nothing reached the cap, so the BYTE window is what bounds the response — "+
 			"%d is still only a bound on a transcript of very short lines, which is what it is for", ccMessagesMax)
 	}
+
+	// tether#96 — the A/B, and the price.
+	t.Logf("tool activity (tether#96), same store, same window:")
+	t.Logf("  %d messages carry words; %d carry only tool calls", withWords, total-withWords)
+	t.Logf("  ^ the first number and the %.2f MB above are what a run of the PRE-#96 build reports as"+
+		" its message count and its text — compare them, and if either has fallen, visible history shrank",
+		float64(bytesServed)/(1<<20))
+	t.Logf("  RESPONSE bytes as the route writes them: %.2f MB before, %.2f MB after, %.2fx",
+		float64(wireBefore)/(1<<20), float64(wireAfter)/(1<<20),
+		float64(wireAfter)/float64(max(wireBefore, 1)))
+	t.Logf("  worst SINGLE transcript: %.1f KB before -> %.1f KB after (%.2fx) [%s] — this is what one"+
+		" page load pays, and the store-wide totals are not",
+		float64(worstBefore)/1024, float64(worstAfter)/1024,
+		float64(worstAfter)/float64(max(worstBefore, 1)), worstName)
+	t.Logf("  %d tool calls served: %.2f MB of tool JSON over %.2f MB of characters (%.2fx — the"+
+		" encoder's <>& escaping, which applies to the text too and is not new), %d carry a failure, %d of"+
+		" those with no message in it",
+		toolCalls, float64(toolBytes)/(1<<20), float64(toolChars)/(1<<20),
+		float64(toolBytes)/float64(max(toolChars, 1)), withFailure, emptyFailure)
+	t.Logf("  largest tool count in ONE merged turn: %d (the renderer folds above 5, so this is one"+
+		" DOM node until clicked; MaxToolsPerTurn = %d is the LIVE path's cap and does not apply here)",
+		maxToolsInATurn, MaxToolsPerTurn)
+	t.Logf("  %d of %d transcripts serve no conversation from the primary window, so Messages widens"+
+		" for those — this is the number the widen trigger keys on, NOT the %d empty ones above",
+		noConversation, len(files), empty)
 }
 
 // ---------------------------------------------------------------------------

@@ -139,43 +139,85 @@ const (
 // turns" was really about 57.
 //
 // That denominator is the population this reader EMITS, and it has to be: a
-// further 941 records wear type:"user", pass isUserTurn, and are dropped anyway
-// — 746 isMeta and 195 <local-command-stdout>, exactly accounted for. Counting
-// them gives a flattering 4.74 assistant records per turn instead of 6.07, and
-// every figure derived from it lands ~30% out. An earlier draft of this comment
-// used precisely that number; a ratio used to size a cap must be measured over
-// the things the cap counts. (Found by review, which is the second time in this
-// file that a confidently stated measurement was taken over the wrong
-// population — see EncodeProjectDir.)
+// further 941 records survive the block filter, wear type:"user" and still
+// produce no message — 746 carrying isMeta and 195 <local-command-stdout>.
+// (Not an exhaustive account of everything type:"user" swallows: thousands more
+// are tool results, which have no text at all and never reach this arithmetic.)
+// Counting those 941 gives a flattering 4.74 assistant records per turn instead
+// of 6.07, and every figure derived from it lands ~30% out. An earlier draft of
+// this comment used precisely that number; a ratio used to size a cap must be
+// measured over the things the cap counts. (Found by review, which is the second
+// time in this file that a confidently stated measurement was taken over the
+// wrong population — see EncodeProjectDir.)
 //
 // Merging makes the unit real: on the same store the conversation goes from
-// 23,675 messages to 6,072 — one merged assistant message per turn that says
-// anything (628 turns say nothing but tool calls), plus one message per thing
-// the user actually said. Two consecutive user turns therefore stay TWO
+// 23,675 records to 6,072 messages — one merged assistant message per turn that
+// says anything (628 turns say nothing but tool calls), plus one message per
+// thing the user actually said. Two consecutive user turns therefore stay TWO
 // messages, which TestMessagesDoesNotMergeAcrossAUserTurn pins, so "two per
-// turn" is the common case and not an invariant. 200 works out at ~110 turns of
-// scrollback against the ~57 that 400 was delivering.
+// turn" is the common case and not an invariant.
 // TestMessagesCapCountsTurnsNotRecords pins the unit, because a doc comment
 // asserting it is exactly what let the two drift apart.
 //
+// Every figure in this section is tether#94's, measured BEFORE tether#95 and left
+// as it was so that it still adds up: 3,350 + 20,325 = 23,675, and 23,675 / 6,072
+// = 3.90. The next section re-measures the same store after #95 rather than
+// editing individual numbers in here, which is how an earlier attempt at this
+// paragraph ended up asserting a 4.74 that no longer followed from the two
+// figures it sat between.
+//
+// # Re-checked after tether#95, which moved every number above
+//
+// Dropping 386 noise records per store does not change the UNIT — a message is
+// still a whole turn's text — but it does change the count, and this constant's
+// meaning is a function of that count. Measured on the same store, before and
+// after, with the same 200:
+//
+//	                       messages   through the 1 MiB window   text served
+//	before #95                6,101                403 messages      0.79 MB
+//	after  #95                5,357                368 messages      0.70 MB
+//
+// So #95 makes 200 cover MORE conversation, not less: measured per real user
+// turn, the same cap now buys ~111 turns instead of ~98, because 386 bubbles that
+// were never worth an element stopped taking one. The cap still binds on 0 of 39
+// transcripts either way — the byte window binds first — so the value needs no
+// change, which is the answer this re-check exists to produce rather than assume.
+//
+// The census reproduces the "after" row's two right-hand columns on demand rather
+// than asking anyone to trust them: ccCensusCapReport in the test file re-reads
+// the store through the real window and prints the message count, the bytes, and
+// how often the cap binds. It does NOT reproduce the left column or the "before"
+// row — a whole-store count needs a full replay rather than a windowed read, and
+// nothing here can run last month's code. Written because the section above once
+// claimed a unit the trim two lines away did not implement, and a number in a
+// comment cannot notice when it stops being true.
+//
 // # The payload consequence: a ceiling this data never reaches
 //
-// Halving the number does not halve the response, because a surviving assistant
-// message carries 3.9 records' worth of text on average instead of one. As an
-// upper bound, 200 messages can hold ~780 source records' worth against the old
-// 400 — call it 2x. Leaving it at 400 would have been ~4x.
+// Halving the number does not halve the response, because a MERGED ASSISTANT
+// message carries 8.6 source records' worth of text on average — 20,445 assistant
+// records over 2,378 assistant messages — instead of one.
 //
-// Measured, it is 1.00x. Replaying all 39 transcripts through the real
-// ccMessagesTailBytes window, old and new both serve 0.77 MB, and the COUNT cap
-// binds on 0 of 39 either way: the byte window binds first. So the ratio above
-// is a ceiling for the transcript of very short lines this cap has always been
-// for, not a change anyone will observe. What does change is the element count
-// the JSON encoder walks — 1,039 messages become 380.
+// 8.6 is the figure a ceiling has to be built from, and getting that wrong is the
+// standing hazard of this comment. A user message always carries exactly one
+// record, so the mean over ALL messages is a much flatter 4.37; #94's version of
+// this paragraph used its equivalent (3.90) and #95's first draft repeated the
+// mistake with 4.37. The worst case is 200 messages that are all merged assistant
+// turns, so:
+//
+//	200 × 8.6 ≈ 1,720 records' worth, against the old cap's 400 → ~4.3x
+//	had the cap stayed 400: ~3,440 → ~8.6x
+//
+// Measured, it is 1.00x: the COUNT cap binds on 0 of 39 transcripts, so the
+// multiple above is a ceiling for the transcript of very short lines this cap has
+// always been for, not a change anyone will observe. Which is the point — the
+// ceiling being 4.3x rather than 2x costs nothing precisely because nothing
+// reaches it, and that is worth stating correctly rather than reassuringly.
 //
 // What this cap no longer bounds is a SINGLE message: the longest merged
-// assistant message in that store is 34 KB, from a run of 114 fragments. Only
-// the byte window bounds that — the same bound as before, now spread across
-// fewer elements.
+// assistant message in that store is 34 KB, from a run of 114 fragments. Only the
+// byte window bounds that — the same bound as before, now spread across fewer
+// elements.
 const ccMessagesMax = 200
 
 // ccTurnJoin separates the fragments of one merged assistant turn.
@@ -563,9 +605,9 @@ func ccUserTextFromLine(line []byte) string {
 		// LoadHistory gives its own. A title is the least important thing here.
 		return ""
 	}
-	if !e.isUserTurn() {
-		return ""
-	}
+	// userText answers the WHOLE question, structural exclusions included — it
+	// used to answer only the shape half and leave isUserTurn to each caller,
+	// which is two places to forget. See userText.
 	return e.userText()
 }
 
@@ -603,12 +645,33 @@ func ccUserTextFromLine(line []byte) string {
 // ship a change that fragments the transcript rather than joining it.
 //
 // Reading the boundary off `out` is what makes that automatic rather than
-// remembered: the impostors (tool results, isMeta preambles, isSidechain
-// chatter, <local-command-stdout>) already produce no message at all, so there
-// is nothing to exclude a second time and no second list to keep in sync with
-// isUserTurn's. Sidechain ASSISTANT records are dropped by the same existing
-// rule, so a sub-agent speaking between two fragments does not split them
-// either.
+// remembered: every impostor already produces no message at all (userText
+// returns "" for it), so there is nothing to exclude a second time and no second
+// list to keep in sync. Sidechain ASSISTANT records are dropped by the same
+// existing rule, so a sub-agent speaking between two fragments does not split
+// them either.
+//
+// # That is the seam tether#95 arrived through, and it needed nothing here
+//
+// #95 found 433 records reaching the pane as raw markup, and DROPPED 386 of them
+// (the other 47 it renders — see ccUserShapes). The bigger half of the damage was
+// not how they looked: replaying the store before and after, those 386 drops turn
+// 2,736 assistant messages into 2,378, so 358 pairs of fragments that #94 could
+// not join now join. Task notifications are essentially all of it — 355 of the 364
+// sit directly between two assistant fragments — and that is what left the
+// reporter looking at exactly the row of colon-terminated bubbles #94 set out to
+// remove.
+//
+// Because the boundary is read off `out`, teaching userText to drop a shape is all
+// it took: there is no list of "records that do not close a turn" here to update,
+// which is the property this paragraph is asserting.
+// TestMessagesMergesAcrossDroppedNoise pins the hop, because "the fix landed in
+// userText and the merge is in ccMessagesFrom" is precisely the kind of
+// two-function claim that goes untested.
+//
+// The two shapes #95 KEPT — `<bash-input>` and cc's interrupt marker — do close
+// a run, and should: the user really did run that command, really did press that
+// key, and an assistant turn genuinely ends there.
 //
 // Merging happens as records are read, so the cap below trims MESSAGES — see
 // ccMessagesMax, whose unit this is the other half of.
@@ -664,7 +727,11 @@ func ccMessageFromLine(line []byte) (HistoryMessage, bool) {
 	}
 	var role, text string
 	switch {
-	case e.isUserTurn():
+	// Type only — every other reason a type:"user" record is not a user turn
+	// (isMeta, isSidechain, a tool result, machine output wearing a tag) is
+	// userText's to know, and it says so by returning "", which the check below
+	// already turns into "emit nothing".
+	case e.Type == "user":
 		role, text = "user", e.userText()
 	case e.Type == "assistant" && !e.IsSidechain:
 		role, text = "assistant", e.Message.text()
@@ -715,53 +782,53 @@ type ccEntry struct {
 	Message   *ccMessage `json:"message"`
 }
 
-// isUserTurn reports whether this record is something the human typed.
+// isUserTurn reports whether cc's own METADATA rules this record out as
+// something the human typed. It is one half of the question; the other half is
+// the shape of the text, and lives in ccClassifyUserText. userText is the single
+// place that asks both, and the only thing any caller needs.
 //
-// FOUR different impostors wear type:"user", and a fixture that omits any one of
-// them proves nothing about that one. Three are excluded here; the fourth is
-// excluded in userText, because it is only recognisable from the text:
+// Two halves rather than one predicate because the two axes grow differently.
+// This one has been closed since tether#92: Type, IsMeta and IsSidechain are
+// fields cc's schema already had, and no impostor has ever arrived as a fourth
+// flag. The shape axis is open — it has grown twice — so it is a table.
 //
 //   - tool results — by far the most common. One measured session had 3 real
-//     inputs and 11 tool results, all of them type:"user". Excluded by
-//     ccMessage.text returning only `text` blocks, so nothing has to name
+//     inputs and 11 tool results, all of them type:"user". Excluded not here but
+//     by ccMessage.text returning only `text` blocks, so nothing has to name
 //     tool_result for it to be kept out.
-//   - injected meta content (IsMeta) — cc's `<local-command-caveat>` preamble.
-//     Measured 14 of 14 carrying the flag, so it is a reliable signal for that.
+//   - injected meta content (IsMeta) — cc's `<local-command-caveat>` preamble
+//     and the expanded body of a slash command. Measured 14 of 14 carrying the
+//     flag, so it is a reliable signal for that.
 //   - sub-agent chatter (IsSidechain).
-//   - command OUTPUT (`<local-command-stdout>`) — see userText. This one was
-//     missed by the first version of this file and found by review: measured 31
-//     of 1146 served turns (2.7%), 24 of them carrying raw ANSI escape
-//     sequences, and NONE of them isMeta or isSidechain. The comment here used
-//     to claim the rule was "what did the user say, rather than a blacklist the
-//     next block type escapes" — this is the thing that escaped it, so the claim
-//     is now stated as what it actually is: three structural exclusions plus one
-//     by shape.
+//
+// This comment used to claim the rule was "what did the user say, rather than a
+// blacklist the next block type escapes". Two batches have escaped it since —
+// `<local-command-stdout>` in tether#92's review, then the four in tether#95 —
+// so the claim is stated as what it is: three structural exclusions, plus a
+// table of text shapes that is explicitly NOT asserted to be complete.
 func (e *ccEntry) isUserTurn() bool {
 	return e.Type == "user" && !e.IsMeta && !e.IsSidechain
 }
 
-// ccCommandStdoutPrefix opens the record cc writes when it feeds a slash
-// command's OUTPUT back into the conversation as if the user had said it.
+// userText is what the user typed, and "" for everything that merely wears
+// type:"user" — the structural impostors isUserTurn knows about, and the machine
+// output ccClassifyUserText recognises by shape.
 //
-// It carries no isMeta (measured 0 of 12), so the flag cannot catch it, and its
-// content is a plain string, so the block filter cannot either. Shape is the only
-// signal left.
-const ccCommandStdoutPrefix = "<local-command-stdout>"
-
-// userText is what the user typed: "" for a record that is a command's output
-// rather than a human's turn, and cc's slash-command markup rendered back into
-// the command it stands for.
+// # This is the ONE place that answers "what is this user record?"
 //
 // Returning "" here rather than filtering in each caller keeps ONE definition of
 // "what the user said" — the title scan and the transcript reader both consume
 // it, and a second opinion in one of them is how a turn ends up in the list but
-// not in the transcript, or the reverse.
+// not in the transcript, or the reverse. tether#95 moved the isUserTurn call in
+// here for exactly that reason: both callers used to make it themselves, so
+// "what counts as a user turn" was spread across three functions and grew a new
+// condition every time cc invented another way to talk to itself.
 func (e *ccEntry) userText() string {
-	t := e.Message.text()
-	if strings.HasPrefix(strings.TrimSpace(t), ccCommandStdoutPrefix) {
+	if !e.isUserTurn() {
 		return ""
 	}
-	return ccRenderCommand(t)
+	_, text := ccClassifyUserText(e.Message.text())
+	return text
 }
 
 type ccMessage struct {
@@ -807,13 +874,369 @@ func (m *ccMessage) text() string {
 	return b.String()
 }
 
+// ---------------------------------------------------------------------------
+// The shape axis: what a type:"user" record's text turns out to be
+// ---------------------------------------------------------------------------
+
+// ccUserShape is one recognised form the TEXT of a type:"user" record can take,
+// and what a human should read in its place.
+//
+// # Why this is a table and not a fifth if-statement
+//
+// cc feeds its own machinery back into the conversation as user turns, and the
+// set of things it feeds back GROWS. Four batches have been found so far, each
+// by someone noticing markup in a bubble:
+//
+//	tether#92         tool results (excluded by block type, see ccMessage.text)
+//	tether#92         cc's isMeta preamble
+//	tether#92 review  <local-command-stdout>
+//	tether#95         <task-notification>, <bash-input>, <bash-stdout>, and cc's
+//	                  interrupt marker — 433 records, 12.9% of every "user
+//	                  message" this reader emitted, across 39 real transcripts
+//
+// The first three were each fixed by adding one more condition beside userText.
+// That is why there was a fourth batch to find. So the shape axis is a table with
+// one row per form: a fifth batch is a ROW, in one place, next to the evidence
+// for the rows already there.
+//
+// The rows are also the vocabulary the census reports in (see
+// TestEnumerateUserRecordShapes), so "which shapes does this reader know about"
+// has exactly one answer and a report cannot drift from the code that acts on it.
+//
+// # This list is NOT asserted to be complete
+//
+// It is what a census of 39 real transcripts found on 2026-08-17. Every earlier
+// version of this reasoning was also complete when it was written. The census is
+// shipped as a test precisely so batch five is found by RUNNING something rather
+// than by a user reporting a bubble full of angle brackets.
+type ccUserShape struct {
+	// name labels the shape in the census report. It is cc's own literal, so the
+	// report names something greppable in cc's output rather than a word invented
+	// here.
+	name string
+	// matches recognises the shape. Its argument has leading and trailing space
+	// already removed, so a row cannot forget to do that.
+	matches func(trimmed string) bool
+	// render returns what a human should read, or "" to emit nothing at all. Its
+	// argument is the same trimmed text matches saw.
+	render func(trimmed string) string
+}
+
+// The literals cc writes, with the census that justifies each row. Named
+// constants rather than inline strings because the fixtures assert against these
+// same names — a fixture that spelled a tag out itself would keep passing after a
+// typo here turned that row off.
+const (
+	// ccCommandStdoutPrefix — a slash command's OUTPUT, fed back in as if the
+	// user had said it. Carries no isMeta (0 of 12 when found in tether#92; 195
+	// records in the #95 census), and its content is a plain string, so neither
+	// the flag nor the block filter can see it. Shape is the only signal left.
+	ccCommandStdoutPrefix = "<local-command-stdout>"
+
+	// ccTaskNotificationPrefix — the harness telling cc that a background task
+	// finished, delivered as a user turn. 364 records: 84% of everything the #95
+	// census found, and the reason this came before making tool cards readable.
+	//
+	// What made them the reporter's symptom rather than merely ugly is that they
+	// sit BETWEEN two assistant fragments — 355 of the 364 do — so each one also
+	// blocked a merge tether#94 would otherwise have made. Dropping all 386 of the
+	// records this table drops joins 358 pairs of fragments, measured by replaying
+	// the store through ccMessagesFrom before and after: 2,736 assistant messages
+	// become 2,378. (358 rather than 355 because two notifications landing between
+	// the same pair register as neither in the per-record count, and the store is
+	// appended to while it is measured.)
+	ccTaskNotificationPrefix = "<task-notification>"
+
+	// ccBashInputPrefix / ccBashInputSuffix — the user running a shell command
+	// with cc's `!` prefix. 22 records, every one of the form
+	// `<bash-input> cmd</bash-input>`. This one the user really did do; see
+	// ccRenderBashInput for why it is kept.
+	ccBashInputPrefix = "<bash-input>"
+	ccBashInputSuffix = "</bash-input>"
+
+	// ccBashStdoutPrefix / ccBashStderrPrefix — that command's OUTPUT, which is
+	// not something the user said. 22 records, every one of them
+	// `<bash-stdout>…</bash-stdout><bash-stderr>…</bash-stderr>` in that order,
+	// so stdout always leads. stderr is registered as a leader too, on the
+	// MECHANISM rather than on an observation: 0 of the 22 led with it, and if a
+	// command that writes only to stderr ever does, the answer is the same. Said
+	// plainly because "measured" and "reasoned" are not the same warrant.
+	ccBashStdoutPrefix = "<bash-stdout>"
+	ccBashStderrPrefix = "<bash-stderr>"
+
+	// ccInterruptPrefix — cc's marker for the user hitting interrupt. 25 records
+	// at the first census and 26 by the end of the change, in two forms:
+	// `[Request interrupted by user]` (23) and `[Request interrupted by user for
+	// tool use]` (2). In every one of them that marker is the ENTIRE text, which
+	// is what lets ccIsInterrupt anchor both ends. Prose rather than markup, so no
+	// tag-shaped rule would ever have caught it. The prefix stops before the
+	// qualifier so both forms match one row.
+	ccInterruptPrefix = "[Request interrupted by user"
+
+	// ccCommandNameTag / ccCommandMessageTag — a slash command the user typed. The
+	// row that KEEPS it is the negative control for every row above; see
+	// ccUserShapes. Both openings are needed and neither is optional: of the 221
+	// records in the census carrying <command-name>, 206 open on it and 15 open on
+	// <command-message> — and all 221 open on one of the two, which is what lets
+	// that row be anchored like every other.
+	ccCommandNameTag    = "<command-name>"
+	ccCommandMessageTag = "<command-message>"
+)
+
+// ccUserShapes is the whole shape axis. First match wins.
+//
+// # The last row is what proves the others are not a blanket rule
+//
+// A slash command is ALSO recorded as markup, and it IS a user turn — 206
+// records in the census, plus 15 more opening on `<command-message>`. So "drop
+// the records that start with a tag" is wrong, and #95's first enumeration
+// proved it by counting those 221 as defects before it re-measured through this
+// function. "Drop the records that CONTAIN a tag" is wrong too: genuine human
+// messages in the same census CONTAIN `<svg>`, `<div>` and `<style>`, because
+// people paste code. (An earlier draft of this sentence said they "open with"
+// those tags. They do not — the census, which tests exactly that, reports zero
+// emitted messages opening on an unrecognised tag across all 93 transcripts. The
+// figure it was written from counted tags appearing ANYWHERE in the text. Same
+// mistake as the one three paragraphs up, in the comment warning about it.)
+//
+// So every row names one specific form and says what to do with that form, and
+// there is no rule about angle brackets in general. Two of the six rows KEEP the
+// record, because the user really did those things and dropping them would be
+// this reader deleting the user's own conversation.
+//
+// # Every row is anchored, and the two kept rows match the WHOLE record
+//
+// Rows 1-3 and 6 match a prefix; rows 4 and 5 match the entire text, end to end.
+// The difference matters for the rows that RENDER rather than drop, because a
+// renderer that keeps part of a record has to decide what to do with the rest,
+// and "silently discard it" would be deleting user text — the exact defect this
+// change exists to remove, one level down. Instead the shape simply does not
+// match: `<bash-input>ls</bash-input> and then I typed this` is not the shape, so
+// it falls through to the human-text row and is emitted whole, as it was before
+// #95, and the census reports it as an unrecognised leading tag.
+//
+// Measured warrant for anchoring, re-taken over all 93 top-level transcripts of
+// the store rather than the one workspace: 22 of 22 bash-input records, 26 of 26
+// interrupt markers and 221 of 221 command records are exactly the shape their row
+// claims. Ratios rather than counts, because this store is one the user is
+// appending to WHILE it is measured — the interrupt count moved from 25 to 26
+// during this change, and the emitted-message total moved five times. Every
+// absolute in this file is a snapshot; the invariant is the fraction.
+//
+// Order: first match wins, and because every row is anchored on a distinct
+// opening, all six are mutually exclusive — verified by moving row 6 to the front
+// and re-classifying a task notification that quotes a command inside its
+// <result>, which still classifies as the notification.
+//
+// That is worth stating as an outcome of anchoring rather than as a fact about
+// tables. An earlier version of this paragraph claimed the same thing while row 6
+// matched <command-name> ANYWHERE: back then, moving it up really did render that
+// notification as `/x`, and review proved it by doing so. First-match-wins is
+// documented so that adding a row stays a decision about position.
+//
+// # The residual risk, and the discriminator that turned out not to exist
+//
+// Matching a PREFIX means a human who pastes one of these records verbatim as
+// the very first thing in a message loses it, where before tether#95 they would
+// at least have seen their own markup.
+//
+// The obvious way out was to require the record's content to be a plain JSON
+// string, on the theory that cc injects strings while a human's message arrives
+// as text blocks. Measured over the census, that is false in BOTH directions:
+// 2,713 genuine human turns carry plain-string content, and the interrupt marker
+// — one of the two shapes kept here — is the only one of the six that arrives as
+// a text-block array, 25 of 25. A filter built on it would have been wrong about
+// humans and would have silently switched itself off for interrupts. So the risk
+// stands, narrowed to "the message BEGINS with the exact tag", and is written
+// down here rather than designed around on a theory nobody checked.
+var ccUserShapes = []ccUserShape{
+	{name: ccTaskNotificationPrefix, matches: ccOpensWith(ccTaskNotificationPrefix), render: ccDropRecord},
+	{name: ccCommandStdoutPrefix, matches: ccOpensWith(ccCommandStdoutPrefix), render: ccDropRecord},
+	{name: ccBashStdoutPrefix, matches: ccOpensWith(ccBashStdoutPrefix, ccBashStderrPrefix), render: ccDropRecord},
+	{name: ccBashInputPrefix, matches: ccIsBashInput, render: ccRenderBashInput},
+	{name: ccInterruptPrefix, matches: ccIsInterrupt, render: ccRenderInterrupt},
+	{name: ccCommandNameTag, matches: ccIsSlashCommand, render: ccRenderCommand},
+}
+
+// ccShapeHumanText is ccClassifyUserText's answer for a record that matched no
+// row: the user's own words, whatever happens to be in them.
+const ccShapeHumanText = ""
+
+// ccClassifyUserText answers "what shape is this user record's text, and what
+// should a human read?" — the shape half of userText, and the only place that
+// knows.
+//
+// It returns the matching row's name alongside the text so that a caller which
+// needs to REPORT what it saw and a caller which needs to DISPLAY it cannot
+// disagree. The census is the caller that needs the name; without it, "which
+// shapes does this reader know about" would be answered by reading the table with
+// a human eye, and a count taken that way is exactly how #95's first enumeration
+// scored 221 correctly-handled slash commands as defects.
+//
+// Text that matched no row comes back UNCHANGED, whitespace included: a human's
+// message is not this function's to reformat.
+func ccClassifyUserText(raw string) (shape, text string) {
+	trimmed := strings.TrimSpace(raw)
+	for _, s := range ccUserShapes {
+		if s.matches(trimmed) {
+			return s.name, s.render(trimmed)
+		}
+	}
+	return ccShapeHumanText, raw
+}
+
+// ccOpensWith builds a matcher for a shape cc writes at the very START of the
+// record.
+//
+// Prefix rather than Contains, and that distinction is the entire safety margin
+// of this table: `<task-notification>` mentioned inside a sentence a human wrote
+// — this one, for instance — is a human's words, and a Contains rule would delete
+// the message it appears in.
+func ccOpensWith(prefixes ...string) func(string) bool {
+	return func(trimmed string) bool {
+		for _, p := range prefixes {
+			if strings.HasPrefix(trimmed, p) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// ccDropRecord emits nothing: the record is machinery, not conversation.
+func ccDropRecord(string) string { return "" }
+
+// ccBashInputRe and ccInterruptRe match the two KEPT shapes end to end.
+//
+// Built from the constants with QuoteMeta rather than spelled out, so the pattern
+// and the literal the fixtures use cannot drift apart — which is the whole reason
+// those literals are constants.
+//
+// The capture is the part that survives rendering. Anchoring the far end is what
+// makes "nothing was discarded" a property of the match rather than a promise in
+// a comment: see ccUserShapes.
+var (
+	ccBashInputRe = regexp.MustCompile(`(?s)^` + regexp.QuoteMeta(ccBashInputPrefix) +
+		`(.*)` + regexp.QuoteMeta(ccBashInputSuffix) + `$`)
+	ccInterruptRe = regexp.MustCompile(`^` + regexp.QuoteMeta(ccInterruptPrefix) + `([^\]]*)\]$`)
+)
+
+// ccIsBashInput reports whether the record is nothing but a `!` shell command.
+func ccIsBashInput(trimmed string) bool { return ccBashInputRe.MatchString(trimmed) }
+
+// ccIsInterrupt reports whether the record is nothing but cc's interrupt marker.
+func ccIsInterrupt(trimmed string) bool { return ccInterruptRe.MatchString(trimmed) }
+
+// ccRenderBashInput renders `<bash-input> ls -la</bash-input>` as `! ls -la`.
+//
+// # Kept, not dropped, and that is this row's judgement
+//
+// The user really did run that command — they typed `!` at cc's prompt to do it.
+// It is as much a user turn as anything they said, so it stays, and it keeps
+// closing an assistant run because a real user action genuinely ends the turn
+// before it. 22 of these silently disappearing would be the failure mode a
+// blanket "drop the tagged records" rule ships: the reader deleting the user's
+// own conversation and no test noticing.
+//
+// Rendered with the `!` the user actually typed, so the bubble reads as the
+// action rather than as a quotation of it, and in PLAIN text with no markdown:
+// the pane renders a user bubble as {m.text} rather than through <Markdown>
+// (web/src/panes/chat/index.tsx), so backticks would show up as backticks.
+//
+// Only the whole-record form matches (ccIsBashInput), so there is never a
+// remainder to discard — a record with anything after the closing tag is not this
+// shape and is emitted as it stands. An empty command emits nothing: there is no
+// action to show, and no real record has one.
+func ccRenderBashInput(trimmed string) string {
+	m := ccBashInputRe.FindStringSubmatch(trimmed)
+	if m == nil {
+		// Unreachable through the table, which matches before it renders. Returning
+		// the text rather than "" so that a future caller which skips the match
+		// cannot make this function delete a record.
+		return trimmed
+	}
+	if cmd := strings.TrimSpace(m[1]); cmd != "" {
+		return "! " + cmd
+	}
+	return ""
+}
+
+// ccRenderInterrupt renders cc's `[Request interrupted by user]` as
+// `(interrupted)`.
+//
+// # Kept, not dropped: the user pressed the key
+//
+// 19 of the 25 in the census sit directly between the answer they cut off and
+// whatever they typed next, so this record is the only thing that explains why
+// that answer stops mid-sentence. Dropping it would silently rewrite history into
+// an agent that simply trailed off.
+//
+// Parenthesised, with cc's third-person framing removed, because it renders in a
+// bubble already labelled "you": "Request interrupted by user" reads as a system
+// line quoted AT the user, and the parentheses say "this is an action, not
+// something they said".
+//
+// The qualifier — cc writes `[Request interrupted by user for tool use]` in 2 of
+// the 25 — is carried through VERBATIM rather than interpreted. What cc means by
+// it has not been read out of cc, and inventing a reading here is how a comment
+// in this file ends up asserting something the code does not do.
+//
+// A record that carries anything after the marker's `]` is NOT this shape
+// (ccIsInterrupt anchors both ends) and is emitted whole instead, so the user's
+// words cannot be thrown away with the marker. That matters more here than
+// anywhere else in the table: this is the one shape cc writes as a text-block
+// array, and ccMessage.text joins blocks with "\n", so a second block is the one
+// structurally reachable way for a real message to arrive attached to a marker.
+// An earlier version discarded it and pointed at the census as the safety net —
+// which could not see it, because a matched shape is never a candidate.
+func ccRenderInterrupt(trimmed string) string {
+	m := ccInterruptRe.FindStringSubmatch(trimmed)
+	if m == nil {
+		return trimmed // unreachable through the table; see ccRenderBashInput
+	}
+	if q := strings.TrimSpace(m[1]); q != "" {
+		return "(interrupted " + q + ")"
+	}
+	return "(interrupted)"
+}
+
 var (
 	ccCommandNameRe = regexp.MustCompile(`<command-name>([^<]*)</command-name>`)
 	ccCommandArgsRe = regexp.MustCompile(`<command-args>([^<]*)</command-args>`)
 )
 
+// ccOpensSlashCommand is the anchor half of ccIsSlashCommand, built once rather
+// than per call.
+var ccOpensSlashCommand = ccOpensWith(ccCommandNameTag, ccCommandMessageTag)
+
+// ccIsSlashCommand reports whether the record IS cc's slash-command markup, with
+// a command actually in it.
+//
+// Two conditions, and both earn their place:
+//
+// It must OPEN on one of cc's two command tags. Until #95 this row matched
+// <command-name> anywhere, which meant a human sentence containing the tag —
+// "please add <command-name>/foo</command-name> to the docs" — was replaced
+// wholesale by "/foo", deleting everything they wrote around it. That is the same
+// defect as the four this change is about, in the row held up as proof that the
+// others are not a blanket rule. Anchoring costs nothing: all 221 records in the
+// census open on one of the two tags.
+//
+// And ccSlashCommand must find a command, so the table cannot claim a shape that
+// ccRenderCommand then declines to render. If this matched on the tag's mere
+// PRESENCE, a malformed record would be reported as a known shape while rendering
+// as raw markup — a defect the census would then be unable to see, because it
+// only reports records that matched NO row. Falling through makes it a candidate.
+func ccIsSlashCommand(trimmed string) bool {
+	if !ccOpensSlashCommand(trimmed) {
+		return false
+	}
+	_, ok := ccSlashCommand(trimmed)
+	return ok
+}
+
 // ccRenderCommand turns cc's slash-command markup back into the command the user
-// typed.
+// typed, and returns text with no command in it unchanged.
 //
 // A slash command is recorded as
 //
@@ -822,23 +1245,34 @@ var (
 //	<command-args>silgrid#123</command-args>
 //
 // which, passed through untouched, renders as a row of visible XML — in 5 of the
-// 38 transcripts measured. Left alone that is 13% of a list whose entire purpose
-// is to be readable. Text with no <command-name> is returned unchanged; this
-// deliberately does not strip tags in general, because the moment it did, a
-// prompt that legitimately contains markup would be silently rewritten.
+// 38 transcripts measured for tether#92. Left alone that is 13% of a list whose
+// entire purpose is to be readable. This deliberately does not strip tags in
+// general, because the moment it did, a prompt that legitimately contains markup
+// would be silently rewritten.
 func ccRenderCommand(text string) string {
+	if cmd, ok := ccSlashCommand(text); ok {
+		return cmd
+	}
+	return text
+}
+
+// ccSlashCommand extracts the command a slash-command record stands for.
+//
+// ok is false when there is no <command-name> or it is empty — the two cases in
+// which there is nothing better to show than the text itself.
+func ccSlashCommand(text string) (string, bool) {
 	name := ccCommandNameRe.FindStringSubmatch(text)
 	if name == nil {
-		return text
+		return "", false
 	}
 	cmd := strings.TrimSpace(name[1])
 	if cmd == "" {
-		return text
+		return "", false
 	}
 	if args := ccCommandArgsRe.FindStringSubmatch(text); args != nil {
 		if a := strings.TrimSpace(args[1]); a != "" {
-			return cmd + " " + a
+			return cmd + " " + a, true
 		}
 	}
-	return cmd
+	return cmd, true
 }

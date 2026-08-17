@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -90,10 +91,23 @@ func sessionAPIHandlers(idx *session.SessionIndex, wis *session.WIBindingStore) 
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
 			}
-			msgs := idx.History.LoadHistory(sid)
+			// One call, because "which store answers for this sid" is one rule and
+			// it lives on the index next to the list that applies the same rule —
+			// see session.SessionIndex.Messages. This route deliberately does not
+			// reach for HistoryStore and then fall back itself: that is how a row
+			// labelled "tether" ends up serving cc's transcript.
+			msgs, source := idx.Messages(sid)
 			if msgs == nil {
 				msgs = []session.HistoryMessage{}
 			}
+			// tether#92 — this route logged NOTHING, and the daemon was blind to
+			// the exact path a user's bug report was about ("clicking a session
+			// does nothing"), so the investigation had to run on indirect evidence.
+			// One line, at Info: the sid asked for, how many turns came back, and
+			// which store they came from. `source` distinguishes the three answers
+			// that look identical from outside — tether had it, cc had it, nobody
+			// had it — which is the whole reason 0 messages is not enough to log.
+			slog.Info("session transcript served", "sid", sid, "count", len(msgs), "source", source)
 			writeJSON(w, msgs)
 		case "wi":
 			if r.Method != http.MethodPut {

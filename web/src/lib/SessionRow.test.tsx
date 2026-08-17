@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { SessionRow, sessionWhen } from './SessionRow'
 import { useStore } from './store'
-import type { SessionSummary } from './wiSession'
+import { EXTERNAL_SESSION_PROMISE, isExternalSession, type SessionSummary } from './wiSession'
 
 const HOUR_AGO = Date.now() - 3_600_000
 
@@ -83,6 +83,92 @@ describe('SessionRow', () => {
     rerender(<SessionRow session={s} omitWorkItem />)
     expect(screen.getByText('the first prompt')).toBeTruthy()
     expect(screen.queryByText('tether#91')).toBeNull()
+  })
+})
+
+// tether#92 — a session the coding agent recorded and tether never saw.
+//
+// The list is now allowed to offer conversations tether cannot promise to
+// continue, so the row has to say so. These pin the promise itself, not just
+// that some markup appeared: the failure this guards against is the one this
+// repo keeps producing — the backend does something reasonable and the user is
+// never told.
+describe('SessionRow marks a session tether did not record', () => {
+  const ccRow = (over: Partial<SessionSummary> = {}) =>
+    row({ sid: 'sid-cc-0000000001', title: 'typed in a terminal', source: 'cc', ...over })
+
+  it('marks it external on the row, before the click', () => {
+    const { container } = render(<SessionRow session={ccRow()} />)
+    const marker = container.querySelector('.session-row-src')
+    expect(marker?.textContent).toBe('external')
+    // NOT "read-only": tether already uses that phrase for a /wt/events observer
+    // attach, where it means "you may watch but not send". Here the composer is
+    // enabled and a prompt IS delivered.
+    expect(marker?.textContent).not.toBe('read-only')
+  })
+
+  it('says nothing of the sort on a session tether recorded', () => {
+    const { container } = render(<SessionRow session={row({ source: 'tether' })} />)
+    expect(container.querySelector('.session-row-src')).toBeNull()
+    // An absent source is a tether row: four test files build rows by hand and
+    // none of them is about provenance.
+    const bare = render(<SessionRow session={row()} />)
+    expect(bare.container.querySelector('.session-row-src')).toBeNull()
+  })
+
+  it('treats an UNRECOGNISED source as external, not as tether’s own', () => {
+    // If the daemon ever grows a third store, a row from it must not render as a
+    // fully trusted tether row. Failing safe means erring towards the warning.
+    const odd = { ...row(), source: 'someday' } as unknown as SessionSummary
+    expect(isExternalSession(odd)).toBe(true)
+    const { container } = render(<SessionRow session={odd} />)
+    expect(container.querySelector('.session-row-src')?.textContent).toBe('external')
+  })
+
+  it('names where it came from on hover, as a bonus rather than as the channel', () => {
+    const { container } = render(<SessionRow session={ccRow()} />)
+    const title = container.querySelector('.tree-row')?.getAttribute('title') ?? ''
+    expect(title).toContain('sid-cc-0000000001')
+    expect(title).toContain('typed in a terminal')
+    expect(title).toContain('coding agent')
+  })
+
+  it('posts NO notice — the promise is state, not an event', () => {
+    // Deliberate and load-bearing. A click-scoped notice vanished on reload while
+    // tether_last_sid survived, so the user came back to an external conversation
+    // with no warning at all. The promise now hangs off the session's own source
+    // (see SessionList), which a reload re-derives.
+    render(<SessionRow session={ccRow()} />)
+    fireEvent.click(screen.getByText('typed in a terminal'))
+    expect(useStore.getState().notices).toHaveLength(0)
+  })
+
+  it('states every limit it needs to, in one sentence', () => {
+    // "may" is the load-bearing word: a failed --resume is only observable after
+    // the first prompt has been delivered, so neither "will" nor "will not" is a
+    // claim tether can make. Matched case-insensitively on the CONCEPT so a
+    // rewording cannot pass by dodging one literal.
+    expect(EXTERNAL_SESSION_PROMISE).toMatch(/coding agent/i)
+    expect(EXTERNAL_SESSION_PROMISE).toMatch(/recent messages only/i)
+    expect(EXTERNAL_SESSION_PROMISE).toMatch(/without tool activity/i)
+    expect(EXTERNAL_SESSION_PROMISE).toMatch(/\bmay\b[^.]*new conversation/i)
+    expect(EXTERNAL_SESSION_PROMISE).not.toMatch(/will (not )?(be )?continu/i)
+  })
+
+  it('still opens the session through the one shared operation', () => {
+    // A read-only session is still a session being opened: tether#61's rule does
+    // not get an exception here, so the WT channel is rebound and the sid
+    // persisted exactly as for any other row.
+    const reconnects = watch('tether:retry-connection')
+    const tabs = watch('tether:select-tab')
+    render(<SessionRow session={ccRow()} />)
+
+    fireEvent.click(screen.getByText('typed in a terminal'))
+
+    expect(tabs()).toEqual(['chat'])
+    expect(reconnects()).toHaveLength(1)
+    expect(useStore.getState().sessionId).toBe('sid-cc-0000000001')
+    expect(localStorage.getItem('tether_last_sid')).toBe('sid-cc-0000000001')
   })
 })
 

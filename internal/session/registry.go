@@ -95,6 +95,25 @@ type Registry struct {
 	// stays the cwd for every session that selected none, which is what keeps a
 	// client that sends no `ws` behaving exactly as it did before.
 	Workdir string
+	// hadConversation is defined below Registry; see it for the rule.
+	//
+	// CC reads cc's own transcript store (tether#92). nil = this daemon knows only
+	// about the conversations it recorded itself, which is what every daemon before
+	// that slice did.
+	//
+	// The Registry needs it for ONE question, and it is a question about honesty
+	// rather than about listing: when a `--resume` fails and Attachment.resolve
+	// falls back to a fresh session, "was there a conversation to lose" decides
+	// whether the user is told. Asking only HistoryStore made that answer NO for
+	// every session tether had not recorded — which, once those became listable and
+	// clickable, is precisely the population most likely to fail a resume. See
+	// Attachment.resolve.
+	//
+	// It is the SAME instance the session list uses (built once in
+	// lifecycle.go, read from here by mux.go). Constructing a second one would be
+	// two answers to "which directories does the user work in" — the shape of
+	// drift this repo has a documented history of.
+	CC *CCStore
 	// Workspaces resolves a client-supplied workspace id to a path. nil = this
 	// daemon cannot honour a `ws` request at all, and says so rather than
 	// substituting a directory of its own (tether#52 — see resolveWorkspace).
@@ -105,6 +124,38 @@ type Registry struct {
 	// the workspace its client asks for (or the default). Wired in lifecycle.go
 	// Step 2a alongside History, which shares its directory.
 	Bindings *BindingStore
+}
+
+// hadConversation reports whether ANY store this daemon can see holds a
+// conversation for sid.
+//
+// It answers exactly one question, asked from two places in Attachment.resolve:
+// when a session is replaced — by a failed `--resume` or by a rebind to another
+// workspace — was there something to lose, and therefore is there anything to
+// tell the user? A false answer here is not a missing feature, it is a fresh
+// empty session appearing with no explanation, which is the failure mode this
+// codebase produces most often.
+//
+// # Why it is not HistoryStore.HasHistory
+//
+// It was, until tether#92, and that was correct while tether's own store was the
+// only one a session could come from. Once the list also offers conversations cc
+// recorded, the old gate is false BY CONSTRUCTION for exactly those sessions —
+// having no tether transcript is what made a row a cc row — so the population
+// most likely to fail a resume (their cwd need not match this daemon's
+// --workspace-root) was the one population guaranteed to fail silently.
+//
+// Both stores are optional and each is consulted only if present: a daemon
+// assembled without either simply cannot know, and stays quiet rather than
+// guessing. That is the same rule the single-store version had, applied twice.
+func (r *Registry) hadConversation(sid string) bool {
+	if r == nil || sid == "" {
+		return false
+	}
+	if r.History != nil && r.History.HasHistory(sid) {
+		return true
+	}
+	return r.CC != nil && r.CC.Has(sid)
 }
 
 // spawnOutcome says where the *Entry a spawnEntry call returns came from. The

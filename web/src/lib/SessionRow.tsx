@@ -1,7 +1,13 @@
 import { useStore } from './store'
 import { openSession } from './session'
 import { relTime } from './timefmt'
-import { sessionLabel, type SessionSummary } from './wiSession'
+import {
+  EXTERNAL_SESSION_BADGE,
+  EXTERNAL_SESSION_PROVENANCE,
+  isExternalSession,
+  sessionLabel,
+  type SessionSummary,
+} from './wiSession'
 
 /**
  * SessionRow — ONE rendering of "a session you can click" (tether#91).
@@ -41,6 +47,8 @@ export function SessionRow({
 }) {
   const currentSid = useStore(s => s.sessionId)
   const isCurrent = session.sid === currentSid
+  // tether#92 — a conversation the coding agent recorded and tether never saw.
+  const isExternal = isExternalSession(session)
 
   const onClick = () => {
     // Chat is a tab in the right column, and this row may be rendered from the
@@ -50,11 +58,20 @@ export function SessionRow({
     // happening. Dispatched unconditionally — from inside chat it is a no-op.
     window.dispatchEvent(new CustomEvent('tether:select-tab', { detail: 'chat' }))
     // tether#61 — opening a session is ONE operation and it lives in
-    // lib/session.ts. Never reimplemented here: the versions that were had
-    // stopped reconnecting the WebTransport channel (so the live stream, and the
-    // next prompt sent, stayed on the session the user had just left) and hidden
-    // setSessionId behind a non-empty history.
+    // lib/session.ts. Never reimplemented here, and NOT forked for tether#92
+    // either: a read-only session is still a session being opened, and the
+    // versions that had their own copy of this had stopped reconnecting the
+    // WebTransport channel (so the live stream, and the next prompt sent, stayed
+    // on the session the user had just left) and hidden setSessionId behind a
+    // non-empty history.
     openSession(session.sid)
+    // NOTHING ELSE. An earlier version posted the "tether cannot promise to
+    // continue this" line from here, which tied a durable property of the SESSION
+    // to a transient event: a reload restores the sid (tether_last_sid) but not
+    // the notice, so the warning vanished exactly when the user was most likely to
+    // type. The promise now lives with the state that implies it — see
+    // EXTERNAL_SESSION_PROMISE and the chat pane's session banner — which also
+    // means the wi detail's "open in chat" gets it without remembering to.
   }
 
   return (
@@ -62,13 +79,33 @@ export function SessionRow({
       className={`tree-row${isCurrent ? ' active' : ''}`}
       style={indent == null ? undefined : { paddingLeft: indent }}
       onClick={onClick}
-      title={session.title ? `${session.sid}\n${session.title}` : session.sid}
+      title={rowTitle(session)}
     >
       <span className={`ws-dot${isCurrent ? ' live' : ''}`} />
       <span className="tree-label">{sessionLabel(session, { omitWorkItem })}</span>
+      {/* Provenance, on the row, before the click. One word is all there is room
+          for, so it is the one that is TRUE of the row — the promise itself needs
+          a sentence and lives in the chat pane's banner, where it survives a
+          reload. */}
+      {isExternal && <span className="session-row-src mono">{EXTERNAL_SESSION_BADGE}</span>}
       <span className="session-row-when mono">{sessionWhen(session.updatedAt)}</span>
     </div>
   )
+}
+
+/**
+ * rowTitle is the hover text: the sid, the opening prompt when there is one, and
+ * — for a session tether did not record — where it came from.
+ *
+ * Hover is a bonus, not the channel: there is no hover on a phone, and tether is
+ * driven from one by design. Anything a user MUST see is on the row or in the
+ * banner; this is for the pointer that happens to be there.
+ */
+function rowTitle(session: SessionSummary): string {
+  const lines = [session.sid]
+  if (session.title) lines.push(session.title)
+  if (isExternalSession(session)) lines.push(EXTERNAL_SESSION_PROVENANCE)
+  return lines.join('\n')
 }
 
 /**

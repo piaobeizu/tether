@@ -705,12 +705,38 @@ describe('FATAL_CODE_MESSAGES (tether#63)', () => {
       expect(text).not.toMatch(/\b(lost|gone|deleted|corrupt|no longer exists)\b/i)
     })
 
-    it('says it becomes resumable, which is what makes the Retry button mean something', () => {
-      // The card renders Retry underneath this sentence unconditionally. For the
-      // other four codes retrying is a formality; here it is the actual remedy once
-      // the job ends, and nothing else on screen says so.
-      expect(text).toMatch(/becomes resumable/i)
-      expect(text).toMatch(/when that finishes/i)
+    // tether#104 REPLACES the two assertions that used to sit here. They pinned
+    // "becomes resumable when that finishes", and that sentence was measured wrong
+    // on the live deployment: the holder of the session that prompted tether#104
+    // was alive, kind bg, cc status `idle`, three days old and hours since its last
+    // status change. "When that finishes" is not a thing that was going to happen.
+    //
+    // The defect underneath the wording is the UNIT. cc refuses a `--resume` on
+    // `kind && kind !== "interactive"` (ccregistry.go's ccInteractiveKind) — a
+    // property of the PROCESS. A turn ending releases nothing; only the process
+    // exiting does. So the sentence has to say which clock the user is waiting on,
+    // and these two assertions pin that it does.
+    it('names the process, not the turn, as what the user is waiting on', () => {
+      expect(text).toMatch(/as long as that agent’s process/)
+      expect(text).toMatch(/not just its current turn/)
+    })
+
+    // The corollary, and the reason this needs no busy/idle branch: cc's `status`
+    // is not in the refusal rule, so the two statuses have the same remedy and the
+    // same waiting condition. Saying so is what stops the next reader from adding
+    // a distinction that changes no advice — and it is the clause that makes the
+    // sentence true for the measured case rather than only for the imagined one.
+    it('says an idle holder is no less of a holder than a busy one', () => {
+      expect(text).toMatch(/an idle job holds this conversation exactly as firmly as a busy one/)
+    })
+
+    // Taking it over is now FIRST, and waiting is the qualified afterthought. On
+    // the measured case the old order sent the user to wait for an event that was
+    // not coming, past the one instruction that works whatever the holder is doing.
+    it('offers taking it over before it offers waiting', () => {
+      expect(text.indexOf('claude agents')).toBeGreaterThan(-1)
+      expect(text.indexOf('Waiting')).toBeGreaterThan(-1)
+      expect(text.indexOf('claude agents')).toBeLessThan(text.indexOf('Waiting'))
     })
 
     it('quotes the agent’s own two ways out', () => {

@@ -789,6 +789,35 @@ body {
   background: var(--danger-tint); border: 1px solid var(--danger);
   border-radius: var(--r-3); padding: 10px 12px; font-size: 12px;
 }
+/* tether#104 — the one terminal refusal that is a STATE rather than a fault: a
+   live background agent has the conversation open, so cc declines the resume for
+   as long as that process lives. Everything about the card is still true; the
+   --danger dressing was the part that was not. A user who reached this saw a red
+   box and concluded something had broken, while the conversation it sits on top
+   of was right there, intact, and readable.
+
+   Scoped by the extra class rather than by rewriting .failed-card, because the
+   other four terminal codes ARE faults and keep the treatment they earned
+   (index.tsx adds `state-card` only for session_held_by_background_agent).
+
+   Quieter, but still an object: the left rule keeps it from reading as ambient
+   chrome, which it must not, because the user still cannot type and this card is
+   the only thing that says why. The distinction from .failed-card is carried by
+   the sentence inside it as well as by the colour, so it survives a reader who
+   cannot separate the two tints — the same rule .session-row-act.held follows a
+   few hundred lines up. */
+.failed-card.state-card {
+  background: var(--bg-tint); border: 1px solid var(--line-soft);
+  border-left: 3px solid var(--accent);
+}
+/* The line that points down at the transcript, between the headline and the
+   daemon's raw detail. Rendered only when there IS a transcript — index.tsx gates
+   it on transcript.length — so it never points at an empty pane. Secondary ink,
+   not tertiary: it is the sentence that tells the user what they CAN do, so it
+   must not sink to the level of the raw refusal string below it. */
+.state-card-read {
+  color: var(--ink-secondary); font-size: 11.5px; line-height: 1.45; margin-bottom: 6px;
+}
 
 /* ── Statusbar ──────────────────────────────────────────────── */
 .dt-statusbar {

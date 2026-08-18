@@ -127,15 +127,20 @@ describe('the shared poller', () => {
 
   it('polls ONCE per tick however many consumers are subscribed', async () => {
     const d = daemon(() => `{"sid-a":"working"}`)
-    const offs = [
-      subscribeSessionActivity(() => {}),
-      subscribeSessionActivity(() => {}),
-      subscribeSessionActivity(() => {}),
-    ]
-    await vi.advanceTimersByTimeAsync(0)
+    const offs: (() => void)[] = []
+    // Each subscription is allowed to SETTLE before the next one arrives, which is
+    // the whole point of this shape. Subscribing three times in one synchronous
+    // burst does not test the sharing: the in-flight guard collapses three
+    // simultaneous polls into one all by itself, so a mutant that polls per
+    // subscriber survives it. Measured — that mutant did survive the burst version
+    // of this test, and this is what kills it.
+    for (let i = 0; i < 3; i++) {
+      offs.push(subscribeSessionActivity(() => {}))
+      await vi.advanceTimersByTimeAsync(0)
+    }
     // One immediate poll for the whole page, not one per subscriber. A row is
-    // rendered by two panes and a list has many rows, so a timer per consumer
-    // multiplies the request rate by the row count.
+    // rendered by two panes and a list has many rows, so a fetch per consumer
+    // multiplies the mount cost by the row count.
     expect(d.calls()).toBe(1)
     expect(sessionActivityPollerState()).toEqual({ running: true, subscribers: 3 })
 
@@ -149,6 +154,25 @@ describe('the shared poller', () => {
     expect(sessionActivityPollerState()).toEqual({ running: false, subscribers: 0 })
     await vi.advanceTimersByTimeAsync(SESSION_ACTIVITY_POLL_MS * 3)
     expect(d.calls()).toBe(2)
+  })
+
+  it('does not accumulate an interval per subscriber', async () => {
+    // The other half of "one poller", and it is a LEAK rather than a cost: a module
+    // that installed a fresh interval on every subscribe would keep only the last
+    // handle, so unsubscribing everyone would clear one timer and leave the rest
+    // firing forever — with `running: false` reported the whole time.
+    const d = daemon(() => `{}`)
+    const offs = [
+      subscribeSessionActivity(() => {}),
+      subscribeSessionActivity(() => {}),
+      subscribeSessionActivity(() => {}),
+    ]
+    await vi.advanceTimersByTimeAsync(0)
+    for (const off of offs) off()
+    expect(sessionActivityPollerState().running).toBe(false)
+    const settled = d.calls()
+    await vi.advanceTimersByTimeAsync(SESSION_ACTIVITY_POLL_MS * 5)
+    expect(d.calls()).toBe(settled)
   })
 
   it('pauses while the tab is hidden and refetches the moment it is shown', async () => {

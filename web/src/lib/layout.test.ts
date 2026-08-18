@@ -230,14 +230,25 @@ describe('loadRightWidth', () => {
 // (chromeLeftOfMiddle), so:
 //
 //   · a call site cannot omit the bar — there is no addend to omit;
-//   · a call site cannot double it either — ACTIVITY_W is no longer exported,
-//     so `+ ACTIVITY_W` in App.tsx is TS2304 rather than a quiet 336.
+//   · a call site cannot double it BY NAME — ACTIVITY_W is no longer exported,
+//     so `+ ACTIVITY_W` in App.tsx is TS2304 and re-adding it to the import is
+//     TS2459, rather than a quiet 336. Both measured.
 //
-// Neither of those is checked below; they are properties of the module's SHAPE
-// and the compiler checks them. What is left for tests is the arithmetic: that
-// the bar is charged, charged ONCE, and charged on the correct side of the
-// negative-input clamp. Those are the forms in which the bug is still
-// expressible, and all of them now live inside this module.
+// It can still be doubled by a bare `+ 48`, which compiles and which no test
+// here or in App.test.tsx would catch (also measured). That is the honest edge
+// of the claim, and it is a different kind of mistake: the old shape made the
+// bug an OMISSION of required boilerplate, and what is left requires inventing a
+// number that the parameter's name contradicts. See the note at App.tsx's
+// `rightW` initializer for the branded-type option that would close even that,
+// and why tether#102 did not take it.
+//
+// None of the compiler-checked parts is checked below; they are properties of the
+// module's SHAPE. What is left for tests is the arithmetic: that the bar is
+// charged, charged ONCE, and charged on the correct side of the negative-input
+// clamp. Those are the forms in which the bug is still expressible inside this
+// module, and the block below covers each of them — verified by mutation, one of
+// which survived the first pass and is why two exact widths are pinned up in the
+// loadRightWidth block.
 //
 // Expected values are derived from the constants, NOT read off a run:
 //

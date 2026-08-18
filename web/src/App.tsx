@@ -148,8 +148,20 @@ export default function App() {
   // happened HERE, at both call sites, and forgetting it at either one produced
   // a plausible width with nothing red (that is tether#90's bug, tether#99's two
   // wrong numbers, and tether#100's documented-but-open gap). layout.ts adds the
-  // bar itself now — do not add it here. You cannot: ACTIVITY_W is no longer
-  // exported, so `+ ACTIVITY_W` on this line does not compile.
+  // bar itself now — do not add it here. Mostly you cannot: ACTIVITY_W is no
+  // longer exported, so `+ ACTIVITY_W` on this line is TS2304 and re-adding it
+  // to the import above is TS2459 (both measured).
+  //
+  // What that does NOT stop, stated so the guard is not read as more than it is:
+  // `+ 48` still compiles here and no test would notice, because nothing asserts
+  // App.tsx's widths — App.test.tsx has no width assertions, and tether#102 did
+  // not add any. The difference is that the old shape made the bug an OMISSION of
+  // required boilerplate, which is the kind people make by accident; what is left
+  // needs someone to invent a number that this argument's name and layout.ts's
+  // JSDoc both contradict. Making even that impossible wants a branded
+  // `TreeWidth` type — considered and dropped for tether#102, because `leftW`
+  // would then need casts in `loadWidth` and `resizeLeft`, and each cast is a new
+  // escape hatch traded for a narrower one.
   const [rightW, setRightW] = useState(() =>
     loadRightWidth(
       localStorage.getItem(STORAGE_KEY_RIGHT),

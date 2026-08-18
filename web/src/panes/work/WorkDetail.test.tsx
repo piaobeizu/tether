@@ -252,8 +252,9 @@ describe('WorkDetail lists every session of the wi (tether#91)', () => {
     const { container } = render(<WorkDetail id={WI_ID} />)
 
     await waitFor(() => screen.getByText('Sessions'))
-    await waitFor(() => expect(container.querySelectorAll('.session-row-act')).toHaveLength(2))
-    const classes = [...container.querySelectorAll('.session-row-act')].map(n => n.className)
+    const stated = () => container.querySelectorAll('.session-row-act.working, .session-row-act.idle, .session-row-act.held')
+    await waitFor(() => expect(stated()).toHaveLength(2))
+    const classes = [...stated()].map(n => n.className)
     expect(classes).toEqual(['session-row-act working', 'session-row-act held'])
 
     // Two rows, ONE request to the activity route.

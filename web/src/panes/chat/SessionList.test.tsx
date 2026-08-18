@@ -516,14 +516,15 @@ describe('SessionList marks which conversations have a turn in flight (tether#10
 
     await waitFor(() => screen.getByText('Sessions'))
     fireEvent.click(screen.getByText('Sessions'))
-    await waitFor(() => expect(container.querySelectorAll('.session-row-act')).toHaveLength(1))
+    const stated = () => container.querySelectorAll('.session-row-act.working, .session-row-act.idle, .session-row-act.held')
+    await waitFor(() => expect(stated()).toHaveLength(1))
 
     const rows = [...container.querySelectorAll('.chat-sessions-list .tree-row')]
     expect(rows).toHaveLength(2)
     // The marked row is the one the daemon named, and the OTHER row carries no
     // marker at all — absence in the map means nothing live holds that session, so
     // the row must say nothing rather than settle on a default.
-    const marked = rows.filter(r => r.querySelector('.session-row-act'))
+    const marked = rows.filter(r => r.querySelector('.session-row-act.working, .session-row-act.idle, .session-row-act.held'))
     expect(marked).toHaveLength(1)
     expect(marked[0].textContent).toContain('B-only prompt')
     expect(marked[0].querySelector('.session-row-act')?.className).toBe('session-row-act working')

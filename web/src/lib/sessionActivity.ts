@@ -109,14 +109,18 @@ export type SessionActivityMap = Record<string, SessionActivityState>
 /**
  * fetchSessionActivity returns the daemon's answer, or throws.
  *
+ * The signal is optional and the poller always passes one — see `poll` for why the
+ * deadline lives there rather than here (this function has no idea whether its
+ * caller serialises).
+ *
  * Unknown state strings are DROPPED rather than passed through. The alternative —
  * letting an unrecognised value reach the UI — would render as no marker anyway,
  * but it would do so by accident: this way `SessionActivityState` is true of
  * everything in the map, and a future daemon state shows up as a row with no
  * marker instead of as a class name nobody styled.
  */
-export async function fetchSessionActivity(): Promise<SessionActivityMap> {
-  const res = await fetch(SESSION_ACTIVITY_PATH)
+export async function fetchSessionActivity(signal?: AbortSignal): Promise<SessionActivityMap> {
+  const res = await fetch(SESSION_ACTIVITY_PATH, signal ? { signal } : undefined)
   if (!res.ok) throw new Error(`session activity: HTTP ${res.status}`)
   const body: unknown = await res.json()
   // `null` and an array are both `typeof 'object'`; neither is the map shape.
@@ -154,14 +158,31 @@ async function poll(): Promise<void> {
   // an older one that happened to land last.
   if (inFlight) return
   inFlight = true
+  // …and a DEADLINE, because that guard is otherwise a way for this module to
+  // freeze itself. `inFlight` is only released when a request settles, so one that
+  // never does would make every later tick a no-op while the timer kept reporting
+  // itself as running — the frozen marker this whole file exists to prevent,
+  // reached through its own safety valve.
+  //
+  // setTimeout + AbortController rather than AbortSignal.timeout, and the reason is
+  // testability rather than taste: AbortSignal.timeout is implemented natively and
+  // does not run on the timer a test can advance, so the recovery would be
+  // unassertable — and an unassertable recovery from "the marker froze" is the one
+  // thing this module cannot afford to leave on trust.
+  //
+  // Two intervals, so an ordinarily slow daemon is not cut off mid-answer. The catch
+  // below already does the right thing with the rejection: keep the last answer.
+  const ac = new AbortController()
+  const deadline = setTimeout(() => ac.abort(), SESSION_ACTIVITY_POLL_MS * 2)
   try {
-    publish(await fetchSessionActivity())
+    publish(await fetchSessionActivity(ac.signal))
   } catch {
     // A poll we could not complete leaves the previous answer on screen and
     // retries on the next tick — the same policy SessionList.load applies to the
     // list itself, for the same reason: there is nothing here the user must act
     // on, and a connection this broken already has its own indicator.
   } finally {
+    clearTimeout(deadline)
     inFlight = false
   }
 }

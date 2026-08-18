@@ -577,37 +577,54 @@ body {
    and the marker's aria-label — a 7px dot cannot say which of three things it
    means, so the words are the channel and the dot is the glance.
 
-   Built from tokens already in this file (--accent, --ink-quat) — design-freeze
-   rule 4, the same constraint the two badges above were built under.
+   Built from tokens already in this file (--accent, --accent-tint, --ink-quat) —
+   design-freeze rule 4, the same constraint the two badges above were built under.
+   There are no colour literals anywhere in these rules, and there were: see the
+   pulse below for the one that got through review's first pass.
 
-   Sized and shaped like .ws-dot deliberately, so the two read as one column rather
-   than as a dot and a decoration. Not merged INTO .ws-dot, because that element
-   means "this is the session you are looking at" and one element cannot carry two
-   independent facts. */
-.session-row-act { width: 7px; height: 7px; border-radius: 999px; flex-shrink: 0; }
+   Sized like .ws-dot deliberately, so the two read as one column rather than as a
+   dot and a decoration. Not merged INTO .ws-dot, because that element means "this
+   is the session you are looking at" and one element cannot carry two independent
+   facts.
+
+   The space is reserved WHETHER OR NOT a state is known, and that is not tidiness:
+   rendering the element only once an answer arrives shifts the label, both badges
+   and the timestamp by 13px (7px + .tree-row's 6px gap) on the first poll after
+   mount, and again every time a sid enters or leaves the answer. A list that
+   twitches every three seconds is a worse defect than the one this marker fixes. */
+.session-row-act { width: 7px; height: 7px; border-radius: 999px; flex-shrink: 0; visibility: hidden; }
+.session-row-act.working, .session-row-act.idle, .session-row-act.held { visibility: visible; }
 /* MOTION carries "working", and it is the one property that cannot be mistaken for
    a static category marker: a still dot of any colour reads as a label, while
-   something that moves reads as something happening. Colour alone would also be
-   the only difference between this and .session-row-act.held for anyone who cannot
-   distinguish them. */
+   something that moves reads as something happening.
+
+   The halo is --accent-tint and NOT a colour literal. The first version of this
+   rule animated `rgba(47,125,91,…)`, copied from .ws-dot.live where it correctly
+   pairs with --success — so an --accent (orange) dot pulsed inside a --success
+   (green) ring, in both themes, directly under a comment claiming the rule used
+   only tokens already in this file. Found by review. Animating the SPREAD rather
+   than the colour keeps the whole rule inside the token set. */
 .session-row-act.working {
   background: var(--accent);
   animation: session-row-act-pulse 1.4s ease-in-out infinite;
 }
 @keyframes session-row-act-pulse {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(47, 125, 91, .45); }
-  50%      { box-shadow: 0 0 0 3px rgba(47, 125, 91, 0); }
+  0%, 100% { box-shadow: 0 0 0 0 var(--accent-tint); }
+  50%      { box-shadow: 0 0 0 3px var(--accent-tint); }
 }
 /* Hollow: a process is there, and nothing is running in it. */
 .session-row-act.idle { background: transparent; box-shadow: inset 0 0 0 1.5px var(--ink-quat); }
-/* Solid and neutral: something has it open and we cannot see inside. Deliberately
-   NOT the accent — this state makes no claim about activity. */
-.session-row-act.held { background: var(--ink-quat); }
-/* Respect a stated preference not to see motion. The state is still legible: the
-   dot keeps its accent fill, which is what distinguishes it from .held and .idle,
-   and the aria-label and title say which state it is regardless. */
+/* A rounded SQUARE, not a dot, and the shape is the point rather than the colour.
+   A solid --ink-quat circle here is pixel-identical to a non-current .ws-dot two
+   elements to its left, so the row read as two grey dots instead of as a marker —
+   and colour alone would leave this state and `working` indistinguishable for
+   anyone who cannot separate them. Shape survives both. */
+.session-row-act.held { background: var(--ink-quat); border-radius: 2px; }
+/* Respect a stated preference not to see motion. The state stays legible: the dot
+   keeps its accent fill and a static halo, which is what distinguishes it from
+   .held and .idle, and the aria-label and title say which state it is regardless. */
 @media (prefers-reduced-motion: reduce) {
-  .session-row-act.working { animation: none; box-shadow: 0 0 0 3px rgba(47, 125, 91, .2); }
+  .session-row-act.working { animation: none; box-shadow: 0 0 0 3px var(--accent-tint); }
 }
 /* Sits ABOVE .chat-sessions-head so collapsing the list — the default — cannot
    hide it. Wraps rather than truncates: it is three clauses and every one of

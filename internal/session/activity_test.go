@@ -13,6 +13,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -527,7 +528,16 @@ func TestEveryPromptDeliveryGoesThroughTheEntryWrapper(t *testing.T) {
 				if !ok {
 					continue
 				}
-				name := fn.Name.Name
+				// The NAME is not enough, and that was found by mutation rather than
+				// reasoned about: a review added `func (a *Attachment) sendPrompt(...)`
+				// that delegated straight to e.Session().SendPrompt, routed the primary
+				// chat path through it so the counter was never incremented, and this
+				// guard stayed green along with the whole package. The receiver is what
+				// makes "the wrapper" mean one function instead of one identifier.
+				enclosed := fn.Name.Name
+				if !isEntryMethod(fn, wrapper) {
+					enclosed = describeFunc(fn)
+				}
 				ast.Inspect(fn.Body, func(n ast.Node) bool {
 					call, ok := n.(*ast.CallExpr)
 					if !ok {
@@ -537,7 +547,7 @@ func TestEveryPromptDeliveryGoesThroughTheEntryWrapper(t *testing.T) {
 					if !ok || sel.Sel.Name != "SendPrompt" {
 						return true
 					}
-					sites = append(sites, site{pos: fset.Position(call.Pos()).String(), enclosed: name})
+					sites = append(sites, site{pos: fset.Position(call.Pos()).String(), enclosed: enclosed})
 					return true
 				})
 			}
@@ -551,8 +561,90 @@ func TestEveryPromptDeliveryGoesThroughTheEntryWrapper(t *testing.T) {
 	for _, s := range sites {
 		if s.enclosed != wrapper {
 			t.Errorf("%s: SendPrompt is called from %s, but the only function allowed to call it is (*Entry).%s.\n"+
-				"Every prompt write is the start of a turn, and the session-activity marker is set there. A delivery path that bypasses the wrapper ships a session whose row never lights up — and the four reopen/resolve paths are exactly the ones a user reaches when something has already gone wrong.",
+				"Every prompt write is the start of a turn, and the session-activity count is incremented there. A delivery path that bypasses the wrapper ships a session whose row never lights up — and the four reopen/resolve paths are exactly the ones a user reaches when something has already gone wrong.",
 				s.pos, s.enclosed, wrapper)
+		}
+	}
+}
+
+// isEntryMethod reports whether fn is `func (… *Entry) <name>(…)`.
+//
+// Both halves are required. A plain function called sendPrompt, or a sendPrompt on
+// any other type, is not the wrapper — see the mutation quoted at the call site.
+func isEntryMethod(fn *ast.FuncDecl, name string) bool {
+	if fn.Name.Name != name || fn.Recv == nil || len(fn.Recv.List) != 1 {
+		return false
+	}
+	star, ok := fn.Recv.List[0].Type.(*ast.StarExpr)
+	if !ok {
+		return false
+	}
+	ident, ok := star.X.(*ast.Ident)
+	return ok && ident.Name == "Entry"
+}
+
+// describeFunc names a function the way the failure message should read, so a
+// method on the wrong type is not reported as if it were the right one.
+func describeFunc(fn *ast.FuncDecl) string {
+	if fn.Recv == nil || len(fn.Recv.List) != 1 {
+		return fn.Name.Name
+	}
+	recv := "?"
+	switch t := fn.Recv.List[0].Type.(type) {
+	case *ast.StarExpr:
+		if ident, ok := t.X.(*ast.Ident); ok {
+			recv = "*" + ident.Name
+		}
+	case *ast.Ident:
+		recv = t.Name
+	}
+	return "(" + recv + ")." + fn.Name.Name
+}
+
+// TestEveryPromptDeliveryGuardRejectsAWrapperOnTheWrongType is the guard on the
+// guard above, and it exists because that guard DID fail open once.
+//
+// A review built `func (a *Attachment) sendPrompt(ctx, e *Entry, text string) error`
+// delegating to e.Session().SendPrompt, routed the primary chat delivery through
+// it, and every test in the package stayed green — including the one whose whole
+// job is to stop that. So the two ways the matcher can be too permissive are
+// exercised against inputs whose answer is known.
+func TestEveryPromptDeliveryGuardRejectsAWrapperOnTheWrongType(t *testing.T) {
+	const src = `package p
+type Entry struct{}
+type Attachment struct{}
+func (e *Entry) sendPrompt() {}
+func (e Entry) sendPrompt2() {}
+func (a *Attachment) sendPrompt() {}
+func sendPrompt() {}
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "p.go", src, 0)
+	if err != nil {
+		t.Fatalf("parse the sample: %v", err)
+	}
+	got := map[string]bool{}
+	for _, decl := range f.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		got[describeFunc(fn)] = isEntryMethod(fn, "sendPrompt")
+	}
+	for _, tc := range []struct {
+		desc string
+		want bool
+		why  string
+	}{
+		{"(*Entry).sendPrompt", true, "the real wrapper"},
+		{"(*Attachment).sendPrompt", false, "the same NAME on another type — the mutation that got through"},
+		{"sendPrompt", false, "a package-level function with the right name and no receiver"},
+		{"(Entry).sendPrompt2", false, "the right receiver, the wrong name"},
+	} {
+		if v, seen := got[tc.desc]; !seen {
+			t.Errorf("the sample's %s was not parsed at all, so this guard-the-guard proves nothing about it", tc.desc)
+		} else if v != tc.want {
+			t.Errorf("isEntryMethod(%s) = %v, want %v — %s", tc.desc, v, tc.want, tc.why)
 		}
 	}
 }
@@ -625,8 +717,11 @@ func TestEntryTurnFlag_InitlessEmptyResultDoesNotClearIt(t *testing.T) {
 	// assertion needs a settling window or it passes by being early.
 	drainOneEvent(t, fs)
 
-	if !e.turnInFlight.Load() {
-		t.Fatal("an init-less empty result cleared the turn flag. That envelope is a failed --resume's artefact, not a turn end: the prompt is still in flight and Attachment.resolve is about to respawn and answer it. Clearing here extinguishes the marker for a turn that has not started.")
+	// A literal 1, not "> 0": the count is the thing under test, and a mutant that
+	// counted the suppressed result down to zero and then somehow back up would
+	// satisfy a bound. One prompt was delivered, so one turn is outstanding.
+	if got := e.turnsInFlight.Load(); got != 1 {
+		t.Fatalf("after an init-less empty result the outstanding-turn count is %d, want 1. That envelope is a failed --resume's artefact, not a turn end: the prompt is still in flight and Attachment.resolve is about to respawn and answer it. Counting it down extinguishes the marker for a turn that has not started.", got)
 	}
 }
 
@@ -657,8 +752,8 @@ func TestEntryTurnFlag_ClearedOnTeardown(t *testing.T) {
 	close(fs.events)
 	waitForCount(t, reg, 0)
 
-	if e.turnInFlight.Load() {
-		t.Fatal("a session that died mid-turn kept its turn flag set; while the entry is still registered — and for a HUNG process that is until the daemon restarts — its row reads \"working\" forever")
+	if got := e.turnsInFlight.Load(); got != 0 {
+		t.Fatalf("a session that died mid-turn kept %d outstanding turn(s); while the entry is still registered — and for a HUNG process that is until the daemon restarts — its row reads \"working\" forever", got)
 	}
 }
 
@@ -681,8 +776,8 @@ func TestEntryTurnFlag_ClearedWhenTheWriteFails(t *testing.T) {
 	if err := e.sendPrompt(context.Background(), "go"); err == nil {
 		t.Fatal("sendPrompt reported success against a session whose write fails")
 	}
-	if e.turnInFlight.Load() {
-		t.Fatal("a REFUSED write left the turn flag set; nothing will ever clear it, because no result is coming for a prompt the agent never received")
+	if got := e.turnsInFlight.Load(); got != 0 {
+		t.Fatalf("a REFUSED write left %d outstanding turn(s); nothing will ever count it down, because no result is coming for a prompt the agent never received", got)
 	}
 }
 
@@ -765,7 +860,7 @@ func TestEntryTurnFlag_ConcurrentSetAndReadIsRaceFree(t *testing.T) {
 		if err := e.sendPrompt(context.Background(), "go"); err != nil {
 			t.Fatalf("sendPrompt: %v", err)
 		}
-		e.clearTurn()
+		e.endTurn()
 	}
 	close(stop)
 	wg.Wait()
@@ -804,4 +899,213 @@ func drainOneEvent(t *testing.T, fs *fakeSession) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("fanOut never consumed the event; the test cannot tell what it decided")
+}
+
+// TestEntryTurnFlag_TwoQueuedPromptsBothCount is the test that turned the flag
+// into a count, and it is here because a bool shipped and a review reproduced the
+// consequence.
+//
+// A second prompt delivered while the first turn is running is not hypothetical in
+// this daemon. It was MEASURED for tether#83 and the measurement is written down in
+// web/src/lib/store.ts: against cc driven with Spawn's own flags, "second prompt
+// written at 7674ms, 2.2s into an answer whose first delta came at 5500ms; that
+// turn's `result` at 19209ms; only then a fresh system/init at 19246ms and the
+// second turn's result at 21112ms". Two prompts, TWO results. And two senders reach
+// it with no streaming gate at all: injectAndSend (click-to-work) and
+// Registry.DeliverAction (a DAG-card click).
+//
+// With a bool, result #1 cleared it and the row reported `idle` — a positive claim
+// that nothing was running — for the whole of turn #2.
+func TestEntryTurnFlag_TwoQueuedPromptsBothCount(t *testing.T) {
+	fs := &fakeSession{sid: "sid-two-turns-0001", events: make(chan agent.Event, 8)}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+	e, err := reg.GetOrSpawnEntry(context.Background(), "sid-two-turns-0001", "fake")
+	if err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	fs.announceInit()
+	waitForRegistered(t, reg, "sid-two-turns-0001")
+
+	for i, text := range []string{"first", "second"} {
+		if err := e.sendPrompt(context.Background(), text); err != nil {
+			t.Fatalf("sendPrompt %d: %v", i, err)
+		}
+	}
+	if got := e.turnsInFlight.Load(); got != 2 {
+		t.Fatalf("outstanding turns after two deliveries = %d, want 2", got)
+	}
+
+	// Turn one ends. cc's own sequence: result, then a fresh init for turn two.
+	fs.events <- agent.Event{Kind: agent.EventResult, Text: "stop"}
+	waitForTurnCount(t, e, 1, "the first result must end ONE turn")
+	if got := reg.LiveTurns()["sid-two-turns-0001"]; !got {
+		t.Fatal("the row reported no turn in flight while the SECOND prompt's turn was still running. That is the bool bug: a positive claim that nothing is happening, for however long the queued turn takes.")
+	}
+
+	fs.events <- agent.Event{Kind: agent.EventResult, Text: "stop"}
+	waitForTurnCount(t, e, 0, "the second result must end the second turn")
+	if got := reg.LiveTurns()["sid-two-turns-0001"]; got {
+		t.Fatal("both turns ended but the row still reports one in flight")
+	}
+}
+
+// TestEntryTurnFlag_AnErrorEndsTheTurnToo — the other provider reports a dead turn
+// by EVENT and returns nil, so this branch is the only thing that ever counts those
+// turns down.
+//
+// opencodeSession.SendPrompt does that on three paths, none of which emits an
+// EventResult and all of which deliberately keep the session ALIVE so the next
+// prompt can retry: the busy rejection ("busy: another prompt is running"), a
+// failed serve relaunch after an Interrupt, and a stdout-pipe or Start failure
+// inside its run goroutine. Because the session survives, Events() never closes and
+// teardown never runs — so without this the row read "working" until the daemon
+// restarted. Found by review, with the emit sites quoted.
+func TestEntryTurnFlag_AnErrorEndsTheTurnToo(t *testing.T) {
+	fs := &fakeSession{sid: "sid-err-ends-turn01", events: make(chan agent.Event, 8)}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+	e, err := reg.GetOrSpawnEntry(context.Background(), "sid-err-ends-turn01", "fake")
+	if err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	fs.announceInit()
+	waitForRegistered(t, reg, "sid-err-ends-turn01")
+
+	if err := e.sendPrompt(context.Background(), "go"); err != nil {
+		t.Fatalf("sendPrompt: %v", err)
+	}
+	// The shape opencode produces: an error event, no result, the session still
+	// alive and its stream still open.
+	fs.events <- agent.Event{Kind: agent.EventError, Err: errors.New("busy: another prompt is running")}
+
+	waitForTurnCount(t, e, 0,
+		"an EventError with no result following left the turn outstanding; for the opencode provider nothing else would ever count it down, so the row reads \"working\" until the daemon restarts")
+
+	// And the stream is still open, which is the whole reason teardown cannot be
+	// relied on here.
+	if regLen(reg) != 1 {
+		t.Fatalf("registry holds %d entries, want 1 — this test is only about a session that SURVIVES its error", regLen(reg))
+	}
+}
+
+// TestEntryTurnFlag_ErrorThenResultDoesNotUnderflow.
+//
+// opencode's run goroutine can emit BOTH: a scan failure it has just killed the
+// child for, and then its terminal EventResult. Two count-downs for one delivery.
+// The floor guard is what stops that leaving the counter negative, which would make
+// a LATER real turn read as idle.
+func TestEntryTurnFlag_ErrorThenResultDoesNotUnderflow(t *testing.T) {
+	fs := &fakeSession{sid: "sid-err-then-result", events: make(chan agent.Event, 8)}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+	e, err := reg.GetOrSpawnEntry(context.Background(), "sid-err-then-result", "fake")
+	if err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	fs.announceInit()
+	waitForRegistered(t, reg, "sid-err-then-result")
+
+	if err := e.sendPrompt(context.Background(), "go"); err != nil {
+		t.Fatalf("sendPrompt: %v", err)
+	}
+	fs.events <- agent.Event{Kind: agent.EventError, Err: errors.New("run: stdout scan: boom")}
+	fs.events <- agent.Event{Kind: agent.EventResult, Text: "stop"}
+	waitForTurnCount(t, e, 0, "one delivery, two end-of-turn signals")
+
+	// The next real turn must still register. Without the floor guard the counter
+	// would be at -1 here and this delivery would read as "nothing running".
+	if err := e.sendPrompt(context.Background(), "again"); err != nil {
+		t.Fatalf("sendPrompt: %v", err)
+	}
+	if got := reg.LiveTurns()["sid-err-then-result"]; !got {
+		t.Fatal("a later real turn reported nothing in flight — the counter went negative on the doubled end-of-turn and never came back")
+	}
+}
+
+// TestActivity_DoesNotOverrideACCRecordThatSaysBusy.
+//
+// The precedence exists because cc's records are BLIND for the sessions tether
+// spawns — they carry no status. A record that carries `busy` is not blind, and
+// overriding it with this daemon's own silence replaces another process's
+// observation with a positive claim that nothing is running.
+//
+// Reachable: cc refuses a `--resume` only for NON-interactive holders, so a
+// conversation a terminal has open can also be registered here, and the two are
+// then genuinely two processes.
+func TestActivity_DoesNotOverrideACCRecordThatSaysBusy(t *testing.T) {
+	requireLinux(t)
+	const sid = "sid-both-sources01"
+	f := newCCRegFixture(t)
+	f.write(t, statusRecord(os.Getpid(), sid, liveToken(t), "bg", "busy"))
+
+	fs := &fakeSession{sid: sid, events: make(chan agent.Event, 8)}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+	if _, err := reg.GetOrSpawnEntry(context.Background(), sid, "fake"); err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	fs.announceInit()
+	waitForRegistered(t, reg, sid)
+
+	// Registered here with NO turn in flight, while cc says busy.
+	if got := (&ActivityIndex{Reg: reg, CCJobs: f.reg()}).States()[sid]; got != SessionActivityWorking {
+		t.Fatalf("States()[%q] = %q, want %q — this daemon having no turn in flight is not evidence that the OTHER process holding the same sid has none either, and %q is a positive claim that nothing is running", sid, got, SessionActivityWorking, SessionActivityIdle)
+	}
+}
+
+// TestActivity_ARealPromptThroughAttachmentCounts closes the gap the AST guard was
+// carrying alone: every other test in this file calls e.sendPrompt directly, so
+// nothing drove the two paths production actually uses.
+//
+// Attachment.SendPrompt is what serveChat calls for every prompt a user types, and
+// Registry.DeliverAction is what /wt/control calls for a DAG-card approval. Both
+// are asserted through their real entry points, so a refactor that stops routing
+// them through the wrapper fails here as well as in the AST guard.
+func TestActivity_ARealPromptThroughAttachmentCounts(t *testing.T) {
+	t.Run("Attachment.SendPrompt", func(t *testing.T) {
+		fs := &fakeSession{sid: "sid-via-attachment1", events: make(chan agent.Event, 8)}
+		reg := NewRegistry(&fakeProvider{sess: fs})
+		att, err := reg.Attach(context.Background(), "", "fake", "")
+		if err != nil {
+			t.Fatalf("Attach: %v", err)
+		}
+		fs.announceInit()
+		waitForRegistered(t, reg, "sid-via-attachment1")
+
+		if err := att.SendPrompt(context.Background(), "hello"); err != nil {
+			t.Fatalf("Attachment.SendPrompt: %v", err)
+		}
+		if got := reg.LiveTurns()["sid-via-attachment1"]; !got {
+			t.Fatal("a prompt delivered through Attachment.SendPrompt — the path every typed prompt takes — did not register a turn in flight")
+		}
+		fs.events <- agent.Event{Kind: agent.EventResult, Text: "stop"}
+		waitForTurnFlag(t, reg, "sid-via-attachment1", false, "the turn did not end")
+	})
+
+	t.Run("Registry.DeliverAction", func(t *testing.T) {
+		fs := &fakeSession{sid: "sid-via-action0001", events: make(chan agent.Event, 8)}
+		reg := NewRegistry(&fakeProvider{sess: fs})
+		if _, err := reg.GetOrSpawnEntry(context.Background(), "sid-via-action0001", "fake"); err != nil {
+			t.Fatalf("GetOrSpawnEntry: %v", err)
+		}
+		fs.announceInit()
+		waitForRegistered(t, reg, "sid-via-action0001")
+
+		if err := reg.DeliverAction("sid-via-action0001", "approve", "block-1", "skill-1"); err != nil {
+			t.Fatalf("DeliverAction: %v", err)
+		}
+		if got := reg.LiveTurns()["sid-via-action0001"]; !got {
+			t.Fatal("a fenced-block approval delivered through DeliverAction did not register a turn in flight; it is a prompt write like any other and it does not go anywhere near Attachment")
+		}
+	})
+}
+
+// waitForTurnCount polls one entry's outstanding-turn count. Bounded.
+func waitForTurnCount(t *testing.T, e *Entry, want int64, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if e.turnsInFlight.Load() == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("%s: outstanding turns = %d, want %d", msg, e.turnsInFlight.Load(), want)
 }

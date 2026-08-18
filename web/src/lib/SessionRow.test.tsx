@@ -347,6 +347,10 @@ describe('SessionRow marks whether a turn is in flight', () => {
     row({ sid: 'sid-act-000000001', title: 'a live conversation', ...over })
 
   const marker = (c: HTMLElement) => c.querySelector('.session-row-act')
+  /** The marker with a STATE. The element is always in the DOM (it holds the
+   *  column so the row cannot twitch), so "says nothing" is "carries no state
+   *  class", not "is absent". */
+  const stated = (c: HTMLElement) => c.querySelector('.session-row-act.working, .session-row-act.idle, .session-row-act.held')
 
   /** Stub the activity endpoint with a body the test can change between polls. */
   function activityDaemon(body: () => string) {
@@ -372,8 +376,12 @@ describe('SessionRow marks whether a turn is in flight', () => {
       const d = activityDaemon(() => body)
       const { container } = render(<SessionRow session={actRow()} />)
 
-      // Nothing is rendered before the first answer lands — the row does not guess.
-      expect(marker(container)).toBeNull()
+      // Nothing is CLAIMED before the first answer lands — the row does not guess.
+      // The element is there, holding its column, carrying no state and no label.
+      expect(stated(container)).toBeNull()
+      expect(marker(container)?.className).toBe('session-row-act')
+      expect(marker(container)?.getAttribute('aria-hidden')).toBe('true')
+      expect(marker(container)?.getAttribute('aria-label')).toBeNull()
 
       await act(async () => { await vi.advanceTimersByTimeAsync(0) })
       expect(marker(container)?.className).toBe('session-row-act idle')
@@ -391,9 +399,10 @@ describe('SessionRow marks whether a turn is in flight', () => {
 
       body = `{}`
       await act(async () => { await vi.advanceTimersByTimeAsync(SESSION_ACTIVITY_POLL_MS) })
-      // Gone means gone: nothing live holds the session, so the row says nothing
-      // rather than settling on its last known state.
-      expect(marker(container)).toBeNull()
+      // Gone means gone: nothing live holds the session, so the row goes back to
+      // claiming nothing rather than settling on its last known state.
+      expect(stated(container)).toBeNull()
+      expect(marker(container)?.className).toBe('session-row-act')
       expect(d.calls()).toBe(4)
     } finally {
       vi.useRealTimers()
@@ -412,7 +421,7 @@ describe('SessionRow marks whether a turn is in flight', () => {
       resetSessionActivityForTests()
       activityDaemon(() => `{"sid-act-000000001":"${state}"}`)
       const { container, unmount } = render(<SessionRow session={actRow()} />)
-      await waitFor(() => expect(marker(container)).not.toBeNull())
+      await waitFor(() => expect(stated(container)).not.toBeNull())
       expect(marker(container)?.className).toBe(cls)
       expect(marker(container)?.getAttribute('aria-label')).toBe(label)
       // role="img" so the sentence above is the element's accessible NAME rather
@@ -430,13 +439,25 @@ describe('SessionRow marks whether a turn is in flight', () => {
     // nothing about this sid" and not "the fetch had not resolved yet".
     await waitFor(() => expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(0))
     await act(async () => { await Promise.resolve() })
-    expect(marker(container)).toBeNull()
+    expect(stated(container)).toBeNull()
+  })
+
+  it('holds its column so the row does not twitch when a state arrives', async () => {
+    // The element is present before the first answer and after it, so nothing to
+    // its right moves. Rendering it only once a state is known shifts the label,
+    // both badges and the timestamp by 13px (7px + .tree-row's 6px gap) on the
+    // first poll and again on every sid that enters or leaves the answer.
+    activityDaemon(() => `{"sid-act-000000001":"working"}`)
+    const { container } = render(<SessionRow session={actRow()} />)
+    expect(container.querySelectorAll('.session-row-act')).toHaveLength(1)
+    await waitFor(() => expect(stated(container)).not.toBeNull())
+    expect(container.querySelectorAll('.session-row-act')).toHaveLength(1)
   })
 
   it('puts the state in the hover text alongside the sid', async () => {
     activityDaemon(() => `{"sid-act-000000001":"held"}`)
     const { container } = render(<SessionRow session={actRow()} />)
-    await waitFor(() => expect(marker(container)).not.toBeNull())
+    await waitFor(() => expect(stated(container)).not.toBeNull())
     const title = container.querySelector('.tree-row')?.getAttribute('title') ?? ''
     expect(title).toContain('sid-act-000000001')
     expect(title).toContain('cannot see whether a turn is in flight')
@@ -449,7 +470,7 @@ describe('SessionRow marks whether a turn is in flight', () => {
     // the CONCEPT so a rewording cannot pass by dodging one literal.
     activityDaemon(() => `{"sid-act-000000001":"working"}`)
     const { container } = render(<SessionRow session={actRow()} />)
-    await waitFor(() => expect(marker(container)).not.toBeNull())
+    await waitFor(() => expect(stated(container)).not.toBeNull())
     const label = marker(container)?.getAttribute('aria-label') ?? ''
     expect(label).toMatch(/turn/i)
     expect(label).not.toMatch(/token|typing|writing|generat|emitt|replying|responding/i)

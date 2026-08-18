@@ -236,6 +236,37 @@ describe('the shared poller', () => {
     expect(sessionActivityPollerState().running).toBe(true)
   })
 
+  it('recovers from a request that never settles', async () => {
+    // The overlap guard is a way for the poller to freeze ITSELF: `inFlight` is only
+    // released in the finally of a settled fetch, so one request that never answers
+    // would make every later tick a no-op while `running` kept reporting true — the
+    // frozen marker this whole module exists to prevent, reached through its own
+    // safety valve. The deadline is what releases it.
+    let hangs = true
+    let started = 0
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
+      started++
+      if (hangs) {
+        // Settle only when the caller's own signal aborts. No signal ⇒ never.
+        await new Promise((_res, rej) => {
+          init?.signal?.addEventListener('abort', () => rej(new Error('TimeoutError')))
+        })
+      }
+      return { ok: true, status: 200, json: async () => JSON.parse(`{"sid-a":"working"}`) as unknown }
+    }))
+    const seen: SessionActivityMap[] = []
+    subscribeSessionActivity(m => { seen.push(m) })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(started).toBe(1)
+    expect(seen).toHaveLength(0)
+
+    // The deadline fires, the guard is released, and the NEXT tick gets through.
+    hangs = false
+    await vi.advanceTimersByTimeAsync(SESSION_ACTIVITY_POLL_MS * 3)
+    expect(started).toBeGreaterThan(1)
+    expect(seen.at(-1)).toEqual({ 'sid-a': SESSION_ACTIVITY_WORKING })
+  })
+
   it('does not overlap requests when the daemon is slower than the interval', async () => {
     // A holder object rather than a `let`: TypeScript narrows a `let` assigned only
     // inside a closure to `never` at the call below, and the point of this test is
@@ -247,6 +278,9 @@ describe('the shared poller', () => {
       await new Promise<void>(res => { gate.release = res })
       return { ok: true, status: 200, json: async () => ({}) }
     }))
+    // Deliberately ignores the abort signal: this case is about the guard holding
+    // while a request is genuinely still in flight, which is the opposite of the
+    // one above.
     subscribeSessionActivity(() => {})
     await vi.advanceTimersByTimeAsync(0)
     expect(started).toBe(1)

@@ -105,16 +105,20 @@ export function SessionRow({
       {/* tether#103. Its own visual channel, next to the "this is the one you are
           looking at" dot rather than among the badges: the badges answer "what kind
           of row is this" (provenance, possession) and this answers "is it moving".
-          NOTHING is rendered when the daemon reported no state — absence means
-          nothing live holds the session, and an element that says so would be a
-          second thing on every row to mean the same as silence. */}
-      {activity && (
-        <span
-          className={`session-row-act ${activity}`}
-          role="img"
-          aria-label={ACTIVITY_LABELS[activity]}
-        />
-      )}
+
+          Always rendered, and INVISIBLE (not absent) when the daemon reported no
+          state for this sid. Absence means nothing live holds the session, so the
+          row must say nothing — but doing that by omitting the element shifts the
+          label, both badges and the timestamp by 13px on the first poll after
+          mount and again every time a sid enters or leaves the answer, i.e. it
+          makes the list twitch. `visibility: hidden` says nothing and holds the
+          column. Nothing is announced either: no role, no label. */}
+      <span
+        className={`session-row-act${activity ? ` ${activity}` : ''}`}
+        {...(activity
+          ? { role: 'img', 'aria-label': ACTIVITY_LABELS[activity] }
+          : { 'aria-hidden': true })}
+      />
       <span className="tree-label">{sessionLabel(session, { omitWorkItem })}</span>
       {/* Provenance, on the row, before the click. One word is all there is room
           for, so it is the one that is TRUE of the row — the promise itself needs

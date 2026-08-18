@@ -32,8 +32,10 @@ package session
 // on the machine. Registry.LiveTurns answers for the sessions THIS daemon is
 // driving — and it has to exist, because the sessions tether spawns are precisely
 // the ones cc's registry says nothing about: they are `--print` launches, and a
-// `--print` launch writes no `status` at all (123 of 137 records on the reference
-// machine, 2026-08-18; 123 of 123 of that shape). Without the daemon's own flag
+// `--print` launch writes no `status` at all (123 of the 140 records on the
+// reference machine at 2026-08-18T10:45Z, and 123 of 123 of that shape — see
+// CCLiveRecord.Status for the census and for why it is timestamped). Without the
+// daemon's own count
 // this feature would be blank for the majority of the list — which is a FALSE
 // NEGATIVE on every row that is actually working, i.e. the failure mode the whole
 // design is trying not to reproduce.
@@ -50,9 +52,10 @@ package session
 // differ between two polls three seconds apart. Polling it to refresh a dot would
 // pay the whole list's cost for the one field that moves.
 //
-// What this endpoint costs is ONE registry scan (~3.0 ms / 44 KB over 138 records,
-// measured for tether#101, including a /proc read per record) plus one walk of the
-// live-session map under a read lock. No titles, no stat of any transcript. That
+// What this endpoint costs is ONE registry scan (~3.0 ms / 44 KB over ~140 records,
+// measured for tether#101, and unlike the holder scan this one really does read
+// /proc once per record — it has to, since it classifies every kind) plus one walk
+// of the live-session map under a read lock. No titles, no stat of any transcript. That
 // is what makes a 3-second poll defensible, and it leaves List's cost model
 // untouched rather than tuning it.
 //
@@ -139,7 +142,8 @@ type ActivityIndex struct {
 // cc's records first, reduced by rank (working > held > idle) because one sid can
 // have several live records and they can disagree — measured for tether#101, 7 of
 // 103 sids carried more than one record and the worst carried 26. Then tether's
-// own registrations, which OVERWRITE rather than join the max.
+// own registrations, which take PRECEDENCE over `held` — but not over a cc record
+// that positively said `busy`.
 //
 // Both halves of that need their reason.
 //
@@ -151,24 +155,30 @@ type ActivityIndex struct {
 // is the mislabel this whole slice exists to remove. `working` still beats both,
 // because a refusal to claim must never suppress a fact.
 //
-// # Why tether's own registration wins outright
+// # Why tether's own registration wins over `held`, and NOT over `working`
 //
-// Because the two sources here describe the SAME PROCESS, and cc's half of it is
-// blind. Every cc tether spawns is a `--print` launch; kind comes from
-// `UBe() ?? "interactive"` where UBe only reads CLAUDE_CODE_SESSION_KIND (which
-// nothing but cc's own background-job spawners sets), so tether's spawns register
-// as kind "interactive" — and they write no `status`, so they classify as `held`.
-// Merged as a plain max, that `held` would outrank tether's own `idle` and EVERY
-// tether session would render as "cannot tell". Tether's flag is also the tighter
-// signal on its own merits: it brackets the prompt write and the turn-end result,
-// which is exactly the interval being reported.
+// Because for these sessions the two sources describe the SAME PROCESS, and cc's
+// half of it is blind. Every cc tether spawns is a `--print` launch; kind comes
+// from `UBe() ?? "interactive"` where UBe only reads CLAUDE_CODE_SESSION_KIND
+// (which nothing but cc's own background-job spawners sets), so tether's spawns
+// register as kind "interactive" — and they write no `status`, so they classify as
+// `held`. Merged as a plain max, that `held` would outrank tether's own `idle` and
+// EVERY tether session would render as "cannot tell".
 //
-// Named residual: if a terminal cc is open on a sid this daemon has ALSO
-// registered, this reports the daemon's answer and says nothing about the
-// terminal. Narrow (it needs one sid live in two places), and the alternative —
-// telling tether's own spawns from a terminal's by `entrypoint` — would invent a
-// rule cc itself does not have, which is the mistake #101 deliberately avoided in
-// the holder rule.
+// The override stops exactly there. A cc record that positively said `busy` is not
+// blind, and a registration that merely has no turn in flight must not overrule
+// it: cc refuses a `--resume` only for NON-interactive holders, so a conversation a
+// terminal has open can also be registered here, and the two are then genuinely
+// two processes. Overriding in that case would replace another process's
+// observation with this one's silence — the only way outright precedence turns a
+// refusal to claim into a false claim.
+//
+// Named residual, and it is narrower than the previous sentence made it sound: a
+// terminal cc whose record carries NO readable status (an old build, or a
+// status-less launch) on a sid this daemon has also registered still reports the
+// daemon's answer. The alternative — telling tether's own spawns from a terminal's
+// by `entrypoint` — would invent a rule cc itself does not have, which is the
+// mistake #101 deliberately avoided in the holder rule.
 func (a *ActivityIndex) States() map[string]string {
 	// Never nil: the handler encodes this map directly, and a nil map marshals to
 	// `null`, which the SPA cannot index.
@@ -191,7 +201,19 @@ func (a *ActivityIndex) States() map[string]string {
 		for sid, inFlight := range a.Reg.LiveTurns() {
 			if inFlight {
 				out[sid] = SessionActivityWorking
-			} else {
+				continue
+			}
+			// A registration with no turn in flight overrides `held` — that is the
+			// whole point of the precedence — but NOT a cc record that positively
+			// said `busy`. The precedence's argument is that cc's half is BLIND for
+			// these sessions, and a record carrying a status is not blind: a
+			// conversation open in a terminal AND registered here (cc refuses a
+			// `--resume` only for non-interactive holders, so this daemon can and
+			// does resume a sid a terminal has open) would otherwise render `idle` —
+			// "no turn in flight" — while the terminal was mid-turn. Reporting the
+			// daemon's silence over another process's observation is the one case
+			// where outright precedence turns a refusal to claim into a false claim.
+			if out[sid] != SessionActivityWorking {
 				out[sid] = SessionActivityIdle
 			}
 		}
@@ -233,15 +255,27 @@ func (a *ActivityIndex) States() map[string]string {
 // # Keyed on the status, NOT on the kind
 //
 // The tempting rule is "read status only when kind != interactive", inherited from
-// LiveJobs. It is wrong here, and both halves of why are measured rather than
-// argued:
+// LiveJobs. It is wrong here, and the argument is READ FROM THE BINARY — which
+// matters, because the reference machine cannot settle it and an earlier draft of
+// this comment claimed it could:
 //
-//   - The status write is not gated on kind anywhere in the binary — it is one
-//     unconditional effect inside the shared App/REPL component.
-//   - kind does not predict presence: 123 of 137 records on the reference machine
-//     are kind "interactive" and NONE of them carries a status, because they are
-//     all `--print` launches, which never mount that component. A live session a
-//     human is typing at is the same kind and DOES write one.
+//   - The status write is not gated on kind. It is one unconditional effect inside
+//     the shared App/REPL component (quoted above), and nothing in the record
+//     writer consults `kind`.
+//   - `kind` defaults to "interactive" for anything that is not one of cc's own
+//     background-job spawns, so a TERMINAL launch and a `--print` launch are the
+//     same kind while only the terminal one mounts the component that writes a
+//     status.
+//
+// NOT observed here, and the distinction is the point: on the reference machine
+// (2026-08-18) kind predicts status presence perfectly — every record with a status
+// is `bg` and every `interactive` one has none — and there were ZERO live
+// interactive records, so the sample cannot express the disagreement. That is
+// precisely the fallacy ccInteractiveKind's own doc warns about fifty lines away
+// ("Agreement with a sample is not evidence when the sample cannot express the
+// disagreement"), so the rule rests on the source and the sample is corroboration
+// of one half of it only: all 123 interactive records are `entrypoint: "sdk-cli"`,
+// i.e. SDK/`--print` launches.
 //
 // So the discriminator is "did cc tell us", and a kind gate would discard the one
 // row where cc's answer is ground truth. The holder rule in LiveJobs keeps its
@@ -295,6 +329,11 @@ func activityRank(state string) int {
 // how a row gets SessionActivityIdle, which is a positive statement that tether is
 // holding the conversation and nothing is running in it.
 //
+// A bool per sid rather than the count itself, because "how many" is nobody's
+// business out here — only "any". Keeping the count inside the package is what lets
+// Entry.turnsInFlight change shape (it already has, from a bool) without every
+// consumer relearning its discipline.
+//
 // # It deliberately does not ask Alive()
 //
 // Every other consumer of this map goes through liveEntry, which calls
@@ -306,7 +345,7 @@ func activityRank(state string) int {
 //
 // What that costs is bounded, and in the safe direction. An Entry outlives its
 // agent — the window liveEntry's doc describes — so a corpse can still appear
-// here. But teardown clears the flag before fanOut's deferred evict removes the
+// here. But teardown resets the count before fanOut's deferred evict removes the
 // entry, so a dead session reads `idle`, never `working`. Reporting a corpse as
 // "tether is holding this, nothing running" for a few milliseconds is a far
 // cheaper wrong answer than reporting a live one as finished.
@@ -316,7 +355,7 @@ func activityRank(state string) int {
 // One RLock for the whole answer, and the copy is made inside it. Handing out
 // *Entry values would make the caller responsible for reading a field whose
 // concurrency story it cannot see; handing out a plain map of the one bit that
-// matters keeps Entry.turnInFlight's discipline inside this package.
+// matters keeps Entry.turnsInFlight's discipline inside this package.
 func (r *Registry) LiveTurns() map[string]bool {
 	out := make(map[string]bool)
 	if r == nil {
@@ -334,7 +373,7 @@ func (r *Registry) LiveTurns() map[string]bool {
 		if !ValidSessionID(sid) {
 			continue
 		}
-		out[sid] = e.turnInFlight.Load()
+		out[sid] = e.turnsInFlight.Load() > 0
 	}
 	return out
 }

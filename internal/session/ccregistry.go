@@ -182,12 +182,19 @@ func ccRecordPid(name string) (int, bool) {
 // The check is `kind != "" && kind != ccInteractiveKind`, and it is written that
 // way — rather than as `kind == "bg"` — because cc validates the field against
 // FOUR values, read from the same binary: ["interactive","bg","daemon",
-// "daemon-worker"]. Only two of them appear on the reference machine (124
-// interactive, 14 bg on 2026-08-18), so a `== "bg"` implementation would agree
-// with every record that exists here and silently fail to recognise a daemon or
-// daemon-worker holding a session. Agreement with a sample is not evidence when
-// the sample cannot express the disagreement — the same lesson EncodeProjectDir
-// records one file over.
+// "daemon-worker"]. Only two of them appear on the reference machine at all, so a
+// `== "bg"` implementation would agree with every record that exists here and
+// silently fail to recognise a daemon or daemon-worker holding a session.
+// Agreement with a sample is not evidence when the sample cannot express the
+// disagreement — the same lesson EncodeProjectDir records one file over.
+//
+// A census used to sit in that sentence ("124 interactive, 14 bg on 2026-08-18")
+// and it is deliberately gone. The argument needs only "two of the four appear
+// here", the directory grows while the daemon runs (140 records at 10:45 on the
+// same day this was written, up from 137 an hour earlier, and every new one is a
+// bg), and a number pinned to a moving directory becomes a contradiction with the
+// next measurement written a few hundred lines away. CCLiveRecord.Status carries
+// the one timestamped census this file needs.
 //
 // An EMPTY kind is not a holder either, and that is cc's rule too (`r.kind &&`):
 // a record written by a cc old enough not to have the field says nothing about
@@ -238,11 +245,22 @@ type CCLiveRecord struct {
 	Kind string
 	// JobID is cc's `jobId`, empty when the record carries none.
 	JobID string
-	// Status is cc's `status`, and it is ABSENT far more often than not: measured
-	// over the reference machine's 137 records on 2026-08-18, 14 carried one and
-	// 123 did not — the 123 being every `--print` launch, which does not mount
-	// the component that writes it. Empty therefore means "cc did not say", which
-	// is a third answer and not a synonym for idle.
+	// Status is cc's `status`, and it is ABSENT far more often than not. The one
+	// census this file keeps, and it is timestamped because the directory MOVES:
+	// at 2026-08-18T10:45Z the reference machine held 140 records, of which 17
+	// carried a status and 123 did not — and the 123 were exactly the
+	// `entrypoint: "sdk-cli"` ones, i.e. every `--print` launch, which does not
+	// mount the component that writes it. An hour earlier the totals were 137 /
+	// 14 / 123: the bg half grows with every background job, the interactive half
+	// did not move, and neither half is swept (see this file's doc for why).
+	//
+	// Empty therefore means "cc did not say", which is a third answer and not a
+	// synonym for idle.
+	//
+	// What that census does NOT establish is that `kind` fails to predict presence
+	// — here it predicts it perfectly, and there were zero LIVE interactive records
+	// to test against. That claim rests on the binary instead; ccStatusActivity
+	// spells out which half is read and which half is merely corroborated.
 	//
 	// When present it is one of ["busy","shell","idle","waiting"] (XB_, from the
 	// same binary; cc's own parser drops anything else on read). A value outside
@@ -275,10 +293,17 @@ func NewCCRegistry(dir string) *CCRegistry {
 //
 // One scan per call, and the session list calls it once per request rather than
 // once per row — see SessionIndex.List. Measured cost of a full scan on the
-// reference machine (138 records, 138 /proc reads, page-cached): ~3.0 ms and
-// 44 KB, against the ~1.4 MB of transcript prefixes the same request already
-// reads. 5 of those 138 records were live non-interactive sessions, so the map
-// this returns is small even where the directory is not.
+// reference machine: ~3.0 ms and 44 KB over 138 records, against the ~1.4 MB of
+// transcript prefixes the same request already reads. 5 of those records were live
+// non-interactive sessions, so the map this returns is small even where the
+// directory is not.
+//
+// It does NOT do one /proc read per record, and the sentence here used to say it
+// did: the kind filter runs first (see forEachLive), so the reads are one per
+// NON-INTERACTIVE record — 17 of 140 on the reference machine at 10:45 on
+// 2026-08-18, not 140. Worth correcting rather than leaving as a conservative
+// over-estimate, because tether#103 added a second walk that really does read every
+// record, and the two costs have to be tellable apart.
 //
 // Where two live records claim the same sid the first one scanned wins the map
 // value. That only decides which kind and jobId are reported, never WHETHER the
@@ -336,7 +361,7 @@ func (s *CCRegistry) LiveJob(sid string) (CCLiveJob, bool) {
 // pollable at all — see SessionActivityPath's doc for the whole cost argument.
 func (s *CCRegistry) LiveRecords() map[string][]CCLiveRecord {
 	out := make(map[string][]CCLiveRecord)
-	s.forEachLiveRecord(func(sid string, rec ccRegistryRecord) bool {
+	s.forEachLiveRecord(nil, func(sid string, rec ccRegistryRecord) bool {
 		out[sid] = append(out[sid], CCLiveRecord{Kind: rec.Kind, JobID: rec.JobID, Status: rec.Status})
 		return true
 	})
@@ -357,24 +382,38 @@ func (s *CCRegistry) LiveRecords() map[string][]CCLiveRecord {
 // rather than its own walk. The filter — `kind != "" && kind != "interactive"` —
 // is cc's own refusal rule and is unchanged; what moved out is only "which
 // records are live", which both questions need and neither owns.
+//
+// The filter is passed as the `keep` predicate rather than applied to the callback,
+// which is not a style choice: `keep` runs BEFORE the liveness check, so this walk
+// still does one /proc read per NON-INTERACTIVE record and not one per record. On
+// the reference machine that is the difference between ~17 reads and ~140 on every
+// session-list request. The record SET fn sees is identical either way — both are
+// pure predicates over the same record — so this is purely about not making a
+// pre-existing hot path more expensive in order to add a new caller.
 func (s *CCRegistry) forEachLive(fn func(sid string, job CCLiveJob) bool) {
-	s.forEachLiveRecord(func(sid string, rec ccRegistryRecord) bool {
-		if rec.Kind == "" || rec.Kind == ccInteractiveKind {
-			return true
-		}
-		return fn(sid, CCLiveJob{Kind: rec.Kind, JobID: rec.JobID})
-	})
+	s.forEachLiveRecord(
+		func(rec ccRegistryRecord) bool { return rec.Kind != "" && rec.Kind != ccInteractiveKind },
+		func(sid string, rec ccRegistryRecord) bool {
+			return fn(sid, CCLiveJob{Kind: rec.Kind, JobID: rec.JobID})
+		})
 }
 
-// forEachLiveRecord walks the registry and calls fn for every record whose
-// process is still alive, of EVERY kind. fn returns false to stop the walk.
+// forEachLiveRecord walks the registry and calls fn for every record that `keep`
+// accepts and whose process is still alive. fn returns false to stop the walk; a
+// nil `keep` accepts every record, of every kind.
 //
-// The kind filter deliberately is NOT here: it is the holder question's rule, not
-// a property of "this record describes a running cc", and the activity question
-// needs the records it excludes. Keeping the two apart in this direction is the
-// safe one — a caller that wants the holder rule has to say so (forEachLive), and
-// there is no way to get the holder answer by forgetting a filter.
-func (s *CCRegistry) forEachLiveRecord(fn func(sid string, rec ccRegistryRecord) bool) {
+// The kind filter deliberately is NOT baked in here: it is the holder question's
+// rule, not a property of "this record describes a running cc", and the activity
+// question needs the records it excludes. Keeping the two apart in this direction
+// is the safe one — a caller that wants the holder rule has to say so
+// (forEachLive), and there is no way to get the holder answer by forgetting a
+// filter.
+//
+// `keep` is applied before ccPidHoldsRecord because that is the only expensive
+// step (one /proc open per record) and a caller that is going to reject the record
+// anyway should not pay for it. Applying it after would be equally correct and
+// measurably slower for the pre-existing caller — see forEachLive.
+func (s *CCRegistry) forEachLiveRecord(keep func(rec ccRegistryRecord) bool, fn func(sid string, rec ccRegistryRecord) bool) {
 	if s == nil || s.dir == "" {
 		return
 	}
@@ -408,6 +447,9 @@ func (s *CCRegistry) forEachLiveRecord(fn func(sid string, rec ccRegistryRecord)
 		// Non-empty is the whole requirement: a record with no session id says
 		// nothing about any session.
 		if rec.SessionID == "" {
+			continue
+		}
+		if keep != nil && !keep(rec) {
 			continue
 		}
 		if !ccPidHoldsRecord(pid, rec.ProcStart) {

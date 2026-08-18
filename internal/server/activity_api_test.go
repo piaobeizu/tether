@@ -12,8 +12,9 @@ package server
 //	/api/v1/                  PREFIX   the 501 stub
 //	/api/v1/session-activity  exact    this
 //
-// So the table below is written against the real registrations rather than
-// against a reading of them.
+// So the table below runs against buildMux itself. It has to: an earlier draft
+// re-declared those patterns in this file, and deleting the real registration from
+// mux.go then left the suite green with the whole feature unwired.
 
 import (
 	"encoding/json"
@@ -22,47 +23,66 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/piaobeizu/tether/internal/auth"
+	mcplifecycle "github.com/piaobeizu/tether/internal/mcp/lifecycle"
 	"github.com/piaobeizu/tether/internal/session"
 )
 
-// activityRouteMux registers the five patterns above with distinguishable
-// handlers, using the SAME pattern strings and the SAME sub-handler parsing as
-// buildMux and sessionAPIHandlers.
+// activityRouteMux builds the daemon's REAL route table.
 //
-// Built here rather than by calling buildMux because buildMux needs a QUIC
-// listener, an auth state, a cert holder and an MCP server to exist; what is under
-// test is which pattern claims which path, and that is a property of the pattern
-// set. The patterns are the load-bearing part, so they are string literals here
-// and any divergence from mux.go shows up as this test asserting about a route the
-// daemon does not have — which is why session.SessionActivityPath is used rather
-// than re-typed.
-func activityRouteMux(idx *session.ActivityIndex) *http.ServeMux {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v1/session/", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("LOCK-FORCE"))
-	})
-	mux.HandleFunc("/api/v1/", func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "not implemented", http.StatusNotImplemented)
-	})
-	mux.HandleFunc("/api/v1/sessions", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("LIST"))
-	})
-	// sessionSub's real parsing, so the "activity is not a sid" claim is tested
-	// against the code that would have to treat it as one.
-	mux.HandleFunc("/api/v1/sessions/", func(w http.ResponseWriter, r *http.Request) {
-		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-		if len(parts) != 5 {
-			http.Error(w, "bad path", http.StatusBadRequest)
-			return
-		}
-		if !validSID(parts[3]) {
-			http.Error(w, "invalid sid", http.StatusBadRequest)
-			return
-		}
-		_, _ = w.Write([]byte("SUB sid=" + parts[3] + " leaf=" + parts[4]))
-	})
-	mux.HandleFunc(session.SessionActivityPath, handleSessionActivity(idx))
-	return mux
+// buildMux, not a hand-rolled copy of its patterns. The first version of this test
+// did re-declare them, and a review proved what that cost: deleting the
+// `mux.HandleFunc(session.SessionActivityPath, …)` line from mux.go — unwiring the
+// entire feature, so the endpoint falls through to the /api/v1/ 501 stub — left
+// this file green. The frontend suite cannot catch it either, because every
+// consumer test stubs fetch. So "the daemon actually serves this path" was guarded
+// by nothing at all, which is the one thing a routing test is for.
+//
+// Nil is acceptable for most of buildMux's dependencies, and that is not a
+// discovery of this test — cert_rotation_test.go and cert_external_test.go already
+// call it this way for the same reason.
+func activityRouteMux(t *testing.T, ccJobs *session.CCRegistry) (http.Handler, func(path string) *http.Request) {
+	t.Helper()
+	reg := session.NewRegistry()
+	reg.CCJobs = ccJobs
+	// A history store is what gates the /api/v1/sessions family (mux.go), and the
+	// point of several rows below is that THOSE routes are unaffected — so the
+	// daemon under test has to be one that serves them.
+	reg.History = session.NewHistoryStore(t.TempDir())
+	cfg := &Config{Port: 0, Registry: reg, MCPLifecycle: mcplifecycle.New()}
+
+	// A REAL auth state, and a cookie for it. Not a detail: with a nil authState
+	// buildMux's middleware rejects everything with 401, which is itself worth
+	// knowing (this endpoint is inside the middleware, so it is not a hole in the
+	// auth surface) but makes every routing assertion below say "unauthorized"
+	// instead of naming the handler that answered.
+	secret := []byte("test-secret-for-the-routing-table")
+	authState := auth.NewState("test-token", secret)
+	tok, err := auth.IssueJWT(secret, "routing-test")
+	if err != nil {
+		t.Fatalf("mint a session cookie: %v", err)
+	}
+	mux := buildMux(cfg, newCertHolder(mustGenCert(t)), nil, reg, nil, authState, nil, nil, nil, cfg.MCPLifecycle)
+
+	return mux, func(path string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, path, nil)
+		r.AddCookie(&http.Cookie{Name: auth.CookieName, Value: tok})
+		return r
+	}
+}
+
+// TestSessionActivityRoute_IsBehindTheAuthMiddleware — the endpoint is polled every
+// three seconds by every open browser, so "is it authenticated" is not a detail.
+//
+// Asserted against the real buildMux with NO credential, which is the same shape
+// the live check produced: 401 and nothing else.
+func TestSessionActivityRoute_IsBehindTheAuthMiddleware(t *testing.T) {
+	mux, _ := activityRouteMux(t, nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, session.SessionActivityPath, nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("GET %s with no cookie -> %d, want 401; body: %s", session.SessionActivityPath, rec.Code, strings.TrimSpace(rec.Body.String()))
+	}
 }
 
 // TestSessionActivityRoute_IsNotShadowedByItsNeighbours.
@@ -80,7 +100,7 @@ func activityRouteMux(idx *session.ActivityIndex) *http.ServeMux {
 // satisfy validSID (8 alphanumerics). That is the real hazard in the neighbourhood
 // and the reason this endpoint is not a leaf under /sessions/.
 func TestSessionActivityRoute_IsNotShadowedByItsNeighbours(t *testing.T) {
-	mux := activityRouteMux(&session.ActivityIndex{})
+	mux, req := activityRouteMux(t, nil)
 
 	for _, tc := range []struct {
 		path     string
@@ -90,22 +110,18 @@ func TestSessionActivityRoute_IsNotShadowedByItsNeighbours(t *testing.T) {
 	}{
 		{
 			session.SessionActivityPath, http.StatusOK, "{}",
-			"the endpoint itself: reachable, and not swallowed by the /api/v1/ 501 stub",
-		},
-		{
-			"/api/v1/session/whatever/force", http.StatusOK, "LOCK-FORCE",
-			"the singular neighbour still owns its own subtree",
+			"the endpoint itself: REGISTERED by buildMux, and not swallowed by the /api/v1/ 501 stub",
 		},
 		{
 			"/api/v1/session-activity/extra", http.StatusNotImplemented, "not implemented",
 			"an EXACT pattern claims only that path; anything below it falls through to the stub, which is the honest answer for a route that takes no arguments",
 		},
 		{
-			"/api/v1/sessions", http.StatusOK, "LIST",
+			"/api/v1/sessions", http.StatusOK, "[]",
 			"the list is untouched",
 		},
 		{
-			"/api/v1/sessions/633e5ed8-cada-422a-aee1-c7a3502eb4fd/messages", http.StatusOK, "leaf=messages",
+			"/api/v1/sessions/633e5ed8-cada-422a-aee1-c7a3502eb4fd/messages", http.StatusOK, "[]",
 			"the transcript route is untouched — the reason this endpoint stayed out of that subtree",
 		},
 		{
@@ -113,13 +129,13 @@ func TestSessionActivityRoute_IsNotShadowedByItsNeighbours(t *testing.T) {
 			"NOT a 404 and NOT a sid: sessionSub's five-segment check refuses it before validSID is reached",
 		},
 		{
-			"/api/v1/sessions/activity/messages", http.StatusOK, "sid=activity",
-			"five segments, and \"activity\" is 8 alphanumerics — so it IS accepted as a sid here. This is the hazard in the neighbourhood, stated as a fact rather than as a warning.",
+			"/api/v1/sessions/activity/messages", http.StatusOK, "[]",
+			"five segments, and \"activity\" is 8 alphanumerics — so it IS accepted as a sid here, and served as an empty transcript. This is the hazard in the neighbourhood, stated as a fact rather than as a warning.",
 		},
 	} {
 		t.Run(tc.path, func(t *testing.T) {
 			rec := httptest.NewRecorder()
-			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+			mux.ServeHTTP(rec, req(tc.path))
 			if rec.Code != tc.wantCode {
 				t.Fatalf("GET %s -> %d, want %d (%s); body: %s", tc.path, rec.Code, tc.wantCode, tc.why, strings.TrimSpace(rec.Body.String()))
 			}

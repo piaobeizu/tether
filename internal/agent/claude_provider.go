@@ -63,6 +63,17 @@ type ccOption func(*ClaudeCodeProvider)
 // os.Stderr, so a test can assert on what cc wrote there — notably the
 // "No conversation found with session ID: <uuid>" line a failed `--resume`
 // produces, which is otherwise unobservable from inside the process.
+//
+// That is not the only line a failed `--resume` can produce, and tether#101 found
+// the second one the hard way: cc also writes "Error: Session <uuid> is currently
+// running as a background agent (<kind>). Use `claude agents` to find and attach
+// to it, or add --fork-session to branch off a copy." and exits 1, for a session
+// one of its own live non-interactive processes holds (measured, cc 2.1.233,
+// 2026-08-18). Both arrive here as stderr and neither is PARSED anywhere: nothing
+// in tether classifies a resume failure by matching this text, because the text
+// is cc's and moves with its versions. The structured judgement lives in
+// session/ccregistry.go, which reads the same registry cc consults; this seam
+// remains what it says it is — a way for a test to see what cc said.
 func withStderr(w io.Writer) ccOption {
 	return func(p *ClaudeCodeProvider) { p.stderr = w }
 }

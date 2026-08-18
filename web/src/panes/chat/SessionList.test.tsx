@@ -412,3 +412,66 @@ describe('SessionList when the daemon does not answer', () => {
     expect(screen.getByText('nothing said')).toBeTruthy()
   })
 })
+
+// tether#101 — the same wiring hop for `runningAs`, driven from RAW DAEMON JSON.
+//
+// This is the frontend end of a two-part guard, and the two parts check different
+// links of one chain:
+//
+//   Go json tag "runningAs"  ==  the property name in the hand-written TS interface
+//        ← internal/session/sessionlist_test.go's TestSessionSummaryIsMirroredInTypeScript
+//   that property            ==  what the row actually reads and renders
+//        ← this test, plus tsc
+//
+// The fixture below is a JSON literal rather than a typed object on purpose. A typed
+// fixture would be renamed in lockstep by any editor doing a rename, and would go on
+// passing while the daemon kept sending the old key; a raw literal cast at the fetch
+// boundary — which is exactly what fetchSessions does with the daemon's body — does
+// not. The repo has the receipts for missed hops of this shape, and nothing in either
+// language fails when this one breaks.
+describe('SessionList marks a session a background agent is using (tether#101)', () => {
+  const HELD_SID = 'sid-held-by-a-job'
+
+  function mockDaemonWithAHeldRow() {
+    const rows = JSON.parse(`[
+      { "sid": "${SID_WITH_HISTORY}", "title": "not held", "updatedAt": ${HOUR_AGO + 1000}, "source": "tether" },
+      { "sid": "${HELD_SID}", "title": "a job has this open", "updatedAt": ${HOUR_AGO}, "source": "cc", "runningAs": "bg" }
+    ]`) as unknown[]
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url === '/api/v1/sessions') return { ok: true, status: 200, json: async () => rows }
+      return { ok: true, status: 200, json: async () => [] }
+    }))
+  }
+
+  it('renders the marker on the held row only, from the daemon’s own key name', async () => {
+    mockDaemonWithAHeldRow()
+    const { container } = render(<SessionList />)
+
+    await waitFor(() => screen.getByText('Sessions'))
+    fireEvent.click(screen.getByText('Sessions'))
+    await waitFor(() => screen.getByText('a job has this open'))
+
+    const rows = [...container.querySelectorAll('.chat-sessions-list .tree-row')]
+    expect(rows).toHaveLength(2)
+    const marked = rows.filter(r => r.querySelector('.session-row-running'))
+    expect(marked).toHaveLength(1)
+    expect(marked[0].textContent).toContain('a job has this open')
+    expect(marked[0].querySelector('.session-row-running')?.textContent).toBe('running')
+  })
+
+  it('still opens it — the marker is a hint and the daemon has the last word', async () => {
+    // If the job has finished by now the session opens normally; if it has not, the
+    // attach path answers with session_held_by_background_agent and the card
+    // explains it. Either way the click must go through openSession, so the list
+    // never becomes a place that silently refuses.
+    mockDaemonWithAHeldRow()
+    const reconnects = watchReconnects()
+    render(<SessionList />)
+
+    await clickSession('a job has this open')
+
+    expect(reconnects()).toBe(1)
+    await waitFor(() => expect(useStore.getState().sessionId).toBe(HELD_SID))
+    expect(localStorage.getItem('tether_last_sid')).toBe(HELD_SID)
+  })
+})

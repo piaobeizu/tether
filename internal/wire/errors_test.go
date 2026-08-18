@@ -100,6 +100,16 @@ func TestTerminalCodesExhaustive(t *testing.T) {
 // because the point is to catch an ACCIDENTAL flip of one entry (e.g. tether#63
 // M1: ErrCodeUnknownWorkspace flipped to false) — asserting against the map
 // that IS the classification would not catch the map itself being wrong.
+//
+// "every code" was NOT true until tether#101: ErrCodePromptUndelivered had been
+// declared since tether#77 and never listed here, so its bit was pinned by
+// nothing. The count check at the bottom is what makes the claim structural
+// instead of a promise — a new code entered in terminalCodes (which the AST test
+// above already forces) but forgotten here now fails, rather than quietly
+// shrinking this guard's coverage. It is deliberately a count and not a set
+// difference: the pairs above have to be written by hand for the assertion to
+// mean anything, and a set difference would tempt the next author to derive them
+// from the map, which is exactly what this test must not do.
 func TestErrorCodeDisposition(t *testing.T) {
 	cases := []struct {
 		code     ErrorCode
@@ -109,15 +119,24 @@ func TestErrorCodeDisposition(t *testing.T) {
 		{ErrCodeNoWorkspaceRegistry, true},
 		{ErrCodeUnknownProvider, true},
 		{ErrCodeSessionOwned, true},
+		// tether#101. Terminal, unlike ErrCodeSessionUnconfirmed two rows down,
+		// which it would otherwise be easy to read as the same situation: both mean
+		// "the resume did not produce a session". The difference is whether a
+		// reconnect can change the answer.
+		{ErrCodeSessionHeldByBackgroundAgent, true},
 		{ErrCodeSpawnFailed, false},
 		{ErrCodeConnectionClosed, false},
 		{ErrCodeSessionUnconfirmed, false},
 		{ErrCodeAgent, false},
+		{ErrCodePromptUndelivered, false},
 	}
 	for _, c := range cases {
 		if got := c.code.Terminal(); got != c.terminal {
 			t.Errorf("%s.Terminal() = %v, want %v", c.code, got, c.terminal)
 		}
+	}
+	if len(cases) != len(terminalCodes) {
+		t.Errorf("this table pins %d codes but terminalCodes classifies %d — every code must be pinned here by hand", len(cases), len(terminalCodes))
 	}
 }
 

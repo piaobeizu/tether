@@ -4,7 +4,9 @@ import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, fmtTok
 import { PermissionQueue, postDecide } from '../../fenced-blocks/PermissionBlock'
 import {
   ErrCodeUnknownWorkspace, ErrCodeNoWorkspaceRegistry, ErrCodeUnknownProvider, ErrCodeSessionOwned,
+  ErrCodeSessionHeldByBackgroundAgent,
   ErrCodeSpawnFailed, ErrCodeConnectionClosed, ErrCodeSessionUnconfirmed, ErrCodeAgent,
+  ErrCodePromptUndelivered,
 } from '../../lib/wire.gen'
 import type { ToolCall, PermissionRequest } from '../../lib/store'
 
@@ -664,14 +666,65 @@ describe('FATAL_CODE_MESSAGES (tether#63)', () => {
       ErrCodeNoWorkspaceRegistry,
       ErrCodeUnknownProvider,
       ErrCodeSessionOwned,
+      // tether#101
+      ErrCodeSessionHeldByBackgroundAgent,
     ]) {
       expect(FATAL_CODE_MESSAGES[code], `no sentence for ${code}`).toBeTruthy()
     }
   })
 
   it('has no entry for a retryable code — those never reach the card', () => {
-    for (const code of [ErrCodeSpawnFailed, ErrCodeConnectionClosed, ErrCodeSessionUnconfirmed, ErrCodeAgent]) {
+    for (const code of [
+      ErrCodeSpawnFailed, ErrCodeConnectionClosed, ErrCodeSessionUnconfirmed, ErrCodeAgent,
+      // Retryable since tether#77 and never listed here until tether#101 added the
+      // row; the map's own coverage test had the same gap the Go disposition table
+      // did.
+      ErrCodePromptUndelivered,
+    ]) {
       expect(FATAL_CODE_MESSAGES[code]).toBeUndefined()
     }
+  })
+
+  // tether#101 — this code's sentence carries a requirement the other four do not,
+  // and it is the whole reason the code exists rather than reusing one of them.
+  //
+  // The other terminal refusals are permanent: an unknown workspace stays unknown, a
+  // session held by another device is never released. This one is TEMPORARY — the
+  // background job finishes — so the sentence has to point the user forward. A card
+  // that read "this connection was refused and cannot be retried automatically"
+  // would be true about the ladder and useless about the conversation, which is the
+  // shape of unhelpfulness this wi exists to remove one layer down.
+  describe('the background-agent sentence', () => {
+    const text = FATAL_CODE_MESSAGES[ErrCodeSessionHeldByBackgroundAgent] ?? ''
+
+    it('says the conversation is in USE, not broken or gone', () => {
+      expect(text).toMatch(/background agent/i)
+      expect(text).toMatch(/using this conversation/i)
+      // None of the words that would send the user away for good. The session is
+      // fine; something else has it open.
+      expect(text).not.toMatch(/\b(lost|gone|deleted|corrupt|no longer exists)\b/i)
+    })
+
+    it('says it becomes resumable, which is what makes the Retry button mean something', () => {
+      // The card renders Retry underneath this sentence unconditionally. For the
+      // other four codes retrying is a formality; here it is the actual remedy once
+      // the job ends, and nothing else on screen says so.
+      expect(text).toMatch(/becomes resumable/i)
+      expect(text).toMatch(/when that finishes/i)
+    })
+
+    it('quotes the agent’s own two ways out', () => {
+      // `claude agents` to take the session over, --fork-session to branch a copy.
+      // Named because the agent writes them to its stderr, which reaches the
+      // daemon's log and never the user. Naming --fork-session is not offering it:
+      // tether deliberately forks on no path, because a fork mints a new id and
+      // diverges instead of resuming.
+      expect(text).toMatch(/claude agents/)
+      expect(text).toMatch(/--fork-session/)
+    })
+
+    it('does not tell the user tether will fork or take over for them', () => {
+      expect(text).not.toMatch(/tether will|we will|automatically (fork|take)/i)
+    })
   })
 })

@@ -197,6 +197,11 @@ func buildMux(cfg *Config, certs *certHolder, wts *webtransport.Server, reg *ses
 			// is the other consumer and it has to see the same directories, or a
 			// session can be listed here and unknown there (tether#92).
 			CC: reg.CC,
+			// Likewise the live-session registry (tether#101). Registry.ccLiveJob is the
+			// other consumer, and it is the AUTHORITATIVE one: this list only marks a
+			// row, while that decides whether a resume is refused. Two instances would
+			// let the list mark a row the attach path then resumes without complaint.
+			CCJobs: reg.CCJobs,
 		}
 		listSessions, sessionSub := sessionAPIHandlers(idx, cfg.WIBindings)
 		mux.HandleFunc("/api/v1/sessions", listSessions)

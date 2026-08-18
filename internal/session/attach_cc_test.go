@@ -16,10 +16,14 @@ package session
 
 import (
 	"context"
+	"errors"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/piaobeizu/tether/internal/agent"
+	"github.com/piaobeizu/tether/internal/wire"
 )
 
 // TestHadConversation — the predicate on its own, both stores, all four states.
@@ -152,5 +156,275 @@ func TestResolve_StillSilentForASessionNobodyRecorded(t *testing.T) {
 	}
 	if res.Notice {
 		t.Error("Notice = true for a session neither store has ever recorded")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// tether#101 — a resume cc REFUSED is not a resume that failed
+// ---------------------------------------------------------------------------
+//
+// The three shapes of registry record, seen from Attachment.resolve rather than
+// from the reader. CCRegistry's own tests pin the classification; these pin what
+// resolve DOES with it, which is the part the user feels:
+//
+//	live + bg          → a Refusal, and NOTHING is spawned
+//	dead + bg          → the pre-tether#101 fallback, unchanged
+//	live + interactive → the pre-tether#101 fallback, unchanged
+//
+// The two "unchanged" rows are not filler. A misclassification there does not
+// degrade the feature, it inverts it: every one of the 132 dead records on the
+// reference machine would become a permanent refusal, and every session tether
+// itself spawned would too, because tether's own cc registers as interactive.
+
+// ccRegDir builds a registry directory holding one record, and returns the
+// directory. Kept separate from ccRegFixture (ccregistry_test.go) because these
+// tests care about one record and about resolve's behaviour, not about the
+// reader's edges.
+func ccRegDir(t *testing.T, rec map[string]any) string {
+	t.Helper()
+	f := newCCRegFixture(t)
+	f.write(t, rec)
+	return f.dir
+}
+
+// TestResolve_ARefusedResumeIsReportedAndNothingIsSpawned is the payload of
+// tether#101.
+//
+// Before it, this exact situation produced `chat resume failed, starting a fresh
+// session` and a brand-new empty conversation — the user clicked a session and
+// landed in nothing, with the real one alive and working the whole time. The
+// assertion that matters most is therefore the SPAWN COUNT: a build that reports
+// the refusal and then falls back anyway has fixed the log line and none of the
+// damage.
+func TestResolve_ARefusedResumeIsReportedAndNothingIsSpawned(t *testing.T) {
+	requireLinux(t)
+	dead := newDeadSession()
+	// holdDeadStreamOpen, for the reason TestResolve_ReapsTheFailedResumeSubprocess
+	// gives: with the stream open, fanOut cannot reach its own teardown reap, so a
+	// Close() observed below came from the refusal branch and from nothing else.
+	// Without it the count is legitimately 2 (this branch plus the teardown, which
+	// is why agent.Session.Close is required to be idempotent) and the assertion
+	// would no longer be about this change.
+	dp := &deadThenLiveProvider{
+		dead:               dead,
+		live:               &fakeSession{sid: "fresh-sid", events: make(chan agent.Event, 8)},
+		holdDeadStreamOpen: true,
+	}
+	reg := NewRegistry(dp)
+	reg.History = NewHistoryStore(filepath.Join(t.TempDir(), "sessions"))
+	reg.CCJobs = NewCCRegistry(ccRegDir(t, bgRecord(os.Getpid(), "held-sid-000001", liveToken(t))))
+
+	att, err := reg.Attach(context.Background(), "held-sid-000001", "fake", "")
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	// The user's prompt reaches the refused cc and fails, exactly as it does live:
+	// cc wrote its refusal to stderr and exited without reading stdin.
+	_ = att.SendPrompt(context.Background(), "carry on where we left off")
+
+	res, err := att.Resolve(context.Background())
+	if err == nil {
+		t.Fatalf("Resolve returned no error; a refused resume must be reported, got %+v", res)
+	}
+	var ref *Refusal
+	if !errors.As(err, &ref) {
+		t.Fatalf("Resolve error is %T (%v), want a *Refusal — an unclassified error reaches the browser as retryable", err, err)
+	}
+	if ref.Code != wire.ErrCodeSessionHeldByBackgroundAgent {
+		t.Errorf("Refusal.Code = %q, want %q", ref.Code, wire.ErrCodeSessionHeldByBackgroundAgent)
+	}
+	if !ref.Code.Terminal() {
+		t.Error("the code is not Terminal; the browser's ladder would retry once a second against a refusal that cannot clear while the job runs")
+	}
+	// The whole point. One spawn is the resume attempt cc refused; a second would
+	// be the empty conversation this change exists to stop handing over.
+	if got := dp.Spawns(); got != 1 {
+		t.Errorf("spawns = %d, want 1 (the refused resume, and NO fallback) — a second spawn is the silent empty session", got)
+	}
+	if res != (Resolution{}) {
+		t.Errorf("Resolution = %+v, want the zero value; there is no session to report", res)
+	}
+	// The message has to name the holder, because "which job has my conversation"
+	// is the actionable half and cc's own error names it too.
+	for _, want := range []string{"held-sid-000001", "bg", "job-held-sid-000001"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Refusal message %q does not name %q", err.Error(), want)
+		}
+	}
+	// Cleanup still happens: the refused subprocess is reaped and un-registered,
+	// or the daemon accumulates a zombie per refusal and the dead sid keeps
+	// reading as live to the next reconnect.
+	<-dead.emitted
+	if got := dead.Closes(); got != 1 {
+		t.Errorf("refused session Close() calls = %d, want 1; without the reap the cc subprocess stays a zombie for the daemon's lifetime", got)
+	}
+	// The registration itself, not liveEntry: liveEntry answers false for a corpse
+	// whether or not anyone evicted it, so asserting through it would pass with the
+	// evict deleted. Reading the map is what makes this about the evict.
+	reg.mu.RLock()
+	_, stillRegistered := reg.sessions["held-sid-000001"]
+	reg.mu.RUnlock()
+	if stillRegistered {
+		t.Error("the refused resume is still registered under its sid; the corpse would be handed to the next reconnect")
+	}
+	// WaitSID must not hang: a prompt-recording goroutine parked in it would leak
+	// for the daemon's lifetime, and "" is the documented no-op for recording.
+	if sid := att.WaitSID(); sid != "" {
+		t.Errorf("WaitSID = %q, want \"\"", sid)
+	}
+}
+
+// TestResolve_ADeadRecordStillFallsBack — the residue case, and the majority of a
+// real registry: 132 of 138 records on the reference machine referred to pids
+// that had already exited, the oldest by days. cc lets those resumes through, so
+// tether must too, and a reader that did not check liveness would turn almost the
+// whole directory into permanent refusals.
+func TestResolve_ADeadRecordStillFallsBack(t *testing.T) {
+	requireLinux(t)
+	dp := &deadThenLiveProvider{
+		dead: newDeadSession(),
+		live: &fakeSession{sid: "fresh-sid", events: make(chan agent.Event, 8)},
+	}
+	reg := NewRegistry(dp)
+	reg.History = NewHistoryStore(filepath.Join(t.TempDir(), "sessions"))
+	reg.CCJobs = NewCCRegistry(ccRegDir(t, bgRecord(deadPid(t), "stale-sid-00001", "1")))
+
+	att, err := reg.Attach(context.Background(), "stale-sid-00001", "fake", "")
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	_ = att.SendPrompt(context.Background(), "hello again")
+
+	res, err := att.Resolve(context.Background())
+	if err != nil {
+		t.Fatalf("Resolve: %v — a stale registry record must not refuse a resume", err)
+	}
+	if res.SID != "fresh-sid" {
+		t.Errorf("Resolution.SID = %q, want \"fresh-sid\" (the fallback)", res.SID)
+	}
+	if !res.Recovered {
+		t.Error("Recovered = false; the fallback still has to tell the browser its sid moved")
+	}
+	if got := dp.Spawns(); got != 2 {
+		t.Errorf("spawns = %d, want 2 (the resume attempt, then the fallback)", got)
+	}
+}
+
+// TestResolve_ALiveInteractiveRecordStillFallsBack — the anti-mislabel case with
+// the sharpest consequence, and it is about TETHER'S OWN SESSIONS.
+//
+// tether spawns cc with --print --output-format stream-json --input-format
+// stream-json --verbose, and cc registers that as kind "interactive" (measured,
+// 2.1.233, 2026-08-18: 124 of 124 sdk-cli records were interactive). A build that
+// classified interactive records as holders would refuse to resume any session
+// tether had started and not yet torn down — i.e. it would break the daemon's
+// daily path in the name of fixing an edge of it.
+func TestResolve_ALiveInteractiveRecordStillFallsBack(t *testing.T) {
+	requireLinux(t)
+	dp := &deadThenLiveProvider{
+		dead: newDeadSession(),
+		live: &fakeSession{sid: "fresh-sid", events: make(chan agent.Event, 8)},
+	}
+	reg := NewRegistry(dp)
+	reg.History = NewHistoryStore(filepath.Join(t.TempDir(), "sessions"))
+	reg.CCJobs = NewCCRegistry(ccRegDir(t, interactiveRecord(os.Getpid(), "tether-own-000002", liveToken(t))))
+
+	att, err := reg.Attach(context.Background(), "tether-own-000002", "fake", "")
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	_ = att.SendPrompt(context.Background(), "still here?")
+
+	res, err := att.Resolve(context.Background())
+	if err != nil {
+		t.Fatalf("Resolve: %v — a live INTERACTIVE record must not refuse a resume; that is the shape tether's own cc registers as", err)
+	}
+	if res.SID != "fresh-sid" {
+		t.Errorf("Resolution.SID = %q, want \"fresh-sid\"", res.SID)
+	}
+	if got := dp.Spawns(); got != 2 {
+		t.Errorf("spawns = %d, want 2", got)
+	}
+}
+
+// TestResolve_NoRegistryReaderBehavesExactlyAsBefore — a daemon with no CCJobs
+// (or one whose registry directory does not exist) must take the pre-tether#101
+// path. This is the degradation the reader is designed for: it fails towards "not
+// held", so a daemon that cannot see cc's registry keeps working instead of
+// refusing everything.
+func TestResolve_NoRegistryReaderBehavesExactlyAsBefore(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func(t *testing.T) *CCRegistry
+	}{
+		{"nil reader", func(*testing.T) *CCRegistry { return nil }},
+		{"missing directory", func(t *testing.T) *CCRegistry {
+			return NewCCRegistry(filepath.Join(t.TempDir(), "gone", "sessions"))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dp := &deadThenLiveProvider{
+				dead: newDeadSession(),
+				live: &fakeSession{sid: "fresh-sid", events: make(chan agent.Event, 8)},
+			}
+			reg := NewRegistry(dp)
+			reg.History = NewHistoryStore(filepath.Join(t.TempDir(), "sessions"))
+			reg.CCJobs = tc.build(t)
+
+			att, err := reg.Attach(context.Background(), "any-old-sid-01", "fake", "")
+			if err != nil {
+				t.Fatalf("Attach: %v", err)
+			}
+			_ = att.SendPrompt(context.Background(), "hello")
+			res, err := att.Resolve(context.Background())
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+			if res.SID != "fresh-sid" || !res.Recovered {
+				t.Errorf("Resolution = %+v, want the fallback (SID \"fresh-sid\", Recovered true)", res)
+			}
+			if got := dp.Spawns(); got != 2 {
+				t.Errorf("spawns = %d, want 2", got)
+			}
+		})
+	}
+}
+
+// TestResolve_ARefusalDoesNotRetireTheSidsObservers pins a decision that is
+// invisible until it is wrong.
+//
+// The fallback path retires the read-only observers of the old sid, because a
+// fresh sid replaces it and nothing will ever be registered under the old one by
+// that attachment. A REFUSAL is the opposite situation: the sid is not replaced,
+// it is left alone because something else is using it, and a later attach may
+// resume it once the job finishes. Retiring observers there would tell them the
+// session is finished, which is the one thing this branch knows to be false.
+func TestResolve_ARefusalDoesNotRetireTheSidsObservers(t *testing.T) {
+	requireLinux(t)
+	dp := &deadThenLiveProvider{
+		dead: newDeadSession(),
+		live: &fakeSession{sid: "fresh-sid", events: make(chan agent.Event, 8)},
+	}
+	reg := NewRegistry(dp)
+	reg.History = NewHistoryStore(filepath.Join(t.TempDir(), "sessions"))
+	reg.CCJobs = NewCCRegistry(ccRegDir(t, bgRecord(os.Getpid(), "held-sid-000002", liveToken(t))))
+
+	obs := make(chan wire.Envelope, 4)
+	retired := reg.SubscribeObserver("held-sid-000002", obs)
+	defer reg.UnsubscribeObserver("held-sid-000002", obs)
+
+	att, err := reg.Attach(context.Background(), "held-sid-000002", "fake", "")
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	_ = att.SendPrompt(context.Background(), "hello")
+	if _, err := att.Resolve(context.Background()); err == nil {
+		t.Fatal("Resolve returned no error for a held sid")
+	}
+
+	select {
+	case <-retired:
+		t.Error("the sid's observers were retired by a REFUSAL; nothing has replaced that sid, and a later attach may still resume it")
+	default:
 	}
 }

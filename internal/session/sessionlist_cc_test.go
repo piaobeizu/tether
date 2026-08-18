@@ -7,8 +7,10 @@ package session
 // merge is exercised through the same fixtures each side is tested with alone.
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -193,5 +195,189 @@ func TestListWorksWithNoTetherHistoryAtAll(t *testing.T) {
 	rows := (&SessionIndex{History: NewHistoryStore(missing), CC: f.store()}).List()
 	if len(rows) != 1 || rows[0].Sid != "cc-session-0001" || rows[0].Title != "typed in a terminal" {
 		t.Fatalf("List() = %+v, want the cc session", rows)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// tether#101 — RunningAs on the rows
+// ---------------------------------------------------------------------------
+//
+// B is a HINT, not the authority. These tests pin what the list says; what
+// happens on the click is Attachment.resolve's, and attach_cc_test.go pins that.
+// The two must not be confused, which is why the field is named for an
+// observation ("running as") rather than for a promise.
+
+// TestListMarksASessionALiveBackgroundAgentIsHolding — the feature.
+//
+// The fixture deliberately holds only ONE of two rows, because "every row gets
+// the badge" and "the right row gets the badge" are different assertions and only
+// the second one is worth anything.
+func TestListMarksASessionALiveBackgroundAgentIsHolding(t *testing.T) {
+	requireLinux(t)
+	dir := t.TempDir()
+	base := time.Now().Add(-time.Hour)
+	writeTranscript(t, dir, "held-row-0000001", base.Add(20*time.Minute), userLine("the one a job is using"))
+	writeTranscript(t, dir, "free-row-0000001", base.Add(10*time.Minute), userLine("the one nothing is using"))
+
+	reg := newCCRegFixture(t)
+	reg.write(t, bgRecord(os.Getpid(), "held-row-0000001", liveToken(t)))
+
+	idx := &SessionIndex{History: NewHistoryStore(dir), CCJobs: reg.reg()}
+	rows := idx.List()
+	if len(rows) != 2 {
+		t.Fatalf("rows = %d, want 2", len(rows))
+	}
+	byID := map[string]SessionSummary{}
+	for _, r := range rows {
+		byID[r.Sid] = r
+	}
+	if got := byID["held-row-0000001"].RunningAs; got != "bg" {
+		t.Errorf("held row RunningAs = %q, want \"bg\" — cc's own kind value, quoted rather than derived", got)
+	}
+	if got := byID["free-row-0000001"].RunningAs; got != "" {
+		t.Errorf("free row RunningAs = %q, want \"\"; an unheld row must assert nothing", got)
+	}
+	// Still listed, still ordinary in every other way: the row is a hint, and the
+	// UI is required not to disable it (see SessionSummary.RunningAs).
+	if byID["held-row-0000001"].Title != "the one a job is using" {
+		t.Errorf("held row Title = %q; marking a row must not change anything else about it", byID["held-row-0000001"].Title)
+	}
+}
+
+// TestListMarksARowFromEitherStore — the badge is a fact about the SESSION, not
+// about which store its transcript came from, so it has to be attached over every
+// row.
+//
+// A cc-source row is the common case (those are the sessions a terminal `claude -p`
+// job created). A tether-source row can be held too: nothing stops a background job
+// resuming a sid tether once recorded. Marking only the cc rows would be right for
+// most of the list and quietly wrong for the rest — the same mistake tether#92 made
+// with work items, where the binding loop lived inside the tether pass.
+func TestListMarksARowFromEitherStore(t *testing.T) {
+	requireLinux(t)
+	dir := t.TempDir()
+	writeTranscript(t, dir, "tether-held-0001", time.Now().Add(-time.Hour), userLine("recorded by tether"))
+
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-held-00000001.jsonl", ccUser(t, "recorded by cc"))
+
+	reg := newCCRegFixture(t)
+	reg.write(t, bgRecord(os.Getpid(), "tether-held-0001", liveToken(t)))
+	// Only the TETHER row is held, deliberately. A record is named after its pid, so
+	// two live holders would need two live pids, and inventing a second live process
+	// would buy nothing: the direction that could be wrong is "the loop skipped the
+	// tether pass's rows", and one held tether row next to one unheld cc row is
+	// exactly the fixture that catches it.
+	idx := &SessionIndex{History: NewHistoryStore(dir), CC: f.store(), CCJobs: reg.reg()}
+	rows := idx.List()
+	var tetherRow, ccRow SessionSummary
+	for _, r := range rows {
+		switch r.Sid {
+		case "tether-held-0001":
+			tetherRow = r
+		case "cc-held-00000001":
+			ccRow = r
+		}
+	}
+	if tetherRow.Source != SourceTether || ccRow.Source != SourceCC {
+		t.Fatalf("fixture did not produce one row per store: tether %+v, cc %+v", tetherRow, ccRow)
+	}
+	if tetherRow.RunningAs != "bg" {
+		t.Errorf("a TETHER-source row held by a background agent has RunningAs %q, want \"bg\"; the badge is a fact about the session, not about the store", tetherRow.RunningAs)
+	}
+	if ccRow.RunningAs != "" {
+		t.Errorf("cc row RunningAs = %q, want \"\" — nothing in the registry holds it", ccRow.RunningAs)
+	}
+}
+
+// TestListLeavesRowsUnmarkedWithoutARegistryReader — a daemon assembled without
+// CCJobs (every daemon before tether#101) serves the same list it always did. The
+// absent value is the fail-open direction: no badge asserts nothing, so a daemon
+// that cannot see cc's registry cannot mislead anyone.
+func TestListLeavesRowsUnmarkedWithoutARegistryReader(t *testing.T) {
+	dir := t.TempDir()
+	writeTranscript(t, dir, "plain-row-000001", time.Now().Add(-time.Hour), userLine("nothing special"))
+
+	for _, tc := range []struct {
+		name string
+		idx  *SessionIndex
+	}{
+		{"nil CCJobs", &SessionIndex{History: NewHistoryStore(dir)}},
+		{"missing registry dir", &SessionIndex{
+			History: NewHistoryStore(dir),
+			CCJobs:  NewCCRegistry(filepath.Join(t.TempDir(), "gone", "sessions")),
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := tc.idx.List()
+			if len(rows) != 1 {
+				t.Fatalf("rows = %d, want 1", len(rows))
+			}
+			if rows[0].RunningAs != "" {
+				t.Errorf("RunningAs = %q, want \"\"", rows[0].RunningAs)
+			}
+		})
+	}
+}
+
+// TestListDoesNotMarkARowForADeadOrInteractiveRecord — the anti-mislabel pair, at
+// the LIST level rather than the reader level.
+//
+// Asserted here as well as in ccregistry_test.go because the two failures are
+// different sizes. In the reader it is a wrong map entry; in the list it is a
+// badge on ~all of a real profile's rows (132 of 138 records on the reference
+// machine had dead pids) and on every session tether itself spawned (those
+// register interactive) — i.e. a list that warns about everything, which is the
+// same as a list that says nothing.
+func TestListDoesNotMarkARowForADeadOrInteractiveRecord(t *testing.T) {
+	requireLinux(t)
+	for _, tc := range []struct {
+		name string
+		rec  func(t *testing.T, sid string) map[string]any
+	}{
+		{"dead pid, kind bg", func(t *testing.T, sid string) map[string]any {
+			return bgRecord(deadPid(t), sid, "1")
+		}},
+		{"live pid, kind interactive", func(t *testing.T, sid string) map[string]any {
+			return interactiveRecord(os.Getpid(), sid, liveToken(t))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeTranscript(t, dir, "row-unmarked-001", time.Now().Add(-time.Hour), userLine("hello"))
+			reg := newCCRegFixture(t)
+			reg.write(t, tc.rec(t, "row-unmarked-001"))
+
+			rows := (&SessionIndex{History: NewHistoryStore(dir), CCJobs: reg.reg()}).List()
+			if len(rows) != 1 {
+				t.Fatalf("rows = %d, want 1", len(rows))
+			}
+			if rows[0].RunningAs != "" {
+				t.Errorf("RunningAs = %q, want \"\"", rows[0].RunningAs)
+			}
+		})
+	}
+}
+
+// TestSessionSummaryRunningAsIsOmittedWhenEmpty pins the wire shape, because the
+// field's doc comment argues for omitempty on the strength of it and a doc comment
+// is not a struct tag.
+//
+// Both directions: absent when there is nothing to say (which is most rows), and
+// present under exactly the key the hand-written TypeScript mirror reads.
+func TestSessionSummaryRunningAsIsOmittedWhenEmpty(t *testing.T) {
+	plain, err := json.Marshal(SessionSummary{Sid: "s", Source: SourceTether})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(plain), "runningAs") {
+		t.Errorf("an unheld row serialised %s; the empty value is the common case and carries no information", plain)
+	}
+	held, err := json.Marshal(SessionSummary{Sid: "s", Source: SourceTether, RunningAs: "bg"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(held), `"runningAs":"bg"`) {
+		t.Errorf("a held row serialised %s, want a `\"runningAs\":\"bg\"` member", held)
 	}
 }

@@ -6,9 +6,12 @@
 // moving it created.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  RUNNING_ELSEWHERE_BADGE,
   WI_BOUND_EVENT,
   bindWorkItem,
   fetchSessions,
+  isExternalSession,
+  isRunningElsewhere,
   migrateLegacyWiSessions,
   putWiBinding,
   resetArmedBinding,
@@ -389,5 +392,61 @@ describe('list helpers', () => {
     // An empty work item matches nothing — never the unbound sessions, which is
     // what a naive `s.workItem === wi` on an empty argument would do.
     expect(sessionsForWorkItem(rows, '')).toEqual([])
+  })
+})
+
+// tether#101 — isRunningElsewhere, and why its polarity is the OPPOSITE of
+// isExternalSession's.
+//
+// The two predicates sit next to each other and read alike, which is exactly why
+// the difference is worth pinning: an UNKNOWN source must count as external
+// (silence would be the dangerous answer — a row from a third store would render as
+// fully trusted), while an unknown runningAs value must count as HELD (the daemon
+// has already excluded the one kind that is not a holder, so a value it sends is
+// informative and only its absence says nothing).
+describe('isRunningElsewhere', () => {
+  const s = (over: Partial<SessionSummary> = {}): SessionSummary =>
+    ({ sid: 'sid-000000000001', updatedAt: 1, ...over })
+
+  it('is true for any non-empty kind, including one this build predates', () => {
+    for (const kind of ['bg', 'daemon', 'daemon-worker', 'swarm-worker']) {
+      expect(isRunningElsewhere(s({ runningAs: kind }))).toBe(true)
+    }
+  })
+
+  it('is false for absent and for an explicit empty string', () => {
+    // Absent = this fixture has no opinion (most of the rows in this repo's tests).
+    // Empty = the daemon looked and saw nothing, or has no registry reader at all.
+    // Both mean "no observation", and neither may be read as "resumable".
+    expect(isRunningElsewhere(s())).toBe(false)
+    expect(isRunningElsewhere(s({ runningAs: '' }))).toBe(false)
+  })
+
+  it('is independent of the source — the two facts do not imply each other', () => {
+    // A tether-recorded session can be held (a background job may resume a sid
+    // tether once recorded), and a cc-recorded one need not be.
+    expect(isRunningElsewhere(s({ source: 'tether', runningAs: 'bg' }))).toBe(true)
+    expect(isRunningElsewhere(s({ source: 'cc' }))).toBe(false)
+    expect(isExternalSession(s({ source: 'tether', runningAs: 'bg' }))).toBe(false)
+  })
+
+  it('reads the OPPOSITE way from isExternalSession on an unknown value', () => {
+    const oddSource = { ...s(), source: 'someday' } as unknown as SessionSummary
+    expect(isExternalSession(oddSource)).toBe(true) // unknown ⇒ warn
+    expect(isRunningElsewhere(s({ runningAs: 'someday' }))).toBe(true) // value ⇒ inform
+    // …and the asymmetry is only in the ABSENT case, which is what makes it safe:
+    // an absent source warns nothing and an absent runningAs asserts nothing.
+    expect(isExternalSession(s())).toBe(false)
+    expect(isRunningElsewhere(s())).toBe(false)
+  })
+
+  it('the badge word is `running`, and it is not the agent’s status vocabulary', () => {
+    // The agent records a job's status as busy / idle / shell / waiting. An IDLE
+    // held session refuses a resume exactly like a busy one, so a badge that said
+    // `busy` would be wrong for half of them while looking like a quotation.
+    expect(RUNNING_ELSEWHERE_BADGE).toBe('running')
+    for (const status of ['busy', 'idle', 'shell', 'waiting']) {
+      expect(RUNNING_ELSEWHERE_BADGE).not.toBe(status)
+    }
   })
 })

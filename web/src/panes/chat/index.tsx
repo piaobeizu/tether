@@ -195,11 +195,15 @@ export function transcriptTextLength(messages: { text: string }[]): number {
 }
 
 // tether#63 — code→sentence map for the failed-connection card. Only the
-// four codes wire.ErrorCode currently classifies Terminal=true (errors.go's
+// codes wire.ErrorCode classifies Terminal=true (errors.go's
 // terminalCodes) need an entry; any other code (including one this frontend
 // build predates — see wire.ErrorCode.Terminal's "unclassified defaults
 // false" doc comment, which is about retryability, not this map) falls back
 // to FATAL_GENERIC_MESSAGE below rather than rendering `undefined`.
+//
+// ("the four codes" until tether#101 added a fifth. The count is not load-bearing
+// — the map is looked up, not iterated — but a stale number in a comment is how
+// the next reader concludes the list is complete when it is not.)
 export const FATAL_CODE_MESSAGES: Record<string, string> = {
   unknown_workspace: 'This workspace no longer exists on the daemon.',
   no_workspace_registry: "The daemon's workspace registry failed to load.",
@@ -209,6 +213,26 @@ export const FATAL_CODE_MESSAGES: Record<string, string> = {
   // them all. Reaching this means a different DEVICE holds the session — see
   // wire.ErrCodeSessionOwned's doc comment.
   session_owned_by_other: 'This session is open on another device.',
+  // tether#101 — the ONE terminal code that describes a temporary state, so its
+  // sentence is the only one here that has to point forward instead of closing the
+  // door. Three things it must say, and each is checkable:
+  //
+  //  - it is being USED, not broken. The daemon reached this by asking the agent's
+  //    own live-session registry after the agent refused the resume.
+  //  - it will become resumable. The holder is a background job; jobs finish. The
+  //    Retry button below this card is how the user acts on that, and this is the
+  //    only place that tells them retrying later is worth anything.
+  //  - the two ways out are the AGENT's own advice, quoted rather than invented:
+  //    `claude agents` to take the session over, or --fork-session to branch a copy.
+  //    Naming --fork-session is not offering it — tether deliberately does not fork
+  //    on any path, because a fork mints a new id and diverges rather than resuming
+  //    (see the wi's rejected option C). It is here because the user may well want
+  //    it and would otherwise have to be told by the agent's stderr, which goes to
+  //    the daemon's log and not to them.
+  session_held_by_background_agent:
+    'A background agent is using this conversation right now. It becomes resumable when that '
+    + 'finishes — or run `claude agents` in a terminal to take it over, or `--fork-session` to '
+    + 'work on a copy.',
 }
 const FATAL_GENERIC_MESSAGE = 'This connection was refused and cannot be retried automatically.'
 

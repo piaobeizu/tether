@@ -4,7 +4,10 @@ import { relTime } from './timefmt'
 import {
   EXTERNAL_SESSION_BADGE,
   EXTERNAL_SESSION_PROVENANCE,
+  RUNNING_ELSEWHERE_BADGE,
   isExternalSession,
+  isRunningElsewhere,
+  runningElsewhereProvenance,
   sessionLabel,
   type SessionSummary,
 } from './wiSession'
@@ -49,6 +52,10 @@ export function SessionRow({
   const isCurrent = session.sid === currentSid
   // tether#92 — a conversation the coding agent recorded and tether never saw.
   const isExternal = isExternalSession(session)
+  // tether#101 — a background agent was using this conversation when the daemon
+  // built this list. A HINT: the row stays clickable (see below), and the
+  // authoritative answer arrives from the attach path if it is still true.
+  const isRunning = isRunningElsewhere(session)
 
   const onClick = () => {
     // Chat is a tab in the right column, and this row may be rendered from the
@@ -88,6 +95,11 @@ export function SessionRow({
           a sentence and lives in the chat pane's banner, where it survives a
           reload. */}
       {isExternal && <span className="session-row-src mono">{EXTERNAL_SESSION_BADGE}</span>}
+      {/* tether#101. NOT a disabled row and NOT a replacement for the click: the
+          state is temporary (the job finishes) and an unexplained disabled row is
+          worse than a click that explains itself. onClick above is untouched,
+          which TestSessionRow's "still opens" case pins. */}
+      {isRunning && <span className="session-row-running mono">{RUNNING_ELSEWHERE_BADGE}</span>}
       <span className="session-row-when mono">{sessionWhen(session.updatedAt)}</span>
     </div>
   )
@@ -105,6 +117,7 @@ function rowTitle(session: SessionSummary): string {
   const lines = [session.sid]
   if (session.title) lines.push(session.title)
   if (isExternalSession(session)) lines.push(EXTERNAL_SESSION_PROVENANCE)
+  if (isRunningElsewhere(session)) lines.push(runningElsewhereProvenance(session))
   return lines.join('\n')
 }
 

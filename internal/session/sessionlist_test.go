@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -297,5 +298,157 @@ func TestSessionIndex_NoHistoryStoreIsAnEmptyList(t *testing.T) {
 	var nilIdx *SessionIndex
 	if rows := nilIdx.List(); rows != nil {
 		t.Errorf("nil index List() = %+v, want nil", rows)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// tether#101 — the Go → TypeScript hop nothing else checks
+// ---------------------------------------------------------------------------
+
+// wiSessionTSPath is the hand-written TypeScript mirror of SessionSummary.
+const wiSessionTSPath = "../../web/src/lib/wiSession.ts"
+
+// TestSessionSummaryIsMirroredInTypeScript is a codegen gate for a type the
+// codegen does not cover.
+//
+// # The gap
+//
+// tygo.yaml generates web/src/lib/wire.gen.ts from internal/wire and NOTHING
+// else. SessionSummary lives in this package, so its TypeScript counterpart —
+// `export interface SessionSummary` in wiSession.ts — is written BY HAND, and
+// wiSession.ts says so. That means adding a field here and forgetting to mirror it
+// there produces no error in either language: the Go side serialises a key, the
+// frontend's type simply has no property for it, every test on both sides passes,
+// and the feature is a no-op that looks finished. Eight frontend files consume
+// this type; none of them would complain.
+//
+// tether#101 is the field that made it worth closing (RunningAs — a badge nobody
+// would have seen), but the guard is deliberately about the WHOLE type rather
+// than about that one field, so the next field is covered without anyone
+// remembering this test exists.
+//
+// # Why this shape of check
+//
+// It reads the struct's json tags by reflection and the interface's body out of
+// the .ts file, and requires every tag to appear as a property name there. The
+// technique is not new here: internal/wire/errors_test.go parses its own package's
+// source with go/ast to keep terminalCodes exhaustive, for the same reason — a
+// cross-boundary invariant that no compiler enforces has to be enforced by a test
+// that reads both sides.
+//
+// It is NOT a type-checker. It does not verify that `updatedAt` is a number on
+// both sides, and it deliberately does not try: the property names are the part
+// that fails silently, while a wrong TYPE fails loudly at the first use in tsc.
+func TestSessionSummaryIsMirroredInTypeScript(t *testing.T) {
+	src, err := os.ReadFile(wiSessionTSPath)
+	if err != nil {
+		t.Fatalf("read the hand-written mirror at %s: %v", wiSessionTSPath, err)
+	}
+	body, ok := tsInterfaceBody(string(src), "SessionSummary")
+	if !ok {
+		t.Fatalf("could not find `export interface SessionSummary {` in %s; if the mirror was renamed or generated, this guard needs to follow it", wiSessionTSPath)
+	}
+
+	tags := jsonTagNames(t, SessionSummary{})
+	if len(tags) == 0 {
+		t.Fatal("found zero json tags on SessionSummary — the reflection half of this guard is broken, so it would pass against anything")
+	}
+	for _, name := range tags {
+		// Anchored on the property position (start of a line, then the name, then
+		// `?:` or `:`) rather than a bare substring, so a mention inside a doc
+		// comment cannot satisfy the guard.
+		if !tsHasProperty(body, name) {
+			t.Errorf("SessionSummary sends %q but %s's interface has no such property; the daemon would emit a field the SPA cannot read, and nothing else in either language fails", name, wiSessionTSPath)
+		}
+	}
+}
+
+// tsInterfaceBody returns the text between the braces of `export interface <name> {`.
+func tsInterfaceBody(src, name string) (string, bool) {
+	head := "export interface " + name + " {"
+	i := strings.Index(src, head)
+	if i < 0 {
+		return "", false
+	}
+	rest := src[i+len(head):]
+	depth := 1
+	for j := 0; j < len(rest); j++ {
+		switch rest[j] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return rest[:j], true
+			}
+		}
+	}
+	return "", false
+}
+
+// tsHasProperty reports whether body declares a property called name.
+func tsHasProperty(body, name string) bool {
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		for _, sep := range []string{"?:", ":"} {
+			if strings.HasPrefix(trimmed, name+sep) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// jsonTagNames lists the wire names a struct's exported fields serialise under,
+// skipping `json:"-"`.
+func jsonTagNames(t *testing.T, v any) []string {
+	t.Helper()
+	rt := reflect.TypeOf(v)
+	var out []string
+	for i := 0; i < rt.NumField(); i++ {
+		tag := rt.Field(i).Tag.Get("json")
+		if tag == "" || tag == "-" {
+			continue
+		}
+		name := strings.Split(tag, ",")[0]
+		if name == "" {
+			continue
+		}
+		out = append(out, name)
+	}
+	return out
+}
+
+// TestSessionSummaryMirrorGuardFindsAMissingProperty is the guard on the guard.
+//
+// A test that reads a file and asserts something about it can pass because its
+// parsing found nothing to check, and then it is worse than no test: it reports
+// green while the hop it was written for is broken. So the two halves that could
+// fail open — locating the interface, and matching a property — are exercised
+// against inputs where the answer is known.
+func TestSessionSummaryMirrorGuardFindsAMissingProperty(t *testing.T) {
+	const sample = `
+/** Absent from the interface but mentioned here: runningAs. */
+export interface SessionSummary {
+  sid: string
+  updatedAt: number
+  source?: SessionSource
+}
+`
+	body, ok := tsInterfaceBody(sample, "SessionSummary")
+	if !ok {
+		t.Fatal("tsInterfaceBody failed on a well-formed sample")
+	}
+	if !tsHasProperty(body, "sid") || !tsHasProperty(body, "source") {
+		t.Error("tsHasProperty missed a property that is declared")
+	}
+	// The mutation the real test exists to catch: a field the Go side sends and the
+	// interface does not declare — mentioned in a comment, which is exactly how a
+	// substring check would be fooled.
+	if tsHasProperty(body, "runningAs") {
+		t.Error("tsHasProperty accepted a name that appears only in a doc comment; the real guard would pass with the mirror missing")
+	}
+	if _, ok := tsInterfaceBody(sample, "NoSuchInterface"); ok {
+		t.Error("tsInterfaceBody claimed to find an interface that is not there")
 	}
 }

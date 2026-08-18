@@ -677,14 +677,19 @@ func (a *Attachment) reopen(ctx context.Context, dead *Entry, text string, sendE
 	a.mu.Unlock()
 
 	if sid == "" {
-		// Never armed, so there is no transcript this attachment may claim. Both
-		// shapes that reach here are owned by machinery that a reopen would fight:
+		// Never armed, so there is no transcript this attachment may claim. Every
+		// shape that reaches here is owned by machinery that a reopen would fight:
 		// a `--resume` still in flight or already failed, where Resolve falls back
-		// and replays this very prompt from a.pending; and a fresh spawn that has
+		// and replays this very prompt from a.pending; a fresh spawn that has
 		// not emitted system/init, where Resolve reports ErrCodeSessionUnconfirmed
-		// and the browser reconnects onto the resume path. Returning sendErr
+		// and the browser reconnects onto the resume path; and since tether#101 a
+		// resume cc REFUSED because a live background agent holds the sid, where
+		// Resolve reports ErrCodeSessionHeldByBackgroundAgent and deliberately
+		// spawns nothing — so there is no replacement for a reopen to find, and
+		// re-opening the sid would be this daemon starting the very
+		// `cc --resume` cc has just declined. Returning sendErr
 		// unchanged is what hands those back to the machinery that owns them, and
-		// is the reason the two recovery paths cannot collide.
+		// is the reason the recovery paths cannot collide.
 		//
 		// "Never armed" is not the same as "still resolving": an attachment whose
 		// Resolve FAILED stays here permanently (settled, with an empty sid). That
@@ -996,8 +1001,15 @@ func (a *Attachment) reopen(ctx context.Context, dead *Entry, text string, sendE
 //
 // Not applied to the two branches that return sendErr bare, which are not
 // giving up: `sid == ""` hands the prompt back to Resolve (which replays it, or
-// reports ErrCodeSessionUnconfirmed itself), and a cancelled ctx means the
+// reports ErrCodeSessionUnconfirmed or — since tether#101 —
+// ErrCodeSessionHeldByBackgroundAgent itself), and a cancelled ctx means the
 // client is already gone and there is nobody to tell.
+//
+// "Not giving up" is about who ANSWERS, not about whether the prompt survives:
+// on the tether#101 path Resolve reports a refusal and this prompt is gone with
+// it. That is still the right branch for it, because the report the browser gets
+// is Resolve's — classifying here would send a second error frame about the same
+// event, and a less accurate one.
 func undelivered(err error, format string, a ...any) error {
 	if err == nil {
 		return nil
@@ -1051,8 +1063,14 @@ func (a *Attachment) WaitSID() string {
 }
 
 // Resolve waits for the session to confirm itself and, if a resume attempt
-// failed, falls back to a fresh session and replays the buffered prompts.
-// Idempotent: repeat calls return the first outcome without re-resolving.
+// failed, EITHER falls back to a fresh session and replays the buffered prompts,
+// or — when cc refused the resume because a live background agent holds the sid —
+// reports that and starts nothing (tether#101). Idempotent: repeat calls return
+// the first outcome without re-resolving.
+//
+// "Either/or" and not "falls back", which is what this sentence said until
+// tether#101 and which was the whole defect: one recovery for every cause meant a
+// refusal was answered with a brand-new empty conversation. See resolve.
 //
 // Confirming is also what ARMS reopen for every attachment that did not come
 // through Attach's reuse branch (tether#76). A confirmed sid is a sid with a
@@ -1160,6 +1178,65 @@ func (a *Attachment) resolve(ctx context.Context) (Resolution, error) {
 	// old gate was false BY CONSTRUCTION, so the sessions most likely to reach this
 	// line were the ones guaranteed to reach it silently.
 	notice := a.reg.hadConversation(a.reqSID)
+
+	// WHY did it fail? Until tether#101 there was one answer for every cause, and
+	// one of the causes is not a failure at all but a REFUSAL: cc declines a uuid
+	// `--resume` outright while a live non-interactive cc process holds that sid,
+	// writing its reason to stderr and exiting 1 before system/init — so it arrives
+	// here as SessionID() == "", indistinguishable from a missing transcript. The
+	// fresh session that followed was the real damage: not a wasted process, but a
+	// user handed an empty conversation with no explanation, while the one they
+	// asked for was alive and working two directories away.
+	//
+	// # Asked HERE, after the attempt, and never before the spawn
+	//
+	// cc's verdict is the ground truth. Gating the spawn on tether's own reading of
+	// the registry would (a) duplicate a rule that belongs to cc and drifts with
+	// its versions, and (b) be a check-then-spawn race: a background job that exits
+	// between the check and the spawn would have its resume refused by tether for a
+	// reason that had stopped being true. Letting cc decide and then explaining its
+	// answer has neither problem, and costs one directory scan on a path that only
+	// runs when a resume has already failed.
+	//
+	// The registry is only ASKED here; it is never trusted to say a resume WOULD
+	// have worked. A reader that cannot see /proc, a daemon with no CCJobs, a
+	// record cc has not written yet — all of them answer "not held" and leave the
+	// fallback below exactly as it was. So this can suppress the fallback for a
+	// reason it observed, and never for want of one.
+	if job, held := a.reg.ccLiveJob(a.reqSID); held {
+		// Evict and reap BEFORE returning, on this branch as on the fallback below:
+		// the corpse is a `cc --resume` that has already exited (SessionID() returned
+		// "" only because ccSession's `done` closed, and `done` is closed by readLoop's
+		// own defer), so Close() is safe here for the same reason it is safe there, and
+		// un-registering is what stops the dead sid reading as live to the next
+		// reconnect. Nothing else is cleaned up because nothing else was created.
+		a.reg.evict(e)
+		if err := e.Session().Close(); err != nil {
+			slog.Debug("reaped the refused-resume subprocess", "requested_sid", a.reqSID, "err", err)
+		}
+		// Its own log line, not the one below. The line below is an operator's only
+		// answer to "how often do resumes fail", and tether#92 already widened the
+		// population reaching it; folding a REFUSAL into the same sentence would make
+		// that number mean two different things at once. This one names the holder,
+		// because "which job has my conversation" is the actionable half.
+		slog.Info("chat resume refused: a live background agent holds this session",
+			"requested_sid", a.reqSID, "kind", job.Kind, "job_id", job.JobID, "had_history", notice)
+		// NOT retireObservers. The fallback below calls it because a fresh sid
+		// replaces the old one, so nothing will ever be registered under a.reqSID
+		// again by this attachment and an observer waiting on it would wait forever.
+		// Here the sid is not replaced, it is LEFT ALONE — the holder is using it and
+		// a later attach may well resume it once that finishes — so telling observers
+		// it is finished is the one thing this branch knows to be false.
+		//
+		// The message carries cc's own vocabulary (its kind, its jobId) so that what
+		// the browser shows and what `claude agents` shows are the same words. The
+		// user-facing sentence lives with the code, in web/src/panes/chat/index.tsx's
+		// FATAL_CODE_MESSAGES; this text is the detail underneath it.
+		return Resolution{}, refuse(wire.ErrCodeSessionHeldByBackgroundAgent,
+			"session %s is being used by a live background agent (kind %s, job %s); resuming it would take it away from that job",
+			a.reqSID, job.Kind, job.JobID)
+	}
+
 	slog.Info("chat resume failed, starting a fresh session",
 		"requested_sid", a.reqSID, "had_history", notice)
 

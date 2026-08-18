@@ -9,7 +9,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { SessionRow, sessionWhen } from './SessionRow'
 import { useStore } from './store'
-import { EXTERNAL_SESSION_PROMISE, isExternalSession, type SessionSummary } from './wiSession'
+import {
+  EXTERNAL_SESSION_PROMISE,
+  isExternalSession,
+  isRunningElsewhere,
+  runningElsewhereProvenance,
+  type SessionSummary,
+} from './wiSession'
 
 const HOUR_AGO = Date.now() - 3_600_000
 
@@ -233,5 +239,91 @@ describe('sessionWhen', () => {
   // Formatted naively that is "Jan 1, 1970", which reads as information.
   it('is empty for the daemon zero, not a 1970 date', () => {
     expect(sessionWhen(0)).toBe('')
+  })
+})
+
+// tether#101 — the row marks a session a background agent is using, and STAYS
+// CLICKABLE.
+//
+// The badge is a HINT: the state is temporary, so the list's answer can be stale by
+// the time the user clicks, and the authoritative answer comes from the attach path
+// (wire code session_held_by_background_agent). These tests pin the two halves that
+// could each be got wrong on its own — that the marker appears for the right rows,
+// and that adding it did not quietly turn the row into a dead end.
+describe('SessionRow marks a session a background agent is using', () => {
+  const heldRow = (over: Partial<SessionSummary> = {}) =>
+    row({ sid: 'sid-held-00000001', title: 'a job is using this', runningAs: 'bg', ...over })
+
+  it('shows the marker, and the marker says `running`', () => {
+    const { container } = render(<SessionRow session={heldRow()} />)
+    const marker = container.querySelector('.session-row-running')
+    expect(marker?.textContent).toBe('running')
+    // NOT "busy": the agent uses `busy` for a job's status mid-turn, and an IDLE
+    // held session refuses a resume in exactly the same way — so borrowing that word
+    // would make the badge disagree with the thing it quotes. NOT "locked" either:
+    // nothing is locked, and the row below is still clickable.
+    expect(marker?.textContent).not.toBe('busy')
+    expect(marker?.textContent).not.toBe('locked')
+  })
+
+  it('shows nothing for a row the daemon did not mark', () => {
+    const { container } = render(<SessionRow session={row()} />)
+    expect(container.querySelector('.session-row-running')).toBeNull()
+    // An explicit empty string is the daemon's "I looked and saw nothing", and it
+    // must read the same as absent: neither asserts that the session is resumable.
+    const looked = render(<SessionRow session={row({ runningAs: '' })} />)
+    expect(looked.container.querySelector('.session-row-running')).toBeNull()
+  })
+
+  it('marks a kind this build has never heard of', () => {
+    // The value is quoted from another program's file. The daemon has already
+    // excluded the one kind that is not a holder ('interactive'), so anything that
+    // arrives here IS one — including a kind added after this build shipped. A
+    // narrowing union would have dropped the badge exactly when it was newest.
+    const { container } = render(<SessionRow session={heldRow({ runningAs: 'swarm-worker' })} />)
+    expect(container.querySelector('.session-row-running')?.textContent).toBe('running')
+    expect(isRunningElsewhere(heldRow({ runningAs: 'swarm-worker' }))).toBe(true)
+  })
+
+  it('STILL OPENS when clicked — the badge is a hint, not a gate', () => {
+    // The point of not disabling the row. The job finishes, so a disabled row is a
+    // lie a minute later; and if it is still running, the click gets the daemon's
+    // real refusal with the two ways out in it. Both are better than a row that
+    // cannot be clicked and does not say why.
+    const tabs = watch('tether:select-tab')
+    const retry = watch('tether:retry-connection')
+    render(<SessionRow session={heldRow()} />)
+    fireEvent.click(screen.getByText('a job is using this'))
+    expect(useStore.getState().sessionId).toBe('sid-held-00000001')
+    expect(localStorage.getItem('tether_last_sid')).toBe('sid-held-00000001')
+    expect(tabs()).toEqual(['chat'])
+    expect(retry()).toHaveLength(1)
+  })
+
+  it('names the kind on hover, alongside everything else the row knows', () => {
+    const { container } = render(<SessionRow session={heldRow({ source: 'cc' })} />)
+    const title = container.querySelector('.tree-row')?.getAttribute('title') ?? ''
+    expect(title).toContain('sid-held-00000001')
+    expect(title).toContain('a job is using this')
+    // Both provenances, because both are true of this row and one does not replace
+    // the other: it was recorded elsewhere AND something is using it now.
+    expect(title).toContain('coding agent')
+    expect(title).toContain('background agent (bg)')
+  })
+
+  it('carries both markers when both are true, and neither takes the other’s place', () => {
+    const { container } = render(<SessionRow session={heldRow({ source: 'cc' })} />)
+    expect(container.querySelector('.session-row-src')?.textContent).toBe('external')
+    expect(container.querySelector('.session-row-running')?.textContent).toBe('running')
+  })
+
+  it('does not describe the click — that sentence belongs to the refusal', () => {
+    // The hover text may say what was OBSERVED and nothing about what will happen:
+    // by the time the user clicks, the job may have finished. Predicting here is the
+    // lying-list failure this whole feature exists to remove, one layer over.
+    const text = runningElsewhereProvenance(heldRow())
+    expect(text).toMatch(/background agent \(bg\)/)
+    expect(text).toMatch(/when this list was built/i)
+    expect(text).not.toMatch(/cannot|can't|will not|won't|unavailable/i)
   })
 })

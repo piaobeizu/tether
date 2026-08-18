@@ -64,15 +64,58 @@ type SessionSummary struct {
 	// against spending the bytes: the daemon and the SPA ship as one binary
 	// (web/embed.go), so no frontend can be talking to a daemon that disagrees.
 	//
-	// It is a FACT about where the row came from, and that is why it is the only
-	// new field. The question the UI actually wants answered is "can I carry on
-	// with this one", and tether cannot answer it: cc's `--resume` reports failure
-	// only after a prompt has been delivered (Attachment's doc), so a resumability
-	// flag computed here would be a guess that goes stale whenever
+	// It is a FACT about where the row came from, and it was the only new field
+	// tether#92 added. The question the UI actually wants answered is "can I carry
+	// on with this one", and tether STILL cannot answer that: cc's `--resume`
+	// reports failure only after a prompt has been delivered (Attachment's doc), so
+	// a resumability flag computed here would be a guess that goes stale whenever
 	// --workspace-root or the workspace registry moves. A row that is right most
 	// of the time is the lying list this feature exists to avoid; source never
 	// goes stale, and the UI states the limit rather than predicting it.
+	//
+	// tether#101 NARROWS that paragraph and does not overturn it, so read the
+	// boundary rather than either extreme. Resumability in general is still
+	// unknowable here and nothing below predicts it. But one specific OBSTACLE is
+	// not a prediction at all: cc keeps a registry of its own live sessions and
+	// refuses a uuid `--resume` outright while a non-interactive one holds the sid —
+	// a decision it makes from that file, before any prompt is delivered. So "where
+	// this row came from" and "what is holding it right now" are both facts, and
+	// "will the next --resume succeed" is still not one. RunningAs is the first, not
+	// the third.
 	Source string `json:"source"`
+	// RunningAs names the kind of live cc process that was holding this sid AT THE
+	// MOMENT THIS LIST WAS BUILT — cc's own `kind` value ("bg", "daemon",
+	// "daemon-worker"), never "interactive". Empty when no such process was
+	// observed (tether#101).
+	//
+	// # It is an OBSERVATION, not a promise, and the authority is elsewhere
+	//
+	// The list's job here is to stop a row being a surprise; the verdict belongs to
+	// the attach path, which asks the same registry AFTER cc has actually refused
+	// (Attachment.resolve). This value can therefore be out of date by the time the
+	// user clicks, in both directions, and both are fine: a job that has since
+	// finished simply opens, and one that is still running meets a refusal that
+	// explains itself. What the UI must NOT do is disable such a row — the state is
+	// temporary, so a disabled row is a lie a minute later, and an unexplained
+	// disabled row is worse than a click that answers.
+	//
+	// # Deliberately not called Resumable, and not a bool
+	//
+	// `Resumable` is exactly the over-promise Source's paragraph above correctly
+	// refuses, and its absence must not be read as its inverse either: an EMPTY
+	// RunningAs asserts nothing at all. It is also the value cc itself wrote rather
+	// than a derivation of it — a quotation — which is what lets the refusal message
+	// and `claude agents` use the same words for the same thing.
+	//
+	// # Why omitempty here when Source is always sent
+	//
+	// Source's two values are both facts about the row, so an absent one would be
+	// ambiguous. Here the empty value IS the common case (98 of 103 sids on one
+	// measured profile) and it means "no observation", which is also what a daemon
+	// with no registry reader — or one that cannot read /proc — sends for every row.
+	// Those are the same answer to the UI (no badge) and the same fail-open
+	// direction: only a PRESENT value ever asserts anything.
+	RunningAs string `json:"runningAs,omitempty"`
 }
 
 // SessionIndex answers "what sessions are there, and what is each one about?".
@@ -90,6 +133,14 @@ type SessionIndex struct {
 	// only the sessions it recorded itself, which is what every daemon did before
 	// that slice — the field is optional for the same reason the two above are.
 	CC *CCStore
+	// CCJobs is the reader over cc's LIVE-SESSION registry (tether#101). nil = no
+	// row carries RunningAs, which is what every daemon did before that slice.
+	//
+	// It must be the SAME instance Registry.ccLiveJob uses, for the reason CC's own
+	// wiring comment gives: two instances would be two answers, and the symptom is
+	// a row this list marks that the attach path then resumes without complaint —
+	// or, worse, the reverse.
+	CCJobs *CCRegistry
 }
 
 // titlePrefixBytes bounds how much of a transcript List reads looking for the
@@ -217,6 +268,37 @@ func (x *SessionIndex) List() []SessionSummary {
 			}
 		}
 	}
+
+	// What is holding each sid right now (tether#101), attached over EVERY row and
+	// for the same reason the work-item loop above is: "a live cc process holds this
+	// session id" is a fact about the SESSION and knows nothing about which store
+	// its transcript ended up in. A tether-source row can be held too — nothing
+	// stops a `claude -p` job resuming a sid tether once recorded — so marking only
+	// the cc rows would make the badge right for most of the list and quietly wrong
+	// for the rest, which is the failure mode this list keeps being fixed for.
+	//
+	// ONE scan for the whole request, not one per row, and that is what makes the
+	// cost acceptable rather than merely small: the ceiling is records × the
+	// per-record read (see ccRegistryRecordBytes), not rows × records. Measured on
+	// the reference machine (2026-08-18): 138 records, 44 KB, ~3.0 ms including one
+	// /proc read each, of which 5 were live non-interactive holders — against the
+	// ~1.4 MB of transcript prefixes this same call already reads at ~90 sessions.
+	// The quantity to re-measure if this ever gets slow is the RECORD COUNT: cc's
+	// own sweep of stale records is conditional and demonstrably not keeping it
+	// down (132 of those 138 referred to pids that had already exited), so the
+	// directory grows with every cc process the machine has ever run. It is
+	// deliberately not capped: a count cap would drop records unread, and the one
+	// record that matters is the live one.
+	if x.CCJobs != nil {
+		if jobs := x.CCJobs.LiveJobs(); len(jobs) > 0 {
+			for i := range out {
+				if job, held := jobs[out[i].Sid]; held {
+					out[i].RunningAs = job.Kind
+				}
+			}
+		}
+	}
+
 	if len(out) == 0 {
 		return out
 	}

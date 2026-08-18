@@ -23,13 +23,23 @@ package session
 // Every entry point here takes its base directory as an argument, and nothing in
 // this file calls os.UserHomeDir — the caller that knows the home directory does
 // the resolving (lifecycle.go). That is what makes "no test can reach the real
-// store by accident" a property of the API rather than of test discipline. It is
-// a property of THIS TYPE, not of the package: tether#92 also deleted
-// jsonl_sync.go, which was dead code that reached the same store through
-// os.UserHomeDir and, worse, encoded the path wrongly
+// store by accident" a property of the API rather than of test discipline.
+// tether#92 also deleted jsonl_sync.go, which was dead code that reached the same
+// store through os.UserHomeDir and, worse, encoded the path wrongly
 // (projects/<sid>/<sid>.jsonl instead of projects/<encoded-cwd>/<sid>.jsonl) —
 // a second, silently incorrect answer to the question this file exists to answer
-// once. If another such reader appears, this sentence stops being true.
+// once.
+//
+// That paragraph used to end "It is a property of THIS TYPE, not of the package …
+// If another such reader appears, this sentence stops being true." One has
+// appeared: ccregistry.go reads cc's OTHER directory, <cc-config-dir>/sessions,
+// and it holds the property the same way — its directory is an argument and it
+// never calls os.UserHomeDir either. So the rule is now the PACKAGE's, stated
+// twice on purpose, and lifecycle.go resolves both directories from a single
+// CLAUDE_CONFIG_DIR read so the two readers cannot describe two different cc
+// installs. A third reader that resolved its own path would break this again, and
+// the way to tell is still the same: grep this package for os.UserHomeDir and
+// expect nothing.
 //
 // # What this reader promises, and what it deliberately does not
 //
@@ -40,6 +50,16 @@ package session
 // be a prediction, and one that goes stale the moment --workspace-root or the
 // workspace registry changes. The UI therefore states the limit instead of
 // predicting it — see web/src/lib/SessionRow.tsx.
+//
+// tether#101 draws one line INSIDE that, and the line is worth knowing before
+// reading the paragraph as an absolute. Resumability is still not predictable
+// here. But cc's live-session registry — its OTHER directory, read by
+// ccregistry.go — records which of its own processes hold which session id, and
+// cc refuses a uuid `--resume` outright while a non-interactive one does. That is
+// a decision cc takes from a file, before any prompt, so it is a fact rather than
+// a prediction; it is also the only such fact, and it says "this is refused right
+// now", never "this would otherwise work". SessionSummary.RunningAs carries it,
+// and SessionSummary.Source's doc has the long form of the boundary.
 
 import (
 	"bufio"

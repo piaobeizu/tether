@@ -161,10 +161,14 @@ const ACTIVITY_W = 48
  *         ColResizer on the middle's OTHER side and that is unaccounted too.
  *         Where the floor binds, the middle gets 318 rather than the promised
  *         320. (It can be far less where no width satisfies both panes — see
- *         clampRightWidth's over-constrained branch, e.g. window 900 with a
- *         480px tree leaves 158. That is the deliberate MIN_RIGHT-wins case,
- *         not this 2px.) The same 2px is why the 507 quoted above is 2 over
- *         what the middle really gets, 505.
+ *         clampRightWidth's over-constrained branch: window 900 with a 480px
+ *         tree leaves room 52, so MIN_RIGHT wins and the middle gets
+ *         900 - 528 - 260 = 112, or 110 after the dividers. That is the
+ *         deliberate MIN_RIGHT-wins case, not this 2px. This example read 158
+ *         before tether#102 — that was 160 - 2 with `leftWidth` 480 meaning
+ *         the whole chrome rather than the tree, so it does not carry over.)
+ *         The same 2px is why the 507 quoted above is 2 over what the middle
+ *         really gets, 505.
  *
  * Folding the resizers in too was considered for tether#102 and rejected. The
  * reason is NOT "layout.ts must not hold a stylesheet literal" — ACTIVITY_W is

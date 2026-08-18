@@ -272,8 +272,12 @@ describe('the activity bar is charged inside layout.ts (tether#102)', () => {
   // The bar's contribution pinned per tree width. clampRightWidth's room
   // arithmetic is exact — no rounding anywhere in it — so where the MIN_MID
   // floor binds, the width it returns names the chrome directly:
-  // right = window - chrome - MIN_MID. Window fixed at 1200 so every row has a
-  // different expectation and has to be read rather than pattern-matched.
+  // right = window - chrome - MIN_MID. The window is fixed at 1200 rather than
+  // derived per row, so the expectations are distinct numbers that have to be
+  // read — a window computed from `chrome` would make every row expect the same
+  // value and hide a typo in the table. The first two rows do share 832, and
+  // necessarily: both tree widths clamp to no tree, which is the point of the
+  // first one.
   it.each([
     [-1000, 48, 832], // corrupt persisted tree width: no tree, bar still there
     [0, 48, 832], // tree fully collapsed

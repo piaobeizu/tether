@@ -322,8 +322,12 @@ body {
    bar's background, so a fill would have nothing to contrast against. Do not add
    --bg-tint-backed elements in here.
 
-   Width 48px is duplicated as ACTIVITY_W in App.tsx, which needs it as a number
-   to keep the middle column's MIN_MID floor honest. Change both. */
+   Width 48px is duplicated as ACTIVITY_W in lib/layout.ts (it lived in App.tsx
+   until tether#100), which needs it as a number to compute the middle column's
+   MIN_MID floor at all. Change both — nothing checks that you did, so a change
+   here alone turns no test red. box-sizing is border-box globally, so the 1px
+   border-right below is INSIDE the 48: the footprint that constant mirrors is
+   48, not 49. */
 .dt-activity {
   width: 48px; flex-shrink: 0;
   display: flex; flex-direction: column;

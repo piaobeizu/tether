@@ -3,7 +3,7 @@ import { useStore } from './lib/store'
 import { Icon, type IconName } from './lib/icons'
 import { Settings, type SettingsTab } from './Settings'
 import { useAppVersion } from './lib/version'
-import { clampRightWidth, loadRightWidth, DEFAULT_LEFT } from './lib/layout'
+import { clampRightWidth, loadRightWidth, ACTIVITY_W, DEFAULT_LEFT } from './lib/layout'
 import WorkspacePane from './panes/workspace'
 import SkillPane from './panes/skill'
 import ChatPane from './panes/chat'
@@ -39,11 +39,6 @@ const ACTIVITY_ITEMS: { view: MainView; label: string; crumb: string; icon: Icon
   { view: 'canvas', label: 'Canvas', crumb: 'workspace', icon: 'file' },
   { view: 'work',   label: 'Work',   crumb: 'work',      icon: 'bolt' },
 ]
-
-// Width of the activity bar, mirroring `.dt-activity` in index.css. Duplicated
-// because lib/layout.ts's clamps are arithmetic over the space the middle column
-// is left with, and that arithmetic cannot read a stylesheet. Change both.
-const ACTIVITY_W = 48
 
 // tether#45 — restore the last-active right tab across reloads. Previously
 // rightTab always initialized to 'work', so a hard-refresh dropped you off Chat

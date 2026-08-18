@@ -1,5 +1,12 @@
 import { useStore } from './store'
 import { openSession } from './session'
+import {
+  SESSION_ACTIVITY_HELD,
+  SESSION_ACTIVITY_IDLE,
+  SESSION_ACTIVITY_WORKING,
+  useSessionActivity,
+  type SessionActivityState,
+} from './sessionActivity'
 import { relTime } from './timefmt'
 import {
   EXTERNAL_SESSION_BADGE,
@@ -56,6 +63,12 @@ export function SessionRow({
   // built this list. A HINT: the row stays clickable (see below), and the
   // authoritative answer arrives from the attach path if it is still true.
   const isRunning = isRunningElsewhere(session)
+  // tether#103 — is a turn in flight RIGHT NOW? Subscribed here, in the row,
+  // rather than fetched by either pane: mounting a row is then the whole of opting
+  // in, and one module-level poller serves every row on the page. Refreshed on its
+  // own clock (see useSessionActivity), which is what stops the marker being a
+  // snapshot of whenever the list was last fetched.
+  const activity = useSessionActivity(session.sid)
 
   const onClick = () => {
     // Chat is a tab in the right column, and this row may be rendered from the
@@ -86,9 +99,26 @@ export function SessionRow({
       className={`tree-row${isCurrent ? ' active' : ''}`}
       style={indent == null ? undefined : { paddingLeft: indent }}
       onClick={onClick}
-      title={rowTitle(session)}
+      title={rowTitle(session, activity)}
     >
       <span className={`ws-dot${isCurrent ? ' live' : ''}`} />
+      {/* tether#103. Its own visual channel, next to the "this is the one you are
+          looking at" dot rather than among the badges: the badges answer "what kind
+          of row is this" (provenance, possession) and this answers "is it moving".
+
+          Always rendered, and INVISIBLE (not absent) when the daemon reported no
+          state for this sid. Absence means nothing live holds the session, so the
+          row must say nothing — but doing that by omitting the element shifts the
+          label, both badges and the timestamp by 13px on the first poll after
+          mount and again every time a sid enters or leaves the answer, i.e. it
+          makes the list twitch. `visibility: hidden` says nothing and holds the
+          column. Nothing is announced either: no role, no label. */}
+      <span
+        className={`session-row-act${activity ? ` ${activity}` : ''}`}
+        {...(activity
+          ? { role: 'img', 'aria-label': ACTIVITY_LABELS[activity] }
+          : { 'aria-hidden': true })}
+      />
       <span className="tree-label">{sessionLabel(session, { omitWorkItem })}</span>
       {/* Provenance, on the row, before the click. One word is all there is room
           for, so it is the one that is TRUE of the row — the promise itself needs
@@ -106,18 +136,49 @@ export function SessionRow({
 }
 
 /**
+ * What each activity state means, in the words the row is willing to stand behind
+ * (tether#103).
+ *
+ * These are the accessible names AND the hover text — one sentence per state,
+ * written once. Each one is checkable against the daemon:
+ *
+ *  - 'working' says "a turn", not "the model is replying". The agent's own status
+ *    is `busy` for the whole turn including tool execution, so the narrower claim
+ *    would be false for a row three minutes into a test run.
+ *  - 'idle' says "no turn in flight" rather than "between turns", because the
+ *    daemon also reports it for the agent's `waiting` (blocked on the user) and
+ *    `shell` (a shell task while the agent itself is idle).
+ *  - 'held' names the limit instead of hiding it. It is what the daemon sends when
+ *    a live agent process has the conversation open but wrote no status — every
+ *    `--print` launch, which is most of them — so pretending it meant "idle" would
+ *    make the row claim nothing is happening on exactly the sessions it cannot
+ *    see into.
+ */
+const ACTIVITY_LABELS: Record<SessionActivityState, string> = {
+  [SESSION_ACTIVITY_WORKING]: 'a turn is in flight',
+  [SESSION_ACTIVITY_IDLE]: 'a coding agent has this open — no turn in flight',
+  [SESSION_ACTIVITY_HELD]:
+    'a coding agent has this open — tether cannot see whether a turn is in flight',
+}
+
+/**
  * rowTitle is the hover text: the sid, the opening prompt when there is one, and
  * — for a session tether did not record — where it came from.
  *
  * Hover is a bonus, not the channel: there is no hover on a phone, and tether is
  * driven from one by design. Anything a user MUST see is on the row or in the
  * banner; this is for the pointer that happens to be there.
+ *
+ * The activity sentence goes here as well as on the marker's aria-label, because
+ * a coloured dot cannot say which of three things it means and this row already
+ * puts the long form of a fact in the hover text (tether#92, #101).
  */
-function rowTitle(session: SessionSummary): string {
+function rowTitle(session: SessionSummary, activity?: SessionActivityState): string {
   const lines = [session.sid]
   if (session.title) lines.push(session.title)
   if (isExternalSession(session)) lines.push(EXTERNAL_SESSION_PROVENANCE)
   if (isRunningElsewhere(session)) lines.push(runningElsewhereProvenance(session))
+  if (activity) lines.push(ACTIVITY_LABELS[activity])
   return lines.join('\n')
 }
 

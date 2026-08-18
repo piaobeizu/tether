@@ -208,6 +208,26 @@ func buildMux(cfg *Config, certs *certHolder, wts *webtransport.Server, reg *ses
 		mux.HandleFunc("/api/v1/sessions/", sessionSub)
 	}
 
+	// Session activity (tether#103): which sessions have a turn in flight right
+	// now. Registered UNCONDITIONALLY, unlike the list above, and the difference is
+	// deliberate — this answer needs neither a history store nor a transcript, so
+	// gating it on reg.History would switch the marker off for a daemon that can
+	// still answer it perfectly well. With both readers absent it serves `{}`,
+	// which is the honest answer and the one the SPA already handles.
+	//
+	// The two readers are the SAME instances the rest of the daemon uses, for the
+	// reason SessionIndex.CCJobs gives: two instances are two answers, and the
+	// symptom is a marker that contradicts the transcript on screen.
+	//
+	// The path is its own TOP-LEVEL route rather than a leaf under
+	// /api/v1/sessions/ — see session.SessionActivityPath for why, including the
+	// neighbour that actually is a hazard: /api/v1/session/ (singular,
+	// handleLockForce above) is a PREFIX handler one hyphen away from this path.
+	mux.HandleFunc(session.SessionActivityPath, handleSessionActivity(&session.ActivityIndex{
+		Reg:    reg,
+		CCJobs: reg.CCJobs,
+	}))
+
 	mux.Handle("/", newStaticHandler(cfg.DevFrontendURL))
 
 	// Wrap all routes: origin guard first, then auth middleware outermost.

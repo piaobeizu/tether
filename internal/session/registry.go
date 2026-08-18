@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/piaobeizu/tether/internal/agent"
 	"github.com/piaobeizu/tether/internal/wire"
@@ -345,10 +346,156 @@ type Entry struct {
 	// pane resumes a chat session by asking for it (WorkdirForSession).
 	workdir string
 	ws      WorkspaceBinding
+	// turnsInFlight counts the prompts delivered to this session whose turn has
+	// not ended yet (tether#103). It is what lets the session list mark a row that
+	// is working, for the sessions cc's own registry cannot answer for — every cc
+	// this daemon spawns is a `--print` launch and writes no `status`, so without
+	// this the marker would be blank for most of the list.
+	//
+	// # A COUNT and not a bool, because two turns really can be outstanding
+	//
+	// This started as an atomic.Bool and that was wrong. A second prompt delivered
+	// while the first turn is running is not hypothetical here: it was MEASURED for
+	// tether#83 and the measurement is written down in web/src/lib/store.ts —
+	// against cc driven with Spawn's own flags, "second prompt written at 7674ms,
+	// 2.2s into an answer whose first delta came at 5500ms; that turn's `result` at
+	// 19209ms; only then a fresh system/init at 19246ms and the second turn's
+	// result at 21112ms". Two prompts, TWO results. And there are two ungated
+	// senders: injectAndSend (panes/chat, click-to-work) has no streaming gate at
+	// all, and Registry.DeliverAction is a DAG-card click that never consults one.
+	//
+	// With a bool, the first result cleared the flag and the row reported `idle` —
+	// a positive claim that nothing is running — for the whole of the second turn.
+	// A count cannot do that, and because cc emits one result per prompt it does
+	// not drift either.
+	//
+	// The floor guard in endTurn is what keeps the count honest against the events
+	// that legitimately arrive without a matching delivery: the init-less empty
+	// result fanOut suppresses, a provider that emits both an error and a result
+	// for one run, and teardown's unconditional reset.
+	//
+	// # Its concurrency story, because it is the first of its kind here
+	//
+	// Every other mutable field on Entry has a NAMED guard: regKey is under
+	// Registry.mu (it is part of the map's shape), ownerClientID is under subsMu.
+	// Everything else is written before the entry is published and never again.
+	// This one is an atomic, and that is a decision with a reason rather than a
+	// default:
+	//
+	//   - The writers genuinely are different goroutines. It is incremented from
+	//     whichever goroutine is delivering a prompt (serveChat's reader, or
+	//     /wt/control's handler via DeliverAction), decremented from fanOut's event
+	//     loop, and reset from teardown. The reader is an HTTP handler on yet
+	//     another. So the access needs synchronisation in the ordinary case, not an
+	//     exotic one — the same argument Entry.owner's doc makes for guarding a
+	//     single word.
+	//   - It is not coupled to any other state. A mutex earns its keep by making
+	//     two fields agree; there is no second field here, and nothing reads this
+	//     counter together with anything else. subsMu would additionally put a
+	//     status poll in the same critical section as every broadcast.
+	//
+	// Incremented BEFORE the write and decremented on failure, never the other way
+	// round: the result can arrive on fanOut's goroutine before SendPrompt has
+	// returned, so an increment-after-success would race the decrement for that
+	// very turn and leave the count stuck above zero forever. See Entry.sendPrompt,
+	// which is the ONLY thing allowed to increment it — pinned by
+	// TestEveryPromptDeliveryGoesThroughTheEntryWrapper.
+	turnsInFlight atomic.Int64
 }
 
 // Session returns the underlying agent.Session.
+//
+// Since tether#103 this is deliberately NOT the way a prompt is delivered: the
+// six delivery sites go through Entry.sendPrompt so that "a turn started" is
+// recorded once instead of at six call sites. `Session()` remains for the callers
+// that want SessionID / Alive / Interrupt.
 func (e *Entry) Session() agent.Session { return e.sess }
+
+// sendPrompt delivers text to this session's agent and records that a turn is now
+// in flight.
+//
+// # Why this exists rather than a mark at each call site
+//
+// A turn starts when a prompt is WRITTEN, and on e3eda21 that happened at six
+// places: Attachment.SendPrompt, four recovery paths inside Attachment.reopen and
+// Attachment.resolve, and Registry.DeliverAction. Five of the six are the paths a
+// user reaches when something has already gone wrong, which is exactly when a
+// silently-wrong marker is least affordable. All six deliver through an *Entry, so
+// there is a convergence point one level down and this is it.
+//
+// The choice is the same one openSession, lib/session.ts and SessionIndex.Messages
+// each record in their own docs: a rule six call sites must remember is a rule
+// that will be right in five of them. It also makes the invariant CHECKABLE —
+// TestEveryPromptDeliveryGoesThroughTheEntryWrapper parses this package and fails
+// if any function other than (*Entry).sendPrompt calls SendPrompt, so a seventh
+// delivery path INSIDE THIS PACKAGE cannot be added without either using the
+// wrapper or turning a test red. No amount of care at six sites can do that.
+//
+// The qualifier is deliberate and the guard's reach is exactly that: it parses
+// internal/session and nothing else. Entry.Session() is exported and returns an
+// interface with an exported SendPrompt, so a caller in another package could
+// still deliver a prompt this counter never sees. Nothing does today (the only
+// production caller of Attachment.SendPrompt is serveChat), and closing it
+// properly means unexporting Session(), which several tests and the shell pane's
+// workdir lookup would have to be reworked for — a separate change. Stated rather
+// than implied, because "cannot be added without a test turning red" read as a
+// universal claim and it is not one.
+//
+// # Why the decrement on error
+//
+// A refused write means the agent never received the prompt, so no EventResult
+// will ever arrive to close that turn. Without this, a terminal delivery failure —
+// the reopen budget spent, or a respawn that also failed — would leave the row
+// reading "working" until the session dies. The window this opens in the other
+// direction (the write reports failure and the agent answers anyway) is narrow
+// enough to prefer: for cc a SendPrompt error is a broken pipe to a process that
+// is gone, and a result arriving afterwards would decrement a count the floor
+// guard has already parked at zero.
+func (e *Entry) sendPrompt(ctx context.Context, text string) error {
+	e.turnsInFlight.Add(1)
+	if err := e.sess.SendPrompt(ctx, text); err != nil {
+		e.endTurn()
+		return err
+	}
+	return nil
+}
+
+// endTurn records that one turn has ended, never going below zero.
+//
+// The floor is not decoration. Three things reach here without a matching
+// delivery, and each of them would otherwise drive the count negative and make a
+// LATER real turn read as idle:
+//
+//   - a provider that reports one run with BOTH an error and a result
+//     (opencodeSession's run goroutine emits EventError on a scan failure and then
+//     its terminal EventResult),
+//   - the second decrement of a session that dies immediately after its final
+//     result, and
+//   - any future event this daemon decides also ends a turn.
+//
+// A compare-and-swap loop rather than Add(-1) plus a correction, because the
+// correction is not atomic with the add: two decrements racing at zero would each
+// read -1 and each store 0, which happens to be right, but at 1 they would land on
+// -1 and stay there.
+func (e *Entry) endTurn() {
+	for {
+		n := e.turnsInFlight.Load()
+		if n <= 0 {
+			return
+		}
+		if e.turnsInFlight.CompareAndSwap(n, n-1) {
+			return
+		}
+	}
+}
+
+// clearTurns records that NO turn is in flight, whatever the count said.
+//
+// For teardown only: the session has ended, so every outstanding turn has ended
+// with it and there is nothing left to count down. Deliberately not used for a
+// turn ending — that is endTurn, and using this there would be the bool bug all
+// over again (one result clearing a second turn that is still running).
+func (e *Entry) clearTurns() { e.turnsInFlight.Store(0) }
 
 // Subscribe registers ch to receive every wire.Envelope produced by this
 // session's fanOut. Safe to call before the session's real sid is known —
@@ -1229,6 +1376,19 @@ func (r *Registry) teardown(e *Entry) {
 	sid := e.regKey
 	r.mu.RUnlock()
 
+	// No turn can be in flight on a session that has ended (tether#103), and this
+	// is load-bearing rather than tidiness. An Entry OUTLIVES its agent — the
+	// window liveEntry's doc describes — and LiveTurns reads the map without
+	// asking Alive(), so a session that died mid-answer is still visible here with
+	// its count above zero. Worse for a process that HANGS rather than exits:
+	// nothing closes Events(), so the entry and its stale "working" would last as
+	// long as the daemon. Reset before the evict below, so no reader can see the
+	// entry and the stale count together.
+	//
+	// clearTurns and not endTurn: this is the one place that may speak for EVERY
+	// outstanding turn, because the thing that would have answered them is gone.
+	e.clearTurns()
+
 	// Evict FIRST. It is what stops the dead sid from reading as live to the next
 	// reconnect, and it must not queue behind a Wait on a child that is slow to
 	// die. The reap has no such urgency — nothing observes it but the OS.
@@ -1670,7 +1830,11 @@ func (r *Registry) DeliverAction(sid, action, blockID, skill string) error {
 	if err != nil {
 		return fmt.Errorf("deliver action %q: marshal: %w", action, err)
 	}
-	return e.sess.SendPrompt(context.Background(), string(b))
+	// Through the entry's wrapper, not e.sess directly: an action callback is a
+	// prompt delivery like any other, so it starts a turn and the session list has
+	// to say so (tether#103). This was one of the six sites that would otherwise
+	// have been missed — it does not go anywhere near Attachment.
+	return e.sendPrompt(context.Background(), string(b))
 }
 
 // InterruptSession routes a DAG-card "pause" click (D-19 §5, tether#8 T9) to
@@ -1879,12 +2043,51 @@ func (r *Registry) fanOut(e *Entry) {
 			if !sawInit && ev.Text == "" {
 				continue
 			}
+			// ONE turn is over (tether#103). Deliberately AFTER the guard above and
+			// not before it: that envelope is a failed `--resume`'s artefact, and the
+			// prompt that triggered it is STILL IN FLIGHT — Attachment.resolve is
+			// about to respawn and answer it for real. Counting it down there would
+			// put the row's marker out for a turn that has not started, which is the
+			// same mistake, one layer down, that forwarding the envelope would make in
+			// the browser. The frontend store draws the line at this exact point, so
+			// the two agree by construction rather than by coincidence.
+			//
+			// endTurn and not clearTurns: cc answers a queued second prompt with a
+			// SECOND result (measured — see Entry.turnsInFlight), so this result ends
+			// one turn and must not speak for the other.
+			e.endTurn()
 			emitSegments(e.fenceParser.Flush())
 			if r.History != nil && sid != "" {
 				r.History.FinalizeAssistant(sid)
 			}
 			r.broadcast(e, wire.Envelope{Kind: wire.KindResult, Payload: ev.Text})
 			continue
+		}
+
+		// A turn that ends in an ERROR also ends (tether#103), and this branch is
+		// LOAD-BEARING rather than symmetry: for one of the two providers it is the
+		// only thing that ever counts the turn down.
+		//
+		// opencodeSession.SendPrompt reports several failures by EVENT and returns
+		// nil — the busy rejection ("busy: another prompt is running"), a failed
+		// serve relaunch after an Interrupt, and a stdout-pipe or Start failure
+		// inside its run goroutine. On those paths no EventResult is ever emitted
+		// AND the session deliberately stays alive and dormant so the next prompt
+		// can retry, so Events() never closes and teardown never runs. Without this
+		// the row would read "working" until the daemon restarted.
+		//
+		// Safe for every emit site in the tree, which was checked one by one rather
+		// than assumed. cc emits EventError once, when its output stream ends in an
+		// error — teardown follows. opencode's other sites are its serve exiting, a
+		// scan failure it has just killed the child for, and a non-zero run exit;
+		// all three are a run that is over, and the two that are followed by the
+		// terminal EventResult decrement a count the floor guard has already parked.
+		// The one site where the turn can briefly outlive the error is the SSE
+		// `session.error` frame, whose run goroutine still has its EventResult to
+		// emit; that costs a marker that goes out early rather than one that never
+		// goes out, which is the direction to fail in.
+		if ev.Kind == agent.EventError {
+			e.endTurn()
 		}
 
 		// tether#44 — persist thinking + tool activity so a reload reconstructs

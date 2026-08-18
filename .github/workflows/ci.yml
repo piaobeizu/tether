@@ -102,7 +102,38 @@ jobs:
 
       # ── wire-contract tests (D-22 §6) ───────────────────────────────────────
       - name: Run wire-contract tests
+        id: web_tests
         run: cd web && pnpm test
+
+      # Keeps the machine-readable report web/vite.config.ts writes on every run
+      # (tether#105 — this suite has a ~5% flake that has now been seen twice and
+      # named zero times). Without this step a red run leaves the name of the
+      # failing test only in raw log output that nobody opens, so the response to
+      # a red is "rerun it", and a gate people rerun past is not a gate.
+      #
+      # `if: always()` is the entire point and not boilerplate: a step with no
+      # condition is skipped once the job is already failing, i.e. skipped on
+      # precisely the runs worth keeping evidence from.
+      #
+      # `outcome != 'skipped'` narrows always() back to "the test step actually
+      # ran", so a failure further up (codegen drift, build web) does not send an
+      # empty directory into if-no-files-found. That option is `error` on
+      # purpose: if the reporters ever stop writing, `pnpm test` still exits 0 and
+      # this step is the only thing that would notice.
+      #
+      # Both branches were measured on this workflow rather than argued from the
+      # YAML, which cannot show either one. Failing test (run 32148999848): the
+      # test step failed, this step still ran, and the artifact carries the name
+      # of the test. Failing codegen-drift step (run 32149533126): the test step
+      # was skipped, so `outcome` really is 'skipped' for a step that never ran
+      # and this one skipped too instead of erroring on an empty directory.
+      - name: Upload web test report
+        if: always() && steps.web_tests.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-test-report
+          path: web/test-results/
+          if-no-files-found: error
 
       # ── Go tests ────────────────────────────────────────────────────────────
       # -race is the baseline, not an extra: internal/server runs a background

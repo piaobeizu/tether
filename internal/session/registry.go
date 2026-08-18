@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/piaobeizu/tether/internal/agent"
 	"github.com/piaobeizu/tether/internal/wire"
@@ -345,10 +346,91 @@ type Entry struct {
 	// pane resumes a chat session by asking for it (WorkdirForSession).
 	workdir string
 	ws      WorkspaceBinding
+	// turnInFlight records whether a prompt has been delivered to this session and
+	// its turn has not ended yet (tether#103). It is what lets the session list
+	// mark a row that is working, for the sessions cc's own registry cannot answer
+	// for — every cc this daemon spawns is a `--print` launch and writes no
+	// `status`, so without this the marker would be blank for most of the list.
+	//
+	// # Its concurrency story, because it is the first of its kind here
+	//
+	// Every other mutable field on Entry has a NAMED guard: regKey is under
+	// Registry.mu (it is part of the map's shape), ownerClientID is under subsMu.
+	// Everything else is written before the entry is published and never again.
+	// This one is an atomic.Bool, and that is a decision with a reason rather than
+	// a default:
+	//
+	//   - The writers genuinely are different goroutines. It is set from whichever
+	//     goroutine is delivering a prompt (serveChat's reader, or /wt/control's
+	//     handler via DeliverAction), cleared from fanOut's event loop, and cleared
+	//     again from teardown. The reader is an HTTP handler on yet another. So the
+	//     access needs synchronisation in the ordinary case, not an exotic one —
+	//     the same argument Entry.owner's doc makes for guarding a single word.
+	//   - It is not coupled to any other state. A mutex earns its keep by making
+	//     two fields agree; there is no second field here, and nothing reads this
+	//     bit together with anything else. subsMu would additionally put a status
+	//     poll in the same critical section as every broadcast.
+	//
+	// Set BEFORE the write and cleared on failure, never the other way round: the
+	// result can arrive on fanOut's goroutine before SendPrompt has returned, so a
+	// set-after-success would race a clear-for-this-very-turn and stick ON forever.
+	// See Entry.sendPrompt, which is the ONLY thing allowed to set it — pinned by
+	// TestEveryPromptDeliveryGoesThroughTheEntryWrapper.
+	turnInFlight atomic.Bool
 }
 
 // Session returns the underlying agent.Session.
+//
+// Since tether#103 this is deliberately NOT the way a prompt is delivered: the
+// six delivery sites go through Entry.sendPrompt so that "a turn started" is
+// recorded once instead of at six call sites. `Session()` remains for the callers
+// that want SessionID / Alive / Interrupt.
 func (e *Entry) Session() agent.Session { return e.sess }
+
+// sendPrompt delivers text to this session's agent and records that a turn is now
+// in flight.
+//
+// # Why this exists rather than a mark at each call site
+//
+// A turn starts when a prompt is WRITTEN, and on e3eda21 that happened at six
+// places: Attachment.SendPrompt, four recovery paths inside Attachment.reopen and
+// Attachment.resolve, and Registry.DeliverAction. Five of the six are the paths a
+// user reaches when something has already gone wrong, which is exactly when a
+// silently-wrong marker is least affordable. All six deliver through an *Entry, so
+// there is a convergence point one level down and this is it.
+//
+// The choice is the same one openSession, lib/session.ts and SessionIndex.Messages
+// each record in their own docs: a rule six call sites must remember is a rule
+// that will be right in five of them. It also makes the invariant CHECKABLE —
+// TestEveryPromptDeliveryGoesThroughTheEntryWrapper parses this package and fails
+// if any function other than this one calls SendPrompt, so a seventh delivery path
+// cannot be added without either using the wrapper or turning a test red. No
+// amount of care at six sites can do that.
+//
+// # Why the clear on error
+//
+// A refused write means the agent never received the prompt, so no EventResult
+// will ever arrive to close the turn. Without this, a terminal delivery failure —
+// the reopen budget spent, or a respawn that also failed — would leave the row
+// reading "working" until the session dies. The window this opens in the other
+// direction (the write reports failure and cc answers anyway) is narrow enough to
+// prefer: for cc a SendPrompt error is a broken pipe to a process that is gone,
+// and even if a result did arrive it would clear a flag that is already clear.
+func (e *Entry) sendPrompt(ctx context.Context, text string) error {
+	e.turnInFlight.Store(true)
+	if err := e.sess.SendPrompt(ctx, text); err != nil {
+		e.turnInFlight.Store(false)
+		return err
+	}
+	return nil
+}
+
+// clearTurn records that no turn is in flight on this session.
+//
+// Called from fanOut's EventResult branch (a turn ended) and from teardown (the
+// session ended). It is idempotent, which matters because those two can both fire
+// for one turn — a session that dies immediately after its final result.
+func (e *Entry) clearTurn() { e.turnInFlight.Store(false) }
 
 // Subscribe registers ch to receive every wire.Envelope produced by this
 // session's fanOut. Safe to call before the session's real sid is known —
@@ -1229,6 +1311,16 @@ func (r *Registry) teardown(e *Entry) {
 	sid := e.regKey
 	r.mu.RUnlock()
 
+	// No turn can be in flight on a session that has ended (tether#103), and this
+	// is load-bearing rather than tidiness. An Entry OUTLIVES its agent — the
+	// window liveEntry's doc describes — and LiveTurns reads the map without
+	// asking Alive(), so a session that died mid-answer is still visible here with
+	// its flag set. Worse for a process that HANGS rather than exits: nothing
+	// closes Events(), so the entry and its stale "working" would last as long as
+	// the daemon. Cleared before the evict below, so no reader can see the entry
+	// and the stale flag together.
+	e.clearTurn()
+
 	// Evict FIRST. It is what stops the dead sid from reading as live to the next
 	// reconnect, and it must not queue behind a Wait on a child that is slow to
 	// die. The reap has no such urgency — nothing observes it but the OS.
@@ -1670,7 +1762,11 @@ func (r *Registry) DeliverAction(sid, action, blockID, skill string) error {
 	if err != nil {
 		return fmt.Errorf("deliver action %q: marshal: %w", action, err)
 	}
-	return e.sess.SendPrompt(context.Background(), string(b))
+	// Through the entry's wrapper, not e.sess directly: an action callback is a
+	// prompt delivery like any other, so it starts a turn and the session list has
+	// to say so (tether#103). This was one of the six sites that would otherwise
+	// have been missed — it does not go anywhere near Attachment.
+	return e.sendPrompt(context.Background(), string(b))
 }
 
 // InterruptSession routes a DAG-card "pause" click (D-19 §5, tether#8 T9) to
@@ -1879,6 +1975,15 @@ func (r *Registry) fanOut(e *Entry) {
 			if !sawInit && ev.Text == "" {
 				continue
 			}
+			// The turn is over (tether#103). Deliberately AFTER the guard above and
+			// not before it: that envelope is a failed `--resume`'s artefact, and the
+			// prompt that triggered it is STILL IN FLIGHT — Attachment.resolve is
+			// about to respawn and answer it for real. Clearing there would put the
+			// row's marker out for a turn that has not started, which is the same
+			// mistake, one layer down, that forwarding the envelope would make in the
+			// browser. The frontend store draws the line at this exact point, so the
+			// two agree by construction rather than by coincidence.
+			e.clearTurn()
 			emitSegments(e.fenceParser.Flush())
 			if r.History != nil && sid != "" {
 				r.History.FinalizeAssistant(sid)

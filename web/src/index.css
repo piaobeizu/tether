@@ -568,6 +568,47 @@ body {
 .session-row-src ~ .session-row-running,
 .session-row-src ~ .session-row-when,
 .session-row-running ~ .session-row-when { margin-left: 0; }
+/* tether#103 — is a turn in flight on this row RIGHT NOW.
+
+   A separate visual channel from the badges above, and it sits at the START of the
+   row next to .ws-dot rather than with them: the badges answer "what kind of row is
+   this" (where it came from, who holds it) and this answers "is it moving". Three
+   states, three renderings, and the state is also spelled out in the row's title
+   and the marker's aria-label — a 7px dot cannot say which of three things it
+   means, so the words are the channel and the dot is the glance.
+
+   Built from tokens already in this file (--accent, --ink-quat) — design-freeze
+   rule 4, the same constraint the two badges above were built under.
+
+   Sized and shaped like .ws-dot deliberately, so the two read as one column rather
+   than as a dot and a decoration. Not merged INTO .ws-dot, because that element
+   means "this is the session you are looking at" and one element cannot carry two
+   independent facts. */
+.session-row-act { width: 7px; height: 7px; border-radius: 999px; flex-shrink: 0; }
+/* MOTION carries "working", and it is the one property that cannot be mistaken for
+   a static category marker: a still dot of any colour reads as a label, while
+   something that moves reads as something happening. Colour alone would also be
+   the only difference between this and .session-row-act.held for anyone who cannot
+   distinguish them. */
+.session-row-act.working {
+  background: var(--accent);
+  animation: session-row-act-pulse 1.4s ease-in-out infinite;
+}
+@keyframes session-row-act-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(47, 125, 91, .45); }
+  50%      { box-shadow: 0 0 0 3px rgba(47, 125, 91, 0); }
+}
+/* Hollow: a process is there, and nothing is running in it. */
+.session-row-act.idle { background: transparent; box-shadow: inset 0 0 0 1.5px var(--ink-quat); }
+/* Solid and neutral: something has it open and we cannot see inside. Deliberately
+   NOT the accent — this state makes no claim about activity. */
+.session-row-act.held { background: var(--ink-quat); }
+/* Respect a stated preference not to see motion. The state is still legible: the
+   dot keeps its accent fill, which is what distinguishes it from .held and .idle,
+   and the aria-label and title say which state it is regardless. */
+@media (prefers-reduced-motion: reduce) {
+  .session-row-act.working { animation: none; box-shadow: 0 0 0 3px rgba(47, 125, 91, .2); }
+}
 /* Sits ABOVE .chat-sessions-head so collapsing the list — the default — cannot
    hide it. Wraps rather than truncates: it is three clauses and every one of
    them is a limit the user needs before they type. */

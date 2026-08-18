@@ -210,6 +210,47 @@ type CCLiveJob struct {
 	JobID string
 }
 
+// CCLiveRecord is what cc's registry says about ONE live cc process, whatever
+// kind it is (tether#103).
+//
+// # Why this exists alongside CCLiveJob
+//
+// They answer two different questions and they must not be merged, because the
+// kind filter belongs to only one of them:
+//
+//   - CCLiveJob answers "will cc refuse a `--resume` for this sid" — cc's own
+//     rule, `kind && kind !== "interactive"`, so an interactive record is
+//     excluded BY DEFINITION (see ccInteractiveKind).
+//   - CCLiveRecord answers "is a turn in flight on this conversation" — a
+//     question cc has no rule about, and for which the kind is not the
+//     discriminator at all. See ccStatusActivity in activity.go for why: the
+//     status write is not gated on kind anywhere in the binary, and tether's own
+//     `--print` spawns register as kind "interactive", so a kind-gated reader
+//     would throw away the one row where cc's status is ground truth (a live
+//     session a human is typing at) while keeping none of the rows it wanted.
+//
+// Every field is a quotation from the record, never a derivation. The
+// interpretation lives in activity.go, so this type has no opinion to go stale.
+type CCLiveRecord struct {
+	// Kind is cc's `kind`, empty when the record carries none. Any of
+	// ["interactive","bg","daemon","daemon-worker"] — the values cc validates
+	// against (KB_, read from the installed binary, 2.1.233).
+	Kind string
+	// JobID is cc's `jobId`, empty when the record carries none.
+	JobID string
+	// Status is cc's `status`, and it is ABSENT far more often than not: measured
+	// over the reference machine's 137 records on 2026-08-18, 14 carried one and
+	// 123 did not — the 123 being every `--print` launch, which does not mount
+	// the component that writes it. Empty therefore means "cc did not say", which
+	// is a third answer and not a synonym for idle.
+	//
+	// When present it is one of ["busy","shell","idle","waiting"] (XB_, from the
+	// same binary; cc's own parser drops anything else on read). A value outside
+	// that set can still arrive here from a future cc, and activity.go's
+	// classification is written so that it degrades to "cannot tell".
+	Status string
+}
+
 // CCRegistry reads cc's live-session registry. The zero value lists nothing; see
 // NewCCRegistry.
 type CCRegistry struct {
@@ -280,6 +321,28 @@ func (s *CCRegistry) LiveJob(sid string) (CCLiveJob, bool) {
 	return found, ok
 }
 
+// LiveRecords returns every live cc process's record, grouped by the session id
+// it holds — INCLUDING interactive ones, which LiveJobs excludes (tether#103).
+//
+// A slice per sid rather than one record, because one sid accumulates many
+// records (measured for #101: 7 of 103 sids had more than one, the worst had 26)
+// and two LIVE ones can disagree about the turn state. Reducing them here would
+// mean this reader chose the winner, and the reduction rule is a judgement about
+// what to tell a human — it belongs in activity.go, next to the states it picks
+// between, not in the thing that reads the files.
+//
+// One scan per call, the same cost as LiveJobs: measured for #101 at ~3.0 ms and
+// 44 KB over 138 records including one /proc read each. That is what makes this
+// pollable at all — see SessionActivityPath's doc for the whole cost argument.
+func (s *CCRegistry) LiveRecords() map[string][]CCLiveRecord {
+	out := make(map[string][]CCLiveRecord)
+	s.forEachLiveRecord(func(sid string, rec ccRegistryRecord) bool {
+		out[sid] = append(out[sid], CCLiveRecord{Kind: rec.Kind, JobID: rec.JobID, Status: rec.Status})
+		return true
+	})
+	return out
+}
+
 // forEachLive walks the registry and calls fn for every record that describes a
 // LIVE, NON-INTERACTIVE cc session. fn returns false to stop the walk.
 //
@@ -289,7 +352,29 @@ func (s *CCRegistry) LiveJob(sid string) (CCLiveJob, bool) {
 // two would be free to drift, and the symptom of drift is a session list that
 // marks a row the attach path then resumes without complaint (or the reverse,
 // which is the lie this whole change is about).
+//
+// Since tether#103 it is the HOLDER FILTER expressed on top of forEachLiveRecord
+// rather than its own walk. The filter — `kind != "" && kind != "interactive"` —
+// is cc's own refusal rule and is unchanged; what moved out is only "which
+// records are live", which both questions need and neither owns.
 func (s *CCRegistry) forEachLive(fn func(sid string, job CCLiveJob) bool) {
+	s.forEachLiveRecord(func(sid string, rec ccRegistryRecord) bool {
+		if rec.Kind == "" || rec.Kind == ccInteractiveKind {
+			return true
+		}
+		return fn(sid, CCLiveJob{Kind: rec.Kind, JobID: rec.JobID})
+	})
+}
+
+// forEachLiveRecord walks the registry and calls fn for every record whose
+// process is still alive, of EVERY kind. fn returns false to stop the walk.
+//
+// The kind filter deliberately is NOT here: it is the holder question's rule, not
+// a property of "this record describes a running cc", and the activity question
+// needs the records it excludes. Keeping the two apart in this direction is the
+// safe one — a caller that wants the holder rule has to say so (forEachLive), and
+// there is no way to get the holder answer by forgetting a filter.
+func (s *CCRegistry) forEachLiveRecord(fn func(sid string, rec ccRegistryRecord) bool) {
 	if s == nil || s.dir == "" {
 		return
 	}
@@ -322,13 +407,13 @@ func (s *CCRegistry) forEachLive(fn func(sid string, job CCLiveJob) bool) {
 		// changes its id format, this reader silently stops recognising holders.
 		// Non-empty is the whole requirement: a record with no session id says
 		// nothing about any session.
-		if rec.SessionID == "" || rec.Kind == "" || rec.Kind == ccInteractiveKind {
+		if rec.SessionID == "" {
 			continue
 		}
 		if !ccPidHoldsRecord(pid, rec.ProcStart) {
 			continue
 		}
-		if !fn(rec.SessionID, CCLiveJob{Kind: rec.Kind, JobID: rec.JobID}) {
+		if !fn(rec.SessionID, rec) {
 			return
 		}
 	}
@@ -366,15 +451,33 @@ func (s *CCRegistry) readRecord(name string) (ccRegistryRecord, bool) {
 // ccRegistryRecord is the part of one registry record this package understands.
 //
 // cc writes far more than this — pid, cwd, startedAt, version, peerProtocol,
-// entrypoint, name, nameSource, nameSince, formerNames, agent, status,
-// waitingFor, updatedAt, statusUpdatedAt, logPath, tmux, messagingSocketPath —
-// and adds fields over time. Decoding only the three that decide "is a live
-// non-interactive process holding this session, and which one" means a new field
-// costs nothing and an unknown one cannot be misread.
+// entrypoint, name, nameSource, nameSince, formerNames, agent, waitingFor,
+// updatedAt, statusUpdatedAt, logPath, tmux, messagingSocketPath — and adds
+// fields over time. Decoding only the four that decide "is a live process holding
+// this session, which one, and is it mid-turn" means a new field costs nothing and
+// an unknown one cannot be misread.
 //
 // `pid` is deliberately absent even though the record carries one: the pid comes
 // from the FILE NAME, which is where cc's own liveness check takes it from. See
 // ccRecordPid.
+//
+// `statusUpdatedAt` is deliberately absent too, and that is a decision rather
+// than an omission (tether#103). It looks like the obvious way to age out a stale
+// status, and it is not one: cc stamps it ONLY when a status is written, from a
+// React effect keyed on the status itself —
+//
+//	async function Cvn(e,t){ let r=Date.now();
+//	  await IHt({...e, updatedAt:r, ...e.status!==void 0 && {statusUpdatedAt:r}}, t) }
+//	gn.useEffect(()=>{ Cvn({status:zd, waitingFor:zl}, Y) }, [zd,zl,Y]);
+//
+// — so it marks the last TRANSITION, never a heartbeat, and cc's actual heartbeat
+// (touchFleetViewHeartbeat) writes a different file and never touches status. A
+// session busy for an hour keeps an hour-old statusUpdatedAt and is correctly
+// busy: measured on the reference machine, none of 5 live records' timestamps
+// moved across 25 seconds, and one `busy` record's was 51 minutes old and right.
+// Ageing on it would need a threshold nothing supports, and would report a
+// long-running job as finished. The pid liveness check above is what removes dead
+// processes, and it needs no threshold.
 type ccRegistryRecord struct {
 	SessionID string `json:"sessionId"`
 	// ProcStart is cc's snapshot of the pid's start time, as a decimal string of
@@ -383,6 +486,9 @@ type ccRegistryRecord struct {
 	ProcStart string `json:"procStart"`
 	Kind      string `json:"kind"`
 	JobID     string `json:"jobId"`
+	// Status is cc's `status` (tether#103). Absent on most records — see
+	// CCLiveRecord.Status for the measurement and for what absence means.
+	Status string `json:"status"`
 }
 
 // ccPidHoldsRecord reports whether the process this record was written by is

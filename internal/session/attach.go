@@ -520,7 +520,7 @@ func (a *Attachment) SendPrompt(ctx context.Context, text string) error {
 	}
 	e := a.entry
 	a.mu.Unlock()
-	if err := e.Session().SendPrompt(ctx, text); err != nil {
+	if err := e.sendPrompt(ctx, text); err != nil {
 		return a.reopen(ctx, e, text, err)
 	}
 	return nil
@@ -712,7 +712,7 @@ func (a *Attachment) reopen(ctx context.Context, dead *Entry, text string, sendE
 		// Classified if that delivery fails (tether#77): the replacement is this
 		// attachment's session now, so a refusal here is the end of the line for
 		// this prompt — nothing further retries it.
-		return undelivered(cur.Session().SendPrompt(ctx, text),
+		return undelivered(cur.sendPrompt(ctx, text),
 			"session %s was re-opened by another prompt but would not take this one", sid)
 	}
 	if ctx.Err() != nil {
@@ -793,7 +793,7 @@ func (a *Attachment) reopen(ctx context.Context, dead *Entry, text string, sendE
 		// the recovery on this branch — there is no second one behind it, and the
 		// budget was deliberately left unspent, so the NEXT prompt gets a full
 		// reopen. This one does not.
-		return undelivered(sibling.Session().SendPrompt(ctx, text),
+		return undelivered(sibling.sendPrompt(ctx, text),
 			"adopted the live session under %s but it would not take the prompt", sid)
 	}
 
@@ -983,7 +983,7 @@ func (a *Attachment) reopen(ctx context.Context, dead *Entry, text string, sendE
 	if !outcome.startedProcess() {
 		what = "adopted the live session under %s but it would not take the prompt"
 	}
-	return undelivered(fresh.Session().SendPrompt(ctx, text), what, sid)
+	return undelivered(fresh.sendPrompt(ctx, text), what, sid)
 }
 
 // undelivered classifies a failed prompt delivery as ErrCodePromptUndelivered,
@@ -1335,7 +1335,7 @@ func (a *Attachment) resolve(ctx context.Context) (Resolution, error) {
 	// microseconds, and the composer clears on send, so it is accepted rather
 	// than paid for by holding a mutex across I/O.
 	for _, text := range pending {
-		if err := fresh.Session().SendPrompt(ctx, text); err != nil {
+		if err := fresh.sendPrompt(ctx, text); err != nil {
 			// tether#63 — the fallback session exists but would not take the
 			// user's words. Retryable, and classified rather than left to
 			// default so that the enumeration in wire/errors.go is the whole

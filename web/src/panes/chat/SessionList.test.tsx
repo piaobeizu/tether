@@ -14,6 +14,11 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import SessionList from './SessionList'
 import { useStore } from '../../lib/store'
 import {
+  SESSION_ACTIVITY_PATH,
+  resetSessionActivityForTests,
+  type SessionActivityMap,
+} from '../../lib/sessionActivity'
+import {
   EXTERNAL_SESSION_PROMISE,
   putWiBinding,
   resetArmedBinding,
@@ -34,10 +39,22 @@ const DEFAULT_ROWS: SessionSummary[] = [
 /** Route the component's fetches by URL. Anything else throws rather than
  *  quietly succeeding, so the mock's realism is self-enforcing. Paths match
  *  mux.go. `rows` is a getter so a test can change the answer mid-run. */
-function mockDaemon(rows: () => SessionSummary[] = () => DEFAULT_ROWS) {
+function mockDaemon(
+  rows: () => SessionSummary[] = () => DEFAULT_ROWS,
+  activity: () => SessionActivityMap = () => ({}),
+) {
   const fn = vi.fn(async (url: string, init?: RequestInit) => {
     if (url === '/api/v1/sessions') {
       return { ok: true, status: 200, json: async () => rows() }
+    }
+    // tether#103 — every SessionRow subscribes to the shared activity poller, so
+    // rendering this list polls this route. Answered rather than left to the throw
+    // below: the poller swallows its own failures, so an unanswered route would
+    // mean the rows here never got a marker while this suite stayed green — which
+    // is the very shape of silence this mock's "unknown URLs throw" rule exists to
+    // prevent.
+    if (url === SESSION_ACTIVITY_PATH) {
+      return { ok: true, status: 200, json: async () => activity() }
     }
     if (url === `/api/v1/sessions/${SID_WITH_HISTORY}/messages`) {
       return { ok: true, status: 200, json: async () => [{ role: 'user', text: 'B-only prompt', ts: 10 }] }
@@ -75,6 +92,9 @@ beforeEach(() => {
   localStorage.clear()
   resetArmedBinding()
   resetMigrationForTests()
+  // tether#103 — the activity poller is module-level state, so without this one
+  // file's subscribers and timer would still be alive inside the next.
+  resetSessionActivityForTests()
   useStore.setState({
     sessionId: 'sid-previous',
     messages: [],
@@ -84,6 +104,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+  resetSessionActivityForTests()
   offRetry?.(); offRetry = null
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
@@ -473,5 +494,38 @@ describe('SessionList marks a session a background agent is using (tether#101)',
     expect(reconnects()).toBe(1)
     await waitFor(() => expect(useStore.getState().sessionId).toBe(HELD_SID))
     expect(localStorage.getItem('tether_last_sid')).toBe(HELD_SID)
+  })
+})
+
+// tether#103 — the activity marker reaches the CHAT list's rows too.
+//
+// The row is shared with the wi detail pane, and this repo's receipt for "shared
+// component, therefore fine" is the first draft of that very row: two copies that
+// had already diverged three ways by review. So both consumers assert it, and each
+// asserts the half that is its own. Here that half is "the marker rides the same
+// rows the list already renders, and only on the rows the daemon named" — a
+// per-row filter, which is the mistake a `.some()`-shaped implementation makes
+// invisible.
+describe('SessionList marks which conversations have a turn in flight (tether#103)', () => {
+  it('marks only the rows the daemon named, with the state it named', async () => {
+    mockDaemon(
+      () => DEFAULT_ROWS,
+      () => ({ [SID_WITH_HISTORY]: 'working' }),
+    )
+    const { container } = render(<SessionList />)
+
+    await waitFor(() => screen.getByText('Sessions'))
+    fireEvent.click(screen.getByText('Sessions'))
+    await waitFor(() => expect(container.querySelectorAll('.session-row-act')).toHaveLength(1))
+
+    const rows = [...container.querySelectorAll('.chat-sessions-list .tree-row')]
+    expect(rows).toHaveLength(2)
+    // The marked row is the one the daemon named, and the OTHER row carries no
+    // marker at all — absence in the map means nothing live holds that session, so
+    // the row must say nothing rather than settle on a default.
+    const marked = rows.filter(r => r.querySelector('.session-row-act'))
+    expect(marked).toHaveLength(1)
+    expect(marked[0].textContent).toContain('B-only prompt')
+    expect(marked[0].querySelector('.session-row-act')?.className).toBe('session-row-act working')
   })
 })

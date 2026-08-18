@@ -6,8 +6,14 @@
 // Each test below pins one of those three, so a future second copy fails rather
 // than merely looking slightly different.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { SessionRow, sessionWhen } from './SessionRow'
+import {
+  SESSION_ACTIVITY_PATH,
+  SESSION_ACTIVITY_POLL_MS,
+  resetSessionActivityForTests,
+  sessionActivityPollerState,
+} from './sessionActivity'
 import { useStore } from './store'
 import {
   EXTERNAL_SESSION_PROMISE,
@@ -325,5 +331,165 @@ describe('SessionRow marks a session a background agent is using', () => {
     expect(text).toMatch(/background agent \(bg\)/)
     expect(text).toMatch(/when this list was built/i)
     expect(text).not.toMatch(/cannot|can't|will not|won't|unavailable/i)
+  })
+})
+
+// tether#103 — the activity marker, and above all that it MOVES.
+//
+// The wi's first hard requirement is that the marker changes when the state does,
+// and its named worst case is a mutation no render test can see: delete the refresh
+// mechanism and every per-state snapshot below still passes while the row freezes.
+// So the first test here drives idle -> working -> idle through the real poller,
+// the real interval and the real fetch boundary, and only then do the per-state
+// tests pin what each one looks like.
+describe('SessionRow marks whether a turn is in flight', () => {
+  const actRow = (over: Partial<SessionSummary> = {}) =>
+    row({ sid: 'sid-act-000000001', title: 'a live conversation', ...over })
+
+  const marker = (c: HTMLElement) => c.querySelector('.session-row-act')
+
+  /** Stub the activity endpoint with a body the test can change between polls. */
+  function activityDaemon(body: () => string) {
+    let calls = 0
+    const fn = vi.fn(async (url: string) => {
+      if (url === SESSION_ACTIVITY_PATH) {
+        calls++
+        return { ok: true, status: 200, json: async () => JSON.parse(body()) as unknown }
+      }
+      return { ok: true, status: 200, json: async () => [] }
+    })
+    vi.stubGlobal('fetch', fn)
+    return { calls: () => calls }
+  }
+
+  beforeEach(() => { resetSessionActivityForTests() })
+  afterEach(() => { resetSessionActivityForTests() })
+
+  it('follows the state through idle -> working -> idle without a remount', async () => {
+    vi.useFakeTimers()
+    try {
+      let body = `{"sid-act-000000001":"idle"}`
+      const d = activityDaemon(() => body)
+      const { container } = render(<SessionRow session={actRow()} />)
+
+      // Nothing is rendered before the first answer lands — the row does not guess.
+      expect(marker(container)).toBeNull()
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(marker(container)?.className).toBe('session-row-act idle')
+
+      body = `{"sid-act-000000001":"working"}`
+      await act(async () => { await vi.advanceTimersByTimeAsync(SESSION_ACTIVITY_POLL_MS) })
+      // THE assertion this whole slice is for. A marker that is right at mount and
+      // never again is the frozen lie the wi says is worse than no marker at all.
+      expect(marker(container)?.className).toBe('session-row-act working')
+      expect(marker(container)?.getAttribute('aria-label')).toBe('a turn is in flight')
+
+      body = `{"sid-act-000000001":"idle"}`
+      await act(async () => { await vi.advanceTimersByTimeAsync(SESSION_ACTIVITY_POLL_MS) })
+      expect(marker(container)?.className).toBe('session-row-act idle')
+
+      body = `{}`
+      await act(async () => { await vi.advanceTimersByTimeAsync(SESSION_ACTIVITY_POLL_MS) })
+      // Gone means gone: nothing live holds the session, so the row says nothing
+      // rather than settling on its last known state.
+      expect(marker(container)).toBeNull()
+      expect(d.calls()).toBe(4)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('renders each state distinguishably, pinned to the literal class', async () => {
+    // Literal class names, not "some class is present". A property assertion here
+    // would be satisfied by a mutant that gave all three states one rendering
+    // (tether#102 measured a real defect surviving exactly that shape).
+    for (const [state, cls, label] of [
+      ['working', 'session-row-act working', 'a turn is in flight'],
+      ['idle', 'session-row-act idle', 'a coding agent has this open — no turn in flight'],
+      ['held', 'session-row-act held', 'a coding agent has this open — tether cannot see whether a turn is in flight'],
+    ] as const) {
+      resetSessionActivityForTests()
+      activityDaemon(() => `{"sid-act-000000001":"${state}"}`)
+      const { container, unmount } = render(<SessionRow session={actRow()} />)
+      await waitFor(() => expect(marker(container)).not.toBeNull())
+      expect(marker(container)?.className).toBe(cls)
+      expect(marker(container)?.getAttribute('aria-label')).toBe(label)
+      // role="img" so the sentence above is the element's accessible NAME rather
+      // than decoration a screen reader skips. A dot cannot say which of three
+      // things it means; the label is the channel that can.
+      expect(marker(container)?.getAttribute('role')).toBe('img')
+      unmount()
+    }
+  })
+
+  it('says nothing at all for a session nothing live holds', async () => {
+    activityDaemon(() => `{"sid-someone-else":"working"}`)
+    const { container } = render(<SessionRow session={actRow()} />)
+    // Wait for a real answer to have arrived, so this is "the daemon told us
+    // nothing about this sid" and not "the fetch had not resolved yet".
+    await waitFor(() => expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(0))
+    await act(async () => { await Promise.resolve() })
+    expect(marker(container)).toBeNull()
+  })
+
+  it('puts the state in the hover text alongside the sid', async () => {
+    activityDaemon(() => `{"sid-act-000000001":"held"}`)
+    const { container } = render(<SessionRow session={actRow()} />)
+    await waitFor(() => expect(marker(container)).not.toBeNull())
+    const title = container.querySelector('.tree-row')?.getAttribute('title') ?? ''
+    expect(title).toContain('sid-act-000000001')
+    expect(title).toContain('cannot see whether a turn is in flight')
+  })
+
+  it('does NOT claim the model is emitting output', async () => {
+    // The precision that was asked for and is not available: the agent's own status
+    // is `busy` for the whole turn, tool execution included, so "the model is
+    // replying" would be false for a row three minutes into a test run. Asserted on
+    // the CONCEPT so a rewording cannot pass by dodging one literal.
+    activityDaemon(() => `{"sid-act-000000001":"working"}`)
+    const { container } = render(<SessionRow session={actRow()} />)
+    await waitFor(() => expect(marker(container)).not.toBeNull())
+    const label = marker(container)?.getAttribute('aria-label') ?? ''
+    expect(label).toMatch(/turn/i)
+    expect(label).not.toMatch(/token|typing|writing|generat|emitt|replying|responding/i)
+  })
+
+  it('shares ONE poller with every other row on the page', async () => {
+    vi.useFakeTimers()
+    try {
+      const d = activityDaemon(() => `{"sid-act-000000001":"working"}`)
+      render(<SessionRow session={actRow()} />)
+      render(<SessionRow session={actRow({ sid: 'sid-act-000000002', title: 'another' })} />)
+      render(<SessionRow session={actRow({ sid: 'sid-act-000000003', title: 'a third' })} />)
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      // One request for three rows, not three. The row is rendered by two panes and
+      // a list has many of them, so a fetch per row multiplies the request rate by
+      // the row count and lets two panes hold answers that disagree.
+      expect(d.calls()).toBe(1)
+      expect(sessionActivityPollerState().subscribers).toBe(3)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('stops polling when the last row unmounts', async () => {
+    vi.useFakeTimers()
+    try {
+      const d = activityDaemon(() => `{}`)
+      const a = render(<SessionRow session={actRow()} />)
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(sessionActivityPollerState().running).toBe(true)
+
+      a.unmount()
+      // On the TIMER, not only on the request count: a poller still ticking with
+      // nobody listening is invisible to a count taken right after the unmount.
+      expect(sessionActivityPollerState()).toEqual({ running: false, subscribers: 0 })
+      const before = d.calls()
+      await act(async () => { await vi.advanceTimersByTimeAsync(SESSION_ACTIVITY_POLL_MS * 3) })
+      expect(d.calls()).toBe(before)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

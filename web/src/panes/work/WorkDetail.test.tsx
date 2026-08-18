@@ -40,6 +40,11 @@ import { afterEach, beforeEach, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import WorkDetail from './WorkDetail'
 import { useStore } from '../../lib/store'
+import {
+  SESSION_ACTIVITY_PATH,
+  resetSessionActivityForTests,
+  type SessionActivityMap,
+} from '../../lib/sessionActivity'
 import { resetArmedBinding, type SessionSummary } from '../../lib/wiSession'
 
 const WI_ID = 'wi_JAsOyS4F'
@@ -56,7 +61,11 @@ type Call = [string, RequestInit?]
 
 /** Route WorkDetail's fetches. `sessions` is a getter so a test can change the
  *  daemon's answer between renders. Unknown URLs throw. */
-function mockWorkDaemon(status: string, sessions: () => SessionSummary[] = () => []) {
+function mockWorkDaemon(
+  status: string,
+  sessions: () => SessionSummary[] = () => [],
+  activity: () => SessionActivityMap = () => ({}),
+) {
   const fn = vi.fn(async (url: string, init?: RequestInit) => {
     if (url === `/api/v1/work/items/${encodeURIComponent(WI_ID)}`) {
       return { ok: true, status: 200, json: async () => item(status) }
@@ -69,6 +78,15 @@ function mockWorkDaemon(status: string, sessions: () => SessionSummary[] = () =>
     }
     if (url === '/api/v1/sessions') {
       return { ok: true, status: 200, json: async () => sessions() }
+    }
+    // tether#103 — SessionRow now subscribes to the shared activity poller, so
+    // rendering this pane polls this route. Answered rather than left to the
+    // catch-all below, because this mock's realism is what makes it useful: a
+    // rejected poll is swallowed by the poller's own error handling, so leaving it
+    // out would mean the rows here silently never get a marker while the suite
+    // stayed green.
+    if (url === SESSION_ACTIVITY_PATH) {
+      return { ok: true, status: 200, json: async () => activity() }
     }
     if (url.endsWith('/messages')) {
       return { ok: true, status: 200, json: async () => [] }
@@ -97,12 +115,16 @@ function watchPrompts() {
 beforeEach(() => {
   localStorage.clear()
   resetArmedBinding()
+  // tether#103 — the activity poller is module-level, so without this one file's
+  // subscribers and timer would still be alive (and still counted) inside the next.
+  resetSessionActivityForTests()
   useStore.setState({ sessionId: null, messages: [], notices: [] })
   watchPrompts()
 })
 
 afterEach(() => {
   cleanup()
+  resetSessionActivityForTests()
   offInject?.(); offInject = null
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
@@ -211,6 +233,33 @@ describe('WorkDetail lists every session of the wi (tether#91)', () => {
     await screen.findByText('→ Open in chat')
     expect(screen.queryByText('Sessions')).toBeNull()
   })
+
+  // tether#103 — the marker reaches the rows THIS pane renders, not only the chat
+  // list's. It is the same SessionRow, but "the same component" is exactly the
+  // assumption this repo has been burned by: the first draft of that row was two
+  // copies that had diverged three ways before review. One poller, and it is
+  // subscribed from inside the row, so the claim to check here is that this pane
+  // needed no code of its own to get the feature and did not get two timers for it.
+  it('marks a bound session that is working, with ONE shared poller', async () => {
+    const fetchMock = mockWorkDaemon(
+      'running',
+      () => [
+        { sid: 'sid-newest', workItem: SLUG, title: 'second attempt', updatedAt: 300 },
+        { sid: 'sid-older', workItem: SLUG, title: 'first attempt', updatedAt: 100 },
+      ],
+      () => ({ 'sid-newest': 'working', 'sid-older': 'held' }),
+    )
+    const { container } = render(<WorkDetail id={WI_ID} />)
+
+    await waitFor(() => screen.getByText('Sessions'))
+    await waitFor(() => expect(container.querySelectorAll('.session-row-act')).toHaveLength(2))
+    const classes = [...container.querySelectorAll('.session-row-act')].map(n => n.className)
+    expect(classes).toEqual(['session-row-act working', 'session-row-act held'])
+
+    // Two rows, ONE request to the activity route.
+    const activityCalls = fetchMock.mock.calls.filter(([url]) => url === SESSION_ACTIVITY_PATH)
+    expect(activityCalls).toHaveLength(1)
+  })
 })
 
 // The window the old code did not have. The binding used to be a synchronous
@@ -240,6 +289,8 @@ describe('WorkDetail resume before the session list has answered (tether#91)', (
         await listHeld
         return { ok: true, status: 200, json: async () => [{ sid: 'sid-bound', workItem: SLUG, updatedAt: 300 }] }
       }
+      // tether#103 — see mockDaemon above.
+      if (url === SESSION_ACTIVITY_PATH) return { ok: true, status: 200, json: async () => ({}) }
       if (url.endsWith('/messages')) return { ok: true, status: 200, json: async () => [] }
       throw new Error(`unexpected fetch: ${url}`)
     }))

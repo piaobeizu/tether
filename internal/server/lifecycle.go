@@ -80,6 +80,19 @@ type Config struct {
 	// wrong for a directory tether is only allowed to look at.
 	CCProjectsDir string
 
+	// CCSessionsDir is cc's LIVE-SESSION registry — <cc-config-dir>/sessions,
+	// one <pid>.json per running cc process (tether#101). It is how the daemon can
+	// tell a resume that failed because the transcript is gone from one cc REFUSED
+	// because a background job is holding the sid, which it previously answered the
+	// same way: by silently starting an empty conversation.
+	//
+	// READ ONLY, on the same terms as CCProjectsDir, and resolved by Run() from the
+	// SAME CLAUDE_CONFIG_DIR read — they are two directories of one cc config dir,
+	// never independently configured in practice. Set it to a path that does not
+	// exist to switch the feature off; a daemon that cannot read it behaves exactly
+	// as it did before tether#101.
+	CCSessionsDir string
+
 	// v0.3.2: external client API token store
 	APITokensPath string // path to api-tokens.json; "" = ~/.tether/api-tokens.json
 
@@ -252,7 +265,14 @@ func Run(cfg *Config) error {
 	// binary: `env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude")`). Ignoring it
 	// would make this whole feature a silent no-op for anyone who sets it — and a
 	// silent no-op is the exact class of defect this change exists to remove.
-	if cfg.CCProjectsDir == "" {
+	//
+	// ONE read of the variable, TWO directories (tether#101): cc's transcripts live
+	// in <config>/projects and its live-session registry in <config>/sessions, and
+	// they are only ever two views of the same cc install. Resolving them from a
+	// single read is what makes that structural — a second os.Getenv here would be
+	// two chances to disagree, and the disagreement would be invisible (a session
+	// list built from one cc and a "what is running" answer from another).
+	if cfg.CCProjectsDir == "" || cfg.CCSessionsDir == "" {
 		ccHome := os.Getenv("CLAUDE_CONFIG_DIR")
 		if ccHome == "" {
 			home, err := os.UserHomeDir()
@@ -262,7 +282,12 @@ func Run(cfg *Config) error {
 				ccHome = filepath.Join(home, ".claude")
 			}
 		}
-		cfg.CCProjectsDir = session.CCProjectsDir(ccHome)
+		if cfg.CCProjectsDir == "" {
+			cfg.CCProjectsDir = session.CCProjectsDir(ccHome)
+		}
+		if cfg.CCSessionsDir == "" {
+			cfg.CCSessionsDir = session.CCSessionsDir(ccHome)
+		}
 	}
 	// Built ONCE, here, and hung on the Registry. Two consumers need it and they
 	// need the same answers: the session list (mux.go reads cfg.Registry.CC) and
@@ -271,6 +296,19 @@ func Run(cfg *Config) error {
 	// directories the user works in — the drift this repo keeps paying for.
 	if cfg.Registry.CC == nil {
 		cfg.Registry.CC = session.NewCCStore(cfg.CCProjectsDir, ccWorkdirs(cfg, cfg.Registry))
+	}
+	// The live-session registry, on the same terms and for the same reason
+	// (tether#101). Two consumers again — the session list, which marks a row, and
+	// Attachment.resolve, which is the one allowed to refuse — and they must not be
+	// able to disagree about what is running.
+	//
+	// No `dirs` whitelist here, unlike NewCCStore: this reader is asked about a
+	// SESSION ID, not asked to enumerate a directory, so there is nothing for a
+	// whitelist to narrow. A background job holding the sid the client asked for is
+	// the answer whatever directory it is working in — and cc's own refusal does not
+	// consult cwd either.
+	if cfg.Registry.CCJobs == nil {
+		cfg.Registry.CCJobs = session.NewCCRegistry(cfg.CCSessionsDir)
 	}
 	mcpCfg, err := loadMCPConfig(cfg.MCPConfigPath)
 	if err != nil {

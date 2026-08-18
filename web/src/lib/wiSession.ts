@@ -236,6 +236,15 @@ export function resetMigrationForTests(): void {
  * has been delivered — so a flag would be a prediction, and a list that predicts
  * wrong is worse than one that says what it knows. See session.SessionSummary
  * (Go) for the long form.
+ *
+ * tether#101 narrows that last paragraph, and the narrowing belongs HERE rather
+ * than only in the Go doc it was copied from: this comment sits directly above the
+ * interface a frontend author edits, so it is the version that gets read. There is
+ * still no 'resumable', and resumability is still not predictable. But ONE
+ * obstacle is a fact rather than a prediction: the agent keeps a registry of its
+ * own live sessions and refuses a `--resume` outright while a non-interactive one
+ * holds the id, which it decides from that file before any prompt is delivered.
+ * `runningAs` below carries that, and nothing else here predicts anything.
  */
 export type SessionSource = 'tether' | 'cc'
 
@@ -246,6 +255,14 @@ export type SessionSource = 'tether' | 'cc'
  * wire.gen.ts, and this type is not in it. It is THE declaration — a component
  * that needs a field adds it here rather than widening the type at its own call
  * site, which is the same rule sessionLabel below is an instance of.
+ *
+ * "Not in it" used to mean nothing checked the mirror at all: a field added to the
+ * Go struct and forgotten here compiled cleanly on both sides, every test passed,
+ * and the feature was a silent no-op. tether#101 closed that with
+ * TestSessionSummaryIsMirroredInTypeScript (internal/session/sessionlist_test.go),
+ * which reads this interface and requires a property for every json tag the Go
+ * struct sends. So this type is still hand-written, but forgetting to update it is
+ * now a failing Go test rather than a silence.
  */
 export interface SessionSummary {
   sid: string
@@ -259,6 +276,27 @@ export interface SessionSummary {
    * before tether#92.
    */
   source?: SessionSource
+  /**
+   * The kind of live agent process that was holding this session AT THE MOMENT THE
+   * DAEMON BUILT THIS LIST — the agent's own value, 'bg' / 'daemon' /
+   * 'daemon-worker', never 'interactive'. Absent when none was observed
+   * (tether#101).
+   *
+   * It is an OBSERVATION and not a promise, and both ways of being out of date are
+   * fine: a job that has since finished simply opens, and one that is still running
+   * meets a refusal that explains itself (wire code
+   * session_held_by_background_agent). The authority is the attach path, never this
+   * field — which is why a row carrying it stays CLICKABLE. Disabling it would be a
+   * lie a minute later, and an unexplained disabled row is worse than a click that
+   * answers.
+   *
+   * Typed as a plain string rather than a union of the four kinds: it is a value
+   * quoted from another program's file, so a kind this build has not heard of must
+   * arrive intact rather than fail a narrowing. isRunningElsewhere below is the only
+   * thing that interprets it, and it interprets non-empty as "something is holding
+   * this", which stays correct for a fifth kind.
+   */
+  runningAs?: string
 }
 
 /**
@@ -373,6 +411,54 @@ export const EXTERNAL_SESSION_PROMISE =
   `${EXTERNAL_SESSION_PROVENANCE} You are reading it: recent messages only, ` +
   'with the calls it made; their output only where a call failed. ' +
   'A prompt sent here may start a new conversation instead of continuing this one.'
+
+/**
+ * isRunningElsewhere — "a live background agent was holding this session when the
+ * daemon built this list" (tether#101).
+ *
+ * Non-empty rather than a comparison against a known set of kinds, for the reason
+ * SessionSummary.runningAs gives: the daemon has already excluded the one kind that
+ * is not a holder ('interactive'), so anything it sends here IS one, including a
+ * kind this build predates. That is the opposite polarity from isExternalSession,
+ * where an unrecognised value must read as external — there, silence is the
+ * dangerous answer; here, a value is the informative one and its absence asserts
+ * nothing at all.
+ *
+ * One definition because two places ask (the row's badge and its hover text), and
+ * because the question will be asked again by the read-only transcript view this is
+ * a prerequisite for.
+ */
+export function isRunningElsewhere(s: SessionSummary): boolean {
+  return (s.runningAs ?? '') !== ''
+}
+
+/**
+ * The row's one-word marker. 'running', not 'busy' or 'locked':
+ *
+ *  - 'locked' would be false — nothing is locked, and the row is still clickable.
+ *  - 'busy' is what the agent calls a background job's STATUS while it is mid-turn
+ *    (its registry records status 'busy' / 'idle' / 'shell' / 'waiting'), and an
+ *    idle-but-held session refuses a resume exactly the same way. Borrowing that
+ *    word would mean the badge disagrees with the thing it is quoting.
+ *
+ * 'running' is what is true of every value that reaches here: some agent process is
+ * running with this conversation open.
+ */
+export const RUNNING_ELSEWHERE_BADGE = 'running'
+
+/**
+ * Why the badge is there, for the row's hover text. Names the kind, because that is
+ * the only word that distinguishes a background job from a daemon worker and it
+ * costs nothing here.
+ *
+ * Deliberately NOT a promise about what a click will do. That sentence belongs to
+ * the refusal the attach path sends (FATAL_CODE_MESSAGES in panes/chat), which is
+ * the only place that speaks after the agent has actually answered — this list can
+ * only report what it saw.
+ */
+export function runningElsewhereProvenance(s: SessionSummary): string {
+  return `A background agent (${s.runningAs}) was using this conversation when this list was built.`
+}
 
 /** The sessions bound to one work item, newest first (the daemon's order). */
 export function sessionsForWorkItem(rows: SessionSummary[], workItem: string): SessionSummary[] {

@@ -114,6 +114,22 @@ type Registry struct {
 	// two answers to "which directories does the user work in" — the shape of
 	// drift this repo has a documented history of.
 	CC *CCStore
+	// CCJobs reads cc's LIVE-SESSION registry (tether#101). nil = this daemon
+	// cannot tell a resume that failed because the transcript is gone from one cc
+	// REFUSED because a background job is holding the sid, which is what every
+	// daemon before that slice did — and doing it silently is the defect.
+	//
+	// A second store, not a second opinion about the first: CC answers "what
+	// conversations exist", this answers "what is running right now". They are two
+	// directories of ONE cc config dir and are resolved from a single
+	// CLAUDE_CONFIG_DIR read in lifecycle.go, so they cannot end up describing two
+	// different cc installs.
+	//
+	// The same instance the session list uses (built once in lifecycle.go, read
+	// from here by mux.go), for the reason stated above CC: two instances would be
+	// two answers, and the symptom is a row the list marks and the attach path
+	// resumes without complaint.
+	CCJobs *CCRegistry
 	// Workspaces resolves a client-supplied workspace id to a path. nil = this
 	// daemon cannot honour a `ws` request at all, and says so rather than
 	// substituting a directory of its own (tether#52 — see resolveWorkspace).
@@ -156,6 +172,24 @@ func (r *Registry) hadConversation(sid string) bool {
 		return true
 	}
 	return r.CC != nil && r.CC.Has(sid)
+}
+
+// ccLiveJob reports whether a LIVE, NON-INTERACTIVE cc process is holding sid
+// right now, and what cc says about it (tether#101).
+//
+// It sits next to hadConversation because it is the same shape of question asked
+// from the same place — Attachment.resolve, deciding what to tell the user about a
+// resume that did not confirm — and because both must answer "no" for a daemon
+// that has no store to ask rather than guessing. The difference is what a "no"
+// costs: hadConversation's false only withholds a notice, while a false here
+// means the pre-tether#101 fallback runs, which is the behaviour this exists to
+// replace. That asymmetry is why the reader itself is built to fail towards
+// "not live" rather than towards "held" — see CCRegistry's file doc.
+func (r *Registry) ccLiveJob(sid string) (CCLiveJob, bool) {
+	if r == nil || sid == "" || r.CCJobs == nil {
+		return CCLiveJob{}, false
+	}
+	return r.CCJobs.LiveJob(sid)
 }
 
 // spawnOutcome says where the *Entry a spawnEntry call returns came from. The

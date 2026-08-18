@@ -284,9 +284,15 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 
 	// Now confirm the session (cc's system/init only arrives AFTER the first
 	// prompt is delivered on cc stdin by the goroutine above). If this connection
-	// tried to resume and the resume failed, Resolve transparently falls back to
+	// tried to resume and the resume failed, Resolve USUALLY falls back to
 	// a fresh session and replays the buffered prompt(s) — so the user still gets
 	// an answer to what they just typed.
+	//
+	// "Usually", since tether#101: when cc refused the resume because a live
+	// background agent holds that sid, Resolve starts nothing and returns a
+	// Refusal, which the branch below turns into a terminal error frame. That is
+	// the point of the change — a fresh session there is an empty conversation the
+	// user did not ask for, so the honest answer is the refusal and not a reply.
 	res, err := att.Resolve(ctx)
 	if err != nil {
 		slog.Warn("serveChat: session did not resolve", "err", err)

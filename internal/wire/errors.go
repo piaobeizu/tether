@@ -116,6 +116,39 @@ const (
 	// recoverable hiccup (a bad spawn, a transient cc crash) into a dead end
 	// the ladder refuses to retry out of.
 	ErrCodeSessionUnconfirmed ErrorCode = "session_unconfirmed"
+	// ErrCodeSessionHeldByBackgroundAgent means the `--resume` failed because a
+	// LIVE, NON-INTERACTIVE cc process is holding that session id right now, so
+	// cc refused to open it (session/attach.go resolve, tether#101).
+	//
+	// TERMINAL, and the argument has to be made against the code directly below
+	// this one, whose doc says it MUST stay retryable. That verdict rests on a
+	// premise — "an ordinary browser reconnect for the same sid takes the
+	// `--resume` path next time, which is precisely how a transient spawn failure
+	// recovers without the user doing anything" — and this is the one failure
+	// where that premise is false. The reconnect DOES take the `--resume` path and
+	// meets the identical refusal, deterministically, for as long as the other
+	// process lives. The ladder is five attempts across ~31s
+	// (MIN_USABLE_CONN_MS, web/src/panes/chat/index.tsx); a background job runs for
+	// minutes. Retrying is not a recovery here, it is a spinner. Nothing about
+	// ErrCodeSessionUnconfirmed changes — this is a DIFFERENT code precisely so
+	// that its retryability does not have to.
+	//
+	// The nearest existing shape is ErrCodeSessionOwned, also terminal for the
+	// same form of reason ("refused for as long as the entry lives").
+	//
+	// # It is the only terminal code that is TEMPORARY, and that changes the words
+	//
+	// An unknown workspace stays unknown; a registry that failed to load does not
+	// reload itself; a session owned by another device is never released. A
+	// background job FINISHES. So "terminal" here means only what the bit means —
+	// stop the automatic ladder — and the sentence the browser shows must point at
+	// the Retry button rather than read as "this conversation is gone".
+	// Terminal=true is exactly that pair in this codebase, verified rather than
+	// assumed: shouldReconnectAfterClose cancels the ladder and sets connState
+	// 'failed', the 'failed' card renders FATAL_CODE_MESSAGES[code] together with a
+	// Retry button wired to manualRetry, and doConnect clears `fatal` so a manual
+	// attempt (or opening a different row) starts clean.
+	ErrCodeSessionHeldByBackgroundAgent ErrorCode = "session_held_by_background_agent"
 	// ErrCodeAgent means the agent process itself reported an error
 	// (agent.EventError — session/registry.go translateEvent). It is the agent
 	// speaking, not the daemon refusing the connection, and that is the whole of
@@ -220,6 +253,10 @@ var terminalCodes = map[ErrorCode]bool{
 	ErrCodeSessionUnconfirmed:  false,
 	ErrCodeAgent:               false,
 	ErrCodePromptUndelivered:   false,
+	// True, and it sits next to a false one it must not be confused with — see
+	// its doc comment for why the reconnect that rescues ErrCodeSessionUnconfirmed
+	// cannot rescue this.
+	ErrCodeSessionHeldByBackgroundAgent: true,
 }
 
 // Terminal reports whether c is a permanent refusal the browser should stop

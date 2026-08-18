@@ -546,12 +546,28 @@ body {
    margin, because two `auto` margins in one flex row split the free space and
    park the marker mid-row. It is 0 and not 6px: .tree-row already sets
    `gap: 6px`, and a margin adds to the gap rather than replacing it. */
-.session-row-src {
+/* tether#101 adds a SECOND badge (`running` — a background agent has this
+   conversation open). One shape for both, so the row reads as a row of markers
+   rather than as two unrelated decorations; only the word and the colour differ.
+   --warn is already in this file (the reconnect banner's dot), so still no new
+   token. */
+.session-row-src,
+.session-row-running {
   font-size: 9.5px; color: var(--ink-quat);
   border: 1px solid var(--line-soft); border-radius: 3px;
   padding: 0 3px; margin-left: auto; flex-shrink: 0;
 }
-.session-row-src + .session-row-when { margin-left: 0; }
+.session-row-running { color: var(--warn); border-color: var(--warn); }
+/* Whichever marker comes FIRST keeps the `margin-left: auto`; everything after it
+   clears its own. `~` and not `+`, which is the tether#101 change: with two
+   possible badges the timestamp is no longer necessarily adjacent to the one that
+   took the auto margin, and a second `auto` in the same flex row splits the free
+   space and parks the first badge mid-row (the bug the original `+` rule was
+   written for, one badge later). 0 rather than 6px because .tree-row already sets
+   `gap: 6px` and a margin adds to the gap instead of replacing it. */
+.session-row-src ~ .session-row-running,
+.session-row-src ~ .session-row-when,
+.session-row-running ~ .session-row-when { margin-left: 0; }
 /* Sits ABOVE .chat-sessions-head so collapsing the list — the default — cannot
    hide it. Wraps rather than truncates: it is three clauses and every one of
    them is a limit the user needs before they type. */

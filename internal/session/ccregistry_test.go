@@ -165,10 +165,14 @@ func interactiveRecord(pid int, sid, procStart string) map[string]any {
 // same error one step smaller: 9 is the count of dead bg RECORDS, and they collapse
 // onto 2 sids.)
 //
-// Two today is worth a guard anyway, and the reason is the trend rather than the
-// count: the dead half only grows — 9 of those 14 records were already dead, the
-// oldest 3.2 days old, median 0.8 — while the live half is bounded by how many jobs
-// are running at once. Left unchecked, this rule gets steadily wronger.
+// Two today is worth a guard anyway, and the reason is not the count but WHY the
+// count moves in one direction only: cc's sweep of stale records is structurally
+// disabled in tether's environment (Docker, sandbox and non-interactive launch all
+// disable it — see CCRegistry's file doc for the gate), so the dead half
+// accumulates for as long as the machine runs background jobs, while the live half
+// is bounded by how many run at once. 9 of those 14 records were already dead, the
+// oldest 3.2 days old, median 0.8. Left unchecked, this rule does not merely stay
+// slightly wrong, it gets steadily wronger.
 //
 // The interactive row is not a count at all, and must not be read as one: it is the
 // shape TETHER'S OWN spawned agent registers as, so answering "held" for it would
@@ -196,12 +200,13 @@ func TestCCRegistryLiveJob_TheThreeRecordShapes(t *testing.T) {
 		},
 		{
 			name: "dead pid + kind bg is NOT held",
-			// The residue case. 132 of the 138 records on the reference machine referred
-			// to pids that had exited (oldest 3.2 days, median 0.8) — that figure is about
-			// the whole directory; the ones this rule decides are the 9 dead
-			// NON-INTERACTIVE records, over 2 sids. cc lets such a resume through
-			// (measured: it proceeds to "No conversation found with session ID:" or
-			// succeeds), so tether must too.
+			// The residue case, and the residue never gets collected — cc's sweep is off
+			// in this environment (CCRegistry's file doc has the gate). 132 of the 138
+			// records on the reference machine referred to pids that had exited (oldest
+			// 3.2 days, median 0.8) — that figure is about the whole directory; the ones
+			// this rule decides are the 9 dead NON-INTERACTIVE records, over 2 sids. cc
+			// lets such a resume through (measured: it proceeds to "No conversation found
+			// with session ID:" or succeeds), so tether must too.
 			rec:      bgRecord(dead, "sid-dead-bg-00001", "1"),
 			sid:      "sid-dead-bg-00001",
 			wantHeld: false,
@@ -436,11 +441,14 @@ func TestCCRegistryPidComesFromTheFileNameNotTheBody(t *testing.T) {
 //
 // A record whose pid is running but whose start token disagrees is a RECYCLED
 // pid — or, in a container, the same pid number in another namespace. The pid
-// exists; the process that wrote the record does not. On the reference machine
-// 132 of 138 records referred to exited pids, so the pool of records exposed to
-// recycling is the large majority of the directory, and a reader without this
-// comparison would start refusing resumes on the strength of an unrelated
-// process.
+// exists; the process that wrote the record does not.
+//
+// The pool exposed to that is the large majority of the directory (132 of 138
+// records on the reference profile referred to exited pids) and it can only grow,
+// because cc's sweep of stale records never runs in tether's environment — see
+// CCRegistry's file doc. So a reader without this comparison would start refusing
+// resumes on the strength of an unrelated process, and would do it more often over
+// time rather than less.
 func TestCCRegistryLiveJob_ProcStartMismatchIsNotAHolder(t *testing.T) {
 	requireLinux(t)
 	f := newCCRegFixture(t)

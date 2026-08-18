@@ -38,6 +38,46 @@ package session
 // deliberately does not join in: it is the user's live process bookkeeping, and a
 // daemon that is only trying to answer a question has no business editing it.
 //
+// # Why the liveness filter is LOAD-BEARING here, not belt-and-braces
+//
+// The obvious assumption is that cc keeps this directory tidy and that filtering on
+// liveness merely covers a lag. That assumption is wrong, and it is wrong
+// STRUCTURALLY rather than as a matter of timing — which is worth spelling out,
+// because "we measured a lot of stale records" would only ever support "not today".
+//
+// cc sweeps only when isRegistrySweepPermitted(), and that is gated on (read from
+// the installed binary, cc 2.1.233, on 2026-08-18):
+//
+//	async probeRegistrySweepPermitted(){
+//	  if(!xB() || Kt()==="wsl") return !1;   // xB() = launchOptions.isInteractive()
+//	  if(Yz.getIsBubblewrapSandbox() || Mn(V.IS_SANDBOX) || await Yz.getIsDocker()) return !1;
+//	  return uBs() }
+//
+// So the sweep is off for a non-interactive launch, on WSL, inside a bubblewrap
+// sandbox, whenever IS_SANDBOX is set, and inside DOCKER. Two of those are decided
+// by tether's own code and one by where the daemon runs:
+//
+//   - For every cc THIS DAEMON SPAWNS the sweep is off by construction, on any
+//     host: the argv is `--print …` (not an interactive launch, so the first clause
+//     already returns false), and agent.buildEnv injects IS_SANDBOX=1 whenever the
+//     daemon runs as root.
+//   - For EVERY cc on the reference host, tether's own or not, getIsDocker() is
+//     true — /.dockerenv is present (checked 2026-08-18; pid 1 is sshd and there is
+//     no systemd). That is the clause that matters most here, because the records
+//     which actually pile up are written by BACKGROUND JOBS started from a
+//     terminal, not by this daemon.
+//
+// Hence the stale records are not a lag this reader tolerates, they are the steady
+// state of the directory it is pointed at, and a reader without the liveness check
+// would refuse resumes on the strength of processes that exited days ago. The
+// measurements quoted further down (132 of 138 records outliving their process,
+// oldest 3.2 days) are CORROBORATION of that conclusion rather than the argument
+// for it.
+//
+// On a host where none of those clauses hold, cc does sweep and the filter is then
+// merely correct instead of load-bearing — which is the harmless direction, and the
+// reason nothing here depends on knowing which case it is in.
+//
 // The directory is taken as an argument and nothing in this file calls
 // os.UserHomeDir — the same rule CCStore follows, for the same reason (no test
 // can reach the real store by accident, as a property of the API rather than of
@@ -351,10 +391,13 @@ type ccRegistryRecord struct {
 // # Two questions, and the second one is not optional
 //
 // "Is pid N running" is not "is pid N still the process that wrote this record".
-// Pids are recycled, and on this machine 132 of 138 records referred to pids that
-// had already exited (oldest 3.2 days, median 0.8) — so the population of records
-// whose pid could have been reused by something unrelated is the large majority of
-// the directory. Worse in a container: the same pid NUMBER in a different pid
+// Pids are recycled, and records outlive their processes indefinitely here because
+// cc's sweep is structurally disabled in this environment — see "Why the liveness
+// filter is LOAD-BEARING" in this file's doc for the gate and why it never opens.
+// The reference profile bears it out: 132 of 138 records referred to pids that had
+// already exited (oldest 3.2 days, median 0.8), so the population exposed to pid
+// reuse is the large majority of the directory, and it only grows. Worse in a
+// container, which is also where the sweep is off: the same pid NUMBER in a different pid
 // namespace is a different process, and it is a process that exists. procStart is
 // what separates those cases, and it is why cc records it.
 //

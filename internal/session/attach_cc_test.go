@@ -276,11 +276,13 @@ func TestResolve_ARefusedResumeIsReportedAndNothingIsSpawned(t *testing.T) {
 	}
 }
 
-// TestResolve_ADeadRecordStillFallsBack — the residue case. Registry records
-// outlive the processes that wrote them: 132 of the 138 on the reference machine
-// referred to pids that had already exited, the oldest 3.2 days old. cc lets those
-// resumes through, so tether must too — and it must keep doing so as the residue
-// grows, which is the half of this that no count captures.
+// TestResolve_ADeadRecordStillFallsBack — the residue case, and the residue is
+// permanent rather than transient: cc's sweep of stale records is switched off in
+// tether's environment (see CCRegistry's file doc for the gate), so records outlive
+// their processes indefinitely. 132 of the 138 on the reference profile already
+// did, the oldest 3.2 days old. cc lets those resumes through, so tether must too,
+// and must keep doing so as the pile grows — which is the half of this that no
+// snapshot count captures.
 func TestResolve_ADeadRecordStillFallsBack(t *testing.T) {
 	requireLinux(t)
 	dp := &deadThenLiveProvider{

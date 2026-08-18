@@ -283,12 +283,15 @@ func (x *SessionIndex) List() []SessionSummary {
 	// the reference machine (2026-08-18): 138 records, 44 KB, ~3.0 ms including one
 	// /proc read each, of which 5 were live non-interactive holders — against the
 	// ~1.4 MB of transcript prefixes this same call already reads at ~90 sessions.
-	// The quantity to re-measure if this ever gets slow is the RECORD COUNT: cc's
-	// own sweep of stale records is conditional and demonstrably not keeping it
-	// down (132 of those 138 referred to pids that had already exited), so the
-	// directory grows with every cc process the machine has ever run. It is
-	// deliberately not capped: a count cap would drop records unread, and the one
-	// record that matters is the live one.
+	// The quantity to re-measure if this ever gets slow is the RECORD COUNT, and it
+	// grows without bound rather than settling: cc only sweeps stale records when
+	// isRegistrySweepPermitted(), which is false inside Docker, inside a sandbox and
+	// for a non-interactive launch — all three true of tether's environment, so the
+	// sweep never runs here. See CCRegistry's file doc for the gate itself; the 132
+	// of those 138 records that had already outlived their process are what that
+	// predicts, not what it rests on. The scan is deliberately not capped by count: a
+	// count cap would drop records unread, and the one record that matters is the
+	// live one.
 	if x.CCJobs != nil {
 		if jobs := x.CCJobs.LiveJobs(); len(jobs) > 0 {
 			for i := range out {

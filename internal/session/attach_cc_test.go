@@ -172,9 +172,11 @@ func TestResolve_StillSilentForASessionNobodyRecorded(t *testing.T) {
 //	live + interactive → the pre-tether#101 fallback, unchanged
 //
 // The two "unchanged" rows are not filler. A misclassification there does not
-// degrade the feature, it inverts it: every one of the 132 dead records on the
-// reference machine would become a permanent refusal, and every session tether
-// itself spawned would too, because tether's own cc registers as interactive.
+// degrade the feature, it INVERTS it — a session the daemon refuses to open at all.
+// The sizes are in ccregistry_test.go's three-shape test, measured and counted in
+// sids rather than in records; what matters here is that both rows must reach the
+// ordinary fallback, because one of them is the shape tether's OWN spawned agent
+// registers as.
 
 // ccRegDir builds a registry directory holding one record, and returns the
 // directory. Kept separate from ccRegFixture (ccregistry_test.go) because these
@@ -274,11 +276,11 @@ func TestResolve_ARefusedResumeIsReportedAndNothingIsSpawned(t *testing.T) {
 	}
 }
 
-// TestResolve_ADeadRecordStillFallsBack — the residue case, and the majority of a
-// real registry: 132 of 138 records on the reference machine referred to pids
-// that had already exited, the oldest by days. cc lets those resumes through, so
-// tether must too, and a reader that did not check liveness would turn almost the
-// whole directory into permanent refusals.
+// TestResolve_ADeadRecordStillFallsBack — the residue case. Registry records
+// outlive the processes that wrote them: 132 of the 138 on the reference machine
+// referred to pids that had already exited, the oldest 3.2 days old. cc lets those
+// resumes through, so tether must too — and it must keep doing so as the residue
+// grows, which is the half of this that no count captures.
 func TestResolve_ADeadRecordStillFallsBack(t *testing.T) {
 	requireLinux(t)
 	dp := &deadThenLiveProvider{

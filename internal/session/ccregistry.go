@@ -88,9 +88,9 @@ func CCSessionsDir(ccConfigDir string) string {
 // The ceiling that matters is records × this, because the session list scans the
 // whole directory on every request (see CCRegistry.LiveJobs). Measured on the
 // reference machine on 2026-08-18: 138 records, 44,936 bytes in total, LARGEST
-// RECORD 501 bytes, median 316. 64 KiB is therefore ~128x the largest real
+// RECORD 501 bytes, median 316. 64 KiB is therefore ~130x the largest real
 // record and bounds a corrupt or hostile file, while the worst case it permits
-// (138 × 64 KiB ≈ 8.8 MB) is only reachable by a directory full of files that are
+// (138 × 64 KiB = 8.6 MiB) is only reachable by a directory full of files that are
 // not cc session records.
 //
 // cc reads its own records with a 262,144-byte cap. Ours is smaller because the
@@ -352,9 +352,9 @@ type ccRegistryRecord struct {
 //
 // "Is pid N running" is not "is pid N still the process that wrote this record".
 // Pids are recycled, and on this machine 132 of 138 records referred to pids that
-// had already exited — the oldest by days — so the population of records whose
-// pid could have been reused by something unrelated is the large majority of the
-// directory. Worse in a container: the same pid NUMBER in a different pid
+// had already exited (oldest 3.2 days, median 0.8) — so the population of records
+// whose pid could have been reused by something unrelated is the large majority of
+// the directory. Worse in a container: the same pid NUMBER in a different pid
 // namespace is a different process, and it is a process that exists. procStart is
 // what separates those cases, and it is why cc records it.
 //

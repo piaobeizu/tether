@@ -324,11 +324,16 @@ func TestListLeavesRowsUnmarkedWithoutARegistryReader(t *testing.T) {
 // the LIST level rather than the reader level.
 //
 // Asserted here as well as in ccregistry_test.go because the two failures are
-// different sizes. In the reader it is a wrong map entry; in the list it is a
-// badge on ~all of a real profile's rows (132 of 138 records on the reference
-// machine had dead pids) and on every session tether itself spawned (those
-// register interactive) — i.e. a list that warns about everything, which is the
-// same as a list that says nothing.
+// different KINDS, not different sizes. In the reader a mislabel is a wrong map
+// entry; here it is a badge a user acts on — and a badge that appears on rows
+// nothing is holding trains them to ignore it, after which the badge on the row
+// that IS held says nothing either.
+//
+// Deliberately no count. The sid figures live in ccregistry_test.go's three-shape
+// test (measured: 2 sids mismarked today without the liveness check, growing) and
+// repeating them here is how the two copies drift; what matters at this layer is
+// the direction — a warning that fires when it should not is worse than no warning,
+// because it costs the credibility of the one that fires correctly.
 func TestListDoesNotMarkARowForADeadOrInteractiveRecord(t *testing.T) {
 	requireLinux(t)
 	for _, tc := range []struct {

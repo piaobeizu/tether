@@ -130,8 +130,15 @@ func bgRecord(pid int, sid, procStart string) map[string]any {
 }
 
 // interactiveRecord is the shape TETHER'S OWN spawned cc registers as: kind
-// "interactive", entrypoint "sdk-cli". Measured with tether's exact argv
-// (--print --output-format stream-json --input-format stream-json --verbose).
+// "interactive", entrypoint "sdk-cli".
+//
+// Re-measured for tether#101 rather than taken from the wi, because everything
+// downstream of it depends on it: cc was launched with tether's exact argv
+// (--print --output-format stream-json --input-format stream-json --verbose, see
+// ClaudeCodeProvider.Spawn) into a throwaway config dir on 2026-08-18, and the
+// record it wrote for itself carried kind "interactive" / entrypoint "sdk-cli" /
+// agent "claude". Corroborated across the whole reference profile: all 124
+// sdk-cli records are interactive, all 14 cli records are bg.
 func interactiveRecord(pid int, sid, procStart string) map[string]any {
 	return map[string]any{
 		"pid": pid, "sessionId": sid, "procStart": procStart,
@@ -144,12 +151,29 @@ func interactiveRecord(pid int, sid, procStart string) map[string]any {
 // classification, and two of its three rows are the ones that matter most.
 //
 // The first row is the feature. The other two are the ANTI-MISLABEL guards, and
-// they guard against a much more damaging failure: a reader that answered "held"
-// for a dead record would make 132 of this machine's 138 records into permanent
-// refusals, and one that answered "held" for an interactive record would refuse
-// every session TETHER ITSELF spawned, because tether's own cc registers as
-// interactive. Getting either of those wrong turns a fix for a silent fallback
-// into a daemon that cannot open sessions at all.
+// they guard against a failure that INVERTS the fix rather than merely losing it:
+// a reader that answers "held" for a record it should not turns a session into one
+// the daemon refuses to open at all.
+//
+// The consequence has to be counted in SIDS, not in records, and an earlier draft
+// of this comment got that wrong in the flattering direction — it said "132 of 138
+// records" (the number of records with dead pids), which is a fact about the whole
+// directory and not about this rule. Measured on the reference profile
+// (2026-08-18), the population this rule actually decides is the NON-INTERACTIVE
+// records: 14 of them, spread over 7 distinct sids, of which 5 sids are live. So
+// dropping the liveness check mismarks 2 sids TODAY. (The wi's "9 sessions" is the
+// same error one step smaller: 9 is the count of dead bg RECORDS, and they collapse
+// onto 2 sids.)
+//
+// Two today is worth a guard anyway, and the reason is the trend rather than the
+// count: the dead half only grows — 9 of those 14 records were already dead, the
+// oldest 3.2 days old, median 0.8 — while the live half is bounded by how many jobs
+// are running at once. Left unchecked, this rule gets steadily wronger.
+//
+// The interactive row is not a count at all, and must not be read as one: it is the
+// shape TETHER'S OWN spawned agent registers as, so answering "held" for it would
+// refuse the daemon's own sessions. One live interactive record on this profile
+// today; the population is every session tether has open.
 func TestCCRegistryLiveJob_TheThreeRecordShapes(t *testing.T) {
 	requireLinux(t)
 	tok := liveToken(t)
@@ -172,10 +196,12 @@ func TestCCRegistryLiveJob_TheThreeRecordShapes(t *testing.T) {
 		},
 		{
 			name: "dead pid + kind bg is NOT held",
-			// The residue case, and the majority of the real directory: 132 of 138
-			// records on the reference machine referred to pids that had exited, the
-			// oldest by days. cc lets such a resume through (measured: it proceeds to
-			// "No conversation found with session ID:" or succeeds), so tether must too.
+			// The residue case. 132 of the 138 records on the reference machine referred
+			// to pids that had exited (oldest 3.2 days, median 0.8) — that figure is about
+			// the whole directory; the ones this rule decides are the 9 dead
+			// NON-INTERACTIVE records, over 2 sids. cc lets such a resume through
+			// (measured: it proceeds to "No conversation found with session ID:" or
+			// succeeds), so tether must too.
 			rec:      bgRecord(dead, "sid-dead-bg-00001", "1"),
 			sid:      "sid-dead-bg-00001",
 			wantHeld: false,

@@ -448,15 +448,18 @@ describe('computePositions responsive sizing (tether#27)', () => {
   //
   // And the width the middle column actually gets by DEFAULT, so that comparison
   // gets made instead of assumed: App.tsx's `rightW` initializer hands
-  // loadRightWidth `leftW + ACTIVITY_W` (240 + 48 = 288 — all of the chrome left
-  // of the middle, which is the arithmetic layout.ts does), so defaultRightWidth
-  // takes DEFAULT_RIGHT_SHARE = 0.56 of the 1152 / 992 beside it: 645 at a 1440px
-  // window, 556 at 1280, clampRightWidth binding at neither. The middle keeps the
-  // rest, less the two 1px .col-resizer dividers: 505px and 434px. Two other
-  // "default width at 1440" numbers are in the repo and neither contradicts this
-  // one — layout.ts's note on DEFAULT_RIGHT_SHARE says 507, the same quantity
-  // BEFORE those dividers, and 672 is defaultRightWidth given leftWidth 240, i.e.
-  // the variant that omits ACTIVITY_W. Nothing between .dt-mid-work and the
+  // loadRightWidth the TREE width alone and layout.ts adds the 48px activity bar
+  // itself (tether#102 — until then the call site added it, and could forget
+  // to). So the chrome left of the middle is 240 + 48 = 288, and
+  // defaultRightWidth takes DEFAULT_RIGHT_SHARE = 0.56 of the 1152 / 992 beside
+  // it: 645 at a 1440px window, 556 at 1280, clampRightWidth binding at neither.
+  // The middle keeps the rest, less the two 1px .col-resizer dividers: 505px and
+  // 434px. One other "default width at 1440" number is in the repo and it does
+  // not contradict this one — layout.ts's note on DEFAULT_RIGHT_SHARE says 507,
+  // the same quantity BEFORE those dividers. (A third, 672, was
+  // `defaultRightWidth(1440, 240)` while that argument meant the whole left
+  // chrome; tether#102 made 240 mean the tree, so the same call returns 645 now
+  // and 672 is no longer reachable.) Nothing between .dt-mid-work and the
   // measured .fg-scroll adds horizontal padding, so 505 / 434 is also what
   // ForceGraph measures (bucketed to 500 / 440 by CW_BUCKET). Both are past 348:
   // at two present columns the default layout is already at the 132px cap, with

@@ -86,6 +86,44 @@ export const DEFAULT_RIGHT_SHARE = 0.56
 export const DEFAULT_LEFT = 240
 
 /**
+ * Width of the activity bar, mirroring `.dt-activity` in index.css. Duplicated
+ * because the rules above are arithmetic over the space the middle column is
+ * left with, and that arithmetic cannot read a stylesheet. Change both.
+ *
+ * It lives HERE rather than beside the markup that renders it (App.tsx, until
+ * tether#100) because it is an addend of the `leftWidth` those rules take: both
+ * PRODUCTION callers pass the bar plus the tree, and while the two addends lived
+ * in different modules layout.test.ts could not name the sum. It tested
+ * leftWidth 240 — the variant that omits this constant — which is how tether#99
+ * found two wrong middle-column widths written down with every test green.
+ *
+ * `leftWidth` is still not ALL the chrome left of the middle, and the shortfall
+ * is TWO different numbers — worth separating, because they get conflated:
+ *
+ *   1px — what `leftWidth` itself omits. The real chrome left of the middle is
+ *         bar + tree + the `.col-resizer` between them = 289 at the defaults,
+ *         and this module is told 288.
+ *   2px — the slack in the MIN_MID guarantee, because the resizer on the
+ *         middle's OTHER side is unaccounted too. Where the floor binds, the
+ *         middle gets 318 rather than the promised 320. (It can of course be
+ *         far less where no width satisfies both panes — see clampRightWidth's
+ *         over-constrained branch, e.g. window 900 / leftWidth 480 leaves 158.
+ *         That is the deliberate MIN_RIGHT-wins case, not this 2px.)
+ *
+ * The same 2px is why the 507 quoted above is 2 over what the middle really
+ * gets — 505. Both predate tether#100 and are left alone: folding a stylesheet
+ * literal into this module is the thing layout.test.ts's note says it must not
+ * do.
+ *
+ * Unlike the constants above it is not a policy number to be argued about; it
+ * is a measurement of a DOM element, and the only number in this file that is
+ * wrong the moment index.css disagrees with it — nothing checks that. A pure
+ * CSS change to `.dt-activity`'s width turns no test red, in this file or any
+ * other. The pairing is a convention held up by the two comments, not a guard.
+ */
+export const ACTIVITY_W = 48
+
+/**
  * defaultRightWidth is the right-pane width for a browser that has never
  * dragged the divider: a share of whatever sits beside the left pane.
  *

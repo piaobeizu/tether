@@ -6,7 +6,7 @@ import { useStore, historyEntryToMessage, mergeTranscript, type HistoryEntry, ty
 import { CopyButton } from '../../lib/CopyButton'
 import { Icon } from '../../lib/icons'
 import type { FencedBlock, ProviderListResponse } from '../../lib/wire.gen'
-import { ClientFrameAction } from '../../lib/wire.gen'
+import { ClientFrameAction, ErrCodeSessionHeldByBackgroundAgent } from '../../lib/wire.gen'
 import { authedFetch } from '../../lib/auth'
 import { DagBlock } from '../../fenced-blocks/DagBlock'
 import { FormBlock } from '../../fenced-blocks/FormBlock'
@@ -219,21 +219,81 @@ export const FATAL_CODE_MESSAGES: Record<string, string> = {
   //
   //  - it is being USED, not broken. The daemon reached this by asking the agent's
   //    own live-session registry after the agent refused the resume.
-  //  - it will become resumable. The holder is a background job; jobs finish. The
-  //    Retry button below this card is how the user acts on that, and this is the
-  //    only place that tells them retrying later is worth anything.
-  //  - the two ways out are the AGENT's own advice, quoted rather than invented:
+  //  - what the user can do about it, leading with the one thing that always works.
+  //  - the ways out are the AGENT's own advice, quoted rather than invented:
   //    `claude agents` to take the session over, or --fork-session to branch a copy.
   //    Naming --fork-session is not offering it — tether deliberately does not fork
   //    on any path, because a fork mints a new id and diverges rather than resuming
-  //    (see the wi's rejected option C). It is here because the user may well want
-  //    it and would otherwise have to be told by the agent's stderr, which goes to
-  //    the daemon's log and not to them.
+  //    (see tether#101's rejected option C). It is here because the user may well
+  //    want it and would otherwise have to be told by the agent's stderr, which goes
+  //    to the daemon's log and not to them.
+  //
+  // # tether#104 — the order of the advice was wrong, and only the live case showed it
+  //
+  // This read "It becomes resumable when that finishes — or run `claude agents`…",
+  // i.e. WAIT first and take over second. Measured against the session that
+  // prompted tether#104: pid alive, kind bg, cc status `idle`, started three days
+  // earlier, last status change hours before. Telling that user to wait is telling
+  // them to wait for something that is not happening.
+  //
+  // The order is only the symptom. The sentence had the WRONG UNIT: cc refuses a
+  // `--resume` on `kind && kind !== "interactive"` (ccregistry.go's
+  // ccInteractiveKind), which is a property of the PROCESS, not of what it is
+  // doing. So the hold ends when that process exits and at no other moment — a turn
+  // finishing releases nothing. Saying so is also why this needs no busy/idle
+  // branch: cc's status is not in the refusal rule, so both statuses have exactly
+  // the same remedy and the same waiting condition. (CCLiveJob carries Kind and
+  // JobID only, and FatalRefusal carries {code, message} — a branch here would
+  // need a new field threaded through the daemon, which is a change to the fetch
+  // path, for a distinction that changes no advice.)
   session_held_by_background_agent:
-    'A background agent is using this conversation right now. It becomes resumable when that '
-    + 'finishes — or run `claude agents` in a terminal to take it over, or `--fork-session` to '
-    + 'work on a copy.',
+    'A background agent is using this conversation, so tether cannot send into it. Run '
+    + '`claude agents` in a terminal to take it over, or `--fork-session` to work on a copy. '
+    + 'Waiting works too, but the hold lasts as long as that agent’s process, not just its '
+    + 'current turn — an idle job holds this conversation exactly as firmly as a busy one.',
 }
+
+// tether#104 — what the composer says while a background agent holds the session.
+//
+// The generic 'not connected' branch was true and useless: it named a transport
+// the user has no model of, and said nothing about the two things that are
+// actually on screen — that the conversation below IS readable, and that the box
+// is disabled for a reason that has nothing to do with the network.
+//
+// Exported so the render test can pin it by identity as well as by literal, which
+// is how a rewrite that changes the string has to change the test too rather than
+// slipping past a `toMatch`.
+export const HELD_SESSION_PLACEHOLDER = 'read-only — a background agent is using this conversation'
+
+// tether#104 — the line that says the conversation below is there to be read.
+// Nothing said this before; the card only ever talked about the connection.
+//
+// # Why it makes no claim about HOW MUCH of the conversation is below
+//
+// Because the answer depends on which store served it, and the card cannot see
+// which. SessionIndex.Messages (sessionlist.go) prefers tether's own history —
+// HistoryStore.LoadHistory is an os.ReadFile over the whole history.jsonl, no tail
+// and no cap — and only falls through to CCStore, which reads a bounded tail
+// (ccMessagesTailBytes, ccMessagesMax). Both are reachable under this refusal:
+// Attachment.resolve computes hadConversation() and logs it as `had_history` on
+// this very branch, and hadConversation is true when tether's HistoryStore has the
+// sid. So "you are seeing recent messages only" would be false for a session
+// tether recorded in full.
+//
+// The extent claim already exists where it is always true: SessionList renders
+// EXTERNAL_SESSION_PROMISE ("recent messages only, with the calls it made; their
+// output only where a call failed") gated on the session being external, i.e.
+// exactly when the transcript came from CCStore — and it renders ABOVE this card,
+// so on a cc-held session the user reads both. This line therefore states an upper
+// bound that is true under either store and refines into that one rather than
+// contradicting it.
+//
+// "as it stood when this pane fetched it" is the other half: the transcript is one
+// HTTP GET at open time, and with the connection refused nothing updates it. A
+// reader who assumed it followed the other agent's work would be watching a still
+// frame for news.
+export const HELD_SESSION_READABLE_NOTE =
+  'You can read it: what tether has of this conversation is below, as it stood when this pane fetched it.'
 const FATAL_GENERIC_MESSAGE = 'This connection was refused and cannot be retried automatically.'
 
 // tether#47 — @-file mention. parseAtQuery locates the @token the caret is
@@ -300,6 +360,13 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   const [input, setInput] = useState('')
   const [connState, setConnState] = useState<ConnState>('connecting')
   const [connError, setConnError] = useState<string | null>(null)
+  // tether#104 — the read-only READING state, named once because three places ask:
+  // the card's dressing, the line that points at the transcript, and the
+  // composer's placeholder. It is deliberately the CONJUNCTION rather than the
+  // code alone — the presentation below is only honest once the ladder has
+  // actually stopped (connState 'failed'), and reading it off `fatal` alone would
+  // let a mid-reconnect frame claim a state the pane is not in.
+  const readingHeldSession = connState === 'failed' && fatal?.code === ErrCodeSessionHeldByBackgroundAgent
   const [reconnectIn, setReconnectIn] = useState(0)
   const [sessionStart, setSessionStart] = useState<number | null>(null)
   const [_elapsed, setElapsed] = useState('')
@@ -930,8 +997,14 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
           </div>
         )}
 
+        {/* tether#104 — one code's dressing changes here, and only its dressing.
+            `readingHeldSession` gates every difference; every other terminal code
+            renders exactly the bytes it rendered before. The card itself is NOT
+            restructured — FATAL_CODE_MESSAGES is looked up by code, so the way to
+            give one code a different presentation is a conditional at the three
+            points that differ, not a second card. */}
         {connState === 'failed' && (
-          <div className="failed-card">
+          <div className={readingHeldSession ? 'failed-card state-card' : 'failed-card'}>
             {fatal ? (
               // tether#63 — the daemon told us WHY, and it was terminal: lead
               // with the code→sentence translation (falling back to a generic
@@ -939,19 +1012,36 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
               // see FATAL_CODE_MESSAGES' doc comment), then the daemon's own
               // message text for anyone who wants the raw detail.
               <>
-                <div style={{ color: 'var(--danger)', fontWeight: 600, marginBottom: 4 }}>
+                {/* tether#104 — --danger is an assertion, and for this one code it
+                    is a false one: nothing failed, something else is using the
+                    conversation. The sentence carries the meaning either way, so
+                    losing the red costs no information to a reader who cannot
+                    separate the two tints. */}
+                <div className="failed-card-headline" style={{ color: readingHeldSession ? 'var(--ink-primary)' : 'var(--danger)', fontWeight: 600, marginBottom: 4 }}>
                   {FATAL_CODE_MESSAGES[fatal.code] ?? FATAL_GENERIC_MESSAGE}
                 </div>
+                {/* Gated on there BEING a transcript. "The conversation is below"
+                    is a claim about the screen, and an empty transcript is a
+                    normal answer here — SessionIndex.Messages returns SourceNone
+                    with a nil slice for a sid neither store has — so making it
+                    unconditionally would trade one false sentence for another. */}
+                {readingHeldSession && transcript.length > 0 && (
+                  <div className="state-card-read">{HELD_SESSION_READABLE_NOTE}</div>
+                )}
                 <div style={{ color: 'var(--ink-tertiary)', fontSize: 11, marginBottom: 8, wordBreak: 'break-all' }}>{fatal.message}</div>
               </>
             ) : (
               <>
-                <div style={{ color: 'var(--danger)', fontWeight: 600, marginBottom: 4 }}>WebTransport connection failed</div>
+                <div className="failed-card-headline" style={{ color: 'var(--danger)', fontWeight: 600, marginBottom: 4 }}>WebTransport connection failed</div>
                 {connError && <div style={{ color: 'var(--ink-tertiary)', fontSize: 11, marginBottom: 6, wordBreak: 'break-all' }}>{connError}</div>}
                 <div style={{ color: 'var(--ink-tertiary)', fontSize: 11, marginBottom: 8 }}>UDP/QUIC may be blocked — see K.8.1 in README.</div>
               </>
             )}
-            <button onClick={manualRetry} className="btn-ghost-sm">Retry</button>
+            {/* Same button, same handler, different word. "Retry" names a failed
+                thing to attempt again; here the attempt is a question — has that
+                agent's process exited yet — and the answer is not tether's to
+                predict. */}
+            <button onClick={manualRetry} className="btn-ghost-sm">{readingHeldSession ? 'Check again' : 'Retry'}</button>
           </div>
         )}
 
@@ -1161,9 +1251,14 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
                 }
                 if (e.key === 'Escape') { setSlashOpen(false); setAtOpen(false) }
               }}
+              // tether#104 — one branch added, and it is the only one that names a
+              // REASON. 'not connected' stays the answer for every other way the
+              // box can be disabled; it is not wrong there, it is just the most
+              // general true thing, and this state has a specific one available.
               placeholder={
                 connState !== 'connected'
-                  ? connState === 'connecting' ? 'connecting…' : 'not connected'
+                  ? connState === 'connecting' ? 'connecting…'
+                    : readingHeldSession ? HELD_SESSION_PLACEHOLDER : 'not connected'
                   : streaming ? 'Claude is thinking…' : 'message tether…'
               }
             />

@@ -184,6 +184,15 @@ describe('loadRightWidth', () => {
     const right = loadRightWidth(null, 900, 240)
     expect(right).toBeLessThan(defaultRightWidth(900, 240))
     expect(mid(900, 240, right)).toBeGreaterThanOrEqual(MIN_MID)
+    // The exact width, not just the two properties above. This is one of only
+    // two places in the file where the MIN_MID clamp actually BINDS on a value
+    // that came through loadRightWidth, and the properties alone do not pin it:
+    // a loadRightWidth that charged the bar a second time on its way into
+    // clampRightWidth returns MIN_RIGHT (260) here, which is still less than
+    // 343 and still leaves the middle ≥ 320, so both properties hold and the
+    // mutant lives. Measured — it survived the first pass of tether#102's
+    // mutation battery, which is why this line exists.
+    expect(right).toBe(292)
   })
 
   it('restores a persisted width unchanged when it still fits', () => {
@@ -198,6 +207,10 @@ describe('loadRightWidth', () => {
     const restored = loadRightWidth(stored, 1280, 240)
     expect(restored).toBeLessThan(MAX_RIGHT)
     expect(mid(1280, 240, restored)).toBeGreaterThanOrEqual(MIN_MID)
+    // The other binding case, pinned exactly for the same reason as the one
+    // above: 1280 - (240 + 48) - 320 = 672 of room. Charging the bar twice
+    // gives 624, which also satisfies both properties.
+    expect(restored).toBe(672)
   })
 })
 

@@ -25,8 +25,13 @@ cd "$(dirname "$0")/.."
 # supposed to enforce, and would fail on vendored files inside the (committed)
 # web/node_modules — e.g. tldts ships its own dist/cjs/tsconfig.tsbuildinfo. That is
 # not a hypothetical; it turned CI red the first time this ran.
-INDEX_FORBIDDEN=(web/dist ':(glob)web/*.tsbuildinfo')
-MUST_BE_IGNORED=(web/dist/index.html web/tsconfig.app.tsbuildinfo)
+#
+# web/test-results is the vitest junit/json report pair (tether#105). It is in
+# the same class — generated per run, describing that run — and it is written by
+# `pnpm test`, which runs far more often than `pnpm build`, so it is the entry
+# most likely to be swept up by a careless `git add -A`.
+INDEX_FORBIDDEN=(web/dist ':(glob)web/*.tsbuildinfo' web/test-results)
+MUST_BE_IGNORED=(web/dist/index.html web/tsconfig.app.tsbuildinfo web/test-results/junit.xml)
 
 fail=0
 all_tracked=""

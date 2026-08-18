@@ -25,6 +25,12 @@ test: go-test web-test
 go-test:
 	$(GOTEST) ./...
 
+# Leaves web/test-results/{junit.xml,vitest.json} behind — every run, pass or
+# fail. Read those instead of the terminal when a run goes red: this suite has a
+# ~5% flake (tether#105) whose two sightings so far both lost the name of the
+# failing test, once because the output had been piped into `grep`. The files
+# survive that; they are gitignored and rewritten by the next run, so copy one
+# aside before rerunning. web/vite.config.ts has the full record.
 web-test:
 	cd web && pnpm test
 

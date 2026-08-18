@@ -31,6 +31,13 @@
 # build path always left the tree dirty and invited `git add -A` to re-commit it.
 /web/*.tsbuildinfo
 
+# Machine-readable test reports — rewritten by every `pnpm test` (tether#105).
+# See the reporters block in web/vite.config.ts for why the run writes them at
+# all. Same class again: generated, per-run, and therefore never committed —
+# a tracked copy would be one more thing that is stale on every checkout, and
+# the point of these files is that they describe *this* run.
+/web/test-results/
+
 # Spike output (per .plans Step 7) — runtime files only.
 # Curated artifacts (the dated spike-report and verification-report from
 # .plans Step 7 + Step 9) ARE checked in as evidence; everything else in

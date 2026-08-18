@@ -9,16 +9,30 @@ import {
   DEFAULT_RIGHT,
   DEFAULT_RIGHT_SHARE,
   DEFAULT_LEFT,
-  ACTIVITY_W,
 } from './layout'
 
-/** What the middle pane is left with for a given window/left/right. */
-const mid = (windowWidth: number, leftWidth: number, rightWidth: number) =>
-  windowWidth - leftWidth - rightWidth
+/**
+ * The activity bar's width, measured from index.css `.dt-activity`.
+ *
+ * A LITERAL on purpose, and deliberately not imported: lib/layout stopped
+ * exporting ACTIVITY_W in tether#102, but even while it did, an expectation
+ * phrased in terms of that constant is immune to that constant's VALUE — set it
+ * to 0 and every such expectation moves with it and still passes. Written out,
+ * the assertions below fail if layout.ts stops charging exactly 48. This is the
+ * third place 48 appears (index.css, layout.ts, here) and the only one that is
+ * a guard rather than a copy.
+ */
+const ACTIVITY_BAR_PX = 48
+
+/** What the middle pane is left with: the window, less the chrome to its left
+ *  (the workspace tree plus the activity bar), less the right pane. Before
+ *  divider chrome — see the note above the last describe block. */
+const mid = (windowWidth: number, treeWidth: number, rightWidth: number) =>
+  windowWidth - (treeWidth + ACTIVITY_BAR_PX) - rightWidth
 
 describe('clampRightWidth', () => {
   it('honours the requested width when the window has room for it', () => {
-    // 1920 - 240 - 700 = 980 for the middle: nothing to protect against.
+    // 1920 - (240 + 48) - 700 = 932 for the middle: nothing to protect against.
     expect(clampRightWidth(700, 1920, 240)).toBe(700)
   })
 
@@ -38,8 +52,8 @@ describe('clampRightWidth', () => {
   })
 
   // The invariant this module exists for — stated as the conditional it actually
-  // is. When the window cannot fit leftWidth + MIN_RIGHT + MIN_MID at all there
-  // is no width that satisfies both panes, so the contract splits:
+  // is. When the window cannot fit the left chrome + MIN_RIGHT + MIN_MID at all
+  // there is no width that satisfies both panes, so the contract splits:
   //
   //   room enough  -> the middle pane keeps at least MIN_MID
   //   not enough   -> the right pane holds MIN_RIGHT and the middle gives way
@@ -47,20 +61,20 @@ describe('clampRightWidth', () => {
   // The second branch is a deliberate choice, not a gap: at that point the
   // alternative is a right pane below MIN_RIGHT, which trades one unusable pane
   // for two. An earlier version of this test asserted the invariant
-  // unconditionally and failed at window=900/left=480 — worth keeping the shape
+  // unconditionally and failed at window=900/tree=480 — worth keeping the shape
   // of that case below.
   it.each([
     [1280, 240],
     [1440, 240],
     [1024, 160],
-    [900, 480], // over-constrained: 480 + 260 + 320 = 1060 > 900
+    [900, 480], // over-constrained: 480 + 48 + 260 + 320 = 1108 > 900
     [1920, 480],
-  ])('respects the width contract at window=%i left=%i', (windowWidth, leftWidth) => {
-    const fits = windowWidth - leftWidth >= MIN_RIGHT + MIN_MID
+  ])('respects the width contract at window=%i tree=%i', (windowWidth, treeWidth) => {
+    const fits = windowWidth - (treeWidth + ACTIVITY_BAR_PX) >= MIN_RIGHT + MIN_MID
     for (const desired of [0, 300, 600, 900, MAX_RIGHT, 99999]) {
-      const right = clampRightWidth(desired, windowWidth, leftWidth)
+      const right = clampRightWidth(desired, windowWidth, treeWidth)
       if (fits) {
-        expect(mid(windowWidth, leftWidth, right)).toBeGreaterThanOrEqual(MIN_MID)
+        expect(mid(windowWidth, treeWidth, right)).toBeGreaterThanOrEqual(MIN_MID)
       } else {
         expect(right).toBe(MIN_RIGHT)
       }
@@ -68,8 +82,8 @@ describe('clampRightWidth', () => {
   })
 
   it('falls back to MIN_RIGHT when even that leaves no room, rather than shrinking further', () => {
-    // 600 - 160 - MIN_MID(320) = 120 of room, less than MIN_RIGHT: the pane the
-    // user works in wins over the one behind it.
+    // 600 - (160 + 48) - MIN_MID(320) = 72 of room, less than MIN_RIGHT: the pane
+    // the user works in wins over the one behind it.
     expect(clampRightWidth(500, 600, 160)).toBe(MIN_RIGHT)
   })
 
@@ -80,18 +94,26 @@ describe('clampRightWidth', () => {
     }
   })
 
-  it('treats a negative left width as zero rather than widening the right pane', () => {
+  // A negative tree width is a corrupt persisted value (App.tsx's `loadWidth`
+  // returns `Number(localStorage.getItem(key))` unvalidated), not a signal that
+  // the activity bar has gone away. Both halves are asserted: the equality alone
+  // would ALSO hold under the other placement of the clamp,
+  // `Math.max(0, treeWidth + ACTIVITY_W)`, which drops the bar along with the
+  // tree — so the equality on its own does not distinguish the two.
+  it('treats a negative tree width as zero without dropping the activity bar too', () => {
     expect(clampRightWidth(MAX_RIGHT, 900, -1000)).toBe(clampRightWidth(MAX_RIGHT, 900, 0))
+    // 900 - 48 - 320 = 532 of room, and the request (MAX_RIGHT) exceeds it.
+    // Dropping the bar as well would leave 580.
+    expect(clampRightWidth(MAX_RIGHT, 900, -1000)).toBe(532)
   })
 })
 
 describe('defaultRightWidth', () => {
-  // NOTE the leftWidth: 240 is the TREE alone, which is not what production
-  // passes — see the 'production parameter shape' block at the bottom of this
-  // file. 672 is a fact about this function, not the width anyone gets.
-  it('takes its share of the space beside the left pane', () => {
-    expect(defaultRightWidth(1440, 240)).toBe(Math.round(1200 * DEFAULT_RIGHT_SHARE))
-    expect(defaultRightWidth(1440, 240)).toBe(672)
+  it('takes its share of the space beside the chrome left of the middle', () => {
+    expect(defaultRightWidth(1440, 240)).toBe(
+      Math.round((1440 - (240 + ACTIVITY_BAR_PX)) * DEFAULT_RIGHT_SHARE),
+    )
+    expect(defaultRightWidth(1440, 240)).toBe(645)
   })
 
   it('falls back to the constant when the window cannot be measured', () => {
@@ -100,14 +122,19 @@ describe('defaultRightWidth', () => {
     }
   })
 
-  it('treats a negative left width as zero rather than widening the right pane', () => {
+  // Same pair of claims as clampRightWidth's negative case, and the same reason
+  // for asserting the absolute value beside the equality.
+  it('treats a negative tree width as zero without dropping the activity bar too', () => {
     expect(defaultRightWidth(1440, -1000)).toBe(defaultRightWidth(1440, 0))
+    // round((1440 - 48) * 0.56) = round(779.52) = 780. Dropping the bar as well
+    // would give round(1440 * 0.56) = round(806.4) = 806.
+    expect(defaultRightWidth(1440, -1000)).toBe(780)
   })
 
   // The constant is only reachable through the bogus-window branch, but it is
   // still a default width, so it has to satisfy the same property as the
   // computed one on the viewport it is nominally sized for.
-  it('the fallback constant would itself be the widest pane at 1440/240', () => {
+  it('the fallback constant would itself be the widest pane at 1440 with the default tree', () => {
     expect(DEFAULT_RIGHT).toBeGreaterThan(mid(1440, 240, DEFAULT_RIGHT))
   })
 })
@@ -132,11 +159,11 @@ describe('loadRightWidth', () => {
   it.each([1280, 1366, 1440, 1536, 1600, 1920])(
     'makes the right pane the widest pane on a first visit at %ipx',
     (windowWidth) => {
-      const left = 240
-      const right = loadRightWidth(null, windowWidth, left)
+      const tree = 240
+      const right = loadRightWidth(null, windowWidth, tree)
       expect(right).toBeGreaterThan(0) // never pass on an absent measurement
-      expect(right).toBeGreaterThan(mid(windowWidth, left, right))
-      expect(mid(windowWidth, left, right)).toBeGreaterThanOrEqual(MIN_MID)
+      expect(right).toBeGreaterThan(mid(windowWidth, tree, right))
+      expect(mid(windowWidth, tree, right)).toBeGreaterThanOrEqual(MIN_MID)
     },
   )
 
@@ -151,8 +178,9 @@ describe('loadRightWidth', () => {
   })
 
   it('still clamps the default so the middle pane survives a narrow window', () => {
-    // 900 - 240 = 660 beside the left pane; the share would ask for 370 and the
-    // MIN_MID rule allows 340. The guarantee outranks the preference.
+    // 900 - (240 + 48) = 612 beside the left chrome; the share would ask for
+    // round(342.72) = 343 and the MIN_MID rule allows 612 - 320 = 292. The
+    // guarantee outranks the preference.
     const right = loadRightWidth(null, 900, 240)
     expect(right).toBeLessThan(defaultRightWidth(900, 240))
     expect(mid(900, 240, right)).toBeGreaterThanOrEqual(MIN_MID)
@@ -173,71 +201,64 @@ describe('loadRightWidth', () => {
   })
 })
 
-// tether#100. Every leftWidth in the blocks above is a bare number chosen to
-// exercise a rule — 240 mostly, also 160, 480, 0 and -1000. None of them is what
-// production passes. App.tsx's `rightW` initializer hands loadRightWidth
-// `loadWidth(STORAGE_KEY_LEFT, DEFAULT_LEFT) + ACTIVITY_W`, and the divider drag
-// hands clampRightWidth `leftW + ACTIVITY_W`, because both rules here are
-// arithmetic on what is left for the MIDDLE column and the chrome to its left is
-// the activity bar plus the tree. So the number this module is actually asked
-// about on a first visit is 288, and until tether#100 no test named it: the two
-// addends lived in different modules (ACTIVITY_W was private to App.tsx), so the
-// sum could not be written down here at all.
+// tether#102. Until this item the third argument was called `leftWidth` and
+// meant "all the chrome left of the middle column" — a sum App.tsx had to build
+// at each call site (`loadWidth(STORAGE_KEY_LEFT, DEFAULT_LEFT) + ACTIVITY_W` in
+// the `rightW` initializer, `leftW + ACTIVITY_W` in `resizeRight`). Nothing
+// observed whether it did. Dropping the addend at BOTH sites left the whole
+// suite green (measured, tether#100 review). Dropping it at ONE site — the
+// initializer, leaving `resizeRight` intact so the import stays used and
+// `tsc -b` still exits 0 — also left the whole suite green (measured at the head
+// of tether#102: 30 files / 598 passed / 2 skipped). The one-site case is the
+// realistic regression, and it was the one nothing could see: the two-site case
+// is caught by `noUnusedLocals` before any test runs.
 //
-// That is the gap tether#99's two wrong widths came through. Re-derived here
-// rather than copied — the wi that filed this one reports the slip as
-// `1440 - 240 - round((1440 - 240) * 0.56)`, but that is 528, not 478, and it
-// contains no ACTIVITY_W term at all, so it cannot be a mistake about
-// ACTIVITY_W. What actually produces both numbers is taking the share over
-// `window - DEFAULT_LEFT` when the code takes it over
-// `window - DEFAULT_LEFT - ACTIVITY_W`, then charging the middle the full chrome
-// anyway:
+// The argument is now the TREE width and layout.ts adds the bar itself
+// (chromeLeftOfMiddle), so:
 //
-//   478 = 1440 - 240 - 48 - round((1440 - 240) * 0.56) - 2   [right 672, not 645]
-//   408 = 1280 - 240 - 48 - round((1280 - 240) * 0.56) - 2   [right 582, not 556]
+//   · a call site cannot omit the bar — there is no addend to omit;
+//   · a call site cannot double it either — ACTIVITY_W is no longer exported,
+//     so `+ ACTIVITY_W` in App.tsx is TS2304 rather than a quiet 336.
 //
-// i.e. the right pane came out 27px / 26px too wide and the middle lost exactly
-// that, and nothing went red — because nothing was asserting on this shape. The
-// expected values below are likewise derived from the constants, NOT read off a
-// run:
+// Neither of those is checked below; they are properties of the module's SHAPE
+// and the compiler checks them. What is left for tests is the arithmetic: that
+// the bar is charged, charged ONCE, and charged on the correct side of the
+// negative-input clamp. Those are the forms in which the bug is still
+// expressible, and all of them now live inside this module.
 //
-//   beside = window - (DEFAULT_LEFT + ACTIVITY_W)
-//   right  = round(beside * DEFAULT_RIGHT_SHARE)     [clamps bind at neither]
+// Expected values are derived from the constants, NOT read off a run:
+//
+//   chrome = max(0, tree) + 48
+//   beside = window - chrome
+//   right  = round(beside * DEFAULT_RIGHT_SHARE)   [where neither clamp binds]
 //   middle = beside - right
 //
-//   1440 -> beside 1152, right round(645.12) = 645, middle 507
-//   1280 -> beside  992, right round(555.52) = 556, middle 436
+//   1440 -> chrome 288, beside 1152, right round(645.12) = 645, middle 507
+//   1280 -> chrome 288, beside  992, right round(555.52) = 556, middle 436
 //
-// What this block does NOT prove: that App.tsx still passes the sum. These are
-// assertions about layout.ts given the production shape; the call sites
-// (App.tsx `rightW` initializer and `resizeRight`) have no test of their own —
-// App.test.tsx asserts nothing about widths. Drop `+ ACTIVITY_W` from both call
-// sites and the ENTIRE suite stays green (measured, tether#100 review). Said
-// plainly so the next reader does not mistake this for end-to-end coverage;
-// closing that half means folding ACTIVITY_W into the functions themselves so
-// the omission stops being representable, which is its own change — tether#102.
-//
-// Out of scope on purpose: 505 and 434, the widths ForceGraph actually measures.
-// Those are 507/436 less the two 1px `.col-resizer` dividers, and that 2px is a
-// stylesheet literal (index.css `.col-resizer`), not something layout.ts knows
-// or should know. Hard-coding it here would make this file's arithmetic depend
-// on a number no function in it reads — a guard that cannot fail for the reason
-// it names. To be clear about what that costs: NO test anywhere asserts 505 or
+// Out of scope on purpose and unchanged by tether#102: 505 and 434, the widths
+// ForceGraph actually measures. Those are 507/436 less the two 1px
+// `.col-resizer` dividers, and no function in layout.ts reads that 2px — see
+// chromeLeftOfMiddle's note for why folding it in was rejected, on grounds
+// other than "this module may not hold a stylesheet literal" (ACTIVITY_W is
+// one). Asserting 505 here would be a guard that cannot fail for the reason it
+// names. To be clear about what that costs: NO test anywhere asserts 505 or
 // 434. ForceGraph.test.tsx derives them in prose, which is a different thing.
-describe('the production parameter shape (App.tsx passes leftWidth + ACTIVITY_W)', () => {
-  /** All the chrome left of the middle column — what App.tsx actually passes. */
-  const CHROME = DEFAULT_LEFT + ACTIVITY_W
-
-  it('is the tree plus the activity bar, not the tree alone', () => {
-    expect(CHROME).toBe(288)
-    expect(CHROME).not.toBe(DEFAULT_LEFT)
-  })
-
-  // The pair that makes the omission visible: same viewport, same function, 27px
-  // apart. 672 (asserted far above) is the variant without the activity bar.
-  it('yields a different width than the leftWidth-only variant does', () => {
-    expect(defaultRightWidth(1440, DEFAULT_LEFT)).toBe(672)
-    expect(defaultRightWidth(1440, CHROME)).toBe(645)
+describe('the activity bar is charged inside layout.ts (tether#102)', () => {
+  // The bar's contribution pinned per tree width. clampRightWidth's room
+  // arithmetic is exact — no rounding anywhere in it — so where the MIN_MID
+  // floor binds, the width it returns names the chrome directly:
+  // right = window - chrome - MIN_MID. Window fixed at 1200 so every row has a
+  // different expectation and has to be read rather than pattern-matched.
+  it.each([
+    [-1000, 48, 832], // corrupt persisted tree width: no tree, bar still there
+    [0, 48, 832], // tree fully collapsed
+    [160, 208, 672], // App.tsx MIN_LEFT
+    [DEFAULT_LEFT, 288, 592], // the default — and what App.tsx passes
+    [480, 528, 352], // App.tsx MAX_LEFT
+  ])('charges a %ipx tree as %ipx of chrome', (treeWidth, chrome, expected) => {
+    expect(1200 - chrome - MIN_MID).toBe(expected) // the row is self-consistent
+    expect(clampRightWidth(99999, 1200, treeWidth)).toBe(expected)
   })
 
   it.each([
@@ -246,36 +267,46 @@ describe('the production parameter shape (App.tsx passes leftWidth + ACTIVITY_W)
   ])(
     'gives the right pane %ipx -> %i and the middle %i on a first visit',
     (windowWidth, right, middle) => {
-      // The whole chain App.tsx runs with nothing persisted.
-      expect(loadRightWidth(null, windowWidth, CHROME)).toBe(right)
+      // The whole chain App.tsx runs with nothing persisted, at the argument
+      // App.tsx now actually passes.
+      expect(loadRightWidth(null, windowWidth, DEFAULT_LEFT)).toBe(right)
       // Same number unclamped: neither MIN/MAX_RIGHT nor the MIN_MID rule binds
       // at these viewports, which is why the share alone predicts the result.
-      expect(defaultRightWidth(windowWidth, CHROME)).toBe(right)
+      expect(defaultRightWidth(windowWidth, DEFAULT_LEFT)).toBe(right)
       // What the middle column is left with, before divider chrome — the
       // quantity DEFAULT_RIGHT_SHARE's own note in layout.ts claims is 507/436.
-      expect(mid(windowWidth, CHROME, right)).toBe(middle)
+      expect(mid(windowWidth, DEFAULT_LEFT, right)).toBe(middle)
       // tether#71's property, restated on the shape production uses.
       expect(right).toBeGreaterThan(middle)
       expect(middle).toBeGreaterThanOrEqual(MIN_MID)
     },
   )
 
-  // The drag path (App.tsx `resizeRight`), and the claim its comment makes: pass
-  // leftW without ACTIVITY_W and the MIN_MID floor sits exactly 48px too loose.
-  // Asserted because that comment is the only thing standing between the next
-  // reader and re-introducing the bug.
-  it('holds the MIN_MID floor exactly, where the leftWidth-only shape misses it', () => {
-    const dragged = clampRightWidth(99999, 1000, CHROME)
-    expect(dragged).toBe(392)
-    expect(mid(1000, CHROME, dragged)).toBe(MIN_MID)
+  // 672 was `defaultRightWidth(1440, 240)` before tether#102 — the answer a
+  // caller got by passing the tree alone, and the number tether#99's wrong
+  // widths were built on. The same call now returns 645, because 240 IS the tree
+  // and the bar is added regardless. The gap is 27, not 48: what the share loses
+  // is 0.56 of the bar (26.88, twice rounded), not the bar.
+  it('no longer returns the bar-forgotten width for the default tree', () => {
+    const barForgotten = Math.round((1440 - DEFAULT_LEFT) * DEFAULT_RIGHT_SHARE)
+    expect(barForgotten).toBe(672)
+    expect(defaultRightWidth(1440, DEFAULT_LEFT)).toBe(645)
+    expect(barForgotten - defaultRightWidth(1440, DEFAULT_LEFT)).toBe(27)
+  })
 
-    // Same window, activity bar forgotten: 440 is permitted, and the middle it
-    // really leaves is 272 — the floor missed by exactly the width of the bar.
-    // (App.tsx's comment says 270 for the same case; that is 272 less the two
-    // 1px dividers, a different quantity, not a disagreement.)
-    const tooLoose = clampRightWidth(99999, 1000, DEFAULT_LEFT)
-    expect(tooLoose).toBe(440)
-    expect(mid(1000, CHROME, tooLoose)).toBeLessThan(MIN_MID)
-    expect(tooLoose - dragged).toBe(ACTIVITY_W)
+  // The drag path (App.tsx `resizeRight`). Before tether#102 this block also
+  // asserted what a bar-forgetting caller would be permitted — 440 at this
+  // window against 392 — by calling the function with the tree alone. That call
+  // no longer means anything different, so the claim is restated as what it was
+  // always about: the floor is held exactly, and the too-loose width is not what
+  // comes back.
+  it('holds the MIN_MID floor exactly on the drag path', () => {
+    const dragged = clampRightWidth(99999, 1000, DEFAULT_LEFT)
+    expect(dragged).toBe(392)
+    expect(mid(1000, DEFAULT_LEFT, dragged)).toBe(MIN_MID)
+    // 1000 - 240 - 320 = 440: what the floor permits when the bar is not
+    // charged, which is a middle of 272 against a floor of 320.
+    expect(dragged).not.toBe(440)
+    expect(440 - dragged).toBe(ACTIVITY_BAR_PX)
   })
 })

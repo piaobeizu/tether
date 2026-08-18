@@ -3,7 +3,7 @@ import { useStore } from './lib/store'
 import { Icon, type IconName } from './lib/icons'
 import { Settings, type SettingsTab } from './Settings'
 import { useAppVersion } from './lib/version'
-import { clampRightWidth, loadRightWidth, ACTIVITY_W, DEFAULT_LEFT } from './lib/layout'
+import { clampRightWidth, loadRightWidth, DEFAULT_LEFT } from './lib/layout'
 import WorkspacePane from './panes/workspace'
 import SkillPane from './panes/skill'
 import ChatPane from './panes/chat'
@@ -141,19 +141,20 @@ export default function App() {
   // constants: a width persisted on a wide monitor would otherwise crush the
   // middle pane every time the app loads on a narrower one.
   //
-  // tether#90 — the third argument is `leftW + ACTIVITY_W`, not `leftW`. Both of
-  // layout.ts's rules are arithmetic on what is left for the middle column
-  // (`room = window - leftWidth - MIN_MID`, and the default share is taken of
-  // `window - leftWidth`), so the value that argument has to carry is ALL the
-  // chrome to the left of the middle — which is now the bar plus the tree, not
-  // the tree alone. Passing leftW would leave the MIN_MID floor 48px too loose:
-  // on a 1000px window with a 240px tree it would permit a 440px right pane and
-  // a 270px middle, against a floor of 320.
+  // tether#102 — the third argument is the TREE width and nothing else.
+  // layout.ts's rules are arithmetic on what is left for the middle column, so
+  // the quantity they need is all the chrome to the middle's left, which is the
+  // activity bar plus the tree. Between tether#90 and tether#102 the addition
+  // happened HERE, at both call sites, and forgetting it at either one produced
+  // a plausible width with nothing red (that is tether#90's bug, tether#99's two
+  // wrong numbers, and tether#100's documented-but-open gap). layout.ts adds the
+  // bar itself now — do not add it here. You cannot: ACTIVITY_W is no longer
+  // exported, so `+ ACTIVITY_W` on this line does not compile.
   const [rightW, setRightW] = useState(() =>
     loadRightWidth(
       localStorage.getItem(STORAGE_KEY_RIGHT),
       window.innerWidth,
-      loadWidth(STORAGE_KEY_LEFT, DEFAULT_LEFT) + ACTIVITY_W,
+      loadWidth(STORAGE_KEY_LEFT, DEFAULT_LEFT),
     ),
   )
   // Local-only UI dismissals; reset whenever the underlying connection state
@@ -276,8 +277,9 @@ export default function App() {
   }
   const resizeRight = (dx: number) => {
     setRightW(w => {
-      // leftW + ACTIVITY_W — see the rightW initializer for why.
-      const next = clampRightWidth(w - dx, window.innerWidth, leftW + ACTIVITY_W)
+      // The tree width alone — layout.ts charges the activity bar. See the
+      // rightW initializer.
+      const next = clampRightWidth(w - dx, window.innerWidth, leftW)
       localStorage.setItem(STORAGE_KEY_RIGHT, String(next))
       return next
     })

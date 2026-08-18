@@ -322,12 +322,16 @@ body {
    bar's background, so a fill would have nothing to contrast against. Do not add
    --bg-tint-backed elements in here.
 
-   Width 48px is duplicated as ACTIVITY_W in lib/layout.ts (it lived in App.tsx
-   until tether#100), which needs it as a number to compute the middle column's
-   MIN_MID floor at all. Change both — nothing checks that you did, so a change
-   here alone turns no test red. box-sizing is border-box globally, so the 1px
-   border-right below is INSIDE the 48: the footprint that constant mirrors is
-   48, not 49. */
+   Width 48px is mirrored twice in TypeScript. lib/layout.ts holds it as
+   ACTIVITY_W — it lived in App.tsx until tether#100 and stopped being exported
+   in tether#102 — because the middle column's MIN_MID floor cannot be computed
+   without it. lib/layout.test.ts holds it a SECOND time, as its own literal,
+   deliberately: an assertion phrased in terms of ACTIVITY_W moves with
+   ACTIVITY_W and so cannot pin its value, and pinning the value is the point.
+   Change all three — and note that nothing checks THIS file against either of
+   them, so a change here alone still turns no test red. box-sizing is
+   border-box globally, so the 1px border-right below is INSIDE the 48: the
+   footprint those constants mirror is 48, not 49. */
 .dt-activity {
   width: 48px; flex-shrink: 0;
   display: flex; flex-direction: column;

@@ -146,27 +146,9 @@ let subscribers = new Set<(m: SessionActivityMap) => void>()
 let timer: ReturnType<typeof setInterval> | null = null
 let visibilityBound = false
 let inFlight = false
-/**
- * Has the daemon answered even once? (tether#108)
- *
- * The one distinction this module could not express, and a consumer that draws a
- * CONCLUSION from absence needs it. `current[sid] === undefined` means two
- * different things — "nothing live holds that sid" and "we have not asked yet" —
- * and for the session-list marker they are the same invisible dot, which is why
- * nothing needed them apart until now. For a sentence they are not the same at
- * all: the first is a fact worth stating and the second is a false claim held for
- * one round trip after every mount.
- *
- * Set in `publish` and NOWHERE else, so it is true exactly when a fetch SUCCEEDED.
- * A failed poll must not set it: the catch in `poll` deliberately keeps the last
- * answer, and a failure is not an answer — flipping this on a rejection would let
- * a daemon that has never replied read as "answered: nothing holds it".
- */
-let answered = false
 
 function publish(next: SessionActivityMap) {
   current = next
-  answered = true
   for (const fn of subscribers) fn(current)
 }
 
@@ -284,36 +266,52 @@ export function useSessionActivity(sid: string): SessionActivityState | undefine
 }
 
 /**
- * The answer for one session INCLUDING whether there is one yet (tether#108).
+ * The answer for one session INCLUDING whether there is one YET (tether#108).
  *
  * Separate from `useSessionActivity` rather than a widening of it, and that is
  * about the consumers rather than about compatibility. A row wants "show a marker
- * or don't", for which "not yet" and "nothing holds it" are the same instruction —
- * see SessionRow's reserved-space comment. A reader deciding whether to wait wants
- * absence itself, which is the strongest thing the daemon knows (nothing live holds
- * the id, so it is necessarily not running) and cannot be said out loud until the
- * daemon has actually said something.
+ * or don't", for which "not asked yet" and "nothing holds it" are the same
+ * instruction — see SessionRow's reserved-space comment. A consumer that puts a
+ * SENTENCE on screen needs them apart, because absence is the strongest thing the
+ * daemon knows (nothing live holds the id, so it is necessarily not running) and
+ * saying it out loud before anything has been asked is a false claim.
  *
- * `state` is undefined in BOTH the answered-and-absent and the not-yet cases; the
- * pair is what tells them apart. Reading `answered` at render time is sound
- * because `publish` always hands out a NEW object, so the `setMap` that
- * accompanies the flag flipping always re-renders (zustand's identity check is not
- * in play here — this is plain useState).
+ * # `answered` is per-consumer, and deliberately NOT a module-level flag
  *
- * It subscribes the same shared poller, so a consumer of this costs no request a
- * consumer of `useSessionActivity` would not have cost. What it DOES cost, when it
- * is the only consumer mounted, is the poller itself: the chat session list is
- * collapsed by default (SessionList's `open` starts false), so on most screens no
- * row is mounted and no timer is running. Any caller of either hook should be
- * mounted only while its answer is wanted.
+ * It means "the daemon has answered SINCE THIS CONSUMER MOUNTED", which is the only
+ * thing a caller whose copy begins "Right now" can honestly stand behind. A
+ * module-level "has ever answered" is reachably wrong: `current` and any such flag
+ * outlive every unsubscribe, so a reader who expands the session list (rows poll),
+ * collapses it (the timer stops, the last answer is kept) and then opens a held
+ * session would have the first frame of that sentence rendered from a reading taken
+ * an arbitrary time earlier — including the "nothing is holding it" case, which is
+ * exactly what the flag exists to prevent, reached by another route. Starting from
+ * `null` and ignoring `current` until a publish arrives closes that off by
+ * construction rather than by a freshness rule someone has to maintain.
+ *
+ * What it costs is the honest price of that: when another consumer is ALREADY
+ * polling, this one is not the first subscriber, so it gets no immediate poll and
+ * waits up to one interval. In the common case it is the only consumer (the chat
+ * session list is collapsed by default — SessionList's `open` starts false — so on
+ * most screens no row is mounted and no timer is running), and the first subscriber
+ * does poll immediately.
+ *
+ * A FAILED poll is not an answer, and that falls out of the shape too: `publish` is
+ * the only thing that calls a subscriber and `poll`'s catch deliberately keeps the
+ * last answer without publishing, so a daemon that never replies leaves this `null`.
+ *
+ * Residual, named: once an answer has arrived, repeated later failures leave the
+ * last one on screen while the caller's copy keeps claiming freshness. That is the
+ * policy this module states and argues for every consumer (see `poll`'s catch);
+ * changing it here would give one caller a different one.
  */
 export function useSessionActivityAnswer(sid: string): {
   answered: boolean
   state: SessionActivityState | undefined
 } {
-  const [map, setMap] = useState<SessionActivityMap>(current)
-  useEffect(() => subscribeSessionActivity(setMap), [])
-  return { answered, state: map[sid] }
+  const [answer, setAnswer] = useState<SessionActivityMap | null>(null)
+  useEffect(() => subscribeSessionActivity(setAnswer), [])
+  return { answered: answer !== null, state: answer?.[sid] }
 }
 
 /**
@@ -335,25 +333,16 @@ export function resetSessionActivityForTests(): void {
   }
   current = {}
   inFlight = false
-  // tether#108 — without this, one test file's successful poll would leave the next
-  // file's first render claiming the daemon has answered, which is the exact false
-  // claim `answered` exists to prevent.
-  answered = false
 }
 
 /**
- * Test seam: is a timer currently running, how many consumers are subscribed, and
- * has the daemon answered?
+ * Test seam: is a timer currently running, and how many consumers are subscribed?
  *
  * Exposed so a test can assert the SHARING itself — that two mounted rows produce
  * one timer, and that the last unmount stops it. Asserting only on request counts
  * would leave "the timer is still running with nobody listening" invisible, and
  * that leak is the failure mode a reference count exists to prevent.
- *
- * `answered` is here for the same reason (tether#108): "a failed poll is not an
- * answer" is a rule about a variable no consumer can see from the outside, and a
- * mutant that sets it in the `catch` produces identical request counts.
  */
-export function sessionActivityPollerState(): { running: boolean; subscribers: number; answered: boolean } {
-  return { running: timer !== null, subscribers: subscribers.size, answered }
+export function sessionActivityPollerState(): { running: boolean; subscribers: number } {
+  return { running: timer !== null, subscribers: subscribers.size }
 }

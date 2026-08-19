@@ -505,9 +505,7 @@ describe('SessionRow marks whether a turn is in flight', () => {
       a.unmount()
       // On the TIMER, not only on the request count: a poller still ticking with
       // nobody listening is invisible to a count taken right after the unmount.
-      // `answered` (tether#108) stays true: the daemon has spoken, and unmounting the
-      // last row does not un-speak it.
-      expect(sessionActivityPollerState()).toEqual({ running: false, subscribers: 0, answered: true })
+      expect(sessionActivityPollerState()).toEqual({ running: false, subscribers: 0 })
       const before = d.calls()
       await act(async () => { await vi.advanceTimersByTimeAsync(SESSION_ACTIVITY_POLL_MS * 3) })
       expect(d.calls()).toBe(before)

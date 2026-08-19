@@ -142,9 +142,7 @@ describe('the shared poller', () => {
     // rendered by two panes and a list has many rows, so a fetch per consumer
     // multiplies the mount cost by the row count.
     expect(d.calls()).toBe(1)
-    // tether#108 widened this seam with `answered`; the value is asserted rather than
-    // spread in, because one settled poll is exactly what should have set it.
-    expect(sessionActivityPollerState()).toEqual({ running: true, subscribers: 3, answered: true })
+    expect(sessionActivityPollerState()).toEqual({ running: true, subscribers: 3 })
 
     await vi.advanceTimersByTimeAsync(SESSION_ACTIVITY_POLL_MS)
     expect(d.calls()).toBe(2)
@@ -153,9 +151,7 @@ describe('the shared poller', () => {
     // Asserted on the TIMER, not only on the request count: "still ticking with
     // nobody listening" is the leak a reference count exists to prevent, and it is
     // invisible to a count taken right after the last unsubscribe.
-    // `answered` deliberately stays true through the unsubscribe: it records that the
-    // daemon HAS spoken, which unmounting a consumer does not undo.
-    expect(sessionActivityPollerState()).toEqual({ running: false, subscribers: 0, answered: true })
+    expect(sessionActivityPollerState()).toEqual({ running: false, subscribers: 0 })
     await vi.advanceTimersByTimeAsync(SESSION_ACTIVITY_POLL_MS * 3)
     expect(d.calls()).toBe(2)
   })
@@ -296,89 +292,5 @@ describe('the shared poller', () => {
     gate.release?.()
     await vi.advanceTimersByTimeAsync(SESSION_ACTIVITY_POLL_MS)
     expect(started).toBe(2)
-  })
-})
-
-// ────────────────────────────────────────────────────────────────────────────
-// tether#108 — "has the daemon answered even once?", which this module could not
-// say before.
-//
-// Why it needs its own tests rather than riding along: for the session-list marker,
-// "not asked yet" and "nothing holds this sid" are the SAME invisible dot, so every
-// test above passes whether the flag is right or wrong. The consumer that needs it
-// (the chat pane's state line) turns absence into a sentence — "nothing live is
-// holding this conversation any more" — and getting the flag wrong makes that
-// sentence appear for one round trip after every mount, before anything has been
-// asked, which is a false claim about another process.
-describe('whether the daemon has answered at all (tether#108)', () => {
-  it('is false before any poll, and true after one settles', async () => {
-    const d = daemon(() => `{"sid-a":"working"}`)
-    // Before anything: no subscriber, no request, no answer.
-    expect(sessionActivityPollerState().answered).toBe(false)
-
-    subscribeSessionActivity(() => {})
-    // Still false: `subscribeSessionActivity` STARTS a poll, it does not complete one.
-    // This is the frame the state line would otherwise misreport, so it is asserted
-    // between the subscribe and the settle rather than either side of both.
-    expect(sessionActivityPollerState().answered).toBe(false)
-
-    await vi.advanceTimersByTimeAsync(0)
-    expect(d.calls()).toBe(1)
-    expect(sessionActivityPollerState().answered).toBe(true)
-  })
-
-  it('an EMPTY answer is still an answer', async () => {
-    // The case the whole flag exists for, and the one a "did we get a state for this
-    // sid" test cannot express: `{}` is the daemon saying "nothing live holds
-    // anything", which is a conclusion a reader can act on. Treating it as "no answer"
-    // would silence the state line exactly when it has the most to say.
-    daemon(() => `{}`)
-    subscribeSessionActivity(() => {})
-    await vi.advanceTimersByTimeAsync(0)
-    expect(sessionActivityPollerState().answered).toBe(true)
-  })
-
-  it('stays FALSE when every poll fails', async () => {
-    // A failure is not an answer. Setting the flag in the catch — the obvious mutant,
-    // and one that changes no request count and no published map — would make a daemon
-    // that has never replied read as "answered: nothing is holding it", i.e. the pane
-    // would tell the reader the hold had ended because it could not reach the daemon.
-    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('offline') }))
-    const seen: SessionActivityMap[] = []
-    subscribeSessionActivity(m => { seen.push(m) })
-    await vi.advanceTimersByTimeAsync(SESSION_ACTIVITY_POLL_MS * 3)
-    expect(seen).toHaveLength(0)
-    expect(sessionActivityPollerState().answered).toBe(false)
-  })
-
-  it('stays TRUE once set, even when later polls fail', async () => {
-    // The other direction, and it follows from the module's stated policy: a failed
-    // poll keeps the last answer on screen. The flag has to keep it too, or a single
-    // dropped request would blank the line for as long as the outage lasted.
-    let fail = false
-    vi.stubGlobal('fetch', vi.fn(async () => {
-      if (fail) throw new Error('offline')
-      return { ok: true, status: 200, json: async () => JSON.parse(`{"sid-a":"idle"}`) as unknown }
-    }))
-    subscribeSessionActivity(() => {})
-    await vi.advanceTimersByTimeAsync(0)
-    expect(sessionActivityPollerState().answered).toBe(true)
-
-    fail = true
-    await vi.advanceTimersByTimeAsync(SESSION_ACTIVITY_POLL_MS * 3)
-    expect(sessionActivityPollerState().answered).toBe(true)
-  })
-
-  it('is forgotten by the test seam, because module state outlives a component tree', async () => {
-    daemon(() => `{}`)
-    subscribeSessionActivity(() => {})
-    await vi.advanceTimersByTimeAsync(0)
-    expect(sessionActivityPollerState().answered).toBe(true)
-
-    resetSessionActivityForTests()
-    // Without this line in the seam, one test file's successful poll would leave the
-    // next file's first render claiming the daemon had answered — the same class of
-    // cross-file leak the seam's own doc was written for.
-    expect(sessionActivityPollerState()).toEqual({ running: false, subscribers: 0, answered: false })
   })
 })

@@ -9,7 +9,12 @@ import ChatPane, {
 import { useStore } from '../../lib/store'
 import { ErrCodeSessionHeldByBackgroundAgent, ErrCodeSessionOwned } from '../../lib/wire.gen'
 import { resetTranscriptWatchForTests } from '../../lib/transcriptWatch'
-import { SESSION_ACTIVITY_PATH, resetSessionActivityForTests, sessionActivityPollerState } from '../../lib/sessionActivity'
+import {
+  SESSION_ACTIVITY_PATH,
+  resetSessionActivityForTests,
+  sessionActivityPollerState,
+  subscribeSessionActivity,
+} from '../../lib/sessionActivity'
 
 // tether#80 — the LAST hop, which nothing pinned until now.
 //
@@ -423,8 +428,20 @@ describe('a held transcript keeps up, and a live one is still left alone (tether
   /** What GET /api/v1/session-activity answers (tether#108). sid -> state. */
   let daemonActivity: Record<string, string> = {}
   const activityPolls = () => seen.filter(r => r.url === SESSION_ACTIVITY_PATH).length
-  /** The line the card is currently showing, or null when the row is empty. */
-  const activityLine = () => document.querySelector('.state-card-activity')?.textContent || null
+  /**
+   * The sentence the card is SHOWING, or null when it is showing none.
+   *
+   * Reads the one slot carrying `on` rather than the container's textContent, because the
+   * container deliberately holds all four sentences at once — three of them
+   * `visibility: hidden` — so that its height cannot change when the answer does. See
+   * HELD_ACTIVITY_LINES.
+   */
+  const activityLine = () => document.querySelector('.state-card-activity-line.on')?.textContent ?? null
+  /** How many sentences are in the DOM, and how many are showing. */
+  const activitySlots = () => ({
+    all: document.querySelectorAll('.state-card-activity-line').length,
+    on: document.querySelectorAll('.state-card-activity-line.on').length,
+  })
 
   /**
    * A daemon that answers everything the pane asks on its way to a live connection,
@@ -719,9 +736,17 @@ describe('a held transcript keeps up, and a live one is still left alone (tether
     expect(activityLine()).toBe(HELD_ACTIVITY_GONE)
   })
 
-  it('CHANGES when the daemon\'s answer changes, without a remount', async () => {
+  it('re-renders the new sentence when the daemon\'s answer changes', async () => {
     // The mutation this test exists for: a line painted once at mount is right for three
     // seconds and then lies, and a stale sentence is indistinguishable from a live one.
+    //
+    // What it pins is the SUBSCRIPTION — that a fresh answer reaches this pane and repaints
+    // it — and not the interval. `forceProbe` drives a poll by hiding and showing the tab,
+    // which sessionActivity's own visibilitychange handler answers with an immediate refetch
+    // (its "coming back to the tab must not show a marker a whole poll stale" half), so a
+    // module whose 3s interval never started would still pass here. The interval itself is
+    // pinned in sessionActivity.test.ts, with fake timers this harness cannot use — they
+    // fight the connect machinery it needs.
     daemonActivity = { [SID]: 'working' }
     await renderRefusedWithSid(held)
     expect(activityLine()).toBe(HELD_ACTIVITY_WORKING)
@@ -735,12 +760,17 @@ describe('a held transcript keeps up, and a live one is still left alone (tether
     expect(activityLine()).toBe(HELD_ACTIVITY_IDLE)
   })
 
-  it('holds the row EMPTY, and its height, until the daemon has answered', async () => {
-    // The card is inside the scroll container, so a line that APPEARED one round trip
-    // after the card would push the transcript down under a reader already reading it.
-    // The element is therefore always there and empty; the height comes from
-    // .state-card-activity's min-height, which jsdom does not compute — so what is
-    // asserted here is the part that is observable: present, and saying nothing.
+  it('says NOTHING, while holding its height, until the daemon has answered', async () => {
+    // Two properties, and the second is why this card is built the way it is.
+    //
+    // (a) No sentence is shown before an answer arrives. Absence alone would produce
+    //     HELD_ACTIVITY_GONE — a claim about another process, made by default, for one
+    //     round trip after every open.
+    // (b) The row's HEIGHT is already whatever it will ever be, because all four
+    //     sentences are in the DOM from the first render with three of them hidden. jsdom
+    //     computes no layout, so the height itself is not assertable here — what IS
+    //     assertable is the structure that produces it, and that is what a mutation to
+    //     "render only the current line" would break.
     //
     // A request that never settles is what makes the pre-answer frame reachable at all:
     // with a responding daemon, `settle()` drains the poll before any assertion can run.
@@ -760,12 +790,96 @@ describe('a held transcript keeps up, and a live one is still left alone (tether
     const { container } = await renderRefusedWithSid(held)
     // The precondition: it really did ask, and really did not get an answer.
     expect(activityPolls()).toBe(1)
-    const row = container.querySelector('.state-card-activity')
-    expect(row).toBeTruthy()
-    expect(row?.textContent).toBe('')
-    // Specifically NOT the "nothing is holding it" sentence, which absence alone would
-    // produce and which would be a false claim about another process, made by default.
-    expect(row?.textContent).not.toBe(HELD_ACTIVITY_GONE)
+    expect(container.querySelector('.state-card-activity')).toBeTruthy()
+    expect(activityLine()).toBeNull()
+    expect(activitySlots()).toEqual({ all: 4, on: 0 })
+  })
+
+  it('keeps all four sentences in the DOM once one of them is showing', async () => {
+    // The other half of (b) above: the row that reserved its height before the answer must
+    // still be reserving it after, or the answer arriving would shrink it. Exactly one is
+    // showing — two would mean the CSS is deciding, which it is not allowed to.
+    daemonActivity = { [SID]: 'working' }
+    await renderRefusedWithSid(held)
+    expect(activityLine()).toBe(HELD_ACTIVITY_WORKING)
+    expect(activitySlots()).toEqual({ all: 4, on: 1 })
+  })
+
+  it('does not answer from a reading taken before the line appeared', async () => {
+    // The stale-answer hazard, and it is reachable rather than theoretical: the poller's
+    // last answer and its subscriber set are module state that outlives every unsubscribe.
+    // A reader who expands the session list (its rows poll), collapses it (the timer stops,
+    // the answer is kept) and then opens a held session would — with a module-level "has
+    // ever answered" flag — get the first frame of a sentence beginning "Right now" out of
+    // a reading taken an arbitrary time earlier. Since that older answer will not contain
+    // this sid, the sentence would be "nothing live is holding this conversation".
+    //
+    // Seeded here the way an expanded list would seed it: subscribe, let a poll land,
+    // unsubscribe. Then the pane's own activity request never settles, so if it were
+    // willing to use the stale map it would have to.
+    daemonActivity = { 'some-other-session': 'working' }
+    const off = subscribeSessionActivity(() => {})
+    await settle()
+    off()
+    // The precondition: the module really is holding an answer that lacks our sid.
+    expect(activityPolls()).toBe(1)
+    expect(sessionActivityPollerState()).toEqual({ running: false, subscribers: 0 })
+
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url)
+      seen.push({ method: init?.method ?? 'GET', url })
+      if (url === SESSION_ACTIVITY_PATH) return new Promise<Response>(() => {}) // never settles
+      if (url.includes('/providers')) return new Response(JSON.stringify({ providers: ['claude-code'] }), { status: 200 })
+      if (url === MESSAGES_URL) {
+        const headers = new Headers({ 'Content-Type': 'application/json' })
+        headers.set('X-Tether-Transcript-Updated-At', String(daemonVersion))
+        return new Response(init?.method === 'HEAD' ? null : daemonTranscript, { status: 200, headers })
+      }
+      return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }) as unknown as typeof fetch
+
+    await renderRefusedWithSid(held)
+    expect(activityLine()).toBeNull()
+    expect(activityLine()).not.toBe(HELD_ACTIVITY_GONE)
+  })
+
+  it('does not treat a FAILED poll as an answer', async () => {
+    // A failure is not an answer, and the direction matters: read as one, absence would
+    // become "nothing live is holding this conversation" — i.e. the pane would tell the
+    // reader the hold had ended because it could not reach the daemon.
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url)
+      seen.push({ method: init?.method ?? 'GET', url })
+      if (url === SESSION_ACTIVITY_PATH) throw new Error('offline')
+      if (url.includes('/providers')) return new Response(JSON.stringify({ providers: ['claude-code'] }), { status: 200 })
+      if (url === MESSAGES_URL) {
+        const headers = new Headers({ 'Content-Type': 'application/json' })
+        headers.set('X-Tether-Transcript-Updated-At', String(daemonVersion))
+        return new Response(init?.method === 'HEAD' ? null : daemonTranscript, { status: 200, headers })
+      }
+      return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }) as unknown as typeof fetch
+
+    await renderRefusedWithSid(held)
+    expect(activityPolls()).toBe(1)
+    expect(activityLine()).toBeNull()
+  })
+
+  it('puts the state line ABOVE the line that points at the transcript', async () => {
+    // Reading order is a decision this card makes explicitly: "do I wait or do I leave" is
+    // the more urgent of the two questions, and the read-only note answers the other one
+    // ("there is something below to read"). Nothing else would notice a swap.
+    daemonActivity = { [SID]: 'idle' }
+    daemonTranscript = JSON.stringify([{ role: 'user', text: 'hello', ts: 1000 }])
+    const { container } = await renderRefusedWithSid(held)
+    const card = container.querySelector('.failed-card') as HTMLElement
+    const kids = [...card.children].map(e => e.className)
+    const activityAt = kids.findIndex(c => c.includes('state-card-activity'))
+    const noteAt = kids.findIndex(c => c.includes('state-card-read'))
+    // Preconditions: both really are on screen, so this is about order and not presence.
+    expect(activityAt).toBeGreaterThan(-1)
+    expect(noteAt).toBeGreaterThan(-1)
+    expect(activityAt).toBeLessThan(noteAt)
   })
 
   it('asks NOTHING about activity when the session is CONNECTED', async () => {
@@ -807,7 +921,7 @@ describe('a held transcript keeps up, and a live one is still left alone (tether
     r.unmount()
     // On the poller's own bookkeeping, not only on a count taken right after the unmount:
     // "still ticking with nobody listening" is invisible to the latter.
-    expect(sessionActivityPollerState()).toEqual({ running: false, subscribers: 0, answered: true })
+    expect(sessionActivityPollerState()).toEqual({ running: false, subscribers: 0 })
   })
 
   // ──────────────────────────────────────────────────────────────────────────

@@ -302,8 +302,49 @@ export const HELD_ACTIVITY_WORKING = 'Right now: a turn is in flight in that age
 export const HELD_ACTIVITY_IDLE = 'Right now: no turn is in flight in that agent.'
 export const HELD_ACTIVITY_UNKNOWN =
   'Right now: tether cannot see whether a turn is in flight in that agent.'
+// "nothing live is holding this conversation" and NOT "that process has exited", which was
+// the first draft and is one inference too far. cc's liveness check is pid + /proc start
+// token (ccPidHoldsRecord), and it answers "not live" both for a process that exited and
+// for a /proc this daemon cannot read — its own doc says so and calls the direction
+// deliberate. The sentence therefore reports what tether can see, which is also all the
+// reader needs. Residual in that second world: tether stops refusing too, so "Check again"
+// opens a FRESH session rather than resuming — a degenerate host condition, named because
+// the sentence would otherwise be read as a promise about the resume.
 export const HELD_ACTIVITY_GONE =
-  'Right now: nothing live is holding this conversation any more — Check again should open it.'
+  'Right now: nothing live is holding this conversation — Check again should open it.'
+
+/**
+ * All four, in one place, because the ROW HAS TO BE AS TALL AS THE TALLEST OF THEM
+ * (tether#108).
+ *
+ * This card sits inside the scroll container, so any change in its height moves the
+ * transcript under a reader who is reading it. A `min-height` of one line does not
+ * deliver that: measured at 11px mono (~0.6em advance) the four sentences need between
+ * ~300px and ~540px of text width, while `.dt-right` starts at 640px (lib/layout.ts
+ * DEFAULT_RIGHT), drops to 260px (MIN_RIGHT) when dragged, and on a phone is the whole
+ * viewport — so at real widths they wrap to different numbers of lines and the row's
+ * height would change on the first poll AND on every transition between two states that
+ * wrap differently.
+ *
+ * So the row renders ALL FOUR, stacked in one grid cell, with three of them
+ * `visibility: hidden` (and the not-yet case hiding all four). The cell is then as tall
+ * as the tallest sentence AT WHATEVER WIDTH THE PANE HAPPENS TO BE, with no hard-coded
+ * pixel value to go stale — and its height never changes, so there is nothing to shift.
+ * `.session-row-act` makes the same trade for the same reason (its comment: "a list that
+ * twitches every three seconds is a worse defect than the one this marker fixes"); it can
+ * do it with a fixed 7px because a dot has no text to wrap.
+ *
+ * The cost is honest and stated: the card permanently reserves the height of the longest
+ * sentence, which is two lines at the default width and three on a narrow phone, even
+ * before the daemon has answered. `visibility: hidden` also keeps the hidden three out of
+ * the accessibility tree, so a screen reader gets one sentence, not four.
+ */
+export const HELD_ACTIVITY_LINES = [
+  HELD_ACTIVITY_WORKING,
+  HELD_ACTIVITY_IDLE,
+  HELD_ACTIVITY_UNKNOWN,
+  HELD_ACTIVITY_GONE,
+] as const
 
 /**
  * heldActivityLine turns one poll of the activity endpoint into the line to render, or
@@ -388,11 +429,12 @@ export const ARRIVAL_TRACE_MS = 1_100
  *
  * # A message that GROWS is not an arrival, and that is the point
  *
- * `messageKey` excludes `text` on purpose (store.ts), so the turn being watched keeps its
- * id as the other agent writes into it. Tracing "changed" instead of "new" would
- * re-highlight the same bubble every three seconds for the whole of a long turn — which is
- * a spinner wearing a highlight, i.e. the thing this wi rules out. The residual, stated:
- * a turn that grows for ten minutes gets exactly one trace, when it first appeared.
+ * `messageKey` excludes `text` on purpose (store.ts), so a message keeps its id while its
+ * content changes. Tracing "changed" instead of "new" would therefore re-highlight the same
+ * row on every refresh for as long as its content kept moving — which is a spinner wearing
+ * a highlight, i.e. the thing this wi rules out. Stated as the rule rather than as a
+ * scenario: CCStore emits a message per record group, so how often a served message's text
+ * actually grows in place is not something this file should claim to know.
  */
 export function trailingArrivals(prevIds: Set<string>, next: { id: string }[]): string[] {
   const out: string[] = []
@@ -420,27 +462,37 @@ export function trailingArrivals(prevIds: Set<string>, next: { id: string }[]): 
  * counts requests to SESSION_ACTIVITY_PATH in the connected state and requires zero.
  *
  * So the cost is stated honestly instead: rendered only under `readingHeldSession`, this is
- * a second three-second request alongside tether#106's HEAD probe, for exactly as long as
- * someone is looking at a session a background agent holds. Mounting is the whole of opting
- * in, which is SessionRow's argument for putting the subscription in the row rather than in
- * its two parents, applied one level up.
+ * a second three-second request alongside tether#106's HEAD probe, for as long as this pane
+ * is in that state. Mounting is the whole of opting in, which is SessionRow's argument for
+ * putting the subscription in the row rather than in its two parents, applied one level up.
+ * Its bound, since "as long as someone is looking" would overstate it: ChatPane stays
+ * mounted behind the Skills and Shell tabs (App.tsx hides it with display:none), so the
+ * poll continues while the reader is on another right-hand tab. A hidden BROWSER tab does
+ * pause it — that half is the poller's own (see reschedule).
  *
- * # The element is always here, even with nothing to say
+ * # Every sentence is rendered, and three of them are hidden
  *
- * This card sits INSIDE the scroll container (.dt-chat wraps the banner, the card,
- * .transcript-top and every bubble), so a line that appeared one round trip after mount
- * would add height ABOVE the reader and move the transcript under them. The height is
- * reserved in CSS (.state-card-activity) and the text is empty until an answer arrives —
- * the same trade .session-row-act makes for the same reason, spelled out in index.css: a
- * marker that shifts its neighbours every time a sid enters or leaves the answer is a worse
- * defect than the one it fixes.
+ * Not for thoroughness — for the scroll anchor. See HELD_ACTIVITY_LINES for the whole
+ * argument and the measurement behind it; the short version is that the four sentences wrap
+ * to different heights at real pane widths, so a single line whose text changes is a card
+ * that changes height, and this card is inside the scroll container.
  */
 export function HeldSessionActivity({ sid }: { sid: string }) {
   const answer = useSessionActivityAnswer(sid)
   const line = heldActivityLine(answer)
   // No role and no aria-live. It is a plain sentence in a card the reader is already
   // reading, and announcing every three-second transition would talk over them.
-  return <div className="state-card-activity">{line}</div>
+  //
+  // `on` is what the CSS makes visible and what a test reads, so "which sentence is
+  // showing" is one class rather than a comparison a reader has to redo. When `line` is
+  // null nothing carries it, which is the not-yet state: full height, no claim.
+  return (
+    <div className="state-card-activity">
+      {HELD_ACTIVITY_LINES.map(l => (
+        <span key={l} className={l === line ? 'state-card-activity-line on' : 'state-card-activity-line'}>{l}</span>
+      ))}
+    </div>
+  )
 }
 
 // tether#63 — code→sentence map for the failed-connection card. Only the
@@ -855,6 +907,13 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   // rhetorical: a spinner says "you are waiting", which is a state, while a trace says "one
   // just landed", which is an event and stops being shown.
   //
+  // Its population is bounded by the refresh's, and that bound is worth naming because it
+  // is invisible from here: SessionIndex.MessagePage prefers tether's own history.jsonl
+  // whenever it has one, and only this daemon writes that file — so for a sid tether once
+  // recorded and a foreign background job later resumed, the served transcript never
+  // changes, the probe never fires, and nothing here can ever run. That is the same
+  // residual HELD_SESSION_READABLE_NOTE is hedged around, not a new one.
+  //
   // Gated on `readingHeldSession`, the same gate tether#106 put on the refresh — which is
   // what makes the population exactly right rather than approximately right: that state is
   // the ONLY one in this app where messages arrive with no other signal. A connected session
@@ -875,6 +934,14 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   //
   // Checked on the OUTPUT rather than by a flag each path has to remember to set, so a
   // future third way of replacing the array is covered without being enumerated.
+  //
+  // What that rule COSTS, since it is a real case and not a corner: the first message to
+  // arrive into an EMPTY held transcript is also a whole-array answer, so it is not traced.
+  // Kept rather than special-cased, because the two are the same array shape and telling
+  // them apart would mean threading "this was a refresh" through from the watcher — and
+  // because that is the one arrival a reader cannot miss anyway: the pane goes from having
+  // no conversation to having one. The trace is for content appearing AMONG content, which
+  // is where you cannot see what moved. The second message is traced.
   useEffect(() => {
     if (!readingHeldSession || !sessionId) {
       // Forget what was on screen. Re-entering the state later then counts as a first
@@ -1591,10 +1658,11 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
           </div>
         )}
 
-        {/* tether#108 — `arrivalTrace` is appended to the row's class and nothing else
+        {/* tether#108 — `arrivalTrace` is appended to the ROW's class (the .msg-user /
+            .msg-system / .msg-ai container, not the bubble inside it) and nothing else
             changes. Deliberately a class and not a wrapper element: the trace animates
             background-color only (see .msg-arrived), so it cannot reflow, and an extra
-            wrapper around a bubble WOULD be able to. `key={m.id}` is untouched, so React
+            wrapper around a row WOULD be able to. `key={m.id}` is untouched, so React
             reconciles exactly as before and neither expansion Set notices. */}
         {transcript.map((m) => {
           const arrivalTrace = arrived.has(m.id) ? ' msg-arrived' : ''

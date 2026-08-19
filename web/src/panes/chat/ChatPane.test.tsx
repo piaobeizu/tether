@@ -782,14 +782,18 @@ describe('heldActivityLine (tether#108)', () => {
   })
 
   it('refuses to guess when the daemon said `held`', () => {
-    // `held` is the fallback for a status this build cannot classify — a refusal to
-    // claim, not a report about motion. Reading it as either of the other two is the
-    // mislabel tether#103 exists to remove, so both directions are pinned.
+    // `held` is the fallback for a status this build cannot classify — a refusal to claim,
+    // not a report about motion. Reading it as either of the other two is the mislabel
+    // tether#103 exists to remove.
+    //
+    // One exact assertion, not that plus `not.toBe(WORKING)` and `not.toBe(IDLE)`: those
+    // are tautologies once the value is pinned by identity, and a list of them reads like
+    // three guards where there is one. What the `held` LITERAL maps to is pinned end to
+    // end by the mounted test, which goes through fetchSessionActivity's known-set filter.
     expect(heldActivityLine({ answered: true, state: SESSION_ACTIVITY_HELD }))
       .toBe('Right now: tether cannot see whether a turn is in flight in that agent.')
-    expect(heldActivityLine({ answered: true, state: SESSION_ACTIVITY_HELD })).toBe(HELD_ACTIVITY_UNKNOWN)
-    expect(heldActivityLine({ answered: true, state: SESSION_ACTIVITY_HELD })).not.toBe(HELD_ACTIVITY_WORKING)
-    expect(heldActivityLine({ answered: true, state: SESSION_ACTIVITY_HELD })).not.toBe(HELD_ACTIVITY_IDLE)
+    expect(HELD_ACTIVITY_UNKNOWN)
+      .toBe('Right now: tether cannot see whether a turn is in flight in that agent.')
   })
 
   it('reads ABSENCE as the hold having ended, and points at the button', () => {
@@ -799,10 +803,14 @@ describe('heldActivityLine (tether#108)', () => {
     // same cc registry instance through two filters and this one is the wider — see
     // heldActivityLine's doc.
     expect(heldActivityLine({ answered: true, state: undefined }))
-      .toBe('Right now: nothing live is holding this conversation any more — Check again should open it.')
+      .toBe('Right now: nothing live is holding this conversation — Check again should open it.')
     // It names the button by the word the button actually has, so a rename of one has
     // to change the other.
     expect(HELD_ACTIVITY_GONE).toContain('Check again')
+    // And it reports what tether can SEE, not that the process exited. cc's liveness check
+    // is pid + /proc start token and reads "not live" for an unreadable /proc too, so the
+    // stronger sentence would be a claim this pane cannot back.
+    expect(HELD_ACTIVITY_GONE).not.toMatch(/exited|has ended|that process/i)
   })
 
   it('says NOTHING until the daemon has answered once', () => {
@@ -823,9 +831,7 @@ describe('heldActivityLine (tether#108)', () => {
     // reader acts on. Asserted as the exact sentence, because the first version of this
     // test only checked "not working and not idle", which the wrong answer satisfies.
     expect(heldActivityLine({ answered: true, state: 'sprinting' as never }))
-      .toBe(HELD_ACTIVITY_UNKNOWN)
-    expect(heldActivityLine({ answered: true, state: 'sprinting' as never }))
-      .not.toBe(HELD_ACTIVITY_GONE)
+      .toBe('Right now: tether cannot see whether a turn is in flight in that agent.')
     // fetchSessionActivity drops unknown strings, so the poller cannot produce this —
     // pinned anyway, because "unreachable" is a property of another module.
   })

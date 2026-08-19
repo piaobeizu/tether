@@ -308,3 +308,117 @@ func TestHistory_RoundtripEncoding(t *testing.T) {
 		t.Errorf("text mismatch: %q != %q", msg.Text, original)
 	}
 }
+
+// TestLoadHistoryNumbersMessagesByTheirLine pins the tether store's half of
+// HistoryMessage.Ord: 1-based, in file order, and numbered by the LINE rather than by
+// the accepted message.
+//
+// The line is the right unit because a corrupt line then leaves a GAP in the sequence
+// instead of shifting every position after it. Only the ORDER of these numbers is ever
+// read (mergeHistory compares them; nothing indexes by them), so a gap costs nothing —
+// whereas renumbering would make the same message report a different position before and
+// after a line went bad, which is exactly the instability the field exists to remove.
+func TestLoadHistoryNumbersMessagesByTheirLine(t *testing.T) {
+	dir := t.TempDir()
+	h := NewHistoryStore(dir)
+
+	path := filepath.Join(dir, "sid-ordered", "history.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"role":"user","text":"first","ts":1}` + "\n" +
+		`not valid json` + "\n" +
+		`{"role":"assistant","text":"reply","ts":2}` + "\n" +
+		`{"role":"user","text":"again","ts":3}` + "\n")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs := h.LoadHistory("sid-ordered")
+	if len(msgs) != 3 {
+		t.Fatalf("len(msgs) = %d, want 3", len(msgs))
+	}
+	// 1, then 3 and 4: line 2 was the corrupt one.
+	want := []int64{1, 3, 4}
+	for i := range want {
+		if msgs[i].Ord != want[i] {
+			t.Fatalf("message %d (%q) has Ord %d, want %d — ords %d/%d/%d",
+				i, msgs[i].Text, msgs[i].Ord, want[i], msgs[0].Ord, msgs[1].Ord, msgs[2].Ord)
+		}
+	}
+	// Never zero: zero is what omitempty deletes, and a deleted position reads on the
+	// frontend as "this daemon does not report positions", i.e. every refresh of a
+	// paged-back reader would take the visible-reset path.
+	if msgs[0].Ord == 0 {
+		t.Fatal("the first message's Ord is 0 — it would not survive JSON encoding")
+	}
+}
+
+// TestLoadHistoryDoesNotBelieveAPersistedOrd — the position is a fact about the file as
+// it is NOW, so it is assigned after the decode and overwrites anything a line happens
+// to carry.
+//
+// Nothing this daemon writes puts an `ord` in a line (see the test below), so the only
+// way one gets there is a hand-edited file or a future writer — and a believed value
+// would let a file dictate an order the file itself contradicts.
+func TestLoadHistoryDoesNotBelieveAPersistedOrd(t *testing.T) {
+	dir := t.TempDir()
+	h := NewHistoryStore(dir)
+
+	path := filepath.Join(dir, "sid-lying", "history.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"role":"user","text":"first","ts":1,"ord":9999}` + "\n" +
+		`{"role":"assistant","text":"reply","ts":2,"ord":1}` + "\n")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs := h.LoadHistory("sid-lying")
+	if len(msgs) != 2 {
+		t.Fatalf("len(msgs) = %d, want 2", len(msgs))
+	}
+	if msgs[0].Ord != 1 || msgs[1].Ord != 2 {
+		t.Fatalf("ords %d/%d, want 1/2 — the persisted values were believed, and they invert the file's own order",
+			msgs[0].Ord, msgs[1].Ord)
+	}
+}
+
+// TestOrdIsNotWrittenToTheHistoryFile is what the `omitempty` on HistoryMessage.Ord is
+// FOR, asserted rather than argued.
+//
+// HistoryMessage is both the wire shape of the transcript route and the shape this store
+// appends. tether#109 added a field to it, and the requirement was that an appended line
+// stay byte-identical: history.jsonl is read by this daemon's own LoadHistory and by
+// SessionIndex.firstUserText, and it is a file that outlives the binary that wrote it.
+// A position is meaningless in it — it would describe the line's own place, which the
+// line's place already describes.
+func TestOrdIsNotWrittenToTheHistoryFile(t *testing.T) {
+	dir := t.TempDir()
+	h := NewHistoryStore(dir)
+
+	h.RecordUser("sid-clean", "a question")
+	h.AccumulateAssistant("sid-clean", "an answer")
+	h.FinalizeAssistant("sid-clean")
+
+	raw, err := os.ReadFile(filepath.Join(dir, "sid-clean", "history.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"ord"`) {
+		t.Fatalf("an appended line carries an ord:\n%s", raw)
+	}
+	// The lines still load, and they load numbered — so "not persisted" is not the same
+	// as "not available", which is the pair of facts this design rests on.
+	msgs := h.LoadHistory("sid-clean")
+	if len(msgs) != 2 || msgs[0].Ord != 1 || msgs[1].Ord != 2 {
+		t.Fatalf("loaded %d messages with ords %v, want 2 with 1/2", len(msgs), func() []int64 {
+			var o []int64
+			for _, m := range msgs {
+				o = append(o, m.Ord)
+			}
+			return o
+		}())
+	}
+}

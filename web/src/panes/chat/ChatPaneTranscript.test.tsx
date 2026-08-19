@@ -1164,7 +1164,11 @@ describe('paging a transcript backwards (tether#107)', () => {
   }
   let daemonVersion = 1000
 
-  const entry = (role: string, text: string, ts: number) => ({ role, text, ts })
+  // `ord` defaults to `ts` so every tether#106/#107 case below reads as it was written.
+  // A convenience of this fixture, not a fact about the wire: the daemon's ord is a byte
+  // position and its ts is a clock. tether#109's cases pass the two separately, because
+  // its whole mechanism is a ts that moves while the conversation does not.
+  const entry = (role: string, text: string, ts: number, ord: number = ts) => ({ role, text, ts, ord })
 
   const settle = async () => {
     for (let i = 0; i < 5; i++) {
@@ -1483,5 +1487,140 @@ describe('paging a transcript backwards (tether#107)', () => {
       .toEqual(['older-0', 'older-1', 'recent-0', 'recent-1', 'recent-2'])
     // …and none of it is wearing a trace.
     expect(container.querySelectorAll('.msg-arrived')).toHaveLength(0)
+  })
+
+  // ── 6. tether#109, on the real path, with the reader's geometry ────────────
+  //
+  // The reported defect end to end: a probe whose newest window opens one record further
+  // into the assistant turn at its leading edge. cc stamps a merged turn with its FIRST
+  // fragment's time, so that turn arrives with a later ts and a key nothing on screen
+  // has; tether#107 appended it, and the owner photographed a bubble 3h16m older sitting
+  // under the newest one.
+  //
+  // Written at the PANE rather than only at the reducer because the two things this must
+  // not cost are pane-level: the reader's place in the scroll box, and tether#108's
+  // arrival trace. Both are invisible to a store test.
+  const recut = {
+    edgeFull: Date.parse('2026-08-19T03:41:45.555Z'),
+    edgeRecut: Date.parse('2026-08-19T03:41:49.404Z'),
+    newest: Date.parse('2026-08-19T07:18:29.315Z'),
+  }
+
+  /** Drive the pane into the held state with one earlier page loaded. */
+  async function heldWithAPageLoaded() {
+    useStore.setState({ workspacesLoaded: true })
+    localStorage.setItem('tether_last_sid', SID)
+    pages[MESSAGES_URL] = {
+      entries: [
+        entry('assistant', 'the whole turn, first fragment onwards', recut.edgeFull, 122154092),
+        entry('user', 'the newest turn', recut.newest, 123197925),
+      ],
+      earlier: 122154091,
+    }
+    pages[`${MESSAGES_URL}?before=122154091`] = {
+      entries: [entry('user', 'older-0', recut.edgeFull - 3600000, 121000000)],
+      earlier: 120000000,
+    }
+    const { container } = render(<ChatPane />)
+    useStore.setState({ fatal: { code: ErrCodeSessionHeldByBackgroundAgent, message: 'a background agent is using this conversation' } })
+    await settle()
+    expect(container.querySelectorAll('.failed-card')).toHaveLength(1)
+    await act(async () => { (container.querySelector('.transcript-more') as HTMLButtonElement).click() })
+    await settle()
+    return container
+  }
+
+  /** One turn of the three-second probe. */
+  async function probe() {
+    daemonVersion += 1000
+    for (const state of ['hidden', 'visible'] as const) {
+      Object.defineProperty(document, 'visibilityState', { value: state, configurable: true })
+      await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
+    }
+    await settle()
+  }
+
+  it('does not move a reader who has scrolled up when the window re-cuts its leading bubble', async () => {
+    const container = await heldWithAPageLoaded()
+    const box = fakeScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+    expect(box.height()).toBe(300) // three bubbles
+    box.scrollTo(0) // reading the page they just asked for
+    // The precondition that makes this discriminating: the reader is NOT near the bottom,
+    // so an autoscroll would be visible as a jump to 300.
+    expect(box.height() - box.top() - 300).toBe(0)
+
+    pages[MESSAGES_URL] = {
+      entries: [
+        entry('assistant', 'minus its first fragment', recut.edgeRecut, 122155976),
+        entry('user', 'the newest turn', recut.newest, 123197925),
+      ],
+      earlier: 122155975,
+    }
+    await probe()
+
+    // The transcript is unchanged and IN ORDER: the re-cut bubble did not land at the end
+    // under a bubble three hours newer.
+    expect([...container.querySelectorAll('.msg-user-bubble')].map(e => e.textContent))
+      .toEqual(['older-0', 'the newest turn'])
+    expect(useStore.getState().messages.map(m => m.text)).toEqual([
+      'older-0', 'the whole turn, first fragment onwards', 'the newest turn',
+    ])
+    // The reader is where they were, and the cursor still describes the oldest page.
+    expect(box.top()).toBe(0)
+    expect(useStore.getState().transcriptEarlier).toBe(120000000)
+    expect(useStore.getState().transcriptPagesBack).toBe(1)
+  })
+
+  it('marks nothing as arrived when the probe only re-cut a bubble the reader already has', async () => {
+    // tether#108's trace says "one just landed", which is an event. A window that slid
+    // over a turn is not an arrival — nothing was written that the reader cannot already
+    // see — so a trace here would be the feature lying about the only thing it says.
+    const container = await heldWithAPageLoaded()
+    expect(container.querySelectorAll('.msg-arrived')).toHaveLength(0)
+
+    pages[MESSAGES_URL] = {
+      entries: [
+        entry('assistant', 'minus its first fragment', recut.edgeRecut, 122155976),
+        entry('user', 'the newest turn', recut.newest, 123197925),
+      ],
+      earlier: 122155975,
+    }
+    await probe()
+    expect(container.querySelectorAll('.msg-arrived')).toHaveLength(0)
+
+    // The CONTROL, so the assertion above is known to discriminate: a turn that really
+    // did arrive, in the same state, over the same path, IS traced.
+    pages[MESSAGES_URL] = {
+      entries: [
+        entry('assistant', 'minus its first fragment', recut.edgeRecut, 122155976),
+        entry('user', 'the newest turn', recut.newest, 123197925),
+        entry('user', 'what the other agent just wrote', recut.newest + 60000, 123205000),
+      ],
+      earlier: 122155975,
+    }
+    await probe()
+    expect([...container.querySelectorAll('.msg-arrived')].map(e => e.textContent?.includes('what the other agent just wrote')))
+      .toEqual([true])
+  })
+
+  it('still offers the top-of-transcript states while a re-cut page is merged in', async () => {
+    // tether#107's three tops render unconditionally on messages.length > 0. A merge that
+    // skipped a bubble must not be able to empty the transcript or drop the cursor, which
+    // is what would take the button off the screen and leave the reader at a ceiling with
+    // nothing on it again.
+    const container = await heldWithAPageLoaded()
+    expect(container.querySelector('.transcript-more')).toBeTruthy()
+
+    pages[MESSAGES_URL] = {
+      entries: [
+        entry('assistant', 'minus its first fragment', recut.edgeRecut, 122155976),
+        entry('user', 'the newest turn', recut.newest, 123197925),
+      ],
+      earlier: 122155975,
+    }
+    await probe()
+
+    expect(container.querySelector('.transcript-more')).toBeTruthy()
+    expect(useStore.getState().messages.length).toBeGreaterThan(0)
   })
 })

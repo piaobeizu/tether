@@ -84,8 +84,11 @@ export function refreshTranscript(sid: string): Promise<void> {
       // the wholesale server-truth replace, which is what a deliberate session switch
       // needs. Above zero, replacing would throw away pages the reader loaded on
       // purpose — every three seconds, while they read them — so the page is merged in
-      // instead, and `mergeHistory` reporting disjoint windows sends us back to the
-      // replace because a visible jump beats an invisible hole.
+      // instead, and `mergeHistory` refusing sends us back to the replace because a
+      // visible jump beats an invisible hole. Since tether#109 it refuses for four
+      // reasons rather than one (see the reducer); this call site is unchanged by that,
+      // and deliberately so — the fallback was already the honest answer to "the merge
+      // could not be done safely", and #109 only widened what that covers.
       const pagesBack = store.transcriptPagesBack
       const merged = pagesBack > 0 && store.mergeHistory(next)
       if (!merged) store.loadHistory(next)

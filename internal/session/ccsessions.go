@@ -754,6 +754,14 @@ func ccReadWindow(f *os.File, until, window int64) (CCPage, error) {
 	}
 	msgs, off := ccMessagesFromAt(br)
 	at := base + off
+	// tether#109 — ccMessagesFromAt numbers messages relative to the reader it was
+	// handed, and this is the only place that knows where that reader started. An Ord
+	// is compared against Ords from OTHER pages of the same file, so a page-relative
+	// one would make two windows of the same conversation disagree about the order of
+	// the records they share — which is the defect this field exists to detect.
+	for i := range msgs {
+		msgs[i].Ord += base
+	}
 	return CCPage{Messages: msgs, Earlier: at, HasEarlier: at > 0}, nil
 }
 
@@ -1065,6 +1073,14 @@ func ccMessagesFromAt(r io.Reader) ([]HistoryMessage, int64) {
 					out[idx].Text = ccJoinTurn(out[idx].Text, m.Text)
 					out[idx].Tools = append(out[idx].Tools, m.Tools...)
 				} else {
+					// tether#109 — Ord and starts are the SAME fact read two ways, and
+					// they are assigned together here so they cannot drift: starts is the
+					// byte to read FROM (the cursor `?before=` takes, see below), Ord is
+					// the rank to order BY (1-based, see HistoryMessage.Ord). The +1 is
+					// what makes them different numbers on purpose. A MERGE takes neither
+					// branch, so a turn's Ord stays its first fragment's — the same rule
+					// its Ts already follows.
+					m.Ord = lineAt + 1
 					out = append(out, m)
 					starts = append(starts, lineAt)
 				}

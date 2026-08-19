@@ -601,7 +601,7 @@ export const useStore = create<AppState>((set, get) => ({
     localStorage.setItem('tether_last_sid', id)
     set({ sessionId: id })
   },
-  loadHistory: (msgs) => set(() => {
+  loadHistory: (msgs) => set((s) => {
     // Mirror the live 'fenced' replace-by-BlockID reduction (contract §3):
     // a block re-emitted with the same BlockID is persisted as multiple
     // history entries, but must collapse to ONE card — the LAST occurrence's
@@ -620,6 +620,65 @@ export const useStore = create<AppState>((set, get) => ({
         blockPos.set(bid, reduced.length)
       }
       reduced.push(m)
+    }
+    // tether#106 — carry the EXISTING ids over to the messages that are already on
+    // screen, so a reload REPLACES CONTENT without replacing IDENTITY.
+    //
+    // This is still the wholesale server-truth replace it has always been. What
+    // changes is that a message the previous array already had keeps its id. Before
+    // this, `historyEntryToMessage` minted a fresh crypto.randomUUID() for every entry
+    // on every load, so a refetch changed every React key (`key={m.id}` in ChatPane)
+    // and the whole transcript unmounted and remounted: every expanded fenced block
+    // and every expanded thinking block collapsed (both Sets are keyed by message id),
+    // and the scroll container's scrollHeight collapsed to its client height
+    // mid-commit, clamping scrollTop — the reader was thrown to the top of the
+    // conversation. Survivable once per deliberate switch; not survivable now that
+    // tether#106 reloads a held session's transcript whenever the other agent writes.
+    //
+    // # Matched by CONTENT, not by position, and that is the whole design
+    //
+    // A positional (prefix) match was the first attempt and it is inert for the
+    // population this feature exists for. CCStore serves a sliding TAIL —
+    // `out[ccTrimFront(out, ccMessagesMax):]` with ccMessagesMax = 200, inside a 1 MiB
+    // byte window (ccsessions.go) — so once a cc conversation passes either bound,
+    // every append shifts index 0 and a prefix match breaks immediately. That is
+    // exactly the case the reader is watching: the cc transcript behind tether#104 was
+    // 103,388,175 bytes. Keyed by content, a slide costs only the ids of the messages
+    // that actually fell out of the window.
+    //
+    // # The key is role+ts, and text is deliberately NOT in it
+    //
+    // Because the message that is GROWING is the one whose identity matters most. The
+    // other agent's current turn gains text on every write, so a key including text
+    // would give that message a new id every three seconds — collapsing the thinking
+    // block of the only turn anyone is watching. role+ts is the natural key here: a
+    // tether entry's ts is `time.Now().UnixMilli()` at append and a cc turn's is its
+    // first record's timestamp, so it identifies the turn while text is its content.
+    //
+    // # Each old id is handed out AT MOST ONCE
+    //
+    // Two messages can share role+ts (coarse clocks, or the same turn re-read), and
+    // giving both the same id would put duplicate React keys in one list — a worse
+    // failure than the remount this avoids. The queue per key is what makes that
+    // impossible: an id is shifted out when it is used, and a message with no match
+    // left keeps the fresh uuid historyEntryToMessage gave it.
+    //
+    // The separator is written as the ESCAPE `\u0000`, six characters of source, not a
+    // raw NUL byte. A raw one type-checks and passes every test while making the file
+    // one git treats as binary and one no reviewer can see the contents of. It is a
+    // separator rather than nothing because `role` is a closed set that never contains
+    // it, so "assistant" + 1 can never collide with "assistant1" + "".
+    const idsByKey = new Map<string, string[]>()
+    for (const m of s.messages) {
+      const key = `${m.role}\u0000${m.ts}`
+      const q = idsByKey.get(key)
+      if (q) q.push(m.id)
+      else idsByKey.set(key, [m.id])
+    }
+    for (let i = 0; i < reduced.length; i++) {
+      const q = idsByKey.get(`${reduced[i].role}\u0000${reduced[i].ts}`)
+      const id = q?.shift()
+      if (id !== undefined) reduced[i] = { ...reduced[i], id }
     }
     // A session reset (page reload / session switch) drops any stale pending
     // permission requests — they belong to the prior session (tether#40).

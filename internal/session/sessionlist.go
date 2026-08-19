@@ -364,6 +364,94 @@ func (x *SessionIndex) Messages(sid string) ([]HistoryMessage, string) {
 	return nil, SourceNone
 }
 
+// TranscriptUpdatedAtHeader carries, on the transcript route, when the transcript
+// that route would serve was last written — Unix milliseconds, decimal (tether#106).
+//
+// # Why the transcript route grew a cheap answer instead of a new endpoint
+//
+// A session a background agent holds has no live stream (tether#101 refuses the
+// attach), so the one GET this pane makes at open time used to be the whole of what
+// the reader ever saw. Following along needs a "has it changed?" that does not cost
+// what "give it to me" costs, and the honest place for that is the SAME route:
+// Messages picks between two stores by a rule stated once above, and a probe on a
+// route of its own would be free to answer for the other one.
+//
+// # Milliseconds in a header of our own, rather than only Last-Modified
+//
+// Last-Modified is set too and is the standard thing, but its granularity is one
+// SECOND. A change landing in the same second as the reader's last sample is
+// invisible to it, and — because the comparison is against the last sample rather
+// than against now — it stays invisible until the NEXT write. On a conversation
+// whose next write may be minutes away that is a transcript that silently stops at
+// a message the reader can see is not the last one.
+//
+// The name is mirrored by hand in web/src/lib/transcriptWatch.ts;
+// TestTranscriptUpdatedAtHeaderIsMirroredInTypeScript reads both sides, for the
+// reason TestSessionActivityContractIsMirroredInTypeScript gives — a rename on
+// either side alone compiles, type-checks and passes every fixture test.
+const TranscriptUpdatedAtHeader = "X-Tether-Transcript-Updated-At"
+
+// TranscriptUpdatedAt reports when the transcript Messages would serve for sid was
+// last written, in Unix milliseconds, or 0 when neither store has one.
+//
+// # It is the same store choice Messages makes, and that is structural here
+//
+// Not "the same rule restated" — the branch conditions ARE the two stores' own
+// has-it predicates, the ones HasHistory and find already were. So a reader that
+// gets a timestamp from tether's history is a reader whose next GET is served from
+// tether's history. If these could disagree, the failure would be invisible in the
+// worst way: a probe that watches a file nobody is reading reports "nothing
+// changed" forever, and the feature degrades to exactly the bug it fixes.
+//
+// # Two residuals, named
+//
+// CCStore.Messages can return ok=false for a file findStat accepted (unreadable, or
+// nothing in the tail window converts to a turn), in which case Messages answers
+// SourceNone while this answers with cc's mtime. Harmless: it makes the reader refetch
+// an empty transcript it already has.
+//
+// The second is bigger and is NOT about disagreement. Agreeing on a file nothing is
+// writing produces the same end state as disagreeing. `history.jsonl` is appended to
+// only by this daemon's own fan-out; a background agent holding the session writes cc's
+// transcript instead. So for a sid tether once recorded and a `claude -p` job later
+// resumed, both this and Messages select tether's stale copy, the probe correctly and
+// permanently reports "unchanged", and no amount of polling will show the reader the
+// work that agent is doing. Attachment.resolve already models that combination — it
+// logs hadConversation as `had_history` on the refusal branch. Nothing here can fix it:
+// which store wins is List's rule, and changing it is the open question sessionlist's
+// own doc records ("tether shows its own shorter record, 137 lines against cc's 919").
+// What DOES depend on it is the sentence the UI shows, so HELD_SESSION_READABLE_NOTE
+// claims only that tether keeps re-reading — see its comment.
+//
+// # Cost
+//
+// On the tether branch, ONE stat (HistoryStore.ModTime). On the cc branch it is one
+// stat per known workspace directory until the file is found (CCStore.findStat walks
+// s.dirs()), plus one ReadDir of the projects directory for any workspace whose encoded
+// path is longer than ccDirNameMaxLen — so "one stat" is the floor, not the figure. It
+// is still the right order of magnitude for a three-second poll, and the thing it
+// avoids spending is not: Messages prefers HistoryStore.LoadHistory, an os.ReadFile of
+// the WHOLE history.jsonl with no tail and no cap, and falls through to a cc read
+// bounded at ccMessagesTailBytes (1 MiB) widening once to ccMessagesWideTailBytes
+// (16 MiB). The cc transcript of the very session that prompted tether#104 was
+// 103,388,175 bytes.
+func (x *SessionIndex) TranscriptUpdatedAt(sid string) int64 {
+	if x == nil {
+		return 0
+	}
+	if x.History != nil {
+		if ts, ok := x.History.ModTime(sid); ok {
+			return ts
+		}
+	}
+	if x.CC != nil {
+		if ts, ok := x.CC.ModTime(sid); ok {
+			return ts
+		}
+	}
+	return 0
+}
+
 // title derives a human-readable description of a session from the session
 // itself: what the user opened with, else where the session runs.
 //

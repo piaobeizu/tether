@@ -5,8 +5,13 @@
 // tether_last_sid) behind a non-empty history. Each test below pins one half of
 // that divergence, or one of the hazards centralising it made cheap to close.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { openSession } from './session'
+import { openSession, refreshTranscript, REFRESH_TRANSCRIPT_EVENT } from './session'
 import { useStore, type Message } from './store'
+import {
+  TRANSCRIPT_UPDATED_AT_HEADER,
+  resetTranscriptWatchForTests,
+  transcriptWatchState,
+} from './transcriptWatch'
 
 /** Drain openSession's fetch chain. Every hop in it is a microtask and this is
  *  a macrotask, so all of them have run by the time this resolves. */
@@ -33,14 +38,27 @@ let listeners: (() => void)[] = []
 const msg = (id: string, text: string, ts: number): Message =>
   ({ id, role: 'user', text, ts })
 
+/** Record every 'tether:refresh-transcript' — the channel openSession offers a click
+ *  on the ALREADY-OPEN row on (tether#106). ChatPane decides whether it means
+ *  anything; this module only offers it. */
+function watchRefreshOffers(): { count: () => number } {
+  let seen = 0
+  const onRefresh = () => { seen++ }
+  window.addEventListener(REFRESH_TRANSCRIPT_EVENT, onRefresh)
+  listeners.push(() => window.removeEventListener(REFRESH_TRANSCRIPT_EVENT, onRefresh))
+  return { count: () => seen }
+}
+
 beforeEach(() => {
   localStorage.clear()
+  resetTranscriptWatchForTests()
   useStore.setState({ sessionId: null, messages: [], notices: [], pendingPermissions: [] })
 })
 
 afterEach(() => {
   for (const off of listeners) off()
   listeners = []
+  resetTranscriptWatchForTests()
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
 })
@@ -199,7 +217,10 @@ describe('openSession (tether#61)', () => {
     openSession('a/b?c')
     await settle()
 
-    expect(fetchMock).toHaveBeenCalledWith('/api/v1/sessions/a%2Fb%3Fc/messages')
+    // The trailing `undefined` is authedFetch forwarding an absent init (tether#106
+    // routed this through it so an expired cookie redirects instead of looping); the
+    // url is what this test is about.
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/sessions/a%2Fb%3Fc/messages', undefined)
   })
 
   it('is a no-op for an empty sid — no clear, no switch, no reconnect', async () => {
@@ -231,9 +252,137 @@ describe('openSession (tether#61)', () => {
     // The session list highlights the current session, so this click is easy to
     // make. Honouring it would close a live WebTransport mid-turn and reload the
     // transcript over an in-flight turn's bubble — for a session already open.
+    //
+    // tether#106 narrowed what this click MEANS, and this test is the ratchet on
+    // what it must still not DO. Every one of these four is a separate way for the
+    // narrowing to have gone too far: a reconnect tears down the live channel
+    // (tether#61), a fetch here would be an unconditional reload of the transcript
+    // this pane may be streaming into (tether#42), and clearing the notices is the
+    // tether#57 defect exactly.
     expect(wt.count()).toBe(0)
     expect(fetchMock).not.toHaveBeenCalled()
     expect(useStore.getState().messages.map(m => m.text)).toEqual(['mid-turn prompt'])
     expect(useStore.getState().notices).toHaveLength(1)
+  })
+
+  it('OFFERS the already-open click to ChatPane, and offering is all it does', async () => {
+    // tether#106 — the click on the highlighted row is not nothing: for a session a
+    // background agent holds there is no live stream to protect and the transcript
+    // below is a still frame. openSession cannot tell those apart (whether a stream
+    // exists is ChatPane's fact), so it raises the event and stops. Everything the
+    // test above pins stays pinned; this one pins that the offer is made at all,
+    // because deleting it is silent — no test fails, the click just goes back to
+    // meaning nothing.
+    const fetchMock = mockMessages([{ role: 'user', text: 'refetched', ts: 1 }])
+    const offers = watchRefreshOffers()
+    const wt = watchReconnects()
+    useStore.setState({ sessionId: 'sid-a', messages: [msg('live', 'mid-turn prompt', 1)] })
+
+    openSession('sid-a')
+    await settle()
+
+    expect(offers.count()).toBe(1)
+    expect(wt.count()).toBe(0)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('does NOT offer a refresh when the click is a real switch', async () => {
+    // A switch already reloads the transcript on its own. An offer here would make
+    // ChatPane reload it a third time (openSession + the [sessionId] effect + this).
+    mockMessages([])
+    const offers = watchRefreshOffers()
+    useStore.setState({ sessionId: 'sid-a' })
+
+    openSession('sid-b')
+    await settle()
+
+    expect(offers.count()).toBe(0)
+  })
+})
+
+describe('refreshTranscript (tether#106)', () => {
+  /** A /messages reply that carries the version header, the way the daemon sends it. */
+  function mockVersionedMessages(entries: unknown[], version: number | null) {
+    const headers = new Headers()
+    if (version !== null) headers.set(TRANSCRIPT_UPDATED_AT_HEADER, String(version))
+    const fetchMock = vi.fn(async () => ({ ok: true, status: 200, headers, json: async () => entries }))
+    vi.stubGlobal('fetch', fetchMock)
+    return fetchMock
+  }
+
+  it('reloads the transcript and records which version it loaded', async () => {
+    // The recording is the half that is easy to drop and impossible to see: without
+    // it the first probe has no baseline, so everything written between the load and
+    // that probe stays invisible until the write AFTER it — on a conversation whose
+    // next write may be minutes away, a transcript that stops at a message the reader
+    // can see is not the last one.
+    mockVersionedMessages([{ role: 'user', text: 'newly appended', ts: 9 }], 1755500000000)
+    useStore.setState({ sessionId: 'sid-a', messages: [msg('old', 'stale', 1)] })
+
+    await refreshTranscript('sid-a')
+
+    expect(useStore.getState().messages.map(m => m.text)).toEqual(['newly appended'])
+    expect(transcriptWatchState().version).toBe(1755500000000)
+  })
+
+  it('drops a reply that arrives after the sid has moved on', async () => {
+    mockVersionedMessages([{ role: 'user', text: 'from sid-a', ts: 1 }], 100)
+    useStore.setState({ sessionId: 'sid-a', messages: [] })
+
+    const inFlight = refreshTranscript('sid-a')
+    useStore.setState({ sessionId: 'sid-b', messages: [msg('b1', 'B transcript', 2)] })
+    await inFlight
+
+    expect(useStore.getState().messages.map(m => m.text)).toEqual(['B transcript'])
+    // …and the version must not be recorded either: it describes sid-a's file, and
+    // recording it here would make the watch believe sid-b is up to date.
+    expect(transcriptWatchState().version).toBe(0)
+  })
+
+  it('does not blank the transcript when the request fails', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 500, headers: new Headers(), json: async () => [] })))
+    useStore.setState({ sessionId: 'sid-a', messages: [msg('a1', 'still readable', 1)] })
+
+    await refreshTranscript('sid-a')
+
+    expect(useStore.getState().messages.map(m => m.text)).toEqual(['still readable'])
+  })
+
+  it('is a no-op for an empty sid', async () => {
+    const fetchMock = mockVersionedMessages([], 100)
+    await refreshTranscript('')
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('joins a load already in flight for the same session instead of racing it', async () => {
+    // Three callers now share one sid — the watcher's reload, the click on the open row
+    // and "Check again" — where before tether#106 the only caller was a switch and two
+    // in-flight loads were for different sids by construction. Two overlapping loads can
+    // settle in either order, so the older one could land last and take
+    // noteTranscriptVersion with it, leaving the recorded version describing neither
+    // what is on screen nor what the daemon has.
+    let release!: () => void
+    const gate = new Promise<void>(r => { release = r })
+    const headers = new Headers()
+    headers.set(TRANSCRIPT_UPDATED_AT_HEADER, '500')
+    const fetchMock = vi.fn(async () => {
+      await gate
+      return { ok: true, status: 200, headers, json: async () => [{ role: 'user', text: 'once', ts: 1 }] }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    useStore.setState({ sessionId: 'sid-a', messages: [] })
+
+    const a = refreshTranscript('sid-a')
+    const b = refreshTranscript('sid-a')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    release()
+    await Promise.all([a, b])
+    expect(useStore.getState().messages.map(m => m.text)).toEqual(['once'])
+    expect(transcriptWatchState().version).toBe(500)
+
+    // And the slot is released, so the NEXT click really does re-read.
+    await refreshTranscript('sid-a')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 })

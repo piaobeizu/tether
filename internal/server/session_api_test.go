@@ -1,11 +1,14 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -364,5 +367,121 @@ func TestSessionSub_MessagesStillWorks(t *testing.T) {
 	}
 	if len(msgs) != 1 || msgs[0].Text != "hello there" {
 		t.Errorf("messages = %+v, want one user turn %q", msgs, "hello there")
+	}
+}
+
+// ─── tether#106: the cheap "has it changed?" probe ──────────────────────────
+
+// TestGetMessagesCarriesTheTranscriptVersion — the GET has to say which version it
+// just handed over, or the first probe after it has no baseline to compare against
+// and everything the other agent wrote between the two is invisible until the write
+// after that.
+func TestGetMessagesCarriesTheTranscriptVersion(t *testing.T) {
+	dir, _, sub, _ := newSessionAPI(t)
+	at := time.Now().Add(-90 * time.Minute).Truncate(time.Millisecond)
+	seedTranscript(t, dir, "aaaa1111", "hello there", at)
+
+	rec := httptest.NewRecorder()
+	sub(rec, httptest.NewRequest("GET", "/api/v1/sessions/aaaa1111/messages", nil))
+
+	if rec.Code != 200 {
+		t.Fatalf("GET = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	// The exact value, not merely "present". A header carrying some other number —
+	// now(), or the directory's mtime — satisfies presence and is useless: it either
+	// never matches or never stops matching.
+	want := strconv.FormatInt(at.UnixMilli(), 10)
+	if got := rec.Header().Get(session.TranscriptUpdatedAtHeader); got != want {
+		t.Errorf("%s = %q, want %q (the transcript's mtime)", session.TranscriptUpdatedAtHeader, got, want)
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want %q — a revalidating cache in front of this route reports a version as stale as the transcript it describes", got, "no-store")
+	}
+}
+
+// TestHeadMessagesAnswersFromAStatWithoutReadingTheTranscript is the load-bearing
+// one, and asserting the headers alone would not be it: a HEAD that computed the
+// right answer AFTER reading the whole transcript passes every header assertion
+// while costing exactly what the probe exists to avoid, and nothing in the response
+// would show it.
+//
+// So the transcript is seeded with a CORRUPT line, and the read path is required to
+// stay silent. HistoryStore.LoadHistory logs "history: skip corrupt line" for it and
+// the route logs "session transcript served" for every GET, so both log lines are
+// proof of a read having happened. The GET half of the test is what makes the HEAD
+// half meaningful — it shows the probe is a live wire.
+func TestHeadMessagesAnswersFromAStatWithoutReadingTheTranscript(t *testing.T) {
+	dir, _, sub, _ := newSessionAPI(t)
+	at := time.Now().Add(-3 * time.Minute).Truncate(time.Millisecond)
+	seedTranscript(t, dir, "aaaa1111", "hello there", at)
+	// Append a line no parser accepts, without disturbing the mtime the assertions
+	// below use.
+	p := filepath.Join(dir, "aaaa1111", "history.jsonl")
+	f, err := os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("{not json at all\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(p, at, at); err != nil {
+		t.Fatal(err)
+	}
+
+	var logged bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(prev)
+
+	rec := httptest.NewRecorder()
+	sub(rec, httptest.NewRequest("HEAD", "/api/v1/sessions/aaaa1111/messages", nil))
+
+	if rec.Code != 200 {
+		t.Fatalf("HEAD = %d, want 200", rec.Code)
+	}
+	if got, want := rec.Header().Get(session.TranscriptUpdatedAtHeader), strconv.FormatInt(at.UnixMilli(), 10); got != want {
+		t.Errorf("HEAD %s = %q, want %q", session.TranscriptUpdatedAtHeader, got, want)
+	}
+	// httptest.ResponseRecorder does NOT discard a body for HEAD the way a real
+	// server does, which is what makes this assertion mean something here: a
+	// fall-through into writeJSON would leave the whole transcript in it.
+	if rec.Body.Len() != 0 {
+		t.Errorf("HEAD body = %d bytes, want 0: %s", rec.Body.Len(), rec.Body.String())
+	}
+	if s := logged.String(); s != "" {
+		t.Errorf("HEAD produced log output, so something read the transcript (or logged the request): %s", s)
+	}
+
+	logged.Reset()
+	rec = httptest.NewRecorder()
+	sub(rec, httptest.NewRequest("GET", "/api/v1/sessions/aaaa1111/messages", nil))
+	if rec.Code != 200 {
+		t.Fatalf("GET = %d, want 200", rec.Code)
+	}
+	for _, want := range []string{"skip corrupt line", "session transcript served"} {
+		if !strings.Contains(logged.String(), want) {
+			t.Fatalf("GET did not log %q, so the silence asserted for HEAD proves nothing: %s", want, logged.String())
+		}
+	}
+}
+
+// TestHeadMessagesOmitsTheVersionWhenThereIsNoTranscript — absence of the header is
+// how the SPA says "unknown", and unknown compares unequal to every real version, so
+// a reader that lands here refreshes once and learns the truth. Sending a 0 instead
+// would be a version, and versions are things that can match.
+func TestHeadMessagesOmitsTheVersionWhenThereIsNoTranscript(t *testing.T) {
+	_, _, sub, _ := newSessionAPI(t)
+
+	rec := httptest.NewRecorder()
+	sub(rec, httptest.NewRequest("HEAD", "/api/v1/sessions/bbbb2222/messages", nil))
+
+	if rec.Code != 200 {
+		t.Fatalf("HEAD = %d, want 200", rec.Code)
+	}
+	if got := rec.Header().Get(session.TranscriptUpdatedAtHeader); got != "" {
+		t.Errorf("%s = %q for a session with no transcript, want it absent", session.TranscriptUpdatedAtHeader, got)
 	}
 }

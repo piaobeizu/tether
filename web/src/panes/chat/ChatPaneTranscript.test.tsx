@@ -3,6 +3,7 @@ import { act, cleanup, render, screen } from '@testing-library/react'
 import ChatPane, { HELD_SESSION_PLACEHOLDER, HELD_SESSION_READABLE_NOTE } from './index'
 import { useStore } from '../../lib/store'
 import { ErrCodeSessionHeldByBackgroundAgent, ErrCodeSessionOwned } from '../../lib/wire.gen'
+import { resetTranscriptWatchForTests } from '../../lib/transcriptWatch'
 
 // tether#80 — the LAST hop, which nothing pinned until now.
 //
@@ -332,5 +333,278 @@ describe('a session held by a background agent reads as a state, not a failure (
     expect(box.placeholder).toBe('not connected')
     // The transcript is unconditional for every code, not just the new one.
     expect(screen.getByText('hello')).toBeTruthy()
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// tether#106 — the transcript follows the other agent, and the click on the
+// highlighted row still does nothing when there is something to protect.
+//
+// Both halves are wiring, and wiring is this repo's most reliable blind spot: the
+// watcher is unit-tested in transcriptWatch.test.ts and the click is unit-tested in
+// session.test.ts, and BOTH can be perfect while the pane subscribes to neither.
+// Nothing else in the suite would notice — a transcript frozen at the moment it was
+// fetched renders exactly like one that is up to date.
+//
+// The gate under test is `readingHeldSession`, i.e. the conjunction
+// `connState === 'failed' && fatal.code === session_held_by_background_agent`. So the
+// cases below are chosen to break it in each direction independently: connected (the
+// first conjunct false, and the state the tether#61 guard exists for), another
+// terminal code (the second false), and held (both true).
+describe('a held transcript keeps up, and a live one is still left alone (tether#106)', () => {
+  const held = {
+    code: ErrCodeSessionHeldByBackgroundAgent,
+    message: 'session e4d1f668 is being used by a live background agent (kind bg, job e4d1f668)',
+  }
+  const owned = { code: ErrCodeSessionOwned, message: 'session is owned by client abc' }
+  const SID = 'sid-held-0001'
+  const MESSAGES_URL = `/api/v1/sessions/${SID}/messages`
+
+  /** Every request the pane issued, so a test can count the ones it cares about. */
+  let seen: { method: string; url: string }[] = []
+  const transcriptGets = () => seen.filter(r => r.url === MESSAGES_URL && r.method === 'GET').length
+  const transcriptProbes = () => seen.filter(r => r.url === MESSAGES_URL && r.method === 'HEAD').length
+
+  /**
+   * What the daemon has of this transcript. Served by the stub below, so a reload the
+   * pane performs lands the SAME conversation the test seeded rather than emptying it —
+   * which matters here because the note under test is gated on there being a transcript
+   * on screen at all.
+   */
+  let daemonTranscript = '[]'
+
+  /** The version the daemon reports for it. Moving this is how a test says "the other
+   *  agent just wrote". */
+  let daemonVersion = 1000
+
+  /**
+   * A daemon that answers everything the pane asks on its way to a live connection,
+   * and reports a transcript version the test can move.
+   */
+  function stubDaemon() {
+    return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url)
+      seen.push({ method: init?.method ?? 'GET', url })
+      if (url.includes('/providers')) return new Response(JSON.stringify({ providers: ['claude-code'] }), { status: 200 })
+      if (url.includes('/wt-ticket')) return new Response(JSON.stringify({ ticket: 'tkt' }), { status: 200 })
+      if (url.includes('/cert-hash')) return new Response('', { status: 404 })
+      if (url === MESSAGES_URL) {
+        const headers = new Headers({ 'Content-Type': 'application/json' })
+        headers.set('X-Tether-Transcript-Updated-At', String(daemonVersion))
+        return new Response(init?.method === 'HEAD' ? null : daemonTranscript, { status: 200, headers })
+      }
+      return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+  }
+
+  /**
+   * The minimum WebTransport that lets doConnect reach connState 'connected'.
+   *
+   * jsdom has none, which is why every other test in this file exercises the FAILED
+   * path — and why "clicking the current row while connected does nothing" could not
+   * be asserted before. `closed` never settles, so onClose never fires and the pane
+   * stays connected for the length of the test; the incoming stream never yields, so
+   * no envelope arrives to move the store underneath the assertions.
+   */
+  class FakeWebTransport {
+    ready = Promise.resolve()
+    closed = new Promise<never>(() => {})
+    incomingUnidirectionalStreams = new ReadableStream({ start() { /* silent */ } })
+    createBidirectionalStream() {
+      return Promise.resolve({ writable: new WritableStream(), readable: new ReadableStream({ start() { } }) })
+    }
+    close() { /* no-op */ }
+  }
+
+  /**
+   * Force one probe without waiting out TRANSCRIPT_POLL_MS.
+   *
+   * The watcher checks immediately when the tab comes back, so this exercises the real
+   * poll path (same `probe`, same guards) rather than reaching into the module. Fake
+   * timers are the alternative and they fight the connect machinery this harness needs.
+   */
+  const forceProbe = async () => {
+    for (const state of ['hidden', 'visible'] as const) {
+      Object.defineProperty(document, 'visibilityState', { value: state, configurable: true })
+      await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
+    }
+    await settle()
+  }
+
+  /** Let every promise chain the connect path strings together settle. */
+  const settle = async () => {
+    for (let i = 0; i < 5; i++) {
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)) })
+    }
+  }
+
+  beforeEach(() => {
+    localStorage.clear()
+    seen = []
+    daemonTranscript = '[]'
+    daemonVersion = 1000
+    // transcriptWatch is a MODULE, so its loaded-version memory outlives a component
+    // tree: without this, the exact request counts below depend on whichever test ran
+    // before (its own doc says as much, and this is the only file that drives the real
+    // watcher through the real pane).
+    resetTranscriptWatchForTests()
+    globalThis.fetch = stubDaemon() as unknown as typeof fetch
+    localStorage.setItem('tether_last_sid', SID)
+    useStore.setState({
+      messages: [], notices: [], pendingPermissions: [], fatal: null,
+      streaming: false, streamingMsgId: null, curTurnId: null,
+      sessionId: SID, workspacesLoaded: true, activeWorkspace: null,
+    })
+  })
+
+  afterEach(() => {
+    cleanup()
+    resetTranscriptWatchForTests()
+    globalThis.fetch = originalFetch
+    delete (globalThis as { WebTransport?: unknown }).WebTransport
+    useStore.setState({ messages: [], notices: [], sessionId: null, fatal: null, streaming: false, workspacesLoaded: false })
+    localStorage.clear()
+  })
+
+  async function renderRefusedWithSid(fatal: { code: string; message: string }) {
+    const r = render(<ChatPane />)
+    useStore.setState({ fatal })
+    await settle()
+    return r
+  }
+
+  it('probes the held session, and re-reads NOTHING while nothing has changed', async () => {
+    daemonTranscript = JSON.stringify([{ role: 'user', text: 'what the agent said first', ts: 1000 }])
+    const { container } = await renderRefusedWithSid(held)
+    // The harness's precondition: the refusal really landed. Without this the
+    // assertions below would pass just as well on a pane that never reached 'failed'.
+    expect(container.querySelectorAll('.failed-card')).toHaveLength(1)
+
+    // Exact counts, not "at least one" — tether#102 measured a property assertion in
+    // this very suite keeping a real mutant alive. ONE probe (the watcher is wired, and
+    // wired once) and ONE load (the pane's own [sessionId] effect at mount). The second
+    // number is the one that costs something: the mount load records the version it
+    // received, so the probe that follows has a real baseline and does not spend a full
+    // transcript GET learning what that request already knew.
+    expect(transcriptProbes()).toBe(1)
+    expect(transcriptGets()).toBe(1)
+  })
+
+  it('reloads and re-renders when the other agent writes', async () => {
+    daemonTranscript = JSON.stringify([{ role: 'user', text: 'what the agent said first', ts: 1000 }])
+    await renderRefusedWithSid(held)
+    expect(screen.getByText('what the agent said first')).toBeTruthy()
+    expect(screen.queryByText('and then this')).toBeNull()
+
+    // The other agent appends. Nothing about the pane changes; only the daemon does.
+    daemonTranscript = JSON.stringify([
+      { role: 'user', text: 'what the agent said first', ts: 1000 },
+      { role: 'assistant', text: 'and then this', ts: 2000 },
+    ])
+    daemonVersion = 2000
+
+    await forceProbe()
+
+    // The whole feature, end to end and on screen: probe saw a new version, the pane
+    // re-read the transcript, and the new turn is rendered without anyone touching
+    // anything. Deleting the effect that wires the watcher leaves every unit test in
+    // transcriptWatch.test.ts green and fails exactly here.
+    expect(transcriptProbes()).toBe(2)
+    expect(transcriptGets()).toBe(2)
+    expect(screen.getByText('and then this')).toBeTruthy()
+    expect(screen.getByText('what the agent said first')).toBeTruthy()
+  })
+
+  it('reloads on a click on the row that is already open', async () => {
+    await renderRefusedWithSid(held)
+    const before = transcriptGets()
+
+    // What SessionRow's click reaches this pane as (lib/session.ts openSession).
+    await act(async () => { window.dispatchEvent(new CustomEvent('tether:refresh-transcript')) })
+    await settle()
+
+    expect(transcriptGets()).toBe(before + 1)
+  })
+
+  it('asks both questions when "Check again" is pressed', async () => {
+    // tether#104 named the button for the connection question. The reader pressing it
+    // wants the other one too, and the connection attempt alone answers only the first.
+    const { container } = await renderRefusedWithSid(held)
+    const before = transcriptGets()
+
+    const button = container.querySelector('.failed-card .btn-ghost-sm') as HTMLButtonElement
+    expect(button.textContent).toBe('Check again')
+    await act(async () => { button.click() })
+    await settle()
+
+    expect(transcriptGets()).toBe(before + 1)
+  })
+
+  it('does NOT follow or reload for another terminal code', async () => {
+    // The gate is one code's. A watcher that ran for every refusal would poll — and
+    // reload — sessions whose transcripts nothing is writing.
+    await renderRefusedWithSid(owned)
+    const before = transcriptGets()
+    expect(transcriptProbes()).toBe(0)
+
+    await act(async () => { window.dispatchEvent(new CustomEvent('tether:refresh-transcript')) })
+    await settle()
+    expect(transcriptGets()).toBe(before)
+  })
+
+  it('does NOTHING when the row that is already open is CONNECTED', async () => {
+    // THE regression guard for this change (tether#61's rule, narrowed rather than
+    // removed). The session list highlights the current row, so this click is easy to
+    // make by accident, and reloading here would replace `messages` wholesale on top
+    // of a turn the daemon is still streaming — dropping the optimistic bubble
+    // tether#42 exists to keep, and doing it from the one path tether#57 showed can
+    // silently eat state.
+    ;(globalThis as { WebTransport?: unknown }).WebTransport = FakeWebTransport
+    render(<ChatPane />)
+    await settle()
+
+    // The harness's precondition, asserted rather than assumed: the pane really is
+    // connected. `disabled={connState !== 'connected'}` is the only observable that
+    // says so, and without this check a pane stuck in 'connecting' would satisfy
+    // every assertion below while testing nothing.
+    const box = document.querySelector('.composer-input') as HTMLTextAreaElement
+    expect(box.disabled).toBe(false)
+
+    useStore.setState({
+      streaming: true,
+      messages: [{ id: 'live-bubble', role: 'assistant', text: 'mid-turn', ts: 1 }],
+    })
+    const before = transcriptGets()
+
+    await act(async () => { window.dispatchEvent(new CustomEvent('tether:refresh-transcript')) })
+    await settle()
+
+    // Exactly the one load the pane's own [sessionId] effect made at mount, and not
+    // one byte more.
+    expect(before).toBe(1)
+    expect(transcriptGets()).toBe(1)
+    // No probe either: a session with a live stream has nothing to poll for.
+    expect(transcriptProbes()).toBe(0)
+    // And the in-flight turn is untouched — the actual harm, stated as itself.
+    expect(useStore.getState().messages.map(m => m.id)).toEqual(['live-bubble'])
+    expect(useStore.getState().streaming).toBe(true)
+  })
+
+  it('no longer tells the reader the transcript is a still frame', async () => {
+    // The copy is part of the behaviour here. tether#104's line was true when the
+    // transcript was one GET at open time; leaving it after this change would be the
+    // worse of the two defects, because a reader who believes they are looking at a
+    // frozen snapshot goes and reloads the page — the exact effort this removes.
+    // Seeded on the DAEMON, not just in the store: the pane reloads the transcript on
+    // this path, so a store-only fixture would be replaced by the empty body the stub
+    // would otherwise serve — and the note is gated on there being a transcript.
+    daemonTranscript = JSON.stringify([{ role: 'user', text: 'hello', ts: 1000 }])
+    const { container } = await renderRefusedWithSid(held)
+    expect(container.querySelectorAll('.msg-user-bubble')).toHaveLength(1)
+
+    const note = container.querySelector('.failed-card .state-card-read')
+    expect(note?.textContent).toBe(HELD_SESSION_READABLE_NOTE)
+    expect(HELD_SESSION_READABLE_NOTE).not.toContain('as it stood when this pane fetched it')
+    expect(HELD_SESSION_READABLE_NOTE).toContain('what tether has of this conversation')
   })
 })

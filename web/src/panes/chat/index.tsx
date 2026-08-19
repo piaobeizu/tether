@@ -10,6 +10,12 @@ import { ClientFrameAction, ErrCodeSessionHeldByBackgroundAgent } from '../../li
 import { authedFetch } from '../../lib/auth'
 import { loadEarlierTranscript, refreshTranscript, REFRESH_TRANSCRIPT_EVENT } from '../../lib/session'
 import { noteTranscriptVersion, readTranscriptBounds, readTranscriptVersion, transcriptPath, watchTranscript } from '../../lib/transcriptWatch'
+import {
+  SESSION_ACTIVITY_IDLE,
+  SESSION_ACTIVITY_WORKING,
+  useSessionActivityAnswer,
+  type SessionActivityState,
+} from '../../lib/sessionActivity'
 import { DagBlock } from '../../fenced-blocks/DagBlock'
 import { FormBlock } from '../../fenced-blocks/FormBlock'
 import { CandidatesBlock } from '../../fenced-blocks/CandidatesBlock'
@@ -248,6 +254,245 @@ export const TRANSCRIPT_START_OTHER_RECORD_GENERIC =
 
 export function describeOtherRecord(store: string): string {
   return store === 'cc' ? TRANSCRIPT_START_TETHER_RECORD_ONLY : TRANSCRIPT_START_OTHER_RECORD_GENERIC
+}
+
+// tether#108 — the four things the card can say about what that agent is doing RIGHT
+// NOW, and why it is four sentences rather than a spinner.
+//
+// # The question these answer
+//
+// A reader who opens a conversation a background agent is holding wants to decide one
+// thing: wait, or leave. A permanently-spinning indicator answers neither — it says "you
+// are waiting", which they can already see — while the daemon has been able to answer the
+// real question every three seconds since tether#103 and nothing in this pane asked.
+//
+// # Each sentence is checkable against the daemon, and each one is narrower than it
+// # would be natural to write
+//
+//  - `working` says "a turn", not "the model is replying": the agent's status is `busy`
+//    for the whole turn, tool execution included (session/activity.go quotes cc's own
+//    `k2h`), so the narrower claim would be false three minutes into a test run.
+//  - `idle` says "no turn in flight", NOT "between turns", because the daemon also reports
+//    it for cc's `waiting` (mid-conversation, blocked on the user) and `shell` (a shell
+//    task running while the agent itself is idle).
+//  - `held` names the limit rather than picking a side. session.SessionActivityHeld is the
+//    fallback for a status this build cannot classify — it is a refusal to claim, and
+//    reading it as either "working" or "idle" is the mislabel tether#103 exists to remove.
+//  - absence is the fourth answer, and it is a CONCLUSION rather than a report: see
+//    heldActivityLine for why it is sound here and why it needs `answered`.
+//
+// # What none of them says, and this is load-bearing
+//
+// None promises that new content will appear. The obvious line for `working` — "this pane
+// keeps itself up to date" — is a claim tether#106 deliberately removed from
+// HELD_SESSION_READABLE_NOTE: SessionIndex.Messages prefers tether's own history.jsonl,
+// which only this daemon writes, so for a sid tether once recorded and a background job
+// later resumed the served file is stale and STAYS stale while that agent works. These
+// lines report what the AGENT is doing; what TETHER does is the next line down, where it
+// is already stated with the right hedge.
+//
+// They also do not repeat WHEN THE HOLD ENDS. FATAL_CODE_MESSAGES' entry for this code
+// already says the hold lasts as long as that agent's process and that "an idle job holds
+// this conversation exactly as firmly as a busy one" — so the `idle` line's whole job is
+// to say that the hypothetical in the sentence above it is the case now.
+//
+// Exported so the tests can pin them by identity as well as by literal, the same reason
+// HELD_SESSION_PLACEHOLDER is.
+export const HELD_ACTIVITY_WORKING = 'Right now: a turn is in flight in that agent.'
+export const HELD_ACTIVITY_IDLE = 'Right now: no turn is in flight in that agent.'
+export const HELD_ACTIVITY_UNKNOWN =
+  'Right now: tether cannot see whether a turn is in flight in that agent.'
+// "nothing live is holding this conversation" and NOT "that process has exited", which was
+// the first draft and is one inference too far. cc's liveness check is pid + /proc start
+// token (ccPidHoldsRecord), and it answers "not live" both for a process that exited and
+// for a /proc this daemon cannot read — its own doc says so and calls the direction
+// deliberate. The sentence therefore reports what tether can see, which is also all the
+// reader needs. Residual in that second world: tether stops refusing too, so "Check again"
+// opens a FRESH session rather than resuming — a degenerate host condition, named because
+// the sentence would otherwise be read as a promise about the resume.
+export const HELD_ACTIVITY_GONE =
+  'Right now: nothing live is holding this conversation — Check again should open it.'
+
+/**
+ * All four, in one place, because the ROW HAS TO BE AS TALL AS THE TALLEST OF THEM
+ * (tether#108).
+ *
+ * This card sits inside the scroll container, so any change in its height moves the
+ * transcript under a reader who is reading it. A `min-height` of one line does not
+ * deliver that: measured at 11px mono (~0.6em advance) the four sentences need between
+ * ~300px and ~540px of text width, while `.dt-right` starts at 640px (lib/layout.ts
+ * DEFAULT_RIGHT), drops to 260px (MIN_RIGHT) when dragged, and on a phone is the whole
+ * viewport — so at real widths they wrap to different numbers of lines and the row's
+ * height would change on the first poll AND on every transition between two states that
+ * wrap differently.
+ *
+ * So the row renders ALL FOUR, stacked in one grid cell, with three of them
+ * `visibility: hidden` (and the not-yet case hiding all four). The cell is then as tall
+ * as the tallest sentence AT WHATEVER WIDTH THE PANE HAPPENS TO BE, with no hard-coded
+ * pixel value to go stale — and its height never changes, so there is nothing to shift.
+ * `.session-row-act` makes the same trade for the same reason (its comment: "a list that
+ * twitches every three seconds is a worse defect than the one this marker fixes"); it can
+ * do it with a fixed 7px because a dot has no text to wrap.
+ *
+ * The cost is honest and stated: the card permanently reserves the height of the longest
+ * sentence, which is two lines at the default width and three on a narrow phone, even
+ * before the daemon has answered. `visibility: hidden` also keeps the hidden three out of
+ * the accessibility tree, so a screen reader gets one sentence, not four.
+ */
+export const HELD_ACTIVITY_LINES = [
+  HELD_ACTIVITY_WORKING,
+  HELD_ACTIVITY_IDLE,
+  HELD_ACTIVITY_UNKNOWN,
+  HELD_ACTIVITY_GONE,
+] as const
+
+/**
+ * heldActivityLine turns one poll of the activity endpoint into the line to render, or
+ * null when there is nothing true to say yet (tether#108).
+ *
+ * # Why absence is a claim this card is allowed to make
+ *
+ * Because the refusal on screen and the activity answer come from the SAME cc registry
+ * instance through two filters, one of which is strictly wider:
+ *
+ *   - the refusal fires only when `ccLiveJob(sid)` finds a live record (attach.go), which
+ *     is `forEachLiveRecord` PLUS cc's holder filter `kind != "" && kind != "interactive"`;
+ *   - ActivityIndex.States reads `LiveRecords()`, the same walk with NO kind filter;
+ *   - mux.go wires ActivityIndex with `reg.CCJobs`, i.e. the instance the attach path used.
+ *
+ * So while the holding process lives, its sid is necessarily in the map. Absence means
+ * cc's liveness check (pid + /proc start token) stopped matching — that process is gone.
+ * `fatal` is sticky until a reconnect, so this is not a corner case: it is what a reader
+ * watching a background job finish actually sees, and it is the moment "Check again" stops
+ * being a shot in the dark.
+ *
+ * # Why it needs `answered` and cannot read absence alone
+ *
+ * The poller's map starts empty, so for one round trip after mount every sid is absent.
+ * Without the flag this function would announce that the hold had ended, on every open,
+ * before anything had been asked. `answered` is set only on a SUCCESSFUL fetch
+ * (sessionActivity.ts), so a daemon that never replies keeps this at null rather than
+ * degrading into the one answer the reader would act on.
+ *
+ * # ABSENCE is tested first, and an unrecognised state is NOT absence
+ *
+ * The order is the whole correctness of the function. Written as a `switch` with the
+ * "nothing is holding it" sentence in the `default`, a state string this build has not
+ * been taught — a daemon newer than this bundle — would render as "nothing live is
+ * holding this conversation any more", which is the one answer a reader acts on and is
+ * false: the daemon reported something for that sid, so something IS holding it.
+ * `fetchSessionActivity` already drops unknown strings, so the case is unreachable
+ * through the poller; this is written to be right without depending on that, because
+ * "unreachable" is a property of another module that a future edit can change.
+ *
+ * Unknown therefore lands with `held`, which is exactly what the daemon does with a
+ * status IT cannot classify (ccStatusActivity's own `default`) — one sentence that is
+ * true without knowing what the word means.
+ */
+export function heldActivityLine(o: {
+  answered: boolean
+  state: SessionActivityState | undefined
+}): string | null {
+  if (!o.answered) return null
+  if (o.state === undefined) return HELD_ACTIVITY_GONE
+  if (o.state === SESSION_ACTIVITY_WORKING) return HELD_ACTIVITY_WORKING
+  if (o.state === SESSION_ACTIVITY_IDLE) return HELD_ACTIVITY_IDLE
+  // Everything left: `held`, and any state string this build has not been taught. They
+  // get one sentence because they are one situation — a live process has this open and
+  // what it is doing is not readable — so there is nothing for a second branch to say.
+  return HELD_ACTIVITY_UNKNOWN
+}
+
+/**
+ * How long a bubble wears the arrival trace (tether#108). Matched by the CSS animation
+ * on `.msg-arrived`; this side is what takes the class back off.
+ */
+export const ARRIVAL_TRACE_MS = 1_100
+
+/**
+ * trailingArrivals — which of these messages JUST ARRIVED (tether#108).
+ *
+ * tether#106's three-second refresh is completely silent: new content simply appears. This
+ * is the rule behind the light trace that fixes that, and it is deliberately "the trailing
+ * run of ids that were not on screen before" rather than "every id that is new".
+ *
+ * Two properties fall out of the SHAPE rather than out of a flag someone has to remember:
+ *
+ *  - **a prepended page is never traced.** tether#107's "load earlier messages" puts older
+ *    bubbles at the FRONT, so the walk from the end stops immediately. Flashing 25 bubbles
+ *    the reader deliberately asked for would say "these just landed", which is false.
+ * What this function deliberately does NOT decide is whether a WHOLE-ARRAY answer counts.
+ * Against an empty previous set it returns everything, which is honest — every id really is
+ * new — and is also exactly what the first transcript load and tether#107's disjoint
+ * replace look like. The caller drops that case (see the effect), because only the caller
+ * knows which sid the set belongs to and whether the array was replaced or appended to.
+ *
+ * # A message that GROWS is not an arrival, and that is the point
+ *
+ * `messageKey` excludes `text` on purpose (store.ts), so a message keeps its id while its
+ * content changes. Tracing "changed" instead of "new" would therefore re-highlight the same
+ * row on every refresh for as long as its content kept moving — which is a spinner wearing
+ * a highlight, i.e. the thing this wi rules out. Stated as the rule rather than as a
+ * scenario: CCStore emits a message per record group, so how often a served message's text
+ * actually grows in place is not something this file should claim to know.
+ */
+export function trailingArrivals(prevIds: Set<string>, next: { id: string }[]): string[] {
+  const out: string[] = []
+  for (let i = next.length - 1; i >= 0; i--) {
+    if (prevIds.has(next[i].id)) break
+    out.push(next[i].id)
+  }
+  return out.reverse()
+}
+
+/**
+ * HeldSessionActivity — the state line, and the ONLY thing in this pane that subscribes to
+ * the activity poller (tether#108).
+ *
+ * # Why it is a component and not a hook call in ChatPane
+ *
+ * Because the subscription has to be able to STOP. Hooks cannot be conditional, so a
+ * `useSessionActivityAnswer` in ChatPane would subscribe for the entire life of the app —
+ * ChatPane is mounted unconditionally and only hidden with display:none (App.tsx) — and
+ * that is not free. The wi's premise was that this costs no new requests because the poller
+ * is already running; it is NOT already running on most screens: the chat session list is
+ * COLLAPSED BY DEFAULT (SessionList's `open` starts false, and the rows are inside
+ * `{open && …}`), so no SessionRow is mounted, so `subscribeSessionActivity` has no
+ * subscribers and its interval is stopped. Measured, not assumed — see the pane test that
+ * counts requests to SESSION_ACTIVITY_PATH in the connected state and requires zero.
+ *
+ * So the cost is stated honestly instead: rendered only under `readingHeldSession`, this is
+ * a second three-second request alongside tether#106's HEAD probe, for as long as this pane
+ * is in that state. Mounting is the whole of opting in, which is SessionRow's argument for
+ * putting the subscription in the row rather than in its two parents, applied one level up.
+ * Its bound, since "as long as someone is looking" would overstate it: ChatPane stays
+ * mounted behind the Skills and Shell tabs (App.tsx hides it with display:none), so the
+ * poll continues while the reader is on another right-hand tab. A hidden BROWSER tab does
+ * pause it — that half is the poller's own (see reschedule).
+ *
+ * # Every sentence is rendered, and three of them are hidden
+ *
+ * Not for thoroughness — for the scroll anchor. See HELD_ACTIVITY_LINES for the whole
+ * argument and the measurement behind it; the short version is that the four sentences wrap
+ * to different heights at real pane widths, so a single line whose text changes is a card
+ * that changes height, and this card is inside the scroll container.
+ */
+export function HeldSessionActivity({ sid }: { sid: string }) {
+  const answer = useSessionActivityAnswer(sid)
+  const line = heldActivityLine(answer)
+  // No role and no aria-live. It is a plain sentence in a card the reader is already
+  // reading, and announcing every three-second transition would talk over them.
+  //
+  // `on` is what the CSS makes visible and what a test reads, so "which sentence is
+  // showing" is one class rather than a comparison a reader has to redo. When `line` is
+  // null nothing carries it, which is the not-yet state: full height, no claim.
+  return (
+    <div className="state-card-activity">
+      {HELD_ACTIVITY_LINES.map(l => (
+        <span key={l} className={l === line ? 'state-card-activity-line on' : 'state-card-activity-line'}>{l}</span>
+      ))}
+    </div>
+  )
 }
 
 // tether#63 — code→sentence map for the failed-connection card. Only the
@@ -508,6 +753,12 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   // by the autoscroll effect — see the anchor effect for why the flag is necessary and
   // not merely defensive.
   const skipAutoscrollRef = useRef(false)
+  // tether#108 — which message ids are currently wearing the arrival trace, and what was
+  // on screen the last time this pane looked. The seen-set is keyed by sid so a session
+  // switch cannot carry one conversation's ids into another and count the whole of the new
+  // transcript as having "arrived"; null means this pane has not seen a transcript yet.
+  const [arrived, setArrived] = useState<Set<string>>(() => new Set())
+  const seenRef = useRef<{ sid: string; ids: Set<string> } | null>(null)
   const [providers, setProviders] = useState<string[]>(['claude-code'])
   const [selectedProvider, setSelectedProvider] = useState(
     () => localStorage.getItem('tether_default_provider') ?? 'claude-code'
@@ -646,6 +897,89 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
       el.scrollTop = el.scrollHeight
     }
   }, [transcript.length, grown, streaming])
+
+  // tether#108 — let an arrival be SEEN.
+  //
+  // tether#106 gave a held session's transcript a three-second refresh and made it
+  // completely silent: the other agent's new turn simply materialises, and a reader who
+  // looked away has no way to tell that anything happened. This marks what arrived so the
+  // CSS can fade a tint out behind it. It is not a spinner and the distinction is not
+  // rhetorical: a spinner says "you are waiting", which is a state, while a trace says "one
+  // just landed", which is an event and stops being shown.
+  //
+  // Its population is bounded by the refresh's, and that bound is worth naming because it
+  // is invisible from here: SessionIndex.MessagePage prefers tether's own history.jsonl
+  // whenever it has one, and only this daemon writes that file — so for a sid tether once
+  // recorded and a foreign background job later resumed, the served transcript never
+  // changes, the probe never fires, and nothing here can ever run. That is the same
+  // residual HELD_SESSION_READABLE_NOTE is hedged around, not a new one.
+  //
+  // Gated on `readingHeldSession`, the same gate tether#106 put on the refresh — which is
+  // what makes the population exactly right rather than approximately right: that state is
+  // the ONLY one in this app where messages arrive with no other signal. A connected session
+  // announces arrivals already (the thinking dots, the streaming body, and the reader's own
+  // send), and tracing there would flash the user's own message back at them.
+  //
+  // # Two things are NOT arrivals, and both are excluded by one rule
+  //
+  // A commit whose arrivals are the WHOLE array is a (re)population rather than an
+  // arrival, and there are two of those. The first transcript load is one — the pane can
+  // reach this state before or after the mount fetch lands, and flashing an entire
+  // conversation because it just appeared on screen would be a trace that fires exactly
+  // when nothing arrived. tether#107's disjoint fallback is the other: when over a
+  // megabyte is written between two probes, `mergeHistory` reports no overlap and
+  // `loadHistory` replaces the window wholesale, so every id is new. That case already
+  // announces itself — the transcript visibly jumps — and lighting all of it up would say
+  // "twenty-five messages just landed" when what happened was one replacement.
+  //
+  // Checked on the OUTPUT rather than by a flag each path has to remember to set, so a
+  // future third way of replacing the array is covered without being enumerated.
+  //
+  // What that rule COSTS, since it is a real case and not a corner: the first message to
+  // arrive into an EMPTY held transcript is also a whole-array answer, so it is not traced.
+  // Kept rather than special-cased, because the two are the same array shape and telling
+  // them apart would mean threading "this was a refresh" through from the watcher — and
+  // because that is the one arrival a reader cannot miss anyway: the pane goes from having
+  // no conversation to having one. The trace is for content appearing AMONG content, which
+  // is where you cannot see what moved. The second message is traced.
+  useEffect(() => {
+    if (!readingHeldSession || !sessionId) {
+      // Forget what was on screen. Re-entering the state later then counts as a first
+      // sight, which is the honest answer: whatever arrived while nobody was looking did
+      // not "just land".
+      seenRef.current = null
+      return
+    }
+    const prev = seenRef.current
+    const ids = new Set(messages.map(m => m.id))
+    seenRef.current = { sid: sessionId, ids }
+    // "Have we seen THIS sid's transcript?" — the definition of first sight, and the
+    // reason the ref carries a sid at all rather than a bare Set.
+    //
+    // Measured honestly: dropping the `prev.sid !== sessionId` half is a mutant that
+    // SURVIVES this repo's suite, and it survives because it cannot be reached rather
+    // than because nothing looks. Message ids are per-load `crypto.randomUUID()`s
+    // (historyEntryToMessage) and `loadHistory` only ever carries an id forward to a
+    // message with the same role+ts, so no id can cross a session switch — which makes
+    // the arrivals for a freshly-switched sid the WHOLE array, which the repopulation
+    // rule below already drops. Kept anyway because it says the invariant where it is
+    // decided instead of leaving it to be re-derived from two other facts, and noted
+    // here so the next reader does not have to rediscover that it is not falsifiable.
+    if (prev === null || prev.sid !== sessionId) return
+    const fresh = trailingArrivals(prev.ids, messages)
+    if (fresh.length === 0 || fresh.length === messages.length) return
+    setArrived(new Set(fresh))
+  }, [messages, sessionId, readingHeldSession])
+
+  // Take the trace back off. Keyed on `arrived` itself, so a second arrival inside the
+  // window restarts the timer via the cleanup rather than letting the first one cut the
+  // second one short. The functional update keeps an already-empty set's identity, which is
+  // what stops this effect from re-arming a timer for a set it just cleared.
+  useEffect(() => {
+    if (arrived.size === 0) return
+    const t = setTimeout(() => setArrived(prev => (prev.size === 0 ? prev : new Set())), ARRIVAL_TRACE_MS)
+    return () => clearTimeout(t)
+  }, [arrived])
 
   // tether#46 — auto-grow the composer textarea to fit its content, up to
   // MAX_COMPOSER_LINES then scroll internally. Reset to 'auto' first so the
@@ -1241,6 +1575,21 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
                 <div className="failed-card-headline" style={{ color: readingHeldSession ? 'var(--ink-primary)' : 'var(--danger)', fontWeight: 600, marginBottom: 4 }}>
                   {FATAL_CODE_MESSAGES[fatal.code] ?? FATAL_GENERIC_MESSAGE}
                 </div>
+                {/* tether#108 — is that agent actually doing anything? The daemon has
+                    answered this every three seconds since tether#103 and this pane asked
+                    nothing. Above the read-only note because it is the more urgent of the
+                    two: the note says the conversation is readable, this says whether
+                    waiting for more of it is worth anything.
+
+                    NOT gated on transcript.length, unlike the note below. The note makes a
+                    claim about the screen and needs something on it; this makes a claim
+                    about the other process, and an empty transcript is precisely where a
+                    reader most needs to know whether to wait.
+
+                    Mounted only in this state, and that is the whole cost control — see
+                    HeldSessionActivity. `sessionId` is guarded because the component keys
+                    its subscription on it, and an empty sid would ask about no session. */}
+                {readingHeldSession && sessionId && <HeldSessionActivity sid={sessionId} />}
                 {/* Gated on there BEING a transcript. "The conversation is below"
                     is a claim about the screen, and an empty transcript is a
                     normal answer here — SessionIndex.Messages returns SourceNone
@@ -1309,10 +1658,17 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
           </div>
         )}
 
+        {/* tether#108 — `arrivalTrace` is appended to the ROW's class (the .msg-user /
+            .msg-system / .msg-ai container, not the bubble inside it) and nothing else
+            changes. Deliberately a class and not a wrapper element: the trace animates
+            background-color only (see .msg-arrived), so it cannot reflow, and an extra
+            wrapper around a row WOULD be able to. `key={m.id}` is untouched, so React
+            reconciles exactly as before and neither expansion Set notices. */}
         {transcript.map((m) => {
+          const arrivalTrace = arrived.has(m.id) ? ' msg-arrived' : ''
           if (m.role === 'user') {
             return (
-              <div key={m.id} className="msg-user">
+              <div key={m.id} className={`msg-user${arrivalTrace}`}>
                 <div className="msg-user-bubble">{m.text}</div>
                 <div className="msg-user-time">you · {fmtTime(m.ts)}</div>
                 <CopyButton className="msg-copy" getText={() => m.text} label="Copy message" />
@@ -1325,13 +1681,13 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
             // an assistant bubble: it did not come from the model, and dressing
             // it up with the tether avatar would read as the agent saying it.
             return (
-              <div key={m.id} className="msg-system">
+              <div key={m.id} className={`msg-system${arrivalTrace}`}>
                 <span className="msg-system-text">{m.text}</span>
               </div>
             )
           }
           return (
-            <div key={m.id} className="msg-ai">
+            <div key={m.id} className={`msg-ai${arrivalTrace}`}>
               <div className="msg-ai-header">
                 <span className="msg-ai-avatar">
                   <Icon name="tether" size={10} style={{ color: 'white' }} />

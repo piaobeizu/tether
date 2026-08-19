@@ -266,6 +266,55 @@ export function useSessionActivity(sid: string): SessionActivityState | undefine
 }
 
 /**
+ * The answer for one session INCLUDING whether there is one YET (tether#108).
+ *
+ * Separate from `useSessionActivity` rather than a widening of it, and that is
+ * about the consumers rather than about compatibility. A row wants "show a marker
+ * or don't", for which "not asked yet" and "nothing holds it" are the same
+ * instruction — see SessionRow's reserved-space comment. A consumer that puts a
+ * SENTENCE on screen needs them apart, because absence is the strongest thing the
+ * daemon knows (nothing live holds the id, so it is necessarily not running) and
+ * saying it out loud before anything has been asked is a false claim.
+ *
+ * # `answered` is per-consumer, and deliberately NOT a module-level flag
+ *
+ * It means "the daemon has answered SINCE THIS CONSUMER MOUNTED", which is the only
+ * thing a caller whose copy begins "Right now" can honestly stand behind. A
+ * module-level "has ever answered" is reachably wrong: `current` and any such flag
+ * outlive every unsubscribe, so a reader who expands the session list (rows poll),
+ * collapses it (the timer stops, the last answer is kept) and then opens a held
+ * session would have the first frame of that sentence rendered from a reading taken
+ * an arbitrary time earlier — including the "nothing is holding it" case, which is
+ * exactly what the flag exists to prevent, reached by another route. Starting from
+ * `null` and ignoring `current` until a publish arrives closes that off by
+ * construction rather than by a freshness rule someone has to maintain.
+ *
+ * What it costs is the honest price of that: when another consumer is ALREADY
+ * polling, this one is not the first subscriber, so it gets no immediate poll and
+ * waits up to one interval. In the common case it is the only consumer (the chat
+ * session list is collapsed by default — SessionList's `open` starts false — so on
+ * most screens no row is mounted and no timer is running), and the first subscriber
+ * does poll immediately.
+ *
+ * A FAILED poll is not an answer, and that falls out of the shape too: `publish` is
+ * the only thing that calls a subscriber and `poll`'s catch deliberately keeps the
+ * last answer without publishing, so a daemon that never replies leaves this `null`.
+ *
+ * Residual, named: once an answer has arrived, repeated later failures leave the
+ * last one on screen while the caller's copy keeps claiming freshness. That is the
+ * policy this module states and argues for every consumer (see `poll`'s catch);
+ * changing it here would give one caller a different one.
+ */
+export function useSessionActivityAnswer(sid: string): {
+  answered: boolean
+  state: SessionActivityState | undefined
+} {
+  const [answer, setAnswer] = useState<SessionActivityMap | null>(null)
+  useEffect(() => subscribeSessionActivity(setAnswer), [])
+  return { answered: answer !== null, state: answer?.[sid] }
+}
+
+/**
  * Test seam: drop every subscriber, stop the timer and forget the last answer.
  *
  * Module state outlives a component tree, so without this one test file's poller

@@ -843,6 +843,73 @@ body {
 .state-card-read {
   color: var(--ink-secondary); font-size: 11.5px; line-height: 1.45; margin-bottom: 6px;
 }
+/* tether#108 — "is that agent actually doing anything right now", above the read-only
+   note. Mono because it is a READING off the daemon rather than prose about the state —
+   the same distinction .transcript-top-note makes — and it keeps the line from being
+   mistaken for a second sentence of the headline.
+
+   A ONE-CELL GRID holding all four sentences, three of them hidden, and that is the
+   load-bearing part. This card is inside the scroll container, so any change in its
+   height moves the transcript under a reader who is reading it — and the four sentences
+   are between ~300px and ~540px wide at 11px mono while .dt-right starts at 640px, can
+   be dragged to 260px and is the whole viewport on a phone. So they wrap to DIFFERENT
+   numbers of lines at real widths: a single element whose text changes would change
+   height on the first poll and again on transitions. Stacked, the cell is as tall as the
+   tallest sentence at whatever width the pane happens to be, with no px to go stale, and
+   that height never changes.
+
+   `visibility: hidden` rather than `display: none` or opacity: hidden children must still
+   contribute their height (that is the point) and must NOT be read out. `.session-row-act`
+   makes the same trade a few hundred lines up and can do it with a fixed 7px because a dot
+   has no text to wrap. */
+.state-card-activity {
+  display: grid; margin-bottom: 6px;
+  font-family: var(--font-mono); font-size: 11px; line-height: 1.35;
+  color: var(--ink-secondary);
+}
+.state-card-activity-line {
+  grid-area: 1 / 1; visibility: hidden;
+}
+.state-card-activity-line.on { visibility: visible; }
+
+/* tether#108 — the arrival trace: one message just landed.
+
+   It lands on the ROW (.msg-user / .msg-ai / .msg-system), not on the bubble, so what
+   fades is a full-pane-width band behind the whole turn — its timestamp and copy button
+   included, and for a short user message mostly gutter to the left of the bubble. That is
+   deliberate rather than convenient: a turn is a row's worth of content (header, thinking
+   block, tool list, body) and there is no single element that is "the bubble" across the
+   three roles. `border-radius` softens the BAND's ends; it is not trying to match
+   .msg-user-bubble's 14px, which belongs to a different box.
+
+   ONLY background-color and border-radius, and that restriction is the point: tether#106's
+   nearBottom guard and tether#107's prepend anchor both compute from the scroll box's
+   geometry on the very commit this class appears, so anything that reflowed — a border, a
+   padding, an outline offset, a transform — would move the reader as a side effect of
+   telling them something arrived. Neither of these two properties can.
+
+   It runs ONCE and leaves nothing behind (no `forwards`), so a row that keeps the class a
+   moment longer than the animation is indistinguishable from one that never had it.
+
+   --accent-tint, not a colour literal: .session-row-act.working paid for that mistake
+   already (an --accent dot pulsing inside a hard-coded --success ring, in both themes). */
+.msg-arrived { animation: msg-arrived-trace 1.1s ease-out 1; border-radius: 6px; }
+@keyframes msg-arrived-trace {
+  from { background-color: var(--accent-tint); }
+  to   { background-color: transparent; }
+}
+/* Respect a stated preference not to see motion — WITHOUT switching the feature off, which
+   is what `animation: none` alone did in the first draft. That reader would have got back
+   exactly the silent refresh this wi exists to fix, in the name of an accessibility
+   preference that asks for less movement and not for less information.
+
+   A static tint instead. index.tsx removes the class after ARRIVAL_TRACE_MS, so the mark
+   still goes away — as one discrete change rather than a fade, which is what "reduce
+   motion" is asking for. NOTE that this makes that timer load-bearing here: under this
+   query a class that was never removed would tint the row permanently. */
+@media (prefers-reduced-motion: reduce) {
+  .msg-arrived { animation: none; background-color: var(--accent-tint); }
+}
 
 /* ── Statusbar ──────────────────────────────────────────────── */
 .dt-statusbar {

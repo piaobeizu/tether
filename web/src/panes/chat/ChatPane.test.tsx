@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, fmtTokens, summarizeToolInput, summarizeToolResult, truncateResult, shouldSendOnEnter, growHeight, parseAtQuery, fuzzyRankFiles, shouldDeferFirstConnect, shouldReconnectAfterClose, shouldRefundAttemptBudget, transcriptTextLength, FATAL_CODE_MESSAGES } from './index'
+import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, fmtTokens, summarizeToolInput, summarizeToolResult, truncateResult, shouldSendOnEnter, growHeight, parseAtQuery, fuzzyRankFiles, shouldDeferFirstConnect, shouldReconnectAfterClose, shouldRefundAttemptBudget, transcriptTextLength, FATAL_CODE_MESSAGES, heldActivityLine, trailingArrivals, HELD_ACTIVITY_WORKING, HELD_ACTIVITY_IDLE, HELD_ACTIVITY_UNKNOWN, HELD_ACTIVITY_GONE } from './index'
+import { SESSION_ACTIVITY_HELD, SESSION_ACTIVITY_IDLE, SESSION_ACTIVITY_WORKING } from '../../lib/sessionActivity'
 import { PermissionQueue, postDecide } from '../../fenced-blocks/PermissionBlock'
 import {
   ErrCodeUnknownWorkspace, ErrCodeNoWorkspaceRegistry, ErrCodeUnknownProvider, ErrCodeSessionOwned,
@@ -752,5 +753,123 @@ describe('FATAL_CODE_MESSAGES (tether#63)', () => {
     it('does not tell the user tether will fork or take over for them', () => {
       expect(text).not.toMatch(/tether will|we will|automatically (fork|take)/i)
     })
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// tether#108 — the state line's classification, and the arrival rule.
+//
+// Both are pure and exported for the same reason as their five neighbours in
+// index.tsx: the parts that need a mounted pane are tested in
+// ChatPaneTranscript.test.tsx, and these are the parts that do not.
+describe('heldActivityLine (tether#108)', () => {
+  // One exact expected string per case, never a `toMatch` or a "not null": tether#102
+  // measured a property assertion in this repo's own suite keeping a real mutant
+  // alive, and the four answers here differ only by their wording.
+  it('reports a turn in flight', () => {
+    expect(heldActivityLine({ answered: true, state: SESSION_ACTIVITY_WORKING }))
+      .toBe('Right now: a turn is in flight in that agent.')
+    expect(heldActivityLine({ answered: true, state: SESSION_ACTIVITY_WORKING })).toBe(HELD_ACTIVITY_WORKING)
+  })
+
+  it('reports no turn in flight — and does NOT call it "between turns"', () => {
+    expect(heldActivityLine({ answered: true, state: SESSION_ACTIVITY_IDLE }))
+      .toBe('Right now: no turn is in flight in that agent.')
+    // The daemon reports `idle` for cc's `waiting` (blocked on the user) and `shell`
+    // (a shell task while the agent itself is idle), so "between turns" would be false
+    // for both. session/activity.go says so at the constant; this pins the copy.
+    expect(HELD_ACTIVITY_IDLE).not.toMatch(/between turns/i)
+  })
+
+  it('refuses to guess when the daemon said `held`', () => {
+    // `held` is the fallback for a status this build cannot classify — a refusal to claim,
+    // not a report about motion. Reading it as either of the other two is the mislabel
+    // tether#103 exists to remove.
+    //
+    // One exact assertion, not that plus `not.toBe(WORKING)` and `not.toBe(IDLE)`: those
+    // are tautologies once the value is pinned by identity, and a list of them reads like
+    // three guards where there is one. What the `held` LITERAL maps to is pinned end to
+    // end by the mounted test, which goes through fetchSessionActivity's known-set filter.
+    expect(heldActivityLine({ answered: true, state: SESSION_ACTIVITY_HELD }))
+      .toBe('Right now: tether cannot see whether a turn is in flight in that agent.')
+    expect(HELD_ACTIVITY_UNKNOWN)
+      .toBe('Right now: tether cannot see whether a turn is in flight in that agent.')
+  })
+
+  it('reads ABSENCE as the hold having ended, and points at the button', () => {
+    // The fourth answer, and the most common one: the activity map holds every sid
+    // something live is holding, so a sid that is not in it is not held. Absence is
+    // sound here specifically because the refusal on screen and this map come from the
+    // same cc registry instance through two filters and this one is the wider — see
+    // heldActivityLine's doc.
+    expect(heldActivityLine({ answered: true, state: undefined }))
+      .toBe('Right now: nothing live is holding this conversation — Check again should open it.')
+    // It names the button by the word the button actually has, so a rename of one has
+    // to change the other.
+    expect(HELD_ACTIVITY_GONE).toContain('Check again')
+    // And it reports what tether can SEE, not that the process exited. cc's liveness check
+    // is pid + /proc start token and reads "not live" for an unreadable /proc too, so the
+    // stronger sentence would be a claim this pane cannot back.
+    expect(HELD_ACTIVITY_GONE).not.toMatch(/exited|has ended|that process/i)
+  })
+
+  it('says NOTHING until the daemon has answered once', () => {
+    // Without this branch the line would announce that the hold had ended on every
+    // mount, for one round trip, before anything had been asked — a false claim about
+    // another process, made by default.
+    expect(heldActivityLine({ answered: false, state: undefined })).toBeNull()
+    // …and `answered: false` wins even if a state somehow travelled with it, because
+    // the flag is about whether this build has heard from the daemon at all.
+    expect(heldActivityLine({ answered: false, state: SESSION_ACTIVITY_WORKING })).toBeNull()
+  })
+
+  it('degrades an unrecognised state to "cannot tell", NOT to "nothing is holding it"', () => {
+    // A daemon newer than this bundle. This case is the reason the absence test comes
+    // first and the fallback is `held` rather than a `switch` default: an unknown state
+    // string means the daemon reported SOMETHING for that sid, so "nothing live is
+    // holding this conversation any more" would be false — and it is the one answer a
+    // reader acts on. Asserted as the exact sentence, because the first version of this
+    // test only checked "not working and not idle", which the wrong answer satisfies.
+    expect(heldActivityLine({ answered: true, state: 'sprinting' as never }))
+      .toBe('Right now: tether cannot see whether a turn is in flight in that agent.')
+    // fetchSessionActivity drops unknown strings, so the poller cannot produce this —
+    // pinned anyway, because "unreachable" is a property of another module.
+  })
+})
+
+describe('trailingArrivals (tether#108)', () => {
+  const msgs = (...ids: string[]) => ids.map(id => ({ id }))
+
+  it('returns the trailing run of ids that were not on screen before', () => {
+    expect(trailingArrivals(new Set(['a', 'b']), msgs('a', 'b', 'c', 'd'))).toEqual(['c', 'd'])
+  })
+
+  it('returns nothing when the last message is one already on screen', () => {
+    expect(trailingArrivals(new Set(['a', 'b', 'c']), msgs('a', 'b', 'c'))).toEqual([])
+  })
+
+  it('IGNORES new ids that are not at the end — which is what excludes a prepend', () => {
+    // THE property that makes tether#107's "load earlier messages" trace-free without a
+    // flag. Older pages arrive at the FRONT, so the walk from the end stops at the first
+    // id that was already there. A rule written as "every id that is new" would flash 25
+    // bubbles the reader deliberately asked for, saying they had just landed.
+    expect(trailingArrivals(new Set(['c', 'd']), msgs('a', 'b', 'c', 'd'))).toEqual([])
+    // Mixed: a prepend AND an arrival in one commit still traces only the arrival.
+    expect(trailingArrivals(new Set(['c', 'd']), msgs('a', 'b', 'c', 'd', 'e'))).toEqual(['e'])
+  })
+
+  it('returns them in transcript order, oldest first', () => {
+    // The walk is backwards; the answer must not be. Order is not cosmetic here — the
+    // caller builds a Set, but a reversed array is the sort of thing that reads as
+    // working right up until something iterates it.
+    expect(trailingArrivals(new Set(['a']), msgs('a', 'b', 'c', 'd'))).toEqual(['b', 'c', 'd'])
+  })
+
+  it('treats an empty previous set as everything being new', () => {
+    // Honest, and the reason the CALLER owns the "first sight" decision: only it knows
+    // whether the empty set means "this sid had no messages" or "we have never looked",
+    // and flashing an entire transcript on open is the failure mode.
+    expect(trailingArrivals(new Set(), msgs('a', 'b'))).toEqual(['a', 'b'])
+    expect(trailingArrivals(new Set(['a']), msgs())).toEqual([])
   })
 })

@@ -1308,4 +1308,36 @@ describe('paging a transcript backwards (tether#107)', () => {
     // 5120 would send the next click forward, to re-serve pages already rendered.
     expect(useStore.getState().transcriptEarlier).toBe(2048)
   })
+
+  it('does not put tether#108\'s arrival trace on a page the reader asked for', async () => {
+    // The cross-feature case, and the only place both wis are on screen at once: the trace
+    // exists only in the held state, which is also the only state that pages backwards
+    // while something writes. An older page is not an arrival — the reader fetched it —
+    // and flashing 25 bubbles they deliberately asked for would say they had just landed.
+    //
+    // trailingArrivals' walk-from-the-end shape is what makes this hold, and the unit test
+    // in ChatPane.test.tsx pins the rule; this pins that the pane uses it on the real path.
+    useStore.setState({ workspacesLoaded: true })
+    localStorage.setItem('tether_last_sid', SID)
+    pages[MESSAGES_URL] = { entries: turns('recent', 3, 500), earlier: 4096 }
+    pages[`${MESSAGES_URL}?before=4096`] = { entries: turns('older', 2, 100), earlier: 2048 }
+
+    const { container } = render(<ChatPane />)
+    useStore.setState({ fatal: { code: ErrCodeSessionHeldByBackgroundAgent, message: 'a background agent is using this conversation' } })
+    await settle()
+    // Preconditions: the refusal landed (so the trace is armed at all) and nothing is
+    // traced yet. Without the first one this test would pass on a pane where the feature
+    // is switched off entirely.
+    expect(container.querySelectorAll('.failed-card')).toHaveLength(1)
+    expect(container.querySelectorAll('.msg-arrived')).toHaveLength(0)
+
+    await act(async () => { (container.querySelector('.transcript-more') as HTMLButtonElement).click() })
+    await settle()
+
+    // The page really did land…
+    expect([...container.querySelectorAll('.msg-user-bubble')].map(e => e.textContent))
+      .toEqual(['older-0', 'older-1', 'recent-0', 'recent-1', 'recent-2'])
+    // …and none of it is wearing a trace.
+    expect(container.querySelectorAll('.msg-arrived')).toHaveLength(0)
+  })
 })

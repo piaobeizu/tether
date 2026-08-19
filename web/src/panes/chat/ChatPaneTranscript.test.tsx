@@ -149,6 +149,9 @@ function liveScrollBox(el: HTMLElement, clientHeight: number) {
     el.dispatchEvent(new TouchEvent('touchmove', lists(y, resting)))
   const touchEnd = () =>
     el.dispatchEvent(new TouchEvent('touchend', { touches: [], changedTouches: [point(TOUCH_ID, 0)], bubbles: true }))
+  /** The browser claiming the gesture for itself — pull-to-refresh, a back swipe. */
+  const touchCancel = () =>
+    el.dispatchEvent(new TouchEvent('touchcancel', { touches: [], changedTouches: [point(TOUCH_ID, 0)], bubbles: true }))
   return {
     top: box.top,
     height: box.height,
@@ -204,6 +207,7 @@ function liveScrollBox(el: HTMLElement, clientHeight: number) {
     touchStart,
     touchMoveTo,
     touchEnd,
+    touchCancel,
     /**
      * One COMPLETE gesture: finger down, a single pull of `dy`, finger up. Convenience for
      * the cases that are genuinely about one gesture. Anything about what happens WHILE the
@@ -2725,6 +2729,12 @@ describe('loading a transcript by scrolling to its ends (tether#110)', () => {
       // finger the event is actually about. Measured in jsdom: with a resting point at 500 and
       // a moving one at 120, `touches[0].clientY` is 500 while `changedTouches[0].clientY` is
       // 120.
+      //
+      // The GEOMETRY is what makes this discriminate, and the first version of this case got
+      // it wrong: with the thumb ABOVE the gesture's start, `start − thumb` is positive and a
+      // handler reading the thumb loads anyway, for a reason unrelated to the pull. The thumb
+      // is therefore BELOW the start (clientY 500 vs 300), so the wrong reading is −200 while
+      // the real pull is +200. A mutant reading `touches[0]` was still alive until this.
       pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
       const container = await renderHeld()
       const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
@@ -2736,11 +2746,78 @@ describe('loading a transcript by scrolling to its ends (tether#110)', () => {
       const gets = countNewestGets()
 
       pastFloor()
-      await act(async () => { box.touchStart(700, 500) })
-      await act(async () => { box.touchMoveTo(600, 500) })
+      await act(async () => { box.touchStart(300, 500) })
+      await act(async () => { box.touchMoveTo(100, 500) })
       await settle()
       expect(box.touchMoves()).toBe(1)
       expect(countNewestGets()).toBe(gets + 1)
+    })
+
+    it('drops a gesture the browser took away, and keeps one it did not', async () => {
+      // `touchcancel` is how the browser says "this touch is mine now" — Chrome's
+      // pull-to-refresh and back-swipe both do it — and after that, whatever else arrives in
+      // the sequence is not the reader pulling on this pane. Paired with the control so the
+      // assertion is about the cancel rather than about touch being broken.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      const gets = countNewestGets()
+
+      pastFloor()
+      await act(async () => { box.touchStart(700) })
+      await act(async () => { box.touchCancel() })
+      await act(async () => { box.touchMoveTo(100) })
+      await settle()
+      expect(box.touchMoves()).toBe(1)
+      expect(countNewestGets()).toBe(gets)
+
+      // The CONTROL: the identical pull without the cancel asks.
+      await act(async () => { box.touchStart(700) })
+      await act(async () => { box.touchMoveTo(100) })
+      await settle()
+      expect(countNewestGets()).toBe(gets + 1)
+    })
+
+    it('spends the TOP latch on a gesture load too, not only the bottom one', async () => {
+      // The symmetric half of the latch case below. Review found both `…ArmedRef = false`
+      // lines surviving as mutants; a bottom-only test leaves the top one alive.
+      const sameFive = turns('recent', 5, 500)
+      pages[MESSAGES_URL] = { entries: sameFive, earlier: 4096 }
+      pages[`${MESSAGES_URL}?before=4096`] = { entries: sameFive, earlier: 2048 }
+      pages[`${MESSAGES_URL}?before=2048`] = { entries: sameFive, earlier: 1024 }
+      pages[`${MESSAGES_URL}?before=1024`] = { entries: sameFive, earlier: 512 }
+      const container = await renderIdle()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(200) })
+      await settle()
+      await act(async () => { box.scrollTo(0) })
+      await settle()
+      expect(countEarlierPages()).toBe(1)
+
+      // Re-arm and return INSIDE the floor, so the arrival is refused and the latch stays set.
+      await act(async () => { box.scrollTo(200) })
+      await settle()
+      await act(async () => { box.scrollTo(0) })
+      await settle()
+      expect(countEarlierPages()).toBe(1)
+
+      pastFloor()
+      await act(async () => { box.wheel(-120) })
+      await settle()
+      expect(countEarlierPages()).toBe(2)
+
+      // The latch the gesture consumed.
+      pastFloor()
+      await act(async () => { box.fire() })
+      await settle()
+      expect(countEarlierPages()).toBe(2)
+      expect(countReq(`GET ${MESSAGES_URL}?before=1024`)).toBe(0)
     })
 
     it('spends the latch on a gesture load, so a later scroll event cannot ask again', async () => {

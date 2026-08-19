@@ -940,6 +940,18 @@ export const useStore = create<AppState>((set, get) => ({
    *      daemon stores number every message they serve, so in practice this means the
    *      array holds a bubble the BROWSER made (`handleEnvelope`) and the daemon has not
    *      recorded, or a response came from a daemon older than this SPA.
+   *
+   *      The two halves of that gate are NOT equally load-bearing, and saying so is
+   *      cheaper than letting someone find out: deleting it entirely leaves the INCOMING
+   *      side still refused, because `undefined > 1` and `null >= 1` are both false in
+   *      JavaScript and such a message falls through to (2). Measured — a mutant with the
+   *      whole gate removed is killed by exactly one test, the one with the ord-less
+   *      message on SCREEN. That is the half that matters: an unnumbered entry on screen
+   *      simply does not join the index, so the span (2) and the interior case are
+   *      measured against is silently short and the merge proceeds on it. The incoming
+   *      half is kept anyway, because a refusal that happens by coercion is not a
+   *      decision, and the next edit to the arithmetic would not know it was relying on
+   *      one.
    *   4. The arriving page is not itself in `ord` order. Both readers emit in file
    *      order, so this cannot happen from this daemon; it is here because "the page is
    *      sorted" is exactly the kind of assumption this wi exists to stop making.
@@ -983,6 +995,11 @@ export const useStore = create<AppState>((set, get) => ({
         next[i] = { ...m, id: next[i].id }
         continue
       }
+      // Strict, and `>=` here would be an EQUIVALENT mutant rather than a bug: an `ord`
+      // equal to `highest` is in the index, so it was matched above and never reaches
+      // this line. Written strict because that is what the sentence "strictly newer than
+      // everything on screen" means, and the equality case being unreachable is a
+      // property of the index rather than of this comparison.
       if (o > highest) {
         if (o <= lastAppended) return false // (4)
         lastAppended = o

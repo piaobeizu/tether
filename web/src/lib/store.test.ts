@@ -2395,18 +2395,29 @@ describe('mergeHistory checks the order it used to assume (tether#109)', () => {
 
   it('refuses a position that arrives as JSON null rather than treating it as zero', () => {
     // `ord` crosses JSON, and null is the shape a hand-mirrored optional number takes
-    // when the other side stops filling it in. Under a `!== undefined` check this array
-    // would pass the gate and then compare false against every ord in it, which is a
-    // silent permanent refusal wearing a successful merge's clothes — so the gate reads
-    // Number.isFinite. Written with a cast because the TYPE cannot express what the
-    // wire can send, which is the entire reason the check exists.
+    // when the other side stops filling it in. Written with a cast because the TYPE
+    // cannot express what the wire can send, which is the entire reason the check exists.
+    //
+    // The null is on the HELD side deliberately, and that placement is the only version
+    // of this test that discriminates. Measured: a null on the INCOMING side is refused
+    // even with the gate deleted, because `null > 1` and `null >= 1` are both false in
+    // JavaScript and the message falls through to the last refusal — i.e. that arrangement
+    // would pass on a reducer with no gate at all, and an earlier draft of this test did
+    // exactly that. Held, it is different: an entry that fails `Number.isFinite` but
+    // passes `!== undefined` joins the position index and drags `lowest` down to a
+    // coerced zero, so the span the interior case is measured against is silently wrong.
     useStore.setState({
-      messages: [{ id: 'served', role: 'user', text: 'ask', ts: 100, ord: null as unknown as number }],
+      messages: [
+        { id: 'served', role: 'user', text: 'ask', ts: 100, ord: 4096 },
+        { id: 'nulled', role: 'assistant', text: 'answer', ts: 200, ord: null as unknown as number },
+      ],
       transcriptPagesBack: 1,
     })
     expect(useStore.getState().mergeHistory([
       { id: 'x', role: 'user', text: 'ask', ts: 100, ord: 4096 },
+      { id: 'y', role: 'user', text: 'newer', ts: 300, ord: 9000 },
     ])).toBe(false)
+    expect(useStore.getState().messages.map(m => m.id)).toEqual(['served', 'nulled'])
   })
 
   it('refuses a page that is not itself in position order', () => {

@@ -2683,6 +2683,60 @@ describe('loading a transcript by scrolling to its ends (tether#110)', () => {
       expect(countNewestGets()).toBe(getsBefore + 1)
     })
 
+    it('stays out of the region the latch governs: near an end is not AT it', async () => {
+      // The bound that makes this a second entry rather than a bypass, expressed behaviourally
+      // rather than only as a constant. 30px from the bottom is inside TRANSCRIPT_EDGE_PX but
+      // the box can still MOVE, so a real wheel there scrolls, fires a `scroll`, and the latch
+      // is the right authority over whether that arrival loads. Widening the slack towards the
+      // arrival threshold would let this path fire where the latch is meaningful — which is
+      // exactly the loop tether#110 bounded.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(670) })   // 1000 - 670 - 300 = 30: near, not at
+      await settle()
+      const gets = countNewestGets()
+
+      pastFloor()
+      await act(async () => { box.wheel(120) })
+      await settle()
+      expect(box.wheels()).toBe(1)
+      expect(countNewestGets()).toBe(gets)
+
+      // The CONTROL: the same gesture 30px further on, where the box really is clamped.
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      const gets2 = countNewestGets()
+      pastFloor()
+      await act(async () => { box.wheel(120) })
+      await settle()
+      expect(countNewestGets()).toBe(gets2 + 1)
+    })
+
+    it('answers a wheel of any magnitude, because its unit is not pixels', async () => {
+      // A fine trackpad scroll reports `deltaY` around 1, and `deltaMode` can make the number
+      // a line or page count rather than a pixel count at all. Applying the TOUCH floor to a
+      // wheel would therefore throw away the gentlest half of desktop scrolling while passing
+      // every other test in this file, all of which spin a fat 120.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      const gets = countNewestGets()
+
+      pastFloor()
+      await act(async () => { box.wheel(1) })
+      await settle()
+      expect(countNewestGets()).toBe(gets + 1)
+    })
+
     it('shares the interval floor with the scroll path, so a gesture cannot double an arrival', async () => {
       // Why the gesture stamps the SAME `…FiredAt` ref rather than getting its own budget. A
       // touch drag delivers `touchmove` and `scroll` interleaved, so an arrival and a pull land

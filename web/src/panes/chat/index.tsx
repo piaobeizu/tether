@@ -219,6 +219,83 @@ export function scrollAfterPrepend(prev: { top: number; height: number }, nextHe
   return Math.max(0, prev.top + (nextHeight - prev.height))
 }
 
+// tether#110 — how close to an end of the transcript counts as being AT it.
+//
+// One number for both ends, because it means one thing: "the reader has arrived here".
+// It is deliberately not tied to the 120px `nearBottom` threshold below, which answers a
+// different question (should a new message pull the view down) and would be wrong to
+// change while pretending to reuse it.
+export const TRANSCRIPT_EDGE_PX = 48
+
+// The floor between two automatic loads at the same end. The latch below already makes
+// parking at an end fire once, so this covers the shape the latch cannot: a shaky flick —
+// or iOS momentum plus rubber-band — oscillating across the threshold. A frame is 16ms,
+// so this is ~30 frames, and a determined reader can still page back twice a second.
+export const TRANSCRIPT_EDGE_MIN_INTERVAL_MS = 500
+
+/** What a scroll event should do about one end of the transcript. */
+export type EdgeAction = 'idle' | 'arm' | 'load'
+
+/**
+ * transcriptEdgeAction — tether#110's whole trigger, for BOTH ends.
+ *
+ * Pure and extracted for the same reason as its five neighbours above: the thing that
+ * calls it needs a mounted pane and a real scrollable element, so the arithmetic is the
+ * only part a unit test can reach directly. Both ends share it so that "the loop is
+ * bounded" is one argument proved once rather than two that can drift — the caller passes
+ * `scrollTop` for the top and `scrollHeight - scrollTop - clientHeight` for the bottom.
+ *
+ * # Why there is a latch at all
+ *
+ * Auto-loading forms a loop with the prepend anchor. load → prepend →
+ * `scrollAfterPrepend` writes `el.scrollTop` to put the reader back → **a programmatic
+ * scrollTop write is a scroll**, and CSSOM View runs the scroll steps for it on the next
+ * frame, so the browser fires `scroll` again → and if that restored position still reads
+ * as "at the top", it loads again. On the 117 MiB session that prompted tether#107 that is
+ * a dozen pages per flick, each ~1 MiB read on the daemon. The bottom has the same shape:
+ * the `nearBottom` guard that keeps a reader glued to the newest message is ALSO an
+ * `el.scrollTop = el.scrollHeight` write, and if reaching the bottom refetches, and the
+ * refetch appends, and appending sticks to the bottom, that is the second loop.
+ *
+ * So `armed` starts FALSE and is only ever set by an observed position FURTHER than
+ * `TRANSCRIPT_EDGE_PX` from that end. Parking at an end therefore fires exactly once; you
+ * have to leave and come back. That also disposes of both loops by construction rather
+ * than by luck: the anchor correction and the autoscroll both leave the reader at a
+ * distance the latch has already consumed.
+ *
+ * Starting false rather than true is load-bearing in its own right. The transcript's first
+ * load autoscrolls to the bottom, which fires a scroll event at distance ≈ 0 — so an
+ * initially-armed bottom would refetch the page it had just fetched, every time a session
+ * was opened.
+ *
+ * # `available` and `inFlight` are the caller's facts, not this function's
+ *
+ * `available` is "this end has something to fetch" — a cursor at the top, and the
+ * held-session state at the bottom (see the handler for why the bottom is gated at all).
+ * `inFlight` covers BOTH ends and the button too, so at most one transcript request
+ * exists at a time; that is what keeps one end's indicator from changing the scroll
+ * height the other end's anchor arithmetic was measured against.
+ *
+ * Neither is folded in here, because a `'load'` this function returned for an end with
+ * nothing to fetch would be a bug that only the caller could see.
+ */
+export function transcriptEdgeAction(o: {
+  distance: number
+  armed: boolean
+  available: boolean
+  inFlight: boolean
+  sinceLastMs: number
+}): EdgeAction {
+  // Away from this end: re-arm, whatever else is true. Arming is a record that the reader
+  // moved, so an in-flight request is no reason to withhold it.
+  if (o.distance > TRANSCRIPT_EDGE_PX) return 'arm'
+  if (!o.armed) return 'idle'
+  if (!o.available) return 'idle'
+  if (o.inFlight) return 'idle'
+  if (o.sinceLastMs < TRANSCRIPT_EDGE_MIN_INTERVAL_MS) return 'idle'
+  return 'load'
+}
+
 // tether#107 — the two things the top of a transcript can say when there is nothing
 // earlier to fetch, which before this change were the same thing: nothing.
 //
@@ -495,6 +572,42 @@ export function HeldSessionActivity({ sid }: { sid: string }) {
   )
 }
 
+// tether#110 — what the reader is told the two labels mean. Exported so the render tests
+// pin them by identity, the same reason TRANSCRIPT_START_COMPLETE is.
+export const TRANSCRIPT_DOTS_EARLIER_LABEL = 'loading earlier messages'
+export const TRANSCRIPT_DOTS_NEWER_LABEL = 'checking for new messages'
+
+/**
+ * TranscriptDots — three dots, and ONLY while a request is genuinely in flight.
+ *
+ * The distinction this repo has settled repeatedly: spinning where nothing more can
+ * arrive is a lie, because waiting will never produce anything. So this never renders at
+ * the ceiling — the top of a complete transcript keeps tether#107's three sentences — and
+ * it never renders on a timer. Its whole population is "a request exists and will settle".
+ *
+ * THREE ELEMENTS rather than a '···' string in a pseudo-element, and the reason is
+ * concrete rather than stylistic: opacity cannot be animated per-character, so the dots
+ * have to be separate boxes to travel. `.thinking-dots` a few hundred lines down in
+ * index.css is the cautionary case — it puts the glyphs in a `::before` with no animation
+ * and hangs the animation on an EMPTY `::after`, i.e. it animates a box with nothing in
+ * it, so the "animated dots" its call site advertises have never moved. Not this wi's to
+ * fix (tether#34's indicator, its own call site, its own tests), but it is the reason this
+ * one is not built by copying it.
+ *
+ * `role="status"` + an aria-label rather than the bare glyphs: three decorative dots say
+ * nothing to a reader who cannot see them, and this is the one moment where what is
+ * happening is not otherwise announced.
+ */
+export function TranscriptDots({ label, className }: { label: string; className?: string }) {
+  return (
+    <span className={className ? `transcript-dots ${className}` : 'transcript-dots'} role="status" aria-label={label}>
+      <span className="transcript-dot" />
+      <span className="transcript-dot" />
+      <span className="transcript-dot" />
+    </span>
+  )
+}
+
 // tether#63 — code→sentence map for the failed-connection card. Only the
 // codes wire.ErrorCode classifies Terminal=true (errors.go's
 // terminalCodes) need an entry; any other code (including one this frontend
@@ -745,6 +858,25 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   // tether#107 — "load earlier messages" is in flight. Local, not store state: it is
   // about this pane's button, and nothing else has any use for it.
   const [loadingEarlier, setLoadingEarlier] = useState(false)
+  // tether#110 — the same, for the newest page: a re-read the reader asked for by
+  // arriving at the bottom. Its own flag rather than a shared one because the two put
+  // dots at opposite ends of the transcript.
+  const [loadingNewer, setLoadingNewer] = useState(false)
+  // …and the SYNCHRONOUS half of those two, covering both ends and the button as one
+  // fact. The state flags above are what render; this ref is what decides, and the
+  // difference is not tidiness: `setLoadingEarlier(true)` is visible a render away, so two
+  // scroll events landing in one tick would both read `loadingEarlier === false` and both
+  // fire. Holding at most one transcript request at a time is also what keeps one end's
+  // indicator from changing the scroll height the other end's anchor was measured against.
+  const requestInFlightRef = useRef(false)
+  // tether#110 — the two latches, one per end. `false` means "the reader has not moved
+  // away from this end since it last fired", so an end fires once per visit rather than
+  // once per scroll event. See transcriptEdgeAction for why they start false and why they
+  // are refs. `…AtRef` is when that end last fired, for the interval floor.
+  const topArmedRef = useRef(false)
+  const topFiredAtRef = useRef(0)
+  const bottomArmedRef = useRef(false)
+  const bottomFiredAtRef = useRef(0)
   // Where the scroll box was standing when the reader asked for an older page, so the
   // layout effect below can put them back on the same message. Null when no prepend is
   // pending, which is also what makes that effect a no-op on every other commit.
@@ -1232,16 +1364,25 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   // response lands the reader may have scrolled on, and the anchor has to be where they
   // were when they asked. It is read straight off the element rather than from React
   // state because scroll position is not React's to know.
+  //
+  // tether#110 — the guard moved from `loadingEarlier` to `requestInFlightRef`, and that
+  // is a strengthening rather than a rename: the state flag is a render away, so it could
+  // not stop two calls in one tick, and since this is now reached from a scroll handler
+  // as well as from the button, two calls in one tick are ordinary rather than a double
+  // click. The ref also covers the OTHER end, which is what makes "at most one transcript
+  // request exists" true rather than approximately true.
   const loadEarlier = () => {
-    if (!sessionId || loadingEarlier) return
+    if (!sessionId || requestInFlightRef.current) return
     const el = chatRef.current
     prependAnchorRef.current = el ? { top: el.scrollTop, height: el.scrollHeight } : null
     // Read BEFORE the request, so the settle below can tell whether a page actually
     // landed. `transcriptPagesBack` is the honest measure of that: prependHistory is the
     // only thing that raises it, and it raises it only when it prepends.
     const pagesAtClick = useStore.getState().transcriptPagesBack
+    requestInFlightRef.current = true
     setLoadingEarlier(true)
     void loadEarlierTranscript(sessionId).finally(() => {
+      requestInFlightRef.current = false
       setLoadingEarlier(false)
       // A request that failed must leave NO anchor pending, or the next unrelated
       // commit would apply a stale correction to a scroll position it has nothing to do
@@ -1257,6 +1398,161 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
       if (useStore.getState().transcriptPagesBack === pagesAtClick) prependAnchorRef.current = null
     })
   }
+
+  /**
+   * tether#110 — the action arriving at the BOTTOM of the transcript takes: re-read the
+   * newest page now, rather than waiting out the rest of the three-second poll.
+   *
+   * # It is `refreshTranscript` and nothing else
+   *
+   * Not a second fetch that happens to hit the same URL. tether#109 changed that function
+   * to CHECK the ordering it used to assume — `mergeHistory` compares `ord`s and refuses
+   * four ways — and a parallel path would bypass that check and put the out-of-order
+   * defect back. It is also what keeps `transcriptPagesBack` meaningful: a reader who has
+   * paged back gets a merge, not the wholesale replace that would throw those pages away.
+   *
+   * # Why this end is gated on `readingHeldSession` and the other end is not
+   *
+   * Two reasons, and either alone would be enough.
+   *
+   * `refreshTranscript` has NO `!streaming` guard, and its doc says why: "every caller is
+   * a state in which a turn cannot be in flight". A scroll to the bottom of a CONNECTED
+   * session is not such a state — it is the single most ordinary thing to do while a turn
+   * streams — so wiring this end in every state would break that function's stated
+   * precondition and hand back tether#42's regression, the refetch wiping an in-flight
+   * turn's optimistic bubble.
+   *
+   * And there would be nothing to short-circuit. The three-second poll this exists to
+   * pre-empt (watchTranscript, below) only runs under `readingHeldSession`; everywhere
+   * else new messages arrive on the WebTransport stream as they are produced, so the
+   * newest page is already on screen and a re-read is a megabyte spent to learn nothing.
+   *
+   * The cost where it DOES run, stated rather than implied: GET /messages is up to a
+   * megabyte on the wire and an unbounded `os.ReadFile` on the daemon (transcriptWatch's
+   * header states the figures). Bounded to at most one per arrival at the bottom by the
+   * latch, one per 500ms by the floor, and one at a time by both `requestInFlightRef` and
+   * `refreshTranscript`'s own per-sid dedupe. That is the same trade `checkAgain` and the
+   * click-the-open-row path already make for a deliberate gesture, and arriving at the
+   * bottom is one.
+   */
+  //
+  // WHICH of the two in-flight checks is doing the work, stated because a mutation
+  // battery had to establish it and the answer is "not this one": deleting
+  // `requestInFlightRef.current` from the line below leaves the whole suite green,
+  // because the only caller — `onTranscriptScroll` — has already refused through
+  // `transcriptEdgeAction`'s `inFlight`. Kept anyway, and the distinction from the inert
+  // `!streaming` guard `refreshTranscript` argues against is that this condition is
+  // reachable rather than dead (the ref is genuinely set for the duration of a load at
+  // the other end): it makes "this may not be entered while a request is in flight" a
+  // property of the function that sets the flag, not of whoever calls it, and it keeps
+  // this the same shape as `loadEarlier`, where the duplicate IS live because the button
+  // is a second caller. The decision-site check is not redundant with it either — that
+  // one is also what stops the latch being consumed and the floor stamped for a request
+  // that is never going to happen.
+  const refreshNewest = () => {
+    if (!sessionId || requestInFlightRef.current) return
+    requestInFlightRef.current = true
+    setLoadingNewer(true)
+    void refreshTranscript(sessionId).finally(() => {
+      requestInFlightRef.current = false
+      setLoadingNewer(false)
+    })
+  }
+
+  /**
+   * tether#110 — both ends, one scroll event.
+   *
+   * Kept in a ref-to-latest rather than re-bound on every render, the same construction
+   * `manualRetryRef` uses a few dozen lines up: the listener is attached once, to the
+   * element, and a listener that had to be re-attached whenever `loadingEarlier` or
+   * `transcriptEarlier` changed would be re-attached on exactly the commits where a scroll
+   * event is most likely to be in flight.
+   *
+   * Both ends are evaluated on every event, and that is deliberate: on a transcript barely
+   * taller than the viewport a reader can be within `TRANSCRIPT_EDGE_PX` of both at once,
+   * and `transcriptEdgeAction`'s `inFlight` (shared, synchronous) is what decides which
+   * one actually fires rather than an ordering rule that would silently prefer one end.
+   */
+  const onTranscriptScroll = () => {
+    const el = chatRef.current
+    if (!el) return
+    const now = Date.now()
+    const inFlight = requestInFlightRef.current
+
+    const top = transcriptEdgeAction({
+      distance: el.scrollTop,
+      armed: topArmedRef.current,
+      // A cursor is the whole of "there is an earlier page". At the ceiling this is null.
+      //
+      // Deleting the cursor half leaves the suite green (mutation battery), and that is
+      // worth writing down rather than treating as a gap, because it says where the
+      // user-visible property actually lives: the DOTS are kept off the ceiling by the
+      // render gate below (`transcriptEarlier !== null ? slots : note`, which a mutant does
+      // kill), and the REQUEST by `loadEarlierTranscript`'s own no-cursor early return
+      // (tether#107). What this half alone buys is that arriving at a ceiling does not
+      // consume the latch, stamp the floor, or hold `requestInFlightRef` for a microtask
+      // against the other end — real but unobservable from any test in this repo. Not free
+      // to remove, therefore, and not load-bearing either.
+      available: transcriptEarlier !== null && !!sessionId,
+      inFlight,
+      sinceLastMs: now - topFiredAtRef.current,
+    })
+    if (top === 'arm') topArmedRef.current = true
+    if (top === 'load') {
+      topArmedRef.current = false
+      topFiredAtRef.current = now
+      loadEarlier()
+    }
+
+    const bottom = transcriptEdgeAction({
+      distance: el.scrollHeight - el.scrollTop - el.clientHeight,
+      armed: bottomArmedRef.current,
+      available: readingHeldSession && !!sessionId,
+      // Re-read, not the snapshot above: `loadEarlier` sets the ref synchronously, so an
+      // event that fired the top end must not also fire this one.
+      inFlight: requestInFlightRef.current,
+      sinceLastMs: now - bottomFiredAtRef.current,
+    })
+    if (bottom === 'arm') bottomArmedRef.current = true
+    if (bottom === 'load') {
+      bottomArmedRef.current = false
+      bottomFiredAtRef.current = now
+      refreshNewest()
+    }
+  }
+  const onTranscriptScrollRef = useRef(onTranscriptScroll)
+  onTranscriptScrollRef.current = onTranscriptScroll
+
+  // Attach once, to the scroll container itself.
+  //
+  // `addEventListener` rather than React's `onScroll` prop for two reasons that are not
+  // interchangeable: `{ passive: true }` (a scroll listener the browser must wait on
+  // before scrolling is a jank source on touch, and this one never calls
+  // preventDefault), and because a listener this file owns is one a test can reach with
+  // `dispatchEvent` without depending on how React attaches non-delegated events.
+  //
+  // NOT an IntersectionObserver, which is the other obvious shape. jsdom does not
+  // implement one, so an observer-based trigger would be untestable in this repo — and
+  // tether#108 already paid for shipping scroll behaviour that no test in this repo could
+  // express. Scroll position also covers wheel, trackpad, touch and Home/End alike, which
+  // is why nothing here hand-rolls a pull gesture.
+  useEffect(() => {
+    const el = chatRef.current
+    if (!el) return
+    const handler = () => onTranscriptScrollRef.current()
+    el.addEventListener('scroll', handler, { passive: true })
+    return () => el.removeEventListener('scroll', handler)
+  }, [])
+
+  // A session switch retires both latches. They describe where the reader has been in ONE
+  // conversation, and carrying "you have already loaded at this end" into a different one
+  // would suppress the first automatic load of the session they just opened.
+  useEffect(() => {
+    topArmedRef.current = false
+    topFiredAtRef.current = 0
+    bottomArmedRef.current = false
+    bottomFiredAtRef.current = 0
+  }, [sessionId])
 
   // tether#52 — first-connect ordering (see shouldDeferFirstConnect above).
   // Only the sid-less path defers, and only until `workspacesLoaded` flips
@@ -1635,21 +1931,58 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
             HELD_SESSION_READABLE_NOTE.
 
             Gated on `messages` and not `transcript`: a session whose only content is
-            a locally-originated notice has no transcript to be at the top of. */}
+            a locally-originated notice has no transcript to be at the top of.
+
+            tether#110 — the loading state moved OUT of the button and became the dots,
+            at the top of the transcript, where the page is about to appear. The ceiling
+            branch below is untouched, and deliberately so: those are the three sentences
+            #107 exists for, and dots there would be the exact lie this lane keeps
+            re-deciding against. */}
         {messages.length > 0 && (
           <div className="transcript-top">
             {transcriptEarlier !== null ? (
-              // The label swaps and the button disables while a real request is in
-              // flight. This is NOT the loading spinner tether#107 rules out: that
-              // objection is about the CEILING, where "wait and it will arrive" is
-              // false and a spinner therefore misinforms. Here a request exists and
-              // will settle, the label reports that request, and it appears only in
-              // the state that has one. Same construction as EventTimeline's
-              // `load more` / `loading…`, which is the repo's existing pagination
-              // button.
-              <button className="transcript-more" onClick={loadEarlier} disabled={loadingEarlier}>
-                {loadingEarlier ? 'loading…' : 'load earlier messages'}
-              </button>
+              /* A ONE-CELL GRID holding the dots and the button, one of them `on`, and
+                 that is the load-bearing part rather than a layout convenience.
+
+                 This element sits ABOVE the point an older page is inserted, so its
+                 height is an input to `scrollAfterPrepend`. A height change that lands
+                 ON the prepend commit is already absorbed — that function reads the
+                 post-commit `scrollHeight`, so the delta it computes includes it. The
+                 dangerous one is the OTHER commit: button → dots at request start,
+                 which nothing corrects, so a reader standing at the top would be shoved
+                 by the difference between a button and three dots at the moment they
+                 asked for more.
+
+                 tether#108's construction, for tether#108's reason: `min-height: <px>`
+                 does not hold a height (what wraps at 640px does not wrap at 260px, and
+                 the phone is narrower still), and jsdom computes no layout while iOS
+                 Safari has no scroll anchoring, so this class of defect is not
+                 observable from any test in this repo. Stacked in one cell the height is
+                 the taller of the two at whatever width the pane happens to be, it
+                 contains no pixel value to go stale, and it never changes.
+
+                 The #107 note stays OUTSIDE this grid. Its swap with this cell happens
+                 only when `transcriptEarlier` goes non-null → null, which is a prepend
+                 commit and therefore already absorbed — and keeping it out is what keeps
+                 "there is no `.transcript-top-note` while a page is available" an
+                 assertion a test can make. */
+              <div className="transcript-top-slots">
+                <TranscriptDots label={TRANSCRIPT_DOTS_EARLIER_LABEL} className={loadingEarlier ? 'on' : ''} />
+                {/* Still here, and not because removing it was forgotten. Scrolling is
+                    now the way to page back, so this is the fallback — but it is a
+                    fallback that has to exist: a transcript whose newest page does not
+                    overfill the viewport CANNOT SCROLL, so no scroll event ever fires and
+                    every earlier page would be unreachable without it. It is also the
+                    only keyboard-reachable path, since `.dt-chat` is a plain div and
+                    takes no focus. `disabled` is redundant with `visibility: hidden`
+                    while loading and kept anyway: it is the correct state for a control
+                    that is present and unavailable, and it costs one attribute. */}
+                <button
+                  className={loadingEarlier ? 'transcript-more' : 'transcript-more on'}
+                  onClick={loadEarlier}
+                  disabled={loadingEarlier}
+                >load earlier messages</button>
+              </div>
             ) : (
               <span className="transcript-top-note">
                 {transcriptOtherRecord ? describeOtherRecord(transcriptOtherRecord) : TRANSCRIPT_START_COMPLETE}
@@ -1722,6 +2055,33 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
             </div>
           )
         })}
+
+        {/* ── The bottom of the transcript (tether#110) ──────────────────────
+            Immediately after the last bubble, because that is where a new one will
+            appear — the same argument the top marker makes about its own position.
+
+            Only while a request is in flight, so this is an EVENT and not a state:
+            arriving at the bottom asks the daemon now instead of waiting out the rest
+            of the three-second poll, and the dots last exactly as long as that ask.
+            There is nothing to render when the answer is "nothing new", which is the
+            common case and correctly silent.
+
+            Nothing here reserves height. It is BELOW everything, so it cannot move
+            content the reader is looking at, and `requestInFlightRef` makes it
+            impossible for these dots to appear or vanish between the top end's anchor
+            capture and its prepend commit.
+
+            One constraint this DOES carry, named because it is invisible from the CSS:
+            these dots must stay SHORTER than TRANSCRIPT_EDGE_PX. A reader standing at
+            the bottom has the scroll height grow underneath them when they appear, and
+            an indicator taller than the threshold would push the distance past it and
+            re-arm the latch it had just consumed. Three 5px dots in a 4px/2px padded
+            row is ~13px against a 48px threshold. */}
+        {loadingNewer && (
+          <div className="transcript-bottom">
+            <TranscriptDots label={TRANSCRIPT_DOTS_NEWER_LABEL} />
+          </div>
+        )}
 
         {showEmpty && (
           <div className="chat-empty mono">message tether to start a session</div>

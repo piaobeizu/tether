@@ -296,6 +296,109 @@ export function transcriptEdgeAction(o: {
   return 'load'
 }
 
+// tether#112 — how close to an end counts as "the scroll cannot go any further".
+//
+// A DIFFERENT question from TRANSCRIPT_EDGE_PX above, and the difference is the whole of
+// this wi. That one asks "has the reader arrived here", which is a judgement with a
+// comfortable answer. This one asks "is `scrollTop` clamped", which is a fact — and it has
+// to be answered with a slack rather than `=== 0` because `scrollHeight` and `clientHeight`
+// are integers while `scrollTop` is not: at a fractional device pixel ratio (2.625 on
+// plenty of Android phones) or under browser zoom, the true end reads as a fraction like
+// 0.5 rather than 0. An exact comparison would leave the gesture below silently dead on
+// exactly the devices this product is used on, which is the same shape of defect as the one
+// being fixed.
+//
+// TWO rather than one, and the second pixel is margin rather than derivation. One is what the
+// argument above needs exactly: with integer heights and a fractional `scrollTop`, the worst a
+// true end can read is +1.0. That is a model, and it assumes the two integer heights round in
+// agreement — which is what browser zoom is reported to break, and which nothing in this repo
+// can measure (jsdom computes no layout, and its geometry here is integer by construction).
+// Since being one pixel short means the reported defect silently returns on some devices, and
+// being one pixel long costs only that the gesture may also fire one pixel before the true end
+// — a position from which the shared floor already prevents a second request — the margin is
+// the cheap side of that trade.
+//
+// It must stay SMALL, and that bound is the load-bearing part: further from the end than
+// this, the browser CAN still scroll, so it fires a real `scroll` event and
+// transcriptEdgeAction's latch is the correct authority over whether that arrival loads.
+// A slack anywhere near TRANSCRIPT_EDGE_PX would let the gesture path fire inside the
+// region the latch governs — bypassing it where it is meaningful, rather than only where
+// it is unreachable. 2 ≪ 48, and ChatPane.test.tsx pins the inequality.
+//
+// One thing that does NOT need room here, checked because it looks as though it might: the
+// bottom dots add ~13px of scroll height while a request is in flight, which takes
+// `bottomDistance` well past this slack. It cannot matter — that height only exists while
+// `requestInFlightRef` is set, which is the state in which every path already refuses.
+export const TRANSCRIPT_OVERSCROLL_SLACK_PX = 2
+
+// The smallest touch pull that counts as a pull, in CSS pixels of finger travel.
+//
+// `touchmove` fires for a finger resting on the glass, and a resting finger jitters by
+// fractions of a pixel, so without a floor "the reader pulled" would mean "the reader
+// touched the screen". A wheel needs no equivalent — see the listener for why its
+// magnitude is not a pixel count at all.
+export const TRANSCRIPT_OVERSCROLL_TOUCH_PX = 8
+
+/**
+ * transcriptOverscrolled — did this gesture push further into an end that cannot move?
+ *
+ * tether#112. The trigger tether#110 shipped listens to `scroll` alone, and the owner found
+ * the hole in it within minutes: **at an end, `scrollTop` is already clamped, so pulling
+ * further changes nothing and the browser fires no `scroll` event at all.** The handler is
+ * never called, so none of its bounds are even consulted — and the bottom is where the pane
+ * parks the reader by default (the `nearBottom` autoscroll), so the downward gesture was
+ * dead in the most common state there is. Pulling further UP at the very top was dead by
+ * the same mechanism.
+ *
+ * This is the second entry into the same decision, not a replacement for the first, and it
+ * covers exactly the case the first structurally cannot see: the end itself.
+ *
+ * `toward` is how far the gesture pushed FURTHER INTO the end being asked about, so the
+ * caller passes `+deltaY` for the bottom and `-deltaY` for the top — the same trick
+ * `transcriptEdgeAction` plays with `distance`, and for the same reason: one function, one
+ * argument, no second copy to drift. `distance` is that function's distance, unchanged.
+ *
+ * `minToward` is the caller's unit, not this function's: 0 for a wheel, whose magnitude is
+ * in lines or pages as often as pixels, and TRANSCRIPT_OVERSCROLL_TOUCH_PX for a touch,
+ * whose magnitude is in pixels of finger travel. Passing it in rather than branching on an
+ * event type in here is what keeps this testable without an event.
+ *
+ * # Why this path may skip the latch, and why that is not a hole
+ *
+ * `armed` exists to answer one question: *did the reader do something, or is this the
+ * machinery re-entering itself?* A `scroll` event cannot answer it — CSSOM View makes a
+ * programmatic `scrollTop` write fire the same event a finger does — so the latch answers it
+ * from position history instead, and that is why it is right for that path and must stay
+ * exactly as it is. Neither `wheel` nor `touchmove` is produced by scrolling, so **nothing
+ * this code does can cause one**, and the self-sustaining cycle the latch bounds does not
+ * exist here. That is the whole of the claim, and it is deliberately narrower than "these
+ * events mean the reader did something", which review showed to be false in both directions:
+ *
+ *   - macOS/Chrome inertial momentum keeps delivering `wheel` for about a second after the
+ *     fingers have left the trackpad;
+ *   - a `touchmove` fires for a finger merely resting on the glass.
+ *
+ * Neither is a loop — both are finite in the momentum case and harmless in themselves — but
+ * both are input the reader is not still asking with, so they are bounded explicitly rather
+ * than argued away: the 500ms floor caps the momentum tail at two or three requests per
+ * flick, and the per-gesture `spent` latch on touchPullRef caps a resting finger at zero
+ * (see there — an earlier cut of this wi had no such latch and paid for it).
+ *
+ * What is emphatically NOT skipped: the shared in-flight ref and the 500ms floor. One
+ * continuous wheel spin is ~60 events a second, so without them a single flick would be a
+ * burst of megabyte reads on the daemon.
+ */
+export function transcriptOverscrolled(o: {
+  toward: number
+  distance: number
+  minToward: number
+}): boolean {
+  // Direction first. A gesture pushing AWAY from this end is the ordinary case that moves
+  // `scrollTop`, fires a `scroll`, and belongs entirely to the other path.
+  if (o.toward <= o.minToward) return false
+  return o.distance <= TRANSCRIPT_OVERSCROLL_SLACK_PX
+}
+
 // tether#107 — the two things the top of a transcript can say when there is nothing
 // earlier to fetch, which before this change were the same thing: nothing.
 //
@@ -877,6 +980,26 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   const topFiredAtRef = useRef(0)
   const bottomArmedRef = useRef(false)
   const bottomFiredAtRef = useRef(0)
+  // tether#112 — the touch gesture currently on the glass: WHICH finger, where it started, and
+  // whether it has already been answered. Null between gestures — cleared on touchend and
+  // touchcancel as well as replaced on touchstart, so that sentence is true rather than merely
+  // unfalsifiable.
+  //
+  // `from` is the gesture's START, not the previous move, because a deliberate slow drag
+  // arrives as many small moves and none of them would clear TRANSCRIPT_OVERSCROLL_TOUCH_PX
+  // alone. That accumulation is exactly why `spent` has to exist: once a gesture has travelled
+  // 8px, EVERY later move in it clears the floor too — including the jitter of a finger just
+  // resting on the glass — so without a per-gesture latch a thumb left at the bottom after one
+  // successful pull asks for the whole newest page twice a second for as long as it rests
+  // there. Deep review found that in this wi's first cut. It is the loop tether#110's arm latch
+  // exists to stop, reappearing on the path that legitimately drops that latch, and the answer
+  // is the same shape: one visit, one load — where here the GESTURE is the visit.
+  //
+  // `id` is the `Touch.identifier`, and following it is not fussiness. The browser lists the
+  // OLDER touch first, so for a reader whose thumb is already on the glass holding the phone
+  // `touches[0]` is that stationary thumb and every delta from it is ~0 — the fix would be
+  // silently inert for exactly the two-handed phone reader who reported the bug.
+  const touchPullRef = useRef<{ id: number; from: number; spent: boolean } | null>(null)
   // Where the scroll box was standing when the reader asked for an older page, so the
   // layout effect below can put them back on the same message. Null when no prepend is
   // pending, which is also what makes that effect a no-op on every other commit.
@@ -1523,6 +1646,110 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   const onTranscriptScrollRef = useRef(onTranscriptScroll)
   onTranscriptScrollRef.current = onTranscriptScroll
 
+  /**
+   * tether#112 — the SECOND entry into the same decision: a gesture pushing against an end
+   * the scroll cannot leave. See transcriptOverscrolled for why `scroll` never sees this and
+   * why the latch is the one bound this path does not need.
+   *
+   * `deltaY` is the gesture's own sign convention — positive is toward the bottom of the
+   * transcript, which is what both a `WheelEvent.deltaY` and a finger travelling UP the
+   * screen mean. `minToward` is the unit the caller is speaking in.
+   *
+   * # A residual, named because it is invisible from the CSS and from every test here
+   *
+   * `wheel` and `touchmove` BUBBLE, and the transcript contains a nested scroller of its own:
+   * `.msg-tool-result` is `max-height: 280px; overflow: auto` (index.css). A reader wheeling
+   * inside an expanded tool result is scrolling THAT box, not overscrolling this one — but the
+   * event reaches here anyway, and if `.dt-chat` happens to be parked at its end the gesture
+   * reads as a pull. Cost: one extra re-read, floor-bounded to two a second, in the held state
+   * where a poll is already fetching every three seconds. Not fixed, deliberately: the correct
+   * test is "can any scroller between `e.target` and here still move in this direction", which
+   * is the browser's own scroll-chaining rule, and reimplementing it needs computed styles and
+   * live geometry — neither of which jsdom has, so the fix would be untestable in this repo,
+   * which is the exact trade tether#108 and tether#110 both paid for going the wrong way.
+   *
+   * Returns whether a request was actually started, which is what lets the touch caller spend
+   * its gesture after one load. The wheel caller ignores it, and that asymmetry is the honest
+   * one: a touch gesture has boundaries (touchstart…touchend) so "once per gesture" is a thing
+   * that can be said, while `wheel` events are discrete with no start or end. What bounds the
+   * wheel is the 500ms floor alone — enough, because the input that arrives without the reader
+   * still asking for it is macOS/Chrome inertial momentum, which decays within about a second,
+   * so a flick costs at most two or three requests rather than an unbounded stream.
+   */
+  const onTranscriptOverscroll = (deltaY: number, minToward: number): boolean => {
+    const el = chatRef.current
+    if (!el) return false
+    const now = Date.now()
+    const bottomDistance = el.scrollHeight - el.scrollTop - el.clientHeight
+    const topDistance = el.scrollTop
+
+    // Both ends are asked, and the sign is what separates them: `toward` and `-toward`
+    // cannot both be positive, so at most one of these two blocks can run even on a
+    // transcript short enough that BOTH distances read as "at the end" (which is the case
+    // for any conversation that does not overfill the viewport — where, incidentally, no
+    // scroll event can ever fire, so this path is the only one there is). The `return` is
+    // therefore a saved measurement rather than a precedence rule: `minToward` is never
+    // negative, so `toward > minToward` forces `-toward < 0` and the second test cannot pass.
+    // Deleting the `return` is a mutant that survives the suite, and correctly so — it
+    // changes nothing except the work done.
+    //
+    // `armed: true` is the only field either call states rather than reads, and the argument
+    // for it is in transcriptOverscrolled's header. The real `distance` is passed, not a
+    // hard-coded 0: it is a fact rather than a claim, and it fails safe — if the slack were
+    // ever widened past TRANSCRIPT_EDGE_PX the outcome would be `'arm'`, i.e. do nothing,
+    // rather than a load in the region the latch governs. (`'arm'` is unreachable as long as
+    // SLACK ≪ EDGE_PX, which ChatPane.test.tsx pins.)
+    if (transcriptOverscrolled({ toward: deltaY, distance: bottomDistance, minToward })) {
+      const bottom = transcriptEdgeAction({
+        distance: bottomDistance,
+        armed: true,
+        available: readingHeldSession && !!sessionId,
+        inFlight: requestInFlightRef.current,
+        sinceLastMs: now - bottomFiredAtRef.current,
+      })
+      if (bottom === 'load') {
+        // The latch is cleared and the floor stamped through the SAME refs the scroll path
+        // uses, which is what stops the two entries from each getting their own budget: a
+        // gesture landing in the same moment as an arrival finds the floor already stamped,
+        // so the pair costs one request rather than two. Clearing an already-clear latch is
+        // nothing in the parked case, and in the case where the reader HAD armed it, it
+        // keeps "this end fired, so its latch is spent" true of both entries alike.
+        bottomArmedRef.current = false
+        bottomFiredAtRef.current = now
+        refreshNewest()
+        return true
+      }
+      return false
+    }
+
+    if (transcriptOverscrolled({ toward: -deltaY, distance: topDistance, minToward })) {
+      const top = transcriptEdgeAction({
+        distance: topDistance,
+        armed: true,
+        // Deleting the cursor half leaves the suite green here for exactly the reason it does
+        // on the scroll path above (tether#110's accepted survivor, one layer up): the dots
+        // are kept off the ceiling by the render gate, which has no slot to put them in when
+        // `transcriptEarlier` is null, and the request by `loadEarlierTranscript`'s own
+        // no-cursor early return. Kept for the same reason too — that early return is another
+        // module's property and one edit from changing, and what this half alone buys is that
+        // pulling at a ceiling does not stamp this end's floor or hold the shared in-flight
+        // ref against the other end for a microtask. Real, and unobservable from here.
+        available: transcriptEarlier !== null && !!sessionId,
+        inFlight: requestInFlightRef.current,
+        sinceLastMs: now - topFiredAtRef.current,
+      })
+      if (top === 'load') {
+        topArmedRef.current = false
+        topFiredAtRef.current = now
+        loadEarlier()
+        return true
+      }
+    }
+    return false
+  }
+  const onTranscriptOverscrollRef = useRef(onTranscriptOverscroll)
+  onTranscriptOverscrollRef.current = onTranscriptOverscroll
+
   // Attach once, to the scroll container itself.
   //
   // `addEventListener` rather than React's `onScroll` prop for two reasons that are not
@@ -1534,14 +1761,85 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   // NOT an IntersectionObserver, which is the other obvious shape. jsdom does not
   // implement one, so an observer-based trigger would be untestable in this repo — and
   // tether#108 already paid for shipping scroll behaviour that no test in this repo could
-  // express. Scroll position also covers wheel, trackpad, touch and Home/End alike, which
-  // is why nothing here hand-rolls a pull gesture.
+  // express.
+  //
+  // tether#112 — what `scroll` covers and the one thing it does not, because the comment
+  // that used to stand here got it wrong in a way that cost a release. It claimed "scroll
+  // position also covers wheel, trackpad, touch and Home/End alike, which is why nothing
+  // here hand-rolls a pull gesture", and tether#110's wi ruled gestures out of scope on
+  // that authority. It is true of every input that MOVES the box — a position change is what
+  // fires the event, so the device that caused it genuinely does not matter. It is false at
+  // an END: there `scrollTop` is already clamped, the position does not change, and the
+  // browser fires NOTHING. The three listeners below exist for that hole and only that hole;
+  // `transcriptOverscrolled` is where the reasoning lives.
+  //
+  // `{ passive: true }` on all four, and it does NOT mean the same thing for the gesture
+  // events as for `scroll`. On `scroll` it is only a promise not to delay the scroll; on
+  // `wheel` and `touchmove` it additionally FORBIDS preventDefault(). That is a deliberate
+  // choice and not an oversight: nothing here wants to prevent anything — the browser's own
+  // clamp at the end is the correct behaviour and this wi adds no rubber-band animation — and
+  // a non-passive wheel/touchmove listener on a scroll container is one the browser must
+  // wait for before it may scroll at all, which is the largest single source of scroll jank
+  // on touch. Compare Dag.tsx, which uses `passive: false` for its wheel handler and has to:
+  // it zooms, and must suppress the browser's own Ctrl+wheel page zoom.
   useEffect(() => {
     const el = chatRef.current
     if (!el) return
-    const handler = () => onTranscriptScrollRef.current()
-    el.addEventListener('scroll', handler, { passive: true })
-    return () => el.removeEventListener('scroll', handler)
+    const onScroll = () => onTranscriptScrollRef.current()
+    // Only the SIGN of `deltaY` is read, deliberately. Its unit is whatever `deltaMode` says
+    // — pixels, lines or pages — so measuring it against a pixel budget would compare a line
+    // count to pixels. A wheel event is only ever emitted for a deliberate scroll input, so
+    // zero is the only boundary that means anything, hence `minToward: 0`.
+    const onWheel = (e: WheelEvent) => onTranscriptOverscrollRef.current(e.deltaY, 0)
+    // Touch devices have no wheel at all, so without these the fix would reach only the desktop
+    // half of a product that is mostly used on a phone.
+    //
+    // `changedTouches`, not `touches`: the former is the touches this event is ABOUT, the latter
+    // is every finger currently down with the oldest first. See touchPullRef for why reading
+    // `touches[0]` makes the whole path inert for a reader holding the phone.
+    const onTouchStart = (e: TouchEvent) => {
+      const t = e.changedTouches[0]
+      touchPullRef.current = t ? { id: t.identifier, from: t.clientY, spent: false } : null
+    }
+    const onTouchEnd = () => { touchPullRef.current = null }
+    const onTouchMove = (e: TouchEvent) => {
+      const pull = touchPullRef.current
+      if (!pull || pull.spent) return
+      // The gesture's own finger, by identifier. A move that reports only other fingers says
+      // nothing about this pull.
+      let y: number | undefined
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const t = e.changedTouches[i]
+        if (t.identifier === pull.id) { y = t.clientY; break }
+      }
+      if (y === undefined) return
+      // Finger UP the screen (clientY decreasing) drags the content up, which is toward the
+      // BOTTOM of the transcript — the same direction a positive `deltaY` means.
+      //
+      // Spent only when a request actually STARTED. A pull the floor or the in-flight ref
+      // refused has not been answered, so a later move in the same gesture may still ask; it
+      // cannot burst, because the first one that succeeds closes the gesture.
+      if (onTranscriptOverscrollRef.current(pull.from - y, TRANSCRIPT_OVERSCROLL_TOUCH_PX)) {
+        pull.spent = true
+      }
+    }
+    el.addEventListener('scroll', onScroll, { passive: true })
+    el.addEventListener('wheel', onWheel, { passive: true })
+    el.addEventListener('touchstart', onTouchStart, { passive: true })
+    el.addEventListener('touchmove', onTouchMove, { passive: true })
+    // `touchcancel` as well as `touchend`, because the browser takes a touch away rather than
+    // ending it whenever it claims the gesture for itself (Chrome's pull-to-refresh, a back
+    // swipe). Either way this gesture is over and the next `touchstart` opens a new one.
+    el.addEventListener('touchend', onTouchEnd, { passive: true })
+    el.addEventListener('touchcancel', onTouchEnd, { passive: true })
+    return () => {
+      el.removeEventListener('scroll', onScroll)
+      el.removeEventListener('wheel', onWheel)
+      el.removeEventListener('touchstart', onTouchStart)
+      el.removeEventListener('touchmove', onTouchMove)
+      el.removeEventListener('touchend', onTouchEnd)
+      el.removeEventListener('touchcancel', onTouchEnd)
+    }
   }, [])
 
   // A session switch retires both latches. They describe where the reader has been in ONE

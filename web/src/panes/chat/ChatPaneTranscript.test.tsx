@@ -6,6 +6,7 @@ import ChatPane, {
   HELD_SESSION_PLACEHOLDER, HELD_SESSION_READABLE_NOTE,
   TRANSCRIPT_DOTS_EARLIER_LABEL, TRANSCRIPT_DOTS_NEWER_LABEL,
   TRANSCRIPT_EDGE_MIN_INTERVAL_MS,
+  TRANSCRIPT_OVERSCROLL_TOUCH_PX,
   TRANSCRIPT_START_COMPLETE, TRANSCRIPT_START_TETHER_RECORD_ONLY,
 } from './index'
 import { useStore } from '../../lib/store'
@@ -47,6 +48,12 @@ const originalFetch = globalThis.fetch
 
 /** How tall one bubble is in the geometry model below. */
 const ROW_PX = 100
+
+/** tether#112 — identifiers for the two fingers the touch fixture can put on the glass: the
+ *  one making the gesture, and a thumb already resting there. Distinct and arbitrary; what
+ *  matters is only that the pane must follow the RIGHT one. */
+const TOUCH_ID = 7
+const RESTING_ID = 3
 
 /**
  * Give an element a scroll geometry jsdom does not have.
@@ -109,7 +116,15 @@ function liveScrollBox(el: HTMLElement, clientHeight: number) {
   const get = desc?.get as () => number
   const set = desc?.set as (v: number) => void
   let events = 0
+  let wheels = 0
+  let touchMoves = 0
   el.addEventListener('scroll', () => { events++ })
+  // tether#112 — counted for the same reason the scroll events are: so a test can assert the
+  // FIXTURE really delivered the gesture. Without these, "pulling at the end loads" would be
+  // satisfied by a dispatch that never reached a listener, which is precisely the vacuous
+  // shape jsdom's silent `scrollTop` writes taught this file to distrust.
+  el.addEventListener('wheel', () => { wheels++ })
+  el.addEventListener('touchmove', () => { touchMoves++ })
   Object.defineProperty(el, 'scrollTop', {
     configurable: true,
     get: () => get.call(el),
@@ -118,6 +133,25 @@ function liveScrollBox(el: HTMLElement, clientHeight: number) {
       setTimeout(() => el.dispatchEvent(new Event('scroll')), 0)
     },
   })
+  const point = (identifier: number, clientY: number) => ({ identifier, clientY } as unknown as Touch)
+  const lists = (y: number, resting?: number) => ({
+    touches: resting === undefined
+      ? [point(TOUCH_ID, y)]
+      // The thumb FIRST, which is where the browser puts the older touch — and is what makes
+      // `touches[0]` the wrong thing for a handler to read.
+      : [point(RESTING_ID, resting), point(TOUCH_ID, y)],
+    changedTouches: [point(TOUCH_ID, y)],
+    bubbles: true,
+  })
+  const touchStart = (y: number, resting?: number) =>
+    el.dispatchEvent(new TouchEvent('touchstart', lists(y, resting)))
+  const touchMoveTo = (y: number, resting?: number) =>
+    el.dispatchEvent(new TouchEvent('touchmove', lists(y, resting)))
+  const touchEnd = () =>
+    el.dispatchEvent(new TouchEvent('touchend', { touches: [], changedTouches: [point(TOUCH_ID, 0)], bubbles: true }))
+  /** The browser claiming the gesture for itself — pull-to-refresh, a back swipe. */
+  const touchCancel = () =>
+    el.dispatchEvent(new TouchEvent('touchcancel', { touches: [], changedTouches: [point(TOUCH_ID, 0)], bubbles: true }))
   return {
     top: box.top,
     height: box.height,
@@ -137,6 +171,57 @@ function liveScrollBox(el: HTMLElement, clientHeight: number) {
      *  prepend anchor's, and the autoscroll's. Exposed so a test can assert the fixture
      *  really is re-entrant rather than assuming it. */
     events: () => events,
+
+    /**
+     * tether#112 — the gesture at an end, which is the case `scroll` cannot express.
+     *
+     * `scrollTop` is deliberately NOT touched by either of these. That is not a shortcut: it
+     * is the scenario. At an end the browser has already clamped the position, so pulling
+     * further moves nothing, fires no `scroll`, and the only trace the gesture leaves is the
+     * `wheel` / `touchmove` event itself. A fixture that moved the box would be testing the
+     * path that already worked.
+     *
+     * `deltaY > 0` is toward the bottom, matching the platform's own sign. `deltaMode`
+     * defaults to 0 (measured, not assumed — jsdom 29.1.1's WheelEvent), which is irrelevant
+     * to the pane: it reads only the sign.
+     */
+    wheel: (deltaY: number) => el.dispatchEvent(new WheelEvent('wheel', { deltaY, bubbles: true })),
+
+    /**
+     * A touch gesture, in the three parts a real one has — because whether a defect exists at
+     * all depends on where the gesture BOUNDARIES are. A fixture that restarts the gesture
+     * before every move (which is what this used to do) cannot express "the finger is still
+     * down", and that is precisely where the burst lived that review found.
+     *
+     * The touch points are plain objects rather than `Touch` instances because this jsdom has
+     * no `Touch` interface at all (`typeof Touch === 'undefined'`, measured) while its
+     * `TouchEvent` constructor accepts and re-exposes whatever it is handed — `identifier`,
+     * `clientY`, `touches` and `changedTouches` all round-trip (measured). Using the real
+     * constructor rather than a hand-decorated `Event` keeps `instanceof`/`type` honest at the
+     * one hop that matters.
+     *
+     * `resting` puts a SECOND finger on the glass that never moves — a thumb holding the
+     * phone — and puts it FIRST in `touches`, which is where the browser puts it and which is
+     * what makes `touches[0]` the wrong thing to read.
+     */
+    touchStart,
+    touchMoveTo,
+    touchEnd,
+    touchCancel,
+    /**
+     * One COMPLETE gesture: finger down, a single pull of `dy`, finger up. Convenience for
+     * the cases that are genuinely about one gesture. Anything about what happens WHILE the
+     * finger stays down must use the three parts, or the assertion is about a fixture that
+     * silently starts a new gesture per move.
+     */
+    touchPull: (dy: number, from = 400) => {
+      touchStart(from)
+      touchMoveTo(from - dy)
+      touchEnd()
+    },
+    /** How many wheel / touchmove events this element has actually delivered to a listener. */
+    wheels: () => wheels,
+    touchMoves: () => touchMoves,
   }
 }
 
@@ -2434,5 +2519,681 @@ describe('loading a transcript by scrolling to its ends (tether#110)', () => {
     expect(countEarlierPages()).toBe(1)
     expect([...container.querySelectorAll('.msg-user-bubble')].map(e => e.textContent))
       .toEqual(['older-0', 'older-1', 'recent-0', 'recent-1'])
+  })
+
+  // ── 5. tether#112 — pulling further at an end that cannot move ─────────────
+  //
+  // What the owner reported minutes after tether#110 shipped: "拉到底之后继续往下拉就拉不动
+  // 了，必须先往上拉一点、再往下拉，才会显示三个点加载" — at the bottom, pulling further does
+  // nothing; you have to scroll up a little and back down.
+  //
+  // Two stacked causes, and the FIRST is the one that makes every guard irrelevant: at an end
+  // `scrollTop` is clamped, so pulling further changes no position and the browser fires no
+  // `scroll` event whatsoever. The handler is not called, so its latch, its floor and its
+  // in-flight ref are never even consulted. (The second cause is the latch, which would have
+  // refused anyway — the bottom is where the pane parks the reader, so it is never armed
+  // there.) Every design that keys off `scroll` alone is dead in that state regardless of how
+  // its guards are tuned, which is why this is a new listener rather than a tuning.
+  //
+  // These cases therefore assert the MECHANISM as well as the outcome: that the gesture
+  // produced no scroll event (`box.events()` flat) and moved nothing (`box.top()` flat), while
+  // the request happened anyway.
+  describe('pulling further at an end (tether#112)', () => {
+    it('re-reads the newest page for a reader PARKED at the bottom who pulls further down', async () => {
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      // Arrive at the bottom the way a reader does, and let that arrival have its one load.
+      // This is what leaves the pane in the reported state: the latch spent, and the reader
+      // standing where the autoscroll parks them.
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      const getsBefore = countNewestGets()
+      // Exact, not `> 0`: the mount's own load plus the arrival's re-read, deterministically.
+      expect(getsBefore).toBe(2)
+      // …and standing exactly AT the end, which is the position the whole wi is about:
+      // 1000 - 700 - 300 = 0. Measured, not assumed — that arrival's re-read handed back a
+      // page identical to the one on screen, so nothing was appended and the `nearBottom`
+      // autoscroll had no commit to follow. (When it does append, it moves the reader to
+      // scrollHeight and fires one scroll event; the touch case below pins that.)
+      expect(box.top()).toBe(700)
+      const el0 = container.querySelector('.dt-chat') as HTMLElement
+      expect(el0.scrollHeight - box.top() - 300).toBe(0)
+
+      pastFloor()
+      pages[MESSAGES_URL] = { entries: [...turns('recent', 10, 500), entry('assistant', 'brand new', 9000)] }
+
+      // The PRECONDITION, and tether#110's property that must not weaken: a further scroll
+      // event at this position asks for nothing. The latch is doing that, and it stays.
+      await act(async () => { box.fire() })
+      await settle()
+      expect(countNewestGets()).toBe(getsBefore)
+      expect(screen.queryByText('brand new')).toBeNull()
+
+      let release = () => {}
+      gates[`GET ${MESSAGES_URL}`] = new Promise<void>(r => { release = r })
+      const wheelsBefore = box.wheels()
+      const eventsBefore = box.events()
+      await act(async () => { box.wheel(120) })
+
+      // The fixture really delivered the gesture — without this the assertion below could be
+      // satisfied by a dispatch that reached nothing…
+      expect(box.wheels()).toBe(wheelsBefore + 1)
+      // …the position did not move and NO scroll event was produced, which is the defect's
+      // mechanism stated as an assertion rather than as prose…
+      expect(box.top()).toBe(700)
+      expect(box.events()).toBe(eventsBefore)
+      // …and the request went out anyway, with the dots to say so.
+      expect(countNewestGets()).toBe(getsBefore + 1)
+      expect(container.querySelectorAll('.transcript-bottom .transcript-dots')).toHaveLength(1)
+
+      await act(async () => { release(); await Promise.resolve() })
+      await settle()
+      expect(screen.getByText('brand new')).toBeTruthy()
+      expect(countNewestGets()).toBe(getsBefore + 1)
+      expect(container.querySelectorAll('.transcript-bottom')).toHaveLength(0)
+    })
+
+    it('does the same for a touch pull, where there is no wheel to listen to', async () => {
+      // The half of the fix that reaches the reader who reported it. A phone has no wheel
+      // event at all, so a wheel-only fix would be green here and dead in the owner's hand.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      const getsBefore = countNewestGets()
+
+      pastFloor()
+      pages[MESSAGES_URL] = { entries: [...turns('recent', 10, 500), entry('assistant', 'brand new', 9000)] }
+
+      const movesBefore = box.touchMoves()
+      const eventsBefore = box.events()
+      await act(async () => { box.touchPull(60) })
+      await settle()
+
+      expect(box.touchMoves()).toBe(movesBefore + 1)
+      expect(box.events()).toBe(eventsBefore + 1) // the autoscroll after the append, nothing else
+      expect(countNewestGets()).toBe(getsBefore + 1)
+      expect(screen.getByText('brand new')).toBeTruthy()
+    })
+
+    it('ignores a resting finger, and acts on a pull that clears the threshold', async () => {
+      // `touchmove` fires for a finger sitting on the glass, and a resting finger jitters. The
+      // pair is what makes this discriminate: without the second half, "no request" would also
+      // be what a pane with no touch listener at all reports.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      const getsBefore = countNewestGets()
+
+      pastFloor()
+      await act(async () => { box.touchPull(TRANSCRIPT_OVERSCROLL_TOUCH_PX) })
+      await settle()
+      expect(box.touchMoves()).toBe(1)
+      expect(countNewestGets()).toBe(getsBefore)
+
+      await act(async () => { box.touchPull(TRANSCRIPT_OVERSCROLL_TOUCH_PX + 1) })
+      await settle()
+      expect(countNewestGets()).toBe(getsBefore + 1)
+    })
+
+    it('asks ONCE per touch gesture, however long the finger stays on the glass', async () => {
+      // The defect deep review found in the first cut of this fix, and it is the same shape as
+      // the loop tether#110's latch exists to stop — reintroduced on the path that drops the
+      // latch. The touch floor measures travel since `touchstart` and the anchor never moves,
+      // so once a gesture has travelled 8px EVERY later move in it clears the floor, jitter
+      // included. With only the 500ms interval floor left, a thumb resting at the bottom after
+      // completing the very gesture this wi adds asked for the whole newest page twice a
+      // second, indefinitely — a megabyte on the wire and an unbounded read on the daemon each
+      // time.
+      //
+      // Expressible only because the fixture now has gesture BOUNDARIES: the old `touchPull`
+      // dispatched a fresh `touchstart` before every move, so every case was a new gesture and
+      // this state could not be reached.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      const gets = countNewestGets()
+
+      pastFloor()
+      // One gesture: down at 700, a real pull up to 100 — that asks, correctly…
+      await act(async () => { box.touchStart(700) })
+      await act(async () => { box.touchMoveTo(100) })
+      await settle()
+      expect(countNewestGets()).toBe(gets + 1)
+
+      // …and then the finger just sits there, jittering, for three floors' worth of time.
+      for (const y of [100.3, 99.8, 100.1]) {
+        pastFloor()
+        await act(async () => { box.touchMoveTo(y) })
+        await settle()
+      }
+      expect(box.touchMoves()).toBe(4)
+      expect(countNewestGets()).toBe(gets + 1)
+
+      // The CONTROL: lifting the finger and pulling again is a NEW gesture, and it asks.
+      await act(async () => { box.touchEnd() })
+      pastFloor()
+      await act(async () => { box.touchPull(60) })
+      await settle()
+      expect(countNewestGets()).toBe(gets + 2)
+    })
+
+    it('accumulates a SLOW pull, whose every single move is below the floor', async () => {
+      // The property the anchor exists for, and the other half of the tension the case above
+      // creates: measuring from the previous move instead of from the gesture's start would
+      // also stop that burst, and would silently throw this away. A deliberate slow drag
+      // arrives as many small moves, none of which clears 8px on its own.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      const gets = countNewestGets()
+
+      pastFloor()
+      await act(async () => { box.touchStart(700) })
+      // Six moves of 3px each: no single move clears the 8px floor, the cumulative pull does.
+      for (const y of [697, 694, 691, 688, 685, 682]) {
+        await act(async () => { box.touchMoveTo(y) })
+      }
+      await settle()
+      expect(box.touchMoves()).toBe(6)
+      expect(countNewestGets()).toBe(gets + 1)
+    })
+
+    it('follows the finger that is MOVING, not whichever one is listed first', async () => {
+      // A thumb holding the phone is a second touch that never moves, and the browser lists
+      // the older touch first — so `touches[0]` is the thumb and reading it makes this whole
+      // fix inert for a two-handed reader. `changedTouches` matched on `identifier` is the
+      // finger the event is actually about. Measured in jsdom: with a resting point at 500 and
+      // a moving one at 120, `touches[0].clientY` is 500 while `changedTouches[0].clientY` is
+      // 120.
+      //
+      // The GEOMETRY is what makes this discriminate, and the first version of this case got
+      // it wrong: with the thumb ABOVE the gesture's start, `start − thumb` is positive and a
+      // handler reading the thumb loads anyway, for a reason unrelated to the pull. The thumb
+      // is therefore BELOW the start (clientY 500 vs 300), so the wrong reading is −200 while
+      // the real pull is +200. A mutant reading `touches[0]` was still alive until this.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      const gets = countNewestGets()
+
+      pastFloor()
+      await act(async () => { box.touchStart(300, 500) })
+      await act(async () => { box.touchMoveTo(100, 500) })
+      await settle()
+      expect(box.touchMoves()).toBe(1)
+      expect(countNewestGets()).toBe(gets + 1)
+    })
+
+    it('drops a gesture the browser took away, and keeps one it did not', async () => {
+      // `touchcancel` is how the browser says "this touch is mine now" — Chrome's
+      // pull-to-refresh and back-swipe both do it — and after that, whatever else arrives in
+      // the sequence is not the reader pulling on this pane. Paired with the control so the
+      // assertion is about the cancel rather than about touch being broken.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      const gets = countNewestGets()
+
+      pastFloor()
+      await act(async () => { box.touchStart(700) })
+      await act(async () => { box.touchCancel() })
+      await act(async () => { box.touchMoveTo(100) })
+      await settle()
+      expect(box.touchMoves()).toBe(1)
+      expect(countNewestGets()).toBe(gets)
+
+      // The CONTROL: the identical pull without the cancel asks.
+      await act(async () => { box.touchStart(700) })
+      await act(async () => { box.touchMoveTo(100) })
+      await settle()
+      expect(countNewestGets()).toBe(gets + 1)
+    })
+
+    it('spends the TOP latch on a gesture load too, not only the bottom one', async () => {
+      // The symmetric half of the latch case below. Review found both `…ArmedRef = false`
+      // lines surviving as mutants; a bottom-only test leaves the top one alive.
+      const sameFive = turns('recent', 5, 500)
+      pages[MESSAGES_URL] = { entries: sameFive, earlier: 4096 }
+      pages[`${MESSAGES_URL}?before=4096`] = { entries: sameFive, earlier: 2048 }
+      pages[`${MESSAGES_URL}?before=2048`] = { entries: sameFive, earlier: 1024 }
+      pages[`${MESSAGES_URL}?before=1024`] = { entries: sameFive, earlier: 512 }
+      const container = await renderIdle()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(200) })
+      await settle()
+      await act(async () => { box.scrollTo(0) })
+      await settle()
+      expect(countEarlierPages()).toBe(1)
+
+      // Re-arm and return INSIDE the floor, so the arrival is refused and the latch stays set.
+      await act(async () => { box.scrollTo(200) })
+      await settle()
+      await act(async () => { box.scrollTo(0) })
+      await settle()
+      expect(countEarlierPages()).toBe(1)
+
+      pastFloor()
+      await act(async () => { box.wheel(-120) })
+      await settle()
+      expect(countEarlierPages()).toBe(2)
+
+      // The latch the gesture consumed.
+      pastFloor()
+      await act(async () => { box.fire() })
+      await settle()
+      expect(countEarlierPages()).toBe(2)
+      expect(countReq(`GET ${MESSAGES_URL}?before=1024`)).toBe(0)
+    })
+
+    it('spends the latch on a gesture load, so a later scroll event cannot ask again', async () => {
+      // The two `…ArmedRef.current = false` lines, which review found to be surviving mutants:
+      // the comment claims they matter and nothing tested it. Reachable because a gesture can
+      // fire while the latch is SET — arrive at the bottom, be refused by the floor (so the
+      // latch stays armed), then pull. If the gesture did not spend it, the next bare scroll
+      // event at the same clamped position would load a second time.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      const gets = countNewestGets()
+
+      // Re-arm and come back INSIDE the floor: the arrival is refused, so the latch stays set.
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      expect(countNewestGets()).toBe(gets)
+
+      pastFloor()
+      await act(async () => { box.wheel(120) })
+      await settle()
+      expect(countNewestGets()).toBe(gets + 1)
+
+      // The latch the gesture consumed: a plain scroll event at the same position, a floor
+      // later, must find nothing left to spend.
+      pastFloor()
+      await act(async () => { box.fire() })
+      await settle()
+      expect(countNewestGets()).toBe(gets + 1)
+    })
+
+    it('loads the earlier page for a reader parked at the TOP who pulls further up', async () => {
+      // The same defect at the other end, and the wi named it as such: the top only escaped
+      // notice because you normally ARRIVE there by scrolling, which does move the box. Once
+      // parked, pulling further up was equally dead.
+      //
+      // The construction that leaves a reader parked at the top: an earlier page every record
+      // of which is already on screen, so `prependHistory` drops the lot, the anchor
+      // correction is zero, and `scrollTop` stays at 0 while the daemon still offers a cursor.
+      const sameFive = turns('recent', 5, 500)
+      pages[MESSAGES_URL] = { entries: sameFive, earlier: 4096 }
+      pages[`${MESSAGES_URL}?before=4096`] = { entries: sameFive, earlier: 2048 }
+      pages[`${MESSAGES_URL}?before=2048`] = { entries: turns('older', 3, 100), earlier: 1024 }
+      const container = await renderIdle()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(200) })
+      await settle()
+      await act(async () => { box.scrollTo(0) })
+      await settle()
+      expect(countEarlierPages()).toBe(1)
+      // Parked at the top, latch spent, and the pane still believes there is more.
+      expect(box.top()).toBe(0)
+      expect(box.height()).toBe(500)
+      expect(useStore.getState().transcriptEarlier).toBe(2048)
+
+      pastFloor()
+      await act(async () => { box.fire() })
+      await settle()
+      expect(countEarlierPages()).toBe(1)
+
+      const wheelsBefore = box.wheels()
+      await act(async () => { box.wheel(-120) })
+      await settle()
+
+      expect(box.wheels()).toBe(wheelsBefore + 1)
+      expect(countEarlierPages()).toBe(2)
+      expect(countReq(`GET ${MESSAGES_URL}?before=2048`)).toBe(1)
+      expect([...container.querySelectorAll('.msg-user-bubble')].map(e => e.textContent))
+        .toEqual(['older-0', 'older-1', 'older-2', 'recent-0', 'recent-1', 'recent-2', 'recent-3', 'recent-4'])
+    })
+
+    it('ignores a gesture pushing AWAY from the end the reader is standing at', async () => {
+      // The sign is what separates the two ends, and it has to be read: a transcript short
+      // enough not to overfill the viewport reads as being at BOTH ends at once, and this pane
+      // is at the bottom of a held session with an earlier page available, so a direction-blind
+      // handler would fire the wrong end — or both. Pushing away from an end is also the
+      // ordinary case that MOVES the box, so it belongs to the scroll path entirely.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500), earlier: 4096 }
+      pages[`${MESSAGES_URL}?before=4096`] = { entries: turns('older', 5, 100), earlier: 2048 }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      const getsBefore = countNewestGets()
+      const pagesBefore = countEarlierPages()
+
+      // At the bottom, pulling UP: the browser will scroll, so there is nothing for this path
+      // to do — and in particular it must not read "at the bottom" and refetch.
+      pastFloor()
+      await act(async () => { box.wheel(-120) })
+      await settle()
+      expect(box.wheels()).toBe(1)
+      expect(countNewestGets()).toBe(getsBefore)
+      // …and it did not fire the TOP either: the reader is 700px from it.
+      expect(countEarlierPages()).toBe(pagesBefore)
+
+      // The CONTROL, so the two counts above are known to discriminate.
+      pastFloor()
+      await act(async () => { box.wheel(120) })
+      await settle()
+      expect(countNewestGets()).toBe(getsBefore + 1)
+    })
+
+    it('stays out of the region the latch governs: near an end is not AT it', async () => {
+      // The bound that makes this a second entry rather than a bypass, expressed behaviourally
+      // rather than only as a constant. 30px from the bottom is inside TRANSCRIPT_EDGE_PX but
+      // the box can still MOVE, so a real wheel there scrolls, fires a `scroll`, and the latch
+      // is the right authority over whether that arrival loads. Widening the slack towards the
+      // arrival threshold would let this path fire where the latch is meaningful — which is
+      // exactly the loop tether#110 bounded.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(670) })   // 1000 - 670 - 300 = 30: near, not at
+      await settle()
+      const gets = countNewestGets()
+
+      pastFloor()
+      await act(async () => { box.wheel(120) })
+      await settle()
+      expect(box.wheels()).toBe(1)
+      expect(countNewestGets()).toBe(gets)
+
+      // The CONTROL: the same gesture 30px further on, where the box really is clamped.
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      const gets2 = countNewestGets()
+      pastFloor()
+      await act(async () => { box.wheel(120) })
+      await settle()
+      expect(countNewestGets()).toBe(gets2 + 1)
+    })
+
+    it('answers a wheel of any magnitude, because its unit is not pixels', async () => {
+      // A fine trackpad scroll reports `deltaY` around 1, and `deltaMode` can make the number
+      // a line or page count rather than a pixel count at all. Applying the TOUCH floor to a
+      // wheel would therefore throw away the gentlest half of desktop scrolling while passing
+      // every other test in this file, all of which spin a fat 120.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      const gets = countNewestGets()
+
+      pastFloor()
+      await act(async () => { box.wheel(1) })
+      await settle()
+      expect(countNewestGets()).toBe(gets + 1)
+    })
+
+    it('shares the interval floor with the scroll path, so a gesture cannot double an arrival', async () => {
+      // Why the gesture stamps the SAME `…FiredAt` ref rather than getting its own budget. A
+      // touch drag delivers `touchmove` and `scroll` interleaved, so an arrival and a pull land
+      // in the same moment routinely; two budgets would make that two megabyte reads.
+      //
+      // The arrival is allowed to SETTLE first, which is the separation tether#110's own
+      // battery had to learn: with the request still in flight the shared in-flight ref would
+      // be the thing refusing and this would be measuring that guard instead. `settle()` costs
+      // no simulated time (the clock is a frozen spy), so after it `inFlight` is false and
+      // `sinceLastMs` is 0 — the floor is the only thing left that can refuse.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      const gets = countNewestGets()
+
+      await act(async () => { box.wheel(120) })
+      await settle()
+      expect(box.wheels()).toBe(1)
+      expect(countNewestGets()).toBe(gets)
+
+      // The CONTROL: one floor later the same gesture is answered.
+      pastFloor()
+      await act(async () => { box.wheel(120) })
+      await settle()
+      expect(countNewestGets()).toBe(gets + 1)
+    })
+
+    it('stamps the floor ITSELF, so a second pull is not free after a first', async () => {
+      // The gap the mutation battery found in the case above, and it is tether#110's own
+      // lesson recurring: that test separates an ARRIVAL from a pull, so the stamp being
+      // measured is the arrival's. Deleting the gesture path's own stamp left it green.
+      // Two GESTURES in a row is the only shape that can see it — and the first is allowed
+      // to settle, so the shared in-flight ref is not the thing refusing the second either.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      const gets = countNewestGets()
+
+      pastFloor()
+      await act(async () => { box.wheel(120) })
+      await settle()
+      expect(countNewestGets()).toBe(gets + 1)
+
+      // No pastFloor: the clock has not moved since the pull above, so the ONLY thing that
+      // can refuse this one is the stamp that pull left behind.
+      await act(async () => { box.wheel(120) })
+      await settle()
+      expect(box.wheels()).toBe(2)
+      expect(countNewestGets()).toBe(gets + 1)
+
+      // The CONTROL: one floor later it is answered, so "1" is not simply a pane that has
+      // stopped responding to gestures.
+      pastFloor()
+      await act(async () => { box.wheel(120) })
+      await settle()
+      expect(countNewestGets()).toBe(gets + 2)
+    })
+
+    it('does not spend the floor on a gesture the in-flight ref refused', async () => {
+      // What the DECISION-SITE in-flight check buys over `refreshNewest`'s own duplicate one,
+      // which tether#110 documented as an accepted mutation survivor and which — measured
+      // here — is what silently absorbs the loss if this one is deleted. The request count is
+      // identical either way; what differs is whether a refused gesture burns the 500ms
+      // budget belonging to the gesture that comes after it.
+      //
+      // The construction: hold a request open at the OTHER end (the fallback button starts
+      // one from any scroll position, which is what makes this reachable while the reader
+      // stands at the bottom), pull at the bottom, then release and pull again with the clock
+      // untouched. Correctly, the refused pull left no trace and the second one is answered.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500), earlier: 4096 }
+      pages[`${MESSAGES_URL}?before=4096`] = { entries: turns('older', 5, 100), earlier: 2048 }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      const gets = countNewestGets()
+      pastFloor()
+
+      let release = () => {}
+      gates[`GET ${MESSAGES_URL}?before=4096`] = new Promise<void>(r => { release = r })
+      await act(async () => { (container.querySelector('.transcript-more') as HTMLButtonElement).click() })
+      await settle()
+      expect(countEarlierPages()).toBe(1)
+
+      await act(async () => { box.wheel(120) })
+      await settle()
+      expect(box.wheels()).toBe(1)
+      expect(countNewestGets()).toBe(gets)
+
+      await act(async () => { release(); await Promise.resolve() })
+      await settle()
+      // The anchor correction kept the reader on the same message, which is still the end:
+      // 1500 - 1200 - 300 = 0. Asserted because the pull below depends on it.
+      expect(box.top()).toBe(1200)
+      expect(box.height()).toBe(1500)
+
+      // Clock untouched since the refused pull. If that pull had stamped the floor, this one
+      // would be inside it.
+      await act(async () => { box.wheel(120) })
+      await settle()
+      expect(countNewestGets()).toBe(gets + 1)
+    })
+
+    it('holds one request at a time however long the wheel spins', async () => {
+      // The bound that replaces the latch on this path, and the one that matters: a continuous
+      // trackpad flick is ~60 wheel events a second. The floor is stepped PAST between every
+      // one of them, so the floor cannot be what is refusing — this isolates the shared
+      // in-flight ref.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      const gets = countNewestGets()
+
+      let release = () => {}
+      gates[`GET ${MESSAGES_URL}`] = new Promise<void>(r => { release = r })
+      pastFloor()
+      await act(async () => { box.wheel(120) })
+      await settle()
+      expect(countNewestGets()).toBe(gets + 1)
+
+      for (let i = 0; i < 6; i++) {
+        pastFloor()
+        await act(async () => { box.wheel(120) })
+        await settle()
+      }
+      expect(box.wheels()).toBe(7)
+      expect(countNewestGets()).toBe(gets + 1)
+
+      // The CONTROL: once it settles, the next spin is answered.
+      await act(async () => { release(); await Promise.resolve() })
+      await settle()
+      pastFloor()
+      await act(async () => { box.wheel(120) })
+      await settle()
+      expect(countNewestGets()).toBe(gets + 2)
+    })
+
+    it('pulls at NO ceiling: not at a complete top, and not in a session with a live stream', async () => {
+      // The judgement this lane keeps re-making, now reachable from a second direction. The
+      // gesture skips the latch, so `available` is the ONLY thing standing between a pull and
+      // three dots over a place nothing can arrive.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }   // no cursor: complete
+      const container = await renderIdle()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+      expect(useStore.getState().transcriptEarlier).toBeNull()
+      const getsBefore = countNewestGets()
+
+      // At the top of a complete transcript, pulling up.
+      pastFloor()
+      await act(async () => { box.wheel(-120) })
+      await settle()
+      expect(box.wheels()).toBe(1)
+      expect(countEarlierPages()).toBe(0)
+      expect(container.querySelectorAll('.transcript-dots')).toHaveLength(0)
+      expect(container.querySelector('.transcript-top .transcript-top-note')?.textContent)
+        .toBe(TRANSCRIPT_START_COMPLETE)
+
+      // At the bottom of a session that is NOT being read without a stream: the poll this
+      // pre-empts does not exist there, and `refreshTranscript` has no `!streaming` guard.
+      pastFloor()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      await act(async () => { box.wheel(120) })
+      await settle()
+      expect(box.wheels()).toBe(2)
+      expect(countNewestGets()).toBe(getsBefore)
+      expect(container.querySelectorAll('.transcript-bottom')).toHaveLength(0)
+    })
+
+    it('works on a transcript too short to scroll at all, which no scroll event can reach', async () => {
+      // A property this path adds rather than restores. 200px of content in a 300px viewport
+      // produces no scroll event ever — which is why the fallback button had to stay for the
+      // top end — and a gesture is delivered regardless of whether anything can move.
+      pages[MESSAGES_URL] = { entries: turns('recent', 2, 500) }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+      expect(box.height()).toBe(200)
+      // The precondition: this box cannot scroll, so `scroll` is not merely quiet here, it is
+      // impossible.
+      await act(async () => { box.fire() })
+      await settle()
+      const getsBefore = countNewestGets()
+
+      pastFloor()
+      pages[MESSAGES_URL] = { entries: [...turns('recent', 2, 500), entry('assistant', 'brand new', 9000)] }
+      await act(async () => { box.wheel(120) })
+      await settle()
+
+      expect(countNewestGets()).toBe(getsBefore + 1)
+      expect(screen.getByText('brand new')).toBeTruthy()
+    })
   })
 })

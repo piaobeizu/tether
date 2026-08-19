@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, fmtTokens, summarizeToolInput, summarizeToolResult, truncateResult, shouldSendOnEnter, growHeight, parseAtQuery, fuzzyRankFiles, shouldDeferFirstConnect, shouldReconnectAfterClose, shouldRefundAttemptBudget, transcriptTextLength, transcriptEdgeAction, TRANSCRIPT_EDGE_MIN_INTERVAL_MS, TRANSCRIPT_EDGE_PX, FATAL_CODE_MESSAGES, heldActivityLine, trailingArrivals, HELD_ACTIVITY_WORKING, HELD_ACTIVITY_IDLE, HELD_ACTIVITY_UNKNOWN, HELD_ACTIVITY_GONE } from './index'
+import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, fmtTokens, summarizeToolInput, summarizeToolResult, truncateResult, shouldSendOnEnter, growHeight, parseAtQuery, fuzzyRankFiles, shouldDeferFirstConnect, shouldReconnectAfterClose, shouldRefundAttemptBudget, transcriptTextLength, transcriptEdgeAction, TRANSCRIPT_EDGE_MIN_INTERVAL_MS, TRANSCRIPT_EDGE_PX, transcriptOverscrolled, TRANSCRIPT_OVERSCROLL_SLACK_PX, TRANSCRIPT_OVERSCROLL_TOUCH_PX, FATAL_CODE_MESSAGES, heldActivityLine, trailingArrivals, HELD_ACTIVITY_WORKING, HELD_ACTIVITY_IDLE, HELD_ACTIVITY_UNKNOWN, HELD_ACTIVITY_GONE } from './index'
 import { SESSION_ACTIVITY_HELD, SESSION_ACTIVITY_IDLE, SESSION_ACTIVITY_WORKING } from '../../lib/sessionActivity'
 import { PermissionQueue, postDecide } from '../../fenced-blocks/PermissionBlock'
 import {
@@ -951,5 +951,83 @@ describe('transcriptEdgeAction (tether#110)', () => {
     // floor has to stay well above one frame to be worth anything.
     expect(TRANSCRIPT_EDGE_PX).toBe(48)
     expect(TRANSCRIPT_EDGE_MIN_INTERVAL_MS).toBe(500)
+  })
+})
+
+describe('transcriptOverscrolled (tether#112)', () => {
+  // Pulling further into an end that is already clamped — the gesture the `scroll` event
+  // cannot report, because a clamped position does not change and an unchanged position
+  // fires nothing. The base case is a wheel notch downward at the bottom; every test below
+  // flips ONE field.
+  const pull = { toward: 120, distance: 0, minToward: 0 }
+
+  it('is true for a push further into an end the scroll cannot leave', () => {
+    expect(transcriptOverscrolled(pull)).toBe(true)
+  })
+
+  it('is false for a push in the OTHER direction, whatever the position', () => {
+    // The sign is the only thing separating the two ends, and both of them read as "at the
+    // end" simultaneously on any transcript that does not overfill the viewport. A
+    // direction-blind version would fire the wrong end there — or both.
+    expect(transcriptOverscrolled({ ...pull, toward: -120 })).toBe(false)
+    expect(transcriptOverscrolled({ ...pull, toward: -120, distance: -300 })).toBe(false)
+  })
+
+  it('is false for a gesture that moved nothing', () => {
+    // `toward: 0` is a wheel event with a horizontal-only delta, and a touchmove that has
+    // not yet travelled. Neither is a pull.
+    expect(transcriptOverscrolled({ ...pull, toward: 0 })).toBe(false)
+  })
+
+  it('treats the slack as inclusive and one px past it as scrollable', () => {
+    // Both sides, exactly. The slack exists because `scrollTop` is fractional while
+    // `scrollHeight` and `clientHeight` are not, so a real end reads as 0.5 rather than 0 on
+    // a fractional device pixel ratio. `=== 0` would be dead on those devices.
+    expect(transcriptOverscrolled({ ...pull, distance: TRANSCRIPT_OVERSCROLL_SLACK_PX })).toBe(true)
+    expect(transcriptOverscrolled({ ...pull, distance: 0.5 })).toBe(true)
+    expect(transcriptOverscrolled({ ...pull, distance: TRANSCRIPT_OVERSCROLL_SLACK_PX + 1 })).toBe(false)
+  })
+
+  it('is true PAST the end, which is where a rubber-band release leaves a reader', () => {
+    // The autoscroll writes `scrollTop = scrollHeight`, so the bottom distance goes negative
+    // in this repo's geometry, and iOS bounces past an end on touch.
+    expect(transcriptOverscrolled({ ...pull, distance: -300 })).toBe(true)
+  })
+
+  it('applies the caller\'s minimum, so a resting finger is not a pull', () => {
+    // Both sides of the touch floor, and the wheel's absence of one. `touchmove` fires for a
+    // finger sitting still, whose jitter is sub-pixel; a wheel's magnitude is in whatever
+    // unit `deltaMode` names, so a pixel budget could not be applied to it honestly.
+    const touch = { ...pull, minToward: TRANSCRIPT_OVERSCROLL_TOUCH_PX }
+    expect(transcriptOverscrolled({ ...touch, toward: TRANSCRIPT_OVERSCROLL_TOUCH_PX })).toBe(false)
+    expect(transcriptOverscrolled({ ...touch, toward: TRANSCRIPT_OVERSCROLL_TOUCH_PX + 1 })).toBe(true)
+    expect(transcriptOverscrolled({ ...pull, toward: 0.5 })).toBe(true)
+  })
+
+  it('stays far inside the arrival threshold, which is what keeps it out of the latch\'s region', () => {
+    // The bound that makes this a SECOND entry rather than a bypass. Anywhere further from an
+    // end than this slack, the browser can still scroll, so it fires a real `scroll` event and
+    // transcriptEdgeAction's latch is the right authority over whether that arrival loads. A
+    // slack near TRANSCRIPT_EDGE_PX would let this path fire where the latch is meaningful.
+    expect(TRANSCRIPT_OVERSCROLL_SLACK_PX).toBe(2)
+    expect(TRANSCRIPT_OVERSCROLL_TOUCH_PX).toBe(8)
+    expect(TRANSCRIPT_OVERSCROLL_SLACK_PX).toBeLessThan(TRANSCRIPT_EDGE_PX)
+  })
+
+  it('can only ever produce load-or-nothing when its answer is fed to transcriptEdgeAction', () => {
+    // The composition the pane relies on, pinned here rather than left to the reader of two
+    // files. The gesture path passes `armed: true` — see transcriptOverscrolled's header for
+    // why a wheel/touchmove is entitled to claim it and a scroll event is not — and passes the
+    // real distance. Since a `true` from transcriptOverscrolled bounds that distance at the
+    // slack, and the slack is far below the arrival threshold, the `'arm'` branch is
+    // unreachable from this path: the only outcomes are 'load' and 'idle'.
+    const armedAtSlack = {
+      distance: TRANSCRIPT_OVERSCROLL_SLACK_PX, armed: true, available: true, inFlight: false,
+      sinceLastMs: TRANSCRIPT_EDGE_MIN_INTERVAL_MS,
+    }
+    expect(transcriptEdgeAction(armedAtSlack)).toBe('load')
+    expect(transcriptEdgeAction({ ...armedAtSlack, available: false })).toBe('idle')
+    expect(transcriptEdgeAction({ ...armedAtSlack, inFlight: true })).toBe('idle')
+    expect(transcriptEdgeAction({ ...armedAtSlack, sinceLastMs: 0 })).toBe('idle')
   })
 })

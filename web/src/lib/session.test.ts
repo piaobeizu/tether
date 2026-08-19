@@ -217,7 +217,10 @@ describe('openSession (tether#61)', () => {
     openSession('a/b?c')
     await settle()
 
-    expect(fetchMock).toHaveBeenCalledWith('/api/v1/sessions/a%2Fb%3Fc/messages')
+    // The trailing `undefined` is authedFetch forwarding an absent init (tether#106
+    // routed this through it so an expired cookie redirects instead of looping); the
+    // url is what this test is about.
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/sessions/a%2Fb%3Fc/messages', undefined)
   })
 
   it('is a no-op for an empty sid — no clear, no switch, no reconnect', async () => {
@@ -349,5 +352,37 @@ describe('refreshTranscript (tether#106)', () => {
     const fetchMock = mockVersionedMessages([], 100)
     await refreshTranscript('')
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('joins a load already in flight for the same session instead of racing it', async () => {
+    // Three callers now share one sid — the watcher's reload, the click on the open row
+    // and "Check again" — where before tether#106 the only caller was a switch and two
+    // in-flight loads were for different sids by construction. Two overlapping loads can
+    // settle in either order, so the older one could land last and take
+    // noteTranscriptVersion with it, leaving the recorded version describing neither
+    // what is on screen nor what the daemon has.
+    let release!: () => void
+    const gate = new Promise<void>(r => { release = r })
+    const headers = new Headers()
+    headers.set(TRANSCRIPT_UPDATED_AT_HEADER, '500')
+    const fetchMock = vi.fn(async () => {
+      await gate
+      return { ok: true, status: 200, headers, json: async () => [{ role: 'user', text: 'once', ts: 1 }] }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    useStore.setState({ sessionId: 'sid-a', messages: [] })
+
+    const a = refreshTranscript('sid-a')
+    const b = refreshTranscript('sid-a')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    release()
+    await Promise.all([a, b])
+    expect(useStore.getState().messages.map(m => m.text)).toEqual(['once'])
+    expect(transcriptWatchState().version).toBe(500)
+
+    // And the slot is released, so the NEXT click really does re-read.
+    await refreshTranscript('sid-a')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 })

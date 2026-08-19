@@ -21,7 +21,8 @@
  * session that prompted tether#104 was 103,388,175 bytes. A three-second poll of
  * GET /messages is therefore up to a megabyte on the wire every three seconds for one
  * reader, and an unbounded read on the daemon for tether's own sessions. A HEAD of the
- * same route costs one `stat` and returns before the read (session_api.go).
+ * same route costs a stat or two and returns before the read (SessionIndex.TranscriptUpdatedAt
+ * states the exact figure per store; session_api.go is where it returns).
  *
  * Re-fetching is also not free on the CLIENT, which is the half that is easy to miss:
  * `loadHistory` replaces the messages array, and `historyEntryToMessage` mints a fresh
@@ -40,6 +41,8 @@
  * nothing to arbitrate. The watch is last-caller-wins instead, and a stale unsubscribe
  * is a no-op — see the token in watchTranscript.
  */
+
+import { authedFetch } from './auth'
 
 /**
  * The response header the daemon puts the transcript's mtime in, in Unix
@@ -62,10 +65,10 @@ export const TRANSCRIPT_POLL_MS = 3000
 /**
  * The transcript route, for both the probe (HEAD) and the load (GET).
  *
- * One function so those two cannot address different resources. The daemon refuses
- * sids outside [A-Za-z0-9_-] (server/session_api.go validSID), so the encoding is
- * defence in depth — but a sid reaching this module from localStorage or a work-item
- * record is not one this module verified.
+ * One function so those two cannot address different resources. The daemon refuses any
+ * sid session.ValidSessionID rejects — outside [A-Za-z0-9_-], or outside 8..128
+ * characters (history.go) — so the encoding is defence in depth, but a sid reaching
+ * this module from localStorage or a work-item record is not one this module verified.
  */
 export function transcriptPath(sid: string): string {
   return `/api/v1/sessions/${encodeURIComponent(sid)}/messages`
@@ -91,12 +94,18 @@ export function readTranscriptVersion(res: { headers?: { get(name: string): stri
 /**
  * fetchTranscriptVersion asks the daemon for the transcript's version, or throws.
  *
- * HEAD, and that is the whole point: the daemon answers it from one `stat` and returns
+ * HEAD, and that is the whole point: the daemon answers it from a `stat` and returns
  * before touching the transcript. A GET here would cost what the load costs — see this
  * file's header — and nothing in the response would show it.
+ *
+ * `authedFetch` rather than `fetch` because this runs every few seconds for as long as
+ * the session is open. With a bare fetch, a session cookie that expires mid-read turns
+ * this into a silent 401 loop: the catch in `probe` keeps the last answer, the pane
+ * never updates, and the card goes on saying tether is re-reading the conversation.
+ * One request that 401s is a redirect to /auth; a thousand are a lie on screen.
  */
 export async function fetchTranscriptVersion(sid: string, signal?: AbortSignal): Promise<number> {
-  const res = await fetch(transcriptPath(sid), signal ? { method: 'HEAD', signal } : { method: 'HEAD' })
+  const res = await authedFetch(transcriptPath(sid), signal ? { method: 'HEAD', signal } : { method: 'HEAD' })
   if (!res.ok) throw new Error(`transcript probe: HTTP ${res.status}`)
   return readTranscriptVersion(res)
 }
@@ -137,31 +146,49 @@ let onChanged: (() => void) | null = null
 let watchToken = 0
 let timer: ReturnType<typeof setInterval> | null = null
 let visibilityBound = false
-let inFlight = false
+// Which watch has a probe in flight, or 0 for none. A TOKEN rather than a boolean, and
+// the difference is not cosmetic: a boolean makes the dedupe below span watches, so
+// switching sessions while a probe hangs leaves the NEW session unprobed until the old
+// request settles or its deadline fires — a fresh transcript stalled behind a stale
+// one's timeout. Per-watch, the dedupe means what it says.
+let inFlightToken = 0
+// The in-flight probe's AbortController, so replacing or stopping a watch really ends
+// its request rather than leaving one to be discarded on arrival.
+let inFlightAbort: AbortController | null = null
 
 async function probe(): Promise<void> {
   const sid = watchedSid
+  const token = watchToken
   if (sid === null) return
-  // One request at a time. Without this, a daemon slower than the interval would
-  // accumulate overlapping probes and an older answer could land after a newer one.
-  if (inFlight) return
-  inFlight = true
+  // One request at a time per watch. Without this, a daemon slower than the interval
+  // would accumulate overlapping probes and an older answer could land after a newer one.
+  if (inFlightToken === token) return
+  inFlightToken = token
   // …and a DEADLINE, because that guard is otherwise a way for this module to freeze
-  // itself: `inFlight` is released only when a request settles, so one that never does
+  // itself: the token is released only when a request settles, so one that never does
   // would make every later tick a no-op while the timer kept running. Same construction
   // and same reason as sessionActivity.ts — setTimeout + AbortController rather than
   // AbortSignal.timeout, so a test can advance it.
   const ac = new AbortController()
+  inFlightAbort = ac
   const deadline = setTimeout(() => ac.abort(), TRANSCRIPT_POLL_MS * 2)
   try {
     const version = await fetchTranscriptVersion(sid, ac.signal)
-    // The watch moved (or stopped) while this was in flight. Firing now would reload a
-    // session the pane is no longer showing.
+    // The watch moved (or stopped) while this was in flight, so this answer is about a
+    // session nobody is watching. Both lines below would then be actively wrong rather
+    // than merely useless: `onChanged` is the NEW watch's callback (it is reassigned,
+    // not queued), so calling it reloads the session on screen because a different one
+    // changed — and noteTranscriptVersion would record this sid as the loaded one,
+    // which makes the next probe for the session actually on screen see no baseline
+    // and reload it again.
     if (watchedSid !== sid) return
     if (version === versionOnScreen(sid)) return
-    // Recorded BEFORE the callback, so a reload that fails does not re-fire on every
-    // tick from here on. The automatic path is best-effort by design; the guaranteed
-    // one is the reader clicking the row, which reloads unconditionally.
+    // Recorded whether or not the reload that follows succeeds, so a daemon that
+    // answers the probe but not the load cannot turn this into a reload on every tick.
+    // The automatic path is best-effort by design; the guaranteed one is the reader
+    // clicking the row, which reloads unconditionally. (The ORDER of these two lines is
+    // not what buys that — the callback starts an async load either way — the point is
+    // that the record happens at all.)
     noteTranscriptVersion(sid, version)
     onChanged?.()
   } catch {
@@ -170,8 +197,17 @@ async function probe(): Promise<void> {
     // the user must act on, and a connection this broken already has its own indicator.
   } finally {
     clearTimeout(deadline)
-    inFlight = false
+    if (inFlightAbort === ac) inFlightAbort = null
+    // Only if this watch is still the one holding the slot: a later watch has already
+    // taken it, and clearing here would give that one a second concurrent probe.
+    if (inFlightToken === token) inFlightToken = 0
   }
+}
+
+/** End any probe in flight; its answer is about a watch that no longer exists. */
+function abortInFlight() {
+  inFlightAbort?.abort()
+  inFlightAbort = null
 }
 
 /**
@@ -183,6 +219,17 @@ async function probe(): Promise<void> {
 function hidden(): boolean {
   return typeof document !== 'undefined' && document.visibilityState === 'hidden'
 }
+
+// A named limit, because "hidden" here is the TAB and the pane is a smaller thing than
+// that: App.tsx keeps ChatPane mounted under `display: none` while the reader is on the
+// Skill or Shell tab, so a held session goes on being probed — and reloaded — for a
+// pane nobody can see. Kept rather than fixed, and the reason is the same one the
+// visibility-return probe gives: the reader who switches back wants a current
+// transcript, not one that starts catching up when they arrive. The cost while they are
+// away is one probe every three seconds plus one load per write, i.e. it is bounded by
+// what the other agent is doing, not by how long the pane is hidden. Narrowing it would
+// mean ChatPane learning whether it is the visible tab, which is App.tsx's shape to
+// change, not this module's to guess.
 
 /** Restart the interval to match the state of the world. Idempotent. */
 function reschedule() {
@@ -216,6 +263,7 @@ function onVisibilityChange() {
  * fetched, and whatever the other agent wrote in that window is already missing.
  */
 export function watchTranscript(sid: string, onUpdate: () => void): () => void {
+  abortInFlight()
   const token = ++watchToken
   watchedSid = sid
   onChanged = onUpdate
@@ -227,6 +275,7 @@ export function watchTranscript(sid: string, onUpdate: () => void): () => void {
   void probe()
   return () => {
     if (watchToken !== token) return
+    abortInFlight()
     watchedSid = null
     onChanged = null
     reschedule()
@@ -242,7 +291,10 @@ export function watchTranscript(sid: string, onUpdate: () => void): () => void {
 export function resetTranscriptWatchForTests(): void {
   watchedSid = null
   onChanged = null
-  watchToken = 0
+  // Deliberately NOT reset to 0: a live watch holding token N would then be handed
+  // `watchToken !== token` by its own stop and leak. Monotonic is what makes every
+  // outstanding stop a no-op, which is the property the counter exists for.
+  watchToken++
   if (timer !== null) {
     clearInterval(timer)
     timer = null
@@ -253,7 +305,8 @@ export function resetTranscriptWatchForTests(): void {
   }
   loadedSid = null
   loadedVersion = 0
-  inFlight = false
+  abortInFlight()
+  inFlightToken = 0
 }
 
 /**

@@ -83,8 +83,12 @@ func TestTranscriptUpdatedAtFallsThroughToCC(t *testing.T) {
 // "no baseline". A non-zero answer for a session neither store has would put a
 // version on the wire for a transcript that does not exist.
 func TestTranscriptUpdatedAtIsZeroWhenNothingHasIt(t *testing.T) {
+	// Only sids nothing has. The traversal case is deliberately NOT here: it would
+	// answer 0 with or without the sid guard, so putting it in this list would read as
+	// a security assertion while asserting nothing. That guard is pinned where it can
+	// fail — TestHasHistory and TestFindRejectsATraversingSid.
 	idx := &SessionIndex{History: NewHistoryStore(t.TempDir()), CC: newCCFixture(t, "/w").store()}
-	for _, sid := range []string{"absent-sid-0001", "../etc/passwd", ""} {
+	for _, sid := range []string{"absent-sid-0001", ""} {
 		if got := idx.TranscriptUpdatedAt(sid); got != 0 {
 			t.Errorf("TranscriptUpdatedAt(%q) = %d, want 0", sid, got)
 		}
@@ -104,24 +108,40 @@ func TestTranscriptUpdatedAtIsZeroOnAnEmptyTranscript(t *testing.T) {
 	}
 }
 
-// TestHasHistoryAndModTimeCannotDisagree — they are two readings of one predicate
-// (transcriptStat), and this pins that they stay so.
+// TestHasHistoryAndModTimeAnswerTheSameQuestion pins the ANSWERS, per case, against
+// values written out here.
 //
-// It matters because HasHistory is what SessionIndex.Messages branches on and
-// ModTime is what SessionIndex.TranscriptUpdatedAt branches on. Two separate
-// implementations of "does this store have it" would be free to drift by one case —
-// the empty file, the invalid sid — and that single case is enough to serve one
-// store's transcript with the other store's version.
-func TestHasHistoryAndModTimeCannotDisagree(t *testing.T) {
+// Asserting only that the two agree would be a tautology today — both read
+// transcriptStat, so any mutation moves them together — and a test that cannot fail is
+// worse than none, because its name promises a guard. Writing the expected answer for
+// each case gives it something to lose: it fails if either reader drifts AND if the
+// shared predicate itself changes (the empty file, the rejected sid).
+//
+// It matters because HasHistory is what SessionIndex.Messages branches on and ModTime
+// is what SessionIndex.TranscriptUpdatedAt branches on, and one case of disagreement is
+// enough to serve one store's transcript with the other store's version.
+func TestHasHistoryAndModTimeAnswerTheSameQuestion(t *testing.T) {
 	dir := t.TempDir()
 	writeTranscript(t, dir, "good-sid-00001", time.Now(), userLine("hello"))
 	writeTranscript(t, dir, "empty-sid-0001", time.Now())
 	h := NewHistoryStore(dir)
 
-	for _, sid := range []string{"good-sid-00001", "empty-sid-0001", "absent-sid-001", "../etc/passwd", ""} {
-		_, ok := h.ModTime(sid)
-		if has := h.HasHistory(sid); has != ok {
-			t.Errorf("sid %q: HasHistory = %v but ModTime ok = %v — these must be the same predicate", sid, has, ok)
+	for _, tc := range []struct {
+		sid  string
+		want bool
+		why  string
+	}{
+		{"good-sid-00001", true, "a non-empty transcript"},
+		{"empty-sid-0001", false, "a zero-length file is not a conversation"},
+		{"absent-sid-001", false, "no file"},
+		{"../etc/passwd", false, "rejected by ValidSessionID before any path is built"},
+		{"", false, "empty sid"},
+	} {
+		if got := h.HasHistory(tc.sid); got != tc.want {
+			t.Errorf("HasHistory(%q) = %v, want %v — %s", tc.sid, got, tc.want, tc.why)
+		}
+		if _, got := h.ModTime(tc.sid); got != tc.want {
+			t.Errorf("ModTime(%q) ok = %v, want %v — %s", tc.sid, got, tc.want, tc.why)
 		}
 	}
 }

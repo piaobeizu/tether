@@ -621,34 +621,58 @@ export const useStore = create<AppState>((set, get) => ({
       }
       reduced.push(m)
     }
-    // tether#106 — carry the EXISTING ids across the unchanged leading prefix.
+    // tether#106 — carry the EXISTING ids over to the messages that are already on
+    // screen, so a reload REPLACES CONTENT without replacing IDENTITY.
     //
-    // This is still the wholesale server-truth replace it has always been; what
-    // changes is only that a message which is byte-identical to the one already in
-    // that slot keeps its identity. Before this, `historyEntryToMessage` minted a
-    // fresh crypto.randomUUID() for every entry on every load, so a refetch changed
-    // every React key (`key={m.id}` in ChatPane) and the whole transcript unmounted
-    // and remounted: every expanded fenced block and every expanded thinking block
-    // collapsed (both Sets are keyed by message id), and the scroll container's
-    // scrollHeight collapsed to its client height mid-commit, clamping scrollTop —
-    // i.e. the reader was thrown to the top of the conversation.
+    // This is still the wholesale server-truth replace it has always been. What
+    // changes is that a message the previous array already had keeps its id. Before
+    // this, `historyEntryToMessage` minted a fresh crypto.randomUUID() for every entry
+    // on every load, so a refetch changed every React key (`key={m.id}` in ChatPane)
+    // and the whole transcript unmounted and remounted: every expanded fenced block
+    // and every expanded thinking block collapsed (both Sets are keyed by message id),
+    // and the scroll container's scrollHeight collapsed to its client height
+    // mid-commit, clamping scrollTop — the reader was thrown to the top of the
+    // conversation. Survivable once per deliberate switch; not survivable now that
+    // tether#106 reloads a held session's transcript whenever the other agent writes.
     //
-    // That was survivable while a refetch only happened on a deliberate switch. It is
-    // not survivable now that tether#106 refetches a held session's transcript
-    // whenever the other agent writes: the reader would be bounced to the top every
-    // few seconds, by the feature that exists to let them follow along.
+    // # Matched by CONTENT, not by position, and that is the whole design
     //
-    // PREFIX only, stopping at the first mismatch, because past a divergence any
-    // alignment is a guess — and the shape this feature actually produces is an
-    // append. When cc's 200-message tail slides, the prefix stops matching at once
-    // and every id is fresh, which is exactly today's behaviour. Identity is
-    // role+ts+text: a message whose tools or block changed is still the same message
-    // and should re-render in place rather than remount.
-    const prev = s.messages
-    for (let i = 0; i < reduced.length && i < prev.length; i++) {
-      const a = prev[i], b = reduced[i]
-      if (a.role !== b.role || a.ts !== b.ts || a.text !== b.text) break
-      reduced[i] = { ...b, id: a.id }
+    // A positional (prefix) match was the first attempt and it is inert for the
+    // population this feature exists for. CCStore serves a sliding TAIL —
+    // `out[ccTrimFront(out, ccMessagesMax):]` with ccMessagesMax = 200, inside a 1 MiB
+    // byte window (ccsessions.go) — so once a cc conversation passes either bound,
+    // every append shifts index 0 and a prefix match breaks immediately. That is
+    // exactly the case the reader is watching: the cc transcript behind tether#104 was
+    // 103,388,175 bytes. Keyed by content, a slide costs only the ids of the messages
+    // that actually fell out of the window.
+    //
+    // # The key is role+ts, and text is deliberately NOT in it
+    //
+    // Because the message that is GROWING is the one whose identity matters most. The
+    // other agent's current turn gains text on every write, so a key including text
+    // would give that message a new id every three seconds — collapsing the thinking
+    // block of the only turn anyone is watching. role+ts is the natural key here: a
+    // tether entry's ts is `time.Now().UnixMilli()` at append and a cc turn's is its
+    // first record's timestamp, so it identifies the turn while text is its content.
+    //
+    // # Each old id is handed out AT MOST ONCE
+    //
+    // Two messages can share role+ts (coarse clocks, or the same turn re-read), and
+    // giving both the same id would put duplicate React keys in one list — a worse
+    // failure than the remount this avoids. The queue per key is what makes that
+    // impossible: an id is shifted out when it is used, and a message with no match
+    // left keeps the fresh uuid historyEntryToMessage gave it.
+    const idsByKey = new Map<string, string[]>()
+    for (const m of s.messages) {
+      const key = `${m.role} ${m.ts}`
+      const q = idsByKey.get(key)
+      if (q) q.push(m.id)
+      else idsByKey.set(key, [m.id])
+    }
+    for (let i = 0; i < reduced.length; i++) {
+      const q = idsByKey.get(`${reduced[i].role} ${reduced[i].ts}`)
+      const id = q?.shift()
+      if (id !== undefined) reduced[i] = { ...reduced[i], id }
     }
     // A session reset (page reload / session switch) drops any stale pending
     // permission requests — they belong to the prior session (tether#40).

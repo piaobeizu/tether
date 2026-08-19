@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/piaobeizu/tether/internal/session"
 )
@@ -100,17 +99,27 @@ func sessionAPIHandlers(idx *session.SessionIndex, wis *session.WIBindingStore) 
 			// baseline instead of having to establish one (and miss whatever landed
 			// in between). On the HEAD it is the whole answer.
 			//
+			// It is read BEFORE the transcript below, and that order is
+			// load-bearing rather than incidental. Stat-then-read makes the
+			// header a LOWER BOUND on the body's age: a write landing in between
+			// produces a body newer than the version beside it, and the reader
+			// pays one redundant reload on its next probe. Read-then-stat would
+			// produce the opposite — a version newer than the body — and the
+			// reader would record it as "this is what I have" and never ask for
+			// that write again. One of those costs a request; the other loses
+			// content silently.
+			//
 			// no-store because the point of the probe is that the answer changes;
 			// a revalidating cache in front of it would report a version that is
 			// as stale as the transcript the reader is complaining about. Same
-			// reasoning handleSessionActivity states for the same header.
+			// reasoning handleSessionActivity states for the same header. It is
+			// also why no Last-Modified is sent: with no-store there is no
+			// conditional request for it to serve, so it would be a second copy
+			// of this fact at one-second resolution, and the only thing a second
+			// copy can do is be believed.
 			w.Header().Set("Cache-Control", "no-store")
 			if ts := idx.TranscriptUpdatedAt(sid); ts > 0 {
 				w.Header().Set(session.TranscriptUpdatedAtHeader, strconv.FormatInt(ts, 10))
-				// The standard field as well, in the standard unit. It is one
-				// SECOND coarse, which is why it is not the one the SPA reads —
-				// see session.TranscriptUpdatedAtHeader.
-				w.Header().Set("Last-Modified", time.UnixMilli(ts).UTC().Format(http.TimeFormat))
 			}
 			if r.Method == http.MethodHead {
 				// Returning HERE is the entire cost argument. Falling through
@@ -118,6 +127,12 @@ func sessionAPIHandlers(idx *session.SessionIndex, wis *session.WIBindingStore) 
 				// history.jsonl — and net/http would then throw the body away,
 				// i.e. the probe would cost exactly what the fetch it exists to
 				// avoid costs, and nothing would show it.
+				//
+				// Content-Type describes what a GET would return; there is
+				// deliberately no Content-Length matching the GET's body, because
+				// producing one means producing the body. RFC 9110 makes that
+				// field's presence optional for exactly this reason, and nothing
+				// on either side of this route reads it.
 				//
 				// It also has to return before the Info line below: a browser
 				// reading a held session probes this route every three seconds,

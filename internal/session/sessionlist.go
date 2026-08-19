@@ -403,23 +403,38 @@ const TranscriptUpdatedAtHeader = "X-Tether-Transcript-Updated-At"
 // worst way: a probe that watches a file nobody is reading reports "nothing
 // changed" forever, and the feature degrades to exactly the bug it fixes.
 //
-// # The one residual, named
+// # Two residuals, named
 //
-// CCStore.Messages can return ok=false for a file findStat accepted (unreadable,
-// or nothing in the tail window converts to a turn), in which case Messages answers
-// SourceNone while this answers with cc's mtime. That direction is harmless: it
-// makes the reader refetch an empty transcript it already has. The opposite
-// direction — a timestamp from a store that is not serving — is the one that would
-// freeze the pane, and it cannot happen, because selection here is only ever the
-// has-it predicate.
+// CCStore.Messages can return ok=false for a file findStat accepted (unreadable, or
+// nothing in the tail window converts to a turn), in which case Messages answers
+// SourceNone while this answers with cc's mtime. Harmless: it makes the reader refetch
+// an empty transcript it already has.
 //
-// Cost is one stat (see HistoryStore.ModTime / CCStore.ModTime), which is what
-// makes this affordable to poll and what a HEAD on the transcript route spends.
-// The thing it avoids spending is not small: Messages prefers
-// HistoryStore.LoadHistory, an os.ReadFile of the WHOLE history.jsonl with no tail
-// and no cap, and falls through to a cc read bounded at ccMessagesTailBytes (1 MiB)
-// widening once to ccMessagesWideTailBytes (16 MiB). The cc transcript of the very
-// session that prompted tether#104 was 103,388,175 bytes.
+// The second is bigger and is NOT about disagreement. Agreeing on a file nothing is
+// writing produces the same end state as disagreeing. `history.jsonl` is appended to
+// only by this daemon's own fan-out; a background agent holding the session writes cc's
+// transcript instead. So for a sid tether once recorded and a `claude -p` job later
+// resumed, both this and Messages select tether's stale copy, the probe correctly and
+// permanently reports "unchanged", and no amount of polling will show the reader the
+// work that agent is doing. Attachment.resolve already models that combination — it
+// logs hadConversation as `had_history` on the refusal branch. Nothing here can fix it:
+// which store wins is List's rule, and changing it is the open question sessionlist's
+// own doc records ("tether shows its own shorter record, 137 lines against cc's 919").
+// What DOES depend on it is the sentence the UI shows, so HELD_SESSION_READABLE_NOTE
+// claims only that tether keeps re-reading — see its comment.
+//
+// # Cost
+//
+// On the tether branch, ONE stat (HistoryStore.ModTime). On the cc branch it is one
+// stat per known workspace directory until the file is found (CCStore.findStat walks
+// s.dirs()), plus one ReadDir of the projects directory for any workspace whose encoded
+// path is longer than ccDirNameMaxLen — so "one stat" is the floor, not the figure. It
+// is still the right order of magnitude for a three-second poll, and the thing it
+// avoids spending is not: Messages prefers HistoryStore.LoadHistory, an os.ReadFile of
+// the WHOLE history.jsonl with no tail and no cap, and falls through to a cc read
+// bounded at ccMessagesTailBytes (1 MiB) widening once to ccMessagesWideTailBytes
+// (16 MiB). The cc transcript of the very session that prompted tether#104 was
+// 103,388,175 bytes.
 func (x *SessionIndex) TranscriptUpdatedAt(sid string) int64 {
 	if x == nil {
 		return 0

@@ -9,7 +9,7 @@ import type { FencedBlock, ProviderListResponse } from '../../lib/wire.gen'
 import { ClientFrameAction, ErrCodeSessionHeldByBackgroundAgent } from '../../lib/wire.gen'
 import { authedFetch } from '../../lib/auth'
 import { refreshTranscript, REFRESH_TRANSCRIPT_EVENT } from '../../lib/session'
-import { watchTranscript } from '../../lib/transcriptWatch'
+import { noteTranscriptVersion, readTranscriptVersion, transcriptPath, watchTranscript } from '../../lib/transcriptWatch'
 import { DagBlock } from '../../fenced-blocks/DagBlock'
 import { FormBlock } from '../../fenced-blocks/FormBlock'
 import { CandidatesBlock } from '../../fenced-blocks/CandidatesBlock'
@@ -291,19 +291,33 @@ export const HELD_SESSION_PLACEHOLDER = 'read-only — a background agent is usi
 // contradicting it.
 //
 // The second half used to read "as it stood when this pane fetched it", and it was
-// true: the transcript was one HTTP GET at open time and, with the connection
-// refused, nothing updated it. tether#106 made that false — the pane now probes the
-// transcript's mtime every few seconds (transcriptWatch.ts) and re-reads it when the
-// other agent writes — so the sentence had to change with the behaviour. Leaving it
-// would have been the worse defect of the two: a reader who believes they are looking
-// at a still frame will go and refresh the page to check, which is the exact effort
-// this change removes.
+// true: the transcript was one HTTP GET at open time and, with the connection refused,
+// nothing updated it. tether#106 made that false — the pane now probes the transcript's
+// mtime every few seconds (transcriptWatch.ts) and re-reads it when it moves — so the
+// sentence had to change with the behaviour. Leaving it would have been the worse
+// defect of the two: a reader who believes they are looking at a still frame goes and
+// reloads the page to check, which is the exact effort this change removes.
 //
-// "every few seconds", not the number: TRANSCRIPT_POLL_MS is a tuning decision and a
-// sentence naming it becomes false the moment it is tuned. The claim that has to hold
-// is that new messages arrive without the reader doing anything.
+// # It says what TETHER does, not what the reader will see, and that is not hedging
+//
+// "new messages appear as that agent writes them" was the first draft and it is a claim
+// this pane cannot keep. SessionIndex.Messages prefers tether's OWN history whenever it
+// has one for the sid (sessionlist.go), and `history.jsonl` is written only by this
+// daemon's fan-out — a foreign background agent writes cc's transcript and never
+// touches it. So for a sid tether once recorded and a background job later resumed, the
+// file this route serves is stale and STAYS stale: the probe correctly reports
+// unchanged, forever. That combination is not hypothetical — the refusal branch logs it
+// as `had_history` (attach.go) — and preferring the fuller transcript there is
+// sessionlist.go's open question, not this change's to settle.
+//
+// So the sentence claims the two things that are true under both stores: tether keeps
+// re-reading, and the reader does not have to reload the page. Which is also the whole
+// of what they were doing by hand.
+//
+// "every few seconds" and not the number: TRANSCRIPT_POLL_MS is a tuning decision, and
+// a sentence naming it is false the moment it is tuned.
 export const HELD_SESSION_READABLE_NOTE =
-  'You can read it: what tether has of this conversation is below, and tether re-checks it every few seconds, so new messages appear as that agent writes them.'
+  'You can read it: what tether has of this conversation is below, and tether keeps re-reading it every few seconds while this pane is open — you do not have to reload.'
 const FATAL_GENERIC_MESSAGE = 'This connection was refused and cannot be retried automatically.'
 
 // tether#47 — @-file mention. parseAtQuery locates the @token the caret is
@@ -473,9 +487,17 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   // Load chat history when session ID is first established.
   useEffect(() => {
     if (!sessionId) return
-    fetch(`/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`)
-      .then(r => r.ok ? r.json() : [])
-      .then((msgs: HistoryEntry[]) => {
+    fetch(transcriptPath(sessionId))
+      // tether#106 — read the version off the SAME response, because this effect is
+      // the other way a transcript gets on screen (a page reload restores
+      // tether_last_sid and lands here, never in openSession). Without it the watcher
+      // that starts moments later has no baseline, treats the daemon's version as a
+      // change, and pays a full transcript GET to learn what this request already
+      // knew. Recorded only where loadHistory actually runs: the version describes
+      // what is ON SCREEN, so recording it next to a load that was skipped would be a
+      // claim about a transcript this effect declined to install.
+      .then(r => r.ok ? r.json().then((msgs: HistoryEntry[]) => ({ v: readTranscriptVersion(r), msgs })) : { v: 0, msgs: [] as HistoryEntry[] })
+      .then(({ v, msgs }: { v: number; msgs: HistoryEntry[] }) => {
         // Don't clobber an in-flight turn (tether#42 fix). On the FIRST send of
         // a new session, session_ready sets sessionId and fires this effect;
         // /messages already has the just-persisted user msg, so loadHistory
@@ -485,6 +507,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
         // authoritative, so skip the reload.
         if (msgs.length > 0 && !useStore.getState().streaming) {
           useStore.getState().loadHistory(msgs.map(historyEntryToMessage))
+          noteTranscriptVersion(sessionId, v)
         }
       })
       .catch(() => {})
@@ -1093,10 +1116,12 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
                 <div style={{ color: 'var(--ink-tertiary)', fontSize: 11, marginBottom: 8 }}>UDP/QUIC may be blocked — see K.8.1 in README.</div>
               </>
             )}
-            {/* Same button, same handler, different word. "Retry" names a failed
-                thing to attempt again; here the attempt is a question — has that
-                agent's process exited yet — and the answer is not tether's to
-                predict. */}
+            {/* Same button, different word — and since tether#106, a different
+                handler. "Retry" names a failed thing to attempt again; here the
+                attempt is a question — has that agent's process exited yet — and the
+                answer is not tether's to predict. `checkAgain` adds the other question
+                the reader has at that moment (see its definition); every other code
+                still gets `manualRetry` and nothing else. */}
             <button onClick={readingHeldSession ? checkAgain : manualRetry} className="btn-ghost-sm">{readingHeldSession ? 'Check again' : 'Retry'}</button>
           </div>
         )}

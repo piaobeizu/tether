@@ -1,4 +1,5 @@
 import { useStore, historyEntryToMessage, type HistoryEntry } from './store'
+import { authedFetch } from './auth'
 import { noteTranscriptVersion, readTranscriptVersion, transcriptPath } from './transcriptWatch'
 
 /**
@@ -11,6 +12,10 @@ import { noteTranscriptVersion, readTranscriptVersion, transcriptPath } from './
  * already uses rather than reaching into the pane.
  */
 export const REFRESH_TRANSCRIPT_EVENT = 'tether:refresh-transcript'
+
+/** The load currently in flight, so two requests for one sid cannot overlap. */
+let inFlightSid: string | null = null
+let inFlightLoad: Promise<void> | null = null
 
 /**
  * refreshTranscript re-reads one session's transcript into the store.
@@ -25,28 +30,42 @@ export const REFRESH_TRANSCRIPT_EVENT = 'tether:refresh-transcript'
  *     PREVIOUS session's transcript — and `loadHistory` is also what clears
  *     pendingPermissions and the turn cursor, so that residue is interactive, not merely
  *     stale text.
- *   - The sid is re-checked after the await, because two loads can be in flight and a
- *     slower earlier one must not land on top of a later one.
+ *   - The sid is re-checked after the await, so a load for a session the user has
+ *     already left cannot land on the one they are now looking at.
+ *   - A second call for the SAME sid joins the first instead of racing it. That was not
+ *     needed before tether#106, because the only caller was a switch and two in-flight
+ *     loads were therefore for different sids by construction. Now three callers share
+ *     one sid — the watcher's reload, the click on the open row, and "Check again" —
+ *     and two overlapping loads can settle in either order, so the older one could land
+ *     last and take `noteTranscriptVersion` with it, leaving the recorded version
+ *     describing neither what is on screen nor what the daemon has.
  *   - There is NO `!streaming` guard, and its absence is deliberate rather than
  *     overlooked. ChatPane's `[sessionId]` effect has one (tether#42) so that
  *     session_ready's refetch cannot wipe an in-flight turn's optimistic bubble. Here
- *     both callers are states in which a turn cannot be in flight — a deliberate switch
+ *     every caller is a state in which a turn cannot be in flight — a deliberate switch
  *     means the user has left that turn, and a session a background agent holds has no
  *     stream to have a turn on — so the check would never be false. An inert guard is
  *     worse than none: it reads like protection at the exact place a future caller would
  *     look for it.
  *
- * A failure leaves what is on screen readable rather than blanking it.
+ * A failure leaves what is on screen readable rather than blanking it. `authedFetch`
+ * rather than `fetch` because this now runs repeatedly for as long as a held session is
+ * open: with a bare fetch, a session cookie that expires turns the whole mechanism into
+ * a silent loop of 401s while the card keeps promising the transcript is being re-read.
  */
 export function refreshTranscript(sid: string): Promise<void> {
   if (!sid) return Promise.resolve()
-  return fetch(transcriptPath(sid))
+  if (inFlightSid === sid && inFlightLoad) return inFlightLoad
+  const load = authedFetch(transcriptPath(sid))
     .then(r => {
       if (!r.ok) throw new Error(`messages: HTTP ${r.status}`)
-      // Read BEFORE the body: this is the version the messages below came from, and
-      // recording it is what lets the next probe compare against something real
-      // instead of establishing its own baseline and losing everything written in
-      // between (see transcriptWatch.noteTranscriptVersion).
+      // Off THIS response. The version and the messages come from one request, so the
+      // version describes a file this call actually read — a version taken from a
+      // separate probe would describe whatever the file was at some other moment.
+      // (It is a LOWER BOUND on the body's age, not an identity: the daemon stats
+      // before it reads, so a write landing in between makes the body newer than the
+      // header. That direction costs one redundant reload; the other direction would
+      // lose a write outright. See session_api.go.)
       const version = readTranscriptVersion(r)
       return r.json().then((msgs: HistoryEntry[]) => ({ version, msgs }))
     })
@@ -56,6 +75,14 @@ export function refreshTranscript(sid: string): Promise<void> {
       noteTranscriptVersion(sid, version)
     })
     .catch(() => {})
+    .finally(() => {
+      // Only if this call is still the one being tracked: a later call for a DIFFERENT
+      // sid has already replaced it, and clearing then would drop that one's dedupe.
+      if (inFlightLoad === load) { inFlightSid = null; inFlightLoad = null }
+    })
+  inFlightSid = sid
+  inFlightLoad = load
+  return load
 }
 
 /**

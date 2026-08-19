@@ -212,6 +212,40 @@ describe('watchTranscript', () => {
     expect(d.calls()).toBe(before + 1)
   })
 
+  it('drops an answer whose watch has been replaced', async () => {
+    // A probe in flight when the reader switches sessions. Without the guard the late
+    // answer is not merely useless, it is wrong twice: `onChanged` is REASSIGNED by the
+    // new watch (not queued), so firing reloads the session on screen because a
+    // DIFFERENT one changed, and the version gets recorded against the old sid — which
+    // leaves the session actually on screen with no baseline, so its next probe reloads
+    // it again. Measured: without this case, replacing the guard with `if (false)`
+    // survives every other test in this file.
+    let releaseA!: () => void
+    const gateA = new Promise<void>(r => { releaseA = r })
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      const headers = new Headers()
+      if (url.includes('sid-a')) {
+        await gateA
+        headers.set(TRANSCRIPT_UPDATED_AT_HEADER, '999')
+      } else {
+        headers.set(TRANSCRIPT_UPDATED_AT_HEADER, '200')
+      }
+      return { ok: true, status: 200, headers }
+    }))
+
+    watchTranscript('sid-a', () => {})   // its probe hangs
+    await vi.advanceTimersByTimeAsync(0)
+    watchTranscript('sid-b', () => {})   // supersedes it
+    await vi.advanceTimersByTimeAsync(0)
+    expect(transcriptWatchState()).toEqual({ running: true, sid: 'sid-b', version: 200 })
+
+    releaseA()
+    await vi.advanceTimersByTimeAsync(0)
+
+    // sid-a's answer landed and changed nothing.
+    expect(transcriptWatchState()).toEqual({ running: true, sid: 'sid-b', version: 200 })
+  })
+
   it('pauses while the tab is hidden and checks immediately on return', async () => {
     let version = 100
     const d = daemon(() => version)

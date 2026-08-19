@@ -516,6 +516,26 @@ body {
   flex: 1 1 0;
   padding: 18px 16px 12px; overflow: auto;
   display: flex; flex-direction: column; gap: 20px; min-height: 0;
+  /* tether#112 — pulling further at an end of this box is now a GESTURE that loads a page
+     (see transcriptOverscrolled in panes/chat/index.tsx), which makes what the browser
+     otherwise does with that overscroll a conflict rather than a curiosity: Chrome on Android
+     treats a downward overscroll at the top as pull-to-refresh and takes the touch away with
+     `touchcancel`, so the upward half of that gesture would be swallowed before the pane ever
+     sees enough of it. `contain` keeps the overscroll inside this element.
+
+     Scroll CHAINING is not what this is for and would not need it — `#root` and `body` are
+     both `overflow: hidden` (see the top of this file), so there is no ancestor scroller to
+     chain to. It is specifically the browser's own pull gesture that is being declined.
+
+     Not `none`: that would also suppress the platform's overscroll AFFORDANCE (iOS rubber
+     band, Android's edge glow), which is the only feedback a reader gets that they have
+     reached an end at all — and this wi is about a missing signal, so removing one would be
+     working against itself. `contain` keeps the bounce and drops only the chaining.
+
+     Unverifiable here, stated rather than implied: jsdom loads no stylesheet and computes no
+     layout, so no test in this repo can observe either the pull-to-refresh conflict or this
+     line's effect on it. It needs a phone. */
+  overscroll-behavior-y: contain;
 }
 
 /* ── Session list (tether#91) ─────────────────────────────────

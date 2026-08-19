@@ -308,13 +308,28 @@ export function transcriptEdgeAction(o: {
 // exactly the devices this product is used on, which is the same shape of defect as the one
 // being fixed.
 //
+// TWO rather than one, and the second pixel is margin rather than derivation. One is what the
+// argument above needs exactly: with integer heights and a fractional `scrollTop`, the worst a
+// true end can read is +1.0. That is a model, and it assumes the two integer heights round in
+// agreement — which is what browser zoom is reported to break, and which nothing in this repo
+// can measure (jsdom computes no layout, and its geometry here is integer by construction).
+// Since being one pixel short means the reported defect silently returns on some devices, and
+// being one pixel long costs only that the gesture may also fire one pixel before the true end
+// — a position from which the shared floor already prevents a second request — the margin is
+// the cheap side of that trade.
+//
 // It must stay SMALL, and that bound is the load-bearing part: further from the end than
 // this, the browser CAN still scroll, so it fires a real `scroll` event and
 // transcriptEdgeAction's latch is the correct authority over whether that arrival loads.
 // A slack anywhere near TRANSCRIPT_EDGE_PX would let the gesture path fire inside the
 // region the latch governs — bypassing it where it is meaningful, rather than only where
-// it is unreachable.
-export const TRANSCRIPT_OVERSCROLL_SLACK_PX = 1
+// it is unreachable. 2 ≪ 48, and ChatPane.test.tsx pins the inequality.
+//
+// One thing that does NOT need room here, checked because it looks as though it might: the
+// bottom dots add ~13px of scroll height while a request is in flight, which takes
+// `bottomDistance` well past this slack. It cannot matter — that height only exists while
+// `requestInFlightRef` is set, which is the state in which every path already refuses.
+export const TRANSCRIPT_OVERSCROLL_SLACK_PX = 2
 
 // The smallest touch pull that counts as a pull, in CSS pixels of finger travel.
 //
@@ -352,11 +367,22 @@ export const TRANSCRIPT_OVERSCROLL_TOUCH_PX = 8
  *
  * `armed` exists to answer one question: *did the reader do something, or is this the
  * machinery re-entering itself?* A `scroll` event cannot answer it — CSSOM View makes a
- * programmatic `scrollTop` write fire the same event a finger does — so the latch answers
- * it from position history instead, and that is why it is right for that path and must stay
- * exactly as it is. A `wheel` or a `touchmove` answers it from the event: the browser never
- * synthesizes either one, so the event existing IS the reader doing something. There is no
- * cycle to bound because nothing this code does can produce one.
+ * programmatic `scrollTop` write fire the same event a finger does — so the latch answers it
+ * from position history instead, and that is why it is right for that path and must stay
+ * exactly as it is. Neither `wheel` nor `touchmove` is produced by scrolling, so **nothing
+ * this code does can cause one**, and the self-sustaining cycle the latch bounds does not
+ * exist here. That is the whole of the claim, and it is deliberately narrower than "these
+ * events mean the reader did something", which review showed to be false in both directions:
+ *
+ *   - macOS/Chrome inertial momentum keeps delivering `wheel` for about a second after the
+ *     fingers have left the trackpad;
+ *   - a `touchmove` fires for a finger merely resting on the glass.
+ *
+ * Neither is a loop — both are finite in the momentum case and harmless in themselves — but
+ * both are input the reader is not still asking with, so they are bounded explicitly rather
+ * than argued away: the 500ms floor caps the momentum tail at two or three requests per
+ * flick, and the per-gesture `spent` latch on touchPullRef caps a resting finger at zero
+ * (see there — an earlier cut of this wi had no such latch and paid for it).
  *
  * What is emphatically NOT skipped: the shared in-flight ref and the 500ms floor. One
  * continuous wheel spin is ~60 events a second, so without them a single flick would be a
@@ -954,12 +980,26 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   const topFiredAtRef = useRef(0)
   const bottomArmedRef = useRef(false)
   const bottomFiredAtRef = useRef(0)
-  // tether#112 — where the current touch gesture started, in client Y. A `touchmove` on its
-  // own says where the finger IS, not which way it is going, and the direction is the whole
-  // of "pulling further into this end". Null between gestures. Deliberately measured from
-  // the START of the gesture rather than from the previous move: a slow pull arrives as many
-  // sub-pixel moves, none of which would clear TRANSCRIPT_OVERSCROLL_TOUCH_PX on its own.
-  const touchAnchorRef = useRef<number | null>(null)
+  // tether#112 — the touch gesture currently on the glass: WHICH finger, where it started, and
+  // whether it has already been answered. Null between gestures — cleared on touchend and
+  // touchcancel as well as replaced on touchstart, so that sentence is true rather than merely
+  // unfalsifiable.
+  //
+  // `from` is the gesture's START, not the previous move, because a deliberate slow drag
+  // arrives as many small moves and none of them would clear TRANSCRIPT_OVERSCROLL_TOUCH_PX
+  // alone. That accumulation is exactly why `spent` has to exist: once a gesture has travelled
+  // 8px, EVERY later move in it clears the floor too — including the jitter of a finger just
+  // resting on the glass — so without a per-gesture latch a thumb left at the bottom after one
+  // successful pull asks for the whole newest page twice a second for as long as it rests
+  // there. Deep review found that in this wi's first cut. It is the loop tether#110's arm latch
+  // exists to stop, reappearing on the path that legitimately drops that latch, and the answer
+  // is the same shape: one visit, one load — where here the GESTURE is the visit.
+  //
+  // `id` is the `Touch.identifier`, and following it is not fussiness. The browser lists the
+  // OLDER touch first, so for a reader whose thumb is already on the glass holding the phone
+  // `touches[0]` is that stationary thumb and every delta from it is ~0 — the fix would be
+  // silently inert for exactly the two-handed phone reader who reported the bug.
+  const touchPullRef = useRef<{ id: number; from: number; spent: boolean } | null>(null)
   // Where the scroll box was standing when the reader asked for an older page, so the
   // layout effect below can put them back on the same message. Null when no prepend is
   // pending, which is also what makes that effect a no-op on every other commit.
@@ -1614,10 +1654,18 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
    * `deltaY` is the gesture's own sign convention — positive is toward the bottom of the
    * transcript, which is what both a `WheelEvent.deltaY` and a finger travelling UP the
    * screen mean. `minToward` is the unit the caller is speaking in.
+   *
+   * Returns whether a request was actually started, which is what lets the touch caller spend
+   * its gesture after one load. The wheel caller ignores it, and that asymmetry is the honest
+   * one: a touch gesture has boundaries (touchstart…touchend) so "once per gesture" is a thing
+   * that can be said, while `wheel` events are discrete with no start or end. What bounds the
+   * wheel is the 500ms floor alone — enough, because the input that arrives without the reader
+   * still asking for it is macOS/Chrome inertial momentum, which decays within about a second,
+   * so a flick costs at most two or three requests rather than an unbounded stream.
    */
-  const onTranscriptOverscroll = (deltaY: number, minToward: number) => {
+  const onTranscriptOverscroll = (deltaY: number, minToward: number): boolean => {
     const el = chatRef.current
-    if (!el) return
+    if (!el) return false
     const now = Date.now()
     const bottomDistance = el.scrollHeight - el.scrollTop - el.clientHeight
     const topDistance = el.scrollTop
@@ -1656,8 +1704,9 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
         bottomArmedRef.current = false
         bottomFiredAtRef.current = now
         refreshNewest()
+        return true
       }
-      return
+      return false
     }
 
     if (transcriptOverscrolled({ toward: -deltaY, distance: topDistance, minToward })) {
@@ -1680,8 +1729,10 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
         topArmedRef.current = false
         topFiredAtRef.current = now
         loadEarlier()
+        return true
       }
     }
+    return false
   }
   const onTranscriptOverscrollRef = useRef(onTranscriptOverscroll)
   onTranscriptOverscrollRef.current = onTranscriptOverscroll
@@ -1727,26 +1778,54 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
     // count to pixels. A wheel event is only ever emitted for a deliberate scroll input, so
     // zero is the only boundary that means anything, hence `minToward: 0`.
     const onWheel = (e: WheelEvent) => onTranscriptOverscrollRef.current(e.deltaY, 0)
-    // Touch devices have no wheel at all, so without these two the fix would reach only the
-    // desktop half of a product that is mostly used on a phone.
-    const onTouchStart = (e: TouchEvent) => { touchAnchorRef.current = e.touches[0]?.clientY ?? null }
+    // Touch devices have no wheel at all, so without these the fix would reach only the desktop
+    // half of a product that is mostly used on a phone.
+    //
+    // `changedTouches`, not `touches`: the former is the touches this event is ABOUT, the latter
+    // is every finger currently down with the oldest first. See touchPullRef for why reading
+    // `touches[0]` makes the whole path inert for a reader holding the phone.
+    const onTouchStart = (e: TouchEvent) => {
+      const t = e.changedTouches[0]
+      touchPullRef.current = t ? { id: t.identifier, from: t.clientY, spent: false } : null
+    }
+    const onTouchEnd = () => { touchPullRef.current = null }
     const onTouchMove = (e: TouchEvent) => {
-      const from = touchAnchorRef.current
-      const y = e.touches[0]?.clientY
-      if (from === null || y === undefined) return
+      const pull = touchPullRef.current
+      if (!pull || pull.spent) return
+      // The gesture's own finger, by identifier. A move that reports only other fingers says
+      // nothing about this pull.
+      let y: number | undefined
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const t = e.changedTouches[i]
+        if (t.identifier === pull.id) { y = t.clientY; break }
+      }
+      if (y === undefined) return
       // Finger UP the screen (clientY decreasing) drags the content up, which is toward the
       // BOTTOM of the transcript — the same direction a positive `deltaY` means.
-      onTranscriptOverscrollRef.current(from - y, TRANSCRIPT_OVERSCROLL_TOUCH_PX)
+      //
+      // Spent only when a request actually STARTED. A pull the floor or the in-flight ref
+      // refused has not been answered, so a later move in the same gesture may still ask; it
+      // cannot burst, because the first one that succeeds closes the gesture.
+      if (onTranscriptOverscrollRef.current(pull.from - y, TRANSCRIPT_OVERSCROLL_TOUCH_PX)) {
+        pull.spent = true
+      }
     }
     el.addEventListener('scroll', onScroll, { passive: true })
     el.addEventListener('wheel', onWheel, { passive: true })
     el.addEventListener('touchstart', onTouchStart, { passive: true })
     el.addEventListener('touchmove', onTouchMove, { passive: true })
+    // `touchcancel` as well as `touchend`, because the browser takes a touch away rather than
+    // ending it whenever it claims the gesture for itself (Chrome's pull-to-refresh, a back
+    // swipe). Either way this gesture is over and the next `touchstart` opens a new one.
+    el.addEventListener('touchend', onTouchEnd, { passive: true })
+    el.addEventListener('touchcancel', onTouchEnd, { passive: true })
     return () => {
       el.removeEventListener('scroll', onScroll)
       el.removeEventListener('wheel', onWheel)
       el.removeEventListener('touchstart', onTouchStart)
       el.removeEventListener('touchmove', onTouchMove)
+      el.removeEventListener('touchend', onTouchEnd)
+      el.removeEventListener('touchcancel', onTouchEnd)
     }
   }, [])
 

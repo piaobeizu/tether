@@ -1009,7 +1009,7 @@ describe('transcriptOverscrolled (tether#112)', () => {
     // end than this slack, the browser can still scroll, so it fires a real `scroll` event and
     // transcriptEdgeAction's latch is the right authority over whether that arrival loads. A
     // slack near TRANSCRIPT_EDGE_PX would let this path fire where the latch is meaningful.
-    expect(TRANSCRIPT_OVERSCROLL_SLACK_PX).toBe(1)
+    expect(TRANSCRIPT_OVERSCROLL_SLACK_PX).toBe(2)
     expect(TRANSCRIPT_OVERSCROLL_TOUCH_PX).toBe(8)
     expect(TRANSCRIPT_OVERSCROLL_SLACK_PX).toBeLessThan(TRANSCRIPT_EDGE_PX)
   })

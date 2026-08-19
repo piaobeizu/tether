@@ -49,6 +49,12 @@ const originalFetch = globalThis.fetch
 /** How tall one bubble is in the geometry model below. */
 const ROW_PX = 100
 
+/** tether#112 — identifiers for the two fingers the touch fixture can put on the glass: the
+ *  one making the gesture, and a thumb already resting there. Distinct and arbitrary; what
+ *  matters is only that the pane must follow the RIGHT one. */
+const TOUCH_ID = 7
+const RESTING_ID = 3
+
 /**
  * Give an element a scroll geometry jsdom does not have.
  *
@@ -127,6 +133,22 @@ function liveScrollBox(el: HTMLElement, clientHeight: number) {
       setTimeout(() => el.dispatchEvent(new Event('scroll')), 0)
     },
   })
+  const point = (identifier: number, clientY: number) => ({ identifier, clientY } as unknown as Touch)
+  const lists = (y: number, resting?: number) => ({
+    touches: resting === undefined
+      ? [point(TOUCH_ID, y)]
+      // The thumb FIRST, which is where the browser puts the older touch — and is what makes
+      // `touches[0]` the wrong thing for a handler to read.
+      : [point(RESTING_ID, resting), point(TOUCH_ID, y)],
+    changedTouches: [point(TOUCH_ID, y)],
+    bubbles: true,
+  })
+  const touchStart = (y: number, resting?: number) =>
+    el.dispatchEvent(new TouchEvent('touchstart', lists(y, resting)))
+  const touchMoveTo = (y: number, resting?: number) =>
+    el.dispatchEvent(new TouchEvent('touchmove', lists(y, resting)))
+  const touchEnd = () =>
+    el.dispatchEvent(new TouchEvent('touchend', { touches: [], changedTouches: [point(TOUCH_ID, 0)], bubbles: true }))
   return {
     top: box.top,
     height: box.height,
@@ -157,26 +179,41 @@ function liveScrollBox(el: HTMLElement, clientHeight: number) {
      * path that already worked.
      *
      * `deltaY > 0` is toward the bottom, matching the platform's own sign. `deltaMode`
-     * defaults to 0 (measured, not assumed — jsdom 27's WheelEvent), which is irrelevant to
-     * the pane: it reads only the sign.
+     * defaults to 0 (measured, not assumed — jsdom 29.1.1's WheelEvent), which is irrelevant
+     * to the pane: it reads only the sign.
      */
     wheel: (deltaY: number) => el.dispatchEvent(new WheelEvent('wheel', { deltaY, bubbles: true })),
+
     /**
-     * A touch pull of `dy` CSS pixels, positive meaning the finger travels UP the screen
-     * (toward the bottom of the transcript), delivered as the touchstart + touchmove pair a
-     * real gesture is.
+     * A touch gesture, in the three parts a real one has — because whether a defect exists at
+     * all depends on where the gesture BOUNDARIES are. A fixture that restarts the gesture
+     * before every move (which is what this used to do) cannot express "the finger is still
+     * down", and that is precisely where the burst lived that review found.
      *
      * The touch points are plain objects rather than `Touch` instances because this jsdom has
      * no `Touch` interface at all (`typeof Touch === 'undefined'`, measured) while its
-     * `TouchEvent` constructor accepts and re-exposes whatever it is handed — so
-     * `e.touches[0].clientY`, which is all the pane reads, round-trips exactly. Using the
-     * real constructor rather than a hand-decorated `Event` keeps `instanceof`/`type`
-     * behaviour honest at the one hop that matters.
+     * `TouchEvent` constructor accepts and re-exposes whatever it is handed — `identifier`,
+     * `clientY`, `touches` and `changedTouches` all round-trip (measured). Using the real
+     * constructor rather than a hand-decorated `Event` keeps `instanceof`/`type` honest at the
+     * one hop that matters.
+     *
+     * `resting` puts a SECOND finger on the glass that never moves — a thumb holding the
+     * phone — and puts it FIRST in `touches`, which is where the browser puts it and which is
+     * what makes `touches[0]` the wrong thing to read.
+     */
+    touchStart,
+    touchMoveTo,
+    touchEnd,
+    /**
+     * One COMPLETE gesture: finger down, a single pull of `dy`, finger up. Convenience for
+     * the cases that are genuinely about one gesture. Anything about what happens WHILE the
+     * finger stays down must use the three parts, or the assertion is about a fixture that
+     * silently starts a new gesture per move.
      */
     touchPull: (dy: number, from = 400) => {
-      const point = (clientY: number) => ({ clientY } as unknown as Touch)
-      el.dispatchEvent(new TouchEvent('touchstart', { touches: [point(from)], bubbles: true }))
-      el.dispatchEvent(new TouchEvent('touchmove', { touches: [point(from - dy)], bubbles: true }))
+      touchStart(from)
+      touchMoveTo(from - dy)
+      touchEnd()
     },
     /** How many wheel / touchmove events this element has actually delivered to a listener. */
     wheels: () => wheels,
@@ -2511,7 +2548,8 @@ describe('loading a transcript by scrolling to its ends (tether#110)', () => {
       await act(async () => { box.scrollTo(700) })
       await settle()
       const getsBefore = countNewestGets()
-      expect(getsBefore).toBeGreaterThan(0)
+      // Exact, not `> 0`: the mount's own load plus the arrival's re-read, deterministically.
+      expect(getsBefore).toBe(2)
       // …and standing exactly AT the end, which is the position the whole wi is about:
       // 1000 - 700 - 300 = 0. Measured, not assumed — that arrival's re-read handed back a
       // page identical to the one on screen, so nothing was appended and the `nearBottom`
@@ -2605,6 +2643,140 @@ describe('loading a transcript by scrolling to its ends (tether#110)', () => {
       await act(async () => { box.touchPull(TRANSCRIPT_OVERSCROLL_TOUCH_PX + 1) })
       await settle()
       expect(countNewestGets()).toBe(getsBefore + 1)
+    })
+
+    it('asks ONCE per touch gesture, however long the finger stays on the glass', async () => {
+      // The defect deep review found in the first cut of this fix, and it is the same shape as
+      // the loop tether#110's latch exists to stop — reintroduced on the path that drops the
+      // latch. The touch floor measures travel since `touchstart` and the anchor never moves,
+      // so once a gesture has travelled 8px EVERY later move in it clears the floor, jitter
+      // included. With only the 500ms interval floor left, a thumb resting at the bottom after
+      // completing the very gesture this wi adds asked for the whole newest page twice a
+      // second, indefinitely — a megabyte on the wire and an unbounded read on the daemon each
+      // time.
+      //
+      // Expressible only because the fixture now has gesture BOUNDARIES: the old `touchPull`
+      // dispatched a fresh `touchstart` before every move, so every case was a new gesture and
+      // this state could not be reached.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      const gets = countNewestGets()
+
+      pastFloor()
+      // One gesture: down at 700, a real pull up to 100 — that asks, correctly…
+      await act(async () => { box.touchStart(700) })
+      await act(async () => { box.touchMoveTo(100) })
+      await settle()
+      expect(countNewestGets()).toBe(gets + 1)
+
+      // …and then the finger just sits there, jittering, for three floors' worth of time.
+      for (const y of [100.3, 99.8, 100.1]) {
+        pastFloor()
+        await act(async () => { box.touchMoveTo(y) })
+        await settle()
+      }
+      expect(box.touchMoves()).toBe(4)
+      expect(countNewestGets()).toBe(gets + 1)
+
+      // The CONTROL: lifting the finger and pulling again is a NEW gesture, and it asks.
+      await act(async () => { box.touchEnd() })
+      pastFloor()
+      await act(async () => { box.touchPull(60) })
+      await settle()
+      expect(countNewestGets()).toBe(gets + 2)
+    })
+
+    it('accumulates a SLOW pull, whose every single move is below the floor', async () => {
+      // The property the anchor exists for, and the other half of the tension the case above
+      // creates: measuring from the previous move instead of from the gesture's start would
+      // also stop that burst, and would silently throw this away. A deliberate slow drag
+      // arrives as many small moves, none of which clears 8px on its own.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      const gets = countNewestGets()
+
+      pastFloor()
+      await act(async () => { box.touchStart(700) })
+      // Six moves of 3px each: no single move clears the 8px floor, the cumulative pull does.
+      for (const y of [697, 694, 691, 688, 685, 682]) {
+        await act(async () => { box.touchMoveTo(y) })
+      }
+      await settle()
+      expect(box.touchMoves()).toBe(6)
+      expect(countNewestGets()).toBe(gets + 1)
+    })
+
+    it('follows the finger that is MOVING, not whichever one is listed first', async () => {
+      // A thumb holding the phone is a second touch that never moves, and the browser lists
+      // the older touch first — so `touches[0]` is the thumb and reading it makes this whole
+      // fix inert for a two-handed reader. `changedTouches` matched on `identifier` is the
+      // finger the event is actually about. Measured in jsdom: with a resting point at 500 and
+      // a moving one at 120, `touches[0].clientY` is 500 while `changedTouches[0].clientY` is
+      // 120.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      const gets = countNewestGets()
+
+      pastFloor()
+      await act(async () => { box.touchStart(700, 500) })
+      await act(async () => { box.touchMoveTo(600, 500) })
+      await settle()
+      expect(box.touchMoves()).toBe(1)
+      expect(countNewestGets()).toBe(gets + 1)
+    })
+
+    it('spends the latch on a gesture load, so a later scroll event cannot ask again', async () => {
+      // The two `…ArmedRef.current = false` lines, which review found to be surviving mutants:
+      // the comment claims they matter and nothing tested it. Reachable because a gesture can
+      // fire while the latch is SET — arrive at the bottom, be refused by the floor (so the
+      // latch stays armed), then pull. If the gesture did not spend it, the next bare scroll
+      // event at the same clamped position would load a second time.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      const gets = countNewestGets()
+
+      // Re-arm and come back INSIDE the floor: the arrival is refused, so the latch stays set.
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      expect(countNewestGets()).toBe(gets)
+
+      pastFloor()
+      await act(async () => { box.wheel(120) })
+      await settle()
+      expect(countNewestGets()).toBe(gets + 1)
+
+      // The latch the gesture consumed: a plain scroll event at the same position, a floor
+      // later, must find nothing left to spend.
+      pastFloor()
+      await act(async () => { box.fire() })
+      await settle()
+      expect(countNewestGets()).toBe(gets + 1)
     })
 
     it('loads the earlier page for a reader parked at the TOP who pulls further up', async () => {

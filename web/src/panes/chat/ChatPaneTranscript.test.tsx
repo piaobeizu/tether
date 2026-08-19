@@ -1,12 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, render, screen } from '@testing-library/react'
 import ChatPane, {
+  ARRIVAL_TRACE_MS,
+  HELD_ACTIVITY_GONE, HELD_ACTIVITY_IDLE, HELD_ACTIVITY_UNKNOWN, HELD_ACTIVITY_WORKING,
   HELD_SESSION_PLACEHOLDER, HELD_SESSION_READABLE_NOTE,
   TRANSCRIPT_START_COMPLETE, TRANSCRIPT_START_TETHER_RECORD_ONLY,
 } from './index'
 import { useStore } from '../../lib/store'
 import { ErrCodeSessionHeldByBackgroundAgent, ErrCodeSessionOwned } from '../../lib/wire.gen'
 import { resetTranscriptWatchForTests } from '../../lib/transcriptWatch'
+import { SESSION_ACTIVITY_PATH, resetSessionActivityForTests, sessionActivityPollerState } from '../../lib/sessionActivity'
 
 // tether#80 — the LAST hop, which nothing pinned until now.
 //
@@ -34,6 +37,43 @@ import { resetTranscriptWatchForTests } from '../../lib/transcriptWatch'
 // quietly exercising a different path.
 
 const originalFetch = globalThis.fetch
+
+/** How tall one bubble is in the geometry model below. */
+const ROW_PX = 100
+
+/**
+ * Give an element a scroll geometry jsdom does not have.
+ *
+ * `scrollHeight` COUNTS THE BUBBLES IN THE DOM rather than being a number the test
+ * sets, so a prepend makes the container taller with no help from the test — which is
+ * the whole point: a model the test drives by hand would let a broken correction and a
+ * correct one produce the same numbers.
+ *
+ * There is deliberately NO clamping to `scrollHeight - clientHeight`. A real browser
+ * clamps, and clamping here would hide the difference between "restored the anchor"
+ * and "jumped to the bottom" in exactly the cases where they land close together.
+ *
+ * At module scope since tether#108, which needs the same model to check that the arrival
+ * TRACE does not move a reader who has scrolled up. Written for tether#107 and unchanged.
+ */
+function fakeScrollBox(el: HTMLElement, clientHeight: number) {
+  let top = 0
+  Object.defineProperty(el, 'clientHeight', { configurable: true, get: () => clientHeight })
+  Object.defineProperty(el, 'scrollHeight', {
+    configurable: true,
+    get: () => el.querySelectorAll('.msg-user, .msg-ai, .msg-system').length * ROW_PX,
+  })
+  Object.defineProperty(el, 'scrollTop', {
+    configurable: true,
+    get: () => top,
+    set: (v: number) => { top = v },
+  })
+  return {
+    top: () => top,
+    scrollTo: (v: number) => { top = v },
+    height: () => el.scrollHeight,
+  }
+}
 
 function stubFetch() {
   // Both mount fetches: GET /api/v1/providers, and GET /messages (never reached
@@ -380,6 +420,12 @@ describe('a held transcript keeps up, and a live one is still left alone (tether
    *  agent just wrote". */
   let daemonVersion = 1000
 
+  /** What GET /api/v1/session-activity answers (tether#108). sid -> state. */
+  let daemonActivity: Record<string, string> = {}
+  const activityPolls = () => seen.filter(r => r.url === SESSION_ACTIVITY_PATH).length
+  /** The line the card is currently showing, or null when the row is empty. */
+  const activityLine = () => document.querySelector('.state-card-activity')?.textContent || null
+
   /**
    * A daemon that answers everything the pane asks on its way to a live connection,
    * and reports a transcript version the test can move.
@@ -391,6 +437,13 @@ describe('a held transcript keeps up, and a live one is still left alone (tether
       if (url.includes('/providers')) return new Response(JSON.stringify({ providers: ['claude-code'] }), { status: 200 })
       if (url.includes('/wt-ticket')) return new Response(JSON.stringify({ ticket: 'tkt' }), { status: 200 })
       if (url.includes('/cert-hash')) return new Response('', { status: 404 })
+      // tether#108 — answered explicitly rather than by the `[]` fall-through below.
+      // `fetchSessionActivity` turns an array into `{}`, so the fall-through would make
+      // every test in this block silently claim the daemon reported "nothing is holding
+      // this sid" — an answer, and the one that reads as "the hold has ended".
+      if (url === SESSION_ACTIVITY_PATH) {
+        return new Response(JSON.stringify(daemonActivity), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
       if (url === MESSAGES_URL) {
         const headers = new Headers({ 'Content-Type': 'application/json' })
         headers.set('X-Tether-Transcript-Updated-At', String(daemonVersion))
@@ -446,11 +499,17 @@ describe('a held transcript keeps up, and a live one is still left alone (tether
     seen = []
     daemonTranscript = '[]'
     daemonVersion = 1000
+    daemonActivity = {}
     // transcriptWatch is a MODULE, so its loaded-version memory outlives a component
     // tree: without this, the exact request counts below depend on whichever test ran
     // before (its own doc says as much, and this is the only file that drives the real
     // watcher through the real pane).
     resetTranscriptWatchForTests()
+    // tether#108 — same argument, second module: the activity poller keeps its last
+    // answer, its `answered` flag and its interval at module scope, so without this a
+    // previous test's successful poll decides what this one's first render says, and its
+    // interval keeps firing inside this one.
+    resetSessionActivityForTests()
     globalThis.fetch = stubDaemon() as unknown as typeof fetch
     localStorage.setItem('tether_last_sid', SID)
     useStore.setState({
@@ -463,6 +522,7 @@ describe('a held transcript keeps up, and a live one is still left alone (tether
   afterEach(() => {
     cleanup()
     resetTranscriptWatchForTests()
+    resetSessionActivityForTests()
     globalThis.fetch = originalFetch
     delete (globalThis as { WebTransport?: unknown }).WebTransport
     useStore.setState({ messages: [], notices: [], sessionId: null, fatal: null, streaming: false, workspacesLoaded: false })
@@ -610,6 +670,303 @@ describe('a held transcript keeps up, and a live one is still left alone (tether
     expect(HELD_SESSION_READABLE_NOTE).not.toContain('as it stood when this pane fetched it')
     expect(HELD_SESSION_READABLE_NOTE).toContain('what tether has of this conversation')
   })
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // tether#108 — the state line, wired.
+  //
+  // This is the hop nothing else can see. `heldActivityLine` is unit-tested in
+  // ChatPane.test.tsx and the poller is unit-tested in sessionActivity.test.ts, and both
+  // can be perfect while this pane subscribes to neither — which is precisely the state
+  // the repo was in at 2ef2f76: the daemon answered this question every three seconds and
+  // `grep sessionActivity web/src/panes/chat/index.tsx` returned nothing.
+
+  it('says a turn is in flight when the daemon says the holder is busy', async () => {
+    daemonActivity = { [SID]: 'working' }
+    daemonTranscript = JSON.stringify([{ role: 'user', text: 'hello', ts: 1000 }])
+    const { container } = await renderRefusedWithSid(held)
+    expect(container.querySelectorAll('.failed-card')).toHaveLength(1)
+
+    // The whole feature, on screen: deleting the one line that renders
+    // <HeldSessionActivity> leaves every unit test green and fails exactly here.
+    expect(activityLine()).toBe(HELD_ACTIVITY_WORKING)
+    // …and it asked. Exact count: ONE poll, because the poller is shared and the pane is
+    // its only subscriber here (the session list is collapsed, so no row is mounted).
+    expect(activityPolls()).toBe(1)
+  })
+
+  it('says no turn is in flight when the daemon says the holder is idle', async () => {
+    daemonActivity = { [SID]: 'idle' }
+    await renderRefusedWithSid(held)
+    expect(activityLine()).toBe(HELD_ACTIVITY_IDLE)
+  })
+
+  it('refuses to guess when the daemon could not read a status', async () => {
+    // `held` on the wire, which is what the daemon sends for a live cc process whose
+    // record carries no status. Rendering "no turn in flight" here would be the mislabel
+    // this whole slice exists to avoid.
+    daemonActivity = { [SID]: 'held' }
+    await renderRefusedWithSid(held)
+    expect(activityLine()).toBe(HELD_ACTIVITY_UNKNOWN)
+    expect(activityLine()).not.toBe(HELD_ACTIVITY_IDLE)
+  })
+
+  it('reads an EMPTY answer as the hold having ended', async () => {
+    // The fourth answer, and the one this state reaches most often: the process that made
+    // the daemon refuse the resume has exited. `fatal` is sticky, so the card is still up
+    // — and this is the line that tells the reader "Check again" is now worth pressing.
+    daemonActivity = {}
+    await renderRefusedWithSid(held)
+    expect(activityLine()).toBe(HELD_ACTIVITY_GONE)
+  })
+
+  it('CHANGES when the daemon\'s answer changes, without a remount', async () => {
+    // The mutation this test exists for: a line painted once at mount is right for three
+    // seconds and then lies, and a stale sentence is indistinguishable from a live one.
+    daemonActivity = { [SID]: 'working' }
+    await renderRefusedWithSid(held)
+    expect(activityLine()).toBe(HELD_ACTIVITY_WORKING)
+    const before = activityPolls()
+
+    // The agent finishes its turn. Nothing about the pane changes; only the daemon does.
+    daemonActivity = { [SID]: 'idle' }
+    await forceProbe()
+
+    expect(activityPolls()).toBe(before + 1)
+    expect(activityLine()).toBe(HELD_ACTIVITY_IDLE)
+  })
+
+  it('holds the row EMPTY, and its height, until the daemon has answered', async () => {
+    // The card is inside the scroll container, so a line that APPEARED one round trip
+    // after the card would push the transcript down under a reader already reading it.
+    // The element is therefore always there and empty; the height comes from
+    // .state-card-activity's min-height, which jsdom does not compute — so what is
+    // asserted here is the part that is observable: present, and saying nothing.
+    //
+    // A request that never settles is what makes the pre-answer frame reachable at all:
+    // with a responding daemon, `settle()` drains the poll before any assertion can run.
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url)
+      seen.push({ method: init?.method ?? 'GET', url })
+      if (url === SESSION_ACTIVITY_PATH) return new Promise<Response>(() => {}) // never settles
+      if (url.includes('/providers')) return new Response(JSON.stringify({ providers: ['claude-code'] }), { status: 200 })
+      if (url === MESSAGES_URL) {
+        const headers = new Headers({ 'Content-Type': 'application/json' })
+        headers.set('X-Tether-Transcript-Updated-At', String(daemonVersion))
+        return new Response(init?.method === 'HEAD' ? null : daemonTranscript, { status: 200, headers })
+      }
+      return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }) as unknown as typeof fetch
+
+    const { container } = await renderRefusedWithSid(held)
+    // The precondition: it really did ask, and really did not get an answer.
+    expect(activityPolls()).toBe(1)
+    const row = container.querySelector('.state-card-activity')
+    expect(row).toBeTruthy()
+    expect(row?.textContent).toBe('')
+    // Specifically NOT the "nothing is holding it" sentence, which absence alone would
+    // produce and which would be a false claim about another process, made by default.
+    expect(row?.textContent).not.toBe(HELD_ACTIVITY_GONE)
+  })
+
+  it('asks NOTHING about activity when the session is CONNECTED', async () => {
+    // The cost claim, asserted as a count rather than argued. The wi assumed this poller
+    // was already running and the subscription therefore free; it is not — the chat
+    // session list is COLLAPSED by default (SessionList's `open` starts false, rows live
+    // inside `{open && …}`), so with no held session on screen nothing subscribes and no
+    // interval exists. An unconditional hook in this pane would have made it a permanent
+    // three-second request for every user.
+    ;(globalThis as { WebTransport?: unknown }).WebTransport = FakeWebTransport
+    const { container } = render(<ChatPane />)
+    await settle()
+    // Precondition: really connected. Without it a pane stuck in 'connecting' satisfies
+    // the assertion below while testing nothing.
+    const box = container.querySelector('.composer-input') as HTMLTextAreaElement
+    expect(box.disabled).toBe(false)
+
+    expect(activityPolls()).toBe(0)
+    expect(document.querySelector('.state-card-activity')).toBeNull()
+  })
+
+  it('asks NOTHING about activity for another terminal code', async () => {
+    // The gate is one code's, the same one tether#106 used. A line saying "no turn is in
+    // flight in that agent" under `session_owned_by_other` would name an agent that has
+    // nothing to do with why the connection was refused.
+    const { container } = await renderRefusedWithSid(owned)
+    expect(container.querySelectorAll('.failed-card')).toHaveLength(1)
+    expect(activityPolls()).toBe(0)
+    expect(document.querySelector('.state-card-activity')).toBeNull()
+  })
+
+  it('stops polling for activity when the pane unmounts', async () => {
+    // The subscription is a mount, so an unmount has to be an unsubscribe — otherwise the
+    // interval outlives the card and keeps asking about a session nobody is looking at.
+    daemonActivity = { [SID]: 'working' }
+    const r = await renderRefusedWithSid(held)
+    expect(activityPolls()).toBe(1)
+
+    r.unmount()
+    // On the poller's own bookkeeping, not only on a count taken right after the unmount:
+    // "still ticking with nobody listening" is invisible to the latter.
+    expect(sessionActivityPollerState()).toEqual({ running: false, subscribers: 0, answered: true })
+  })
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // tether#108 — the arrival trace.
+
+  it('marks the message that just arrived, and only that one', async () => {
+    daemonTranscript = JSON.stringify([{ role: 'user', text: 'first', ts: 1000 }])
+    const { container } = await renderRefusedWithSid(held)
+    expect(container.querySelectorAll('.msg-user')).toHaveLength(1)
+    // Nothing is traced on the way in: the transcript appearing is not an arrival.
+    expect(container.querySelectorAll('.msg-arrived')).toHaveLength(0)
+
+    daemonTranscript = JSON.stringify([
+      { role: 'user', text: 'first', ts: 1000 },
+      { role: 'assistant', text: 'and then this', ts: 2000 },
+    ])
+    daemonVersion = 2000
+    await forceProbe()
+
+    // Exactly one bubble wears the trace, and it is the new one. Count AND identity: a
+    // rule that traced everything new would also produce "at least one".
+    const traced = [...container.querySelectorAll('.msg-arrived')]
+    expect(traced).toHaveLength(1)
+    expect(traced[0].className).toBe('msg-ai msg-arrived')
+    expect(traced[0].textContent).toContain('and then this')
+    // The one that was already there is untouched — including its class, which is what
+    // the CSS keys on.
+    expect((container.querySelector('.msg-user') as HTMLElement).className).toBe('msg-user')
+  })
+
+  it('takes the trace back off, so it is an event and not a state', async () => {
+    // The distinction the wi turns on: a spinner says "you are waiting" and stays, a
+    // trace says "one just landed" and stops. A class that never came off would leave
+    // every message ever received highlighted.
+    daemonTranscript = JSON.stringify([{ role: 'user', text: 'first', ts: 1000 }])
+    const { container } = await renderRefusedWithSid(held)
+    daemonTranscript = JSON.stringify([
+      { role: 'user', text: 'first', ts: 1000 },
+      { role: 'assistant', text: 'and then this', ts: 2000 },
+    ])
+    daemonVersion = 2000
+    await forceProbe()
+    expect(container.querySelectorAll('.msg-arrived')).toHaveLength(1)
+
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, ARRIVAL_TRACE_MS + 20)) })
+    expect(container.querySelectorAll('.msg-arrived')).toHaveLength(0)
+  })
+
+  it('does not trace the whole transcript when a disjoint refresh replaces it', async () => {
+    // tether#107's fallback: over a megabyte written between two probes means the windows
+    // do not overlap, mergeHistory reports it, and loadHistory replaces the array — so
+    // every id is new and at the end. That is a replacement, not twenty arrivals, and it
+    // already announces itself by visibly jumping.
+    daemonTranscript = JSON.stringify([
+      { role: 'user', text: 'old-a', ts: 1000 },
+      { role: 'user', text: 'old-b', ts: 1001 },
+    ])
+    const { container } = await renderRefusedWithSid(held)
+    expect(container.querySelectorAll('.msg-user')).toHaveLength(2)
+
+    daemonTranscript = JSON.stringify([
+      { role: 'user', text: 'new-a', ts: 5000 },
+      { role: 'user', text: 'new-b', ts: 5001 },
+    ])
+    daemonVersion = 2000
+    await forceProbe()
+
+    // The precondition: it really did replace rather than append.
+    expect([...container.querySelectorAll('.msg-user-bubble')].map(e => e.textContent))
+      .toEqual(['new-a', 'new-b'])
+    expect(container.querySelectorAll('.msg-arrived')).toHaveLength(0)
+  })
+
+  it('does not move a reader who has scrolled up when a traced message arrives', async () => {
+    // tether#106's property, re-pinned on the commit tether#108 adds. The trace fires on
+    // the same commit the autoscroll effect reads its geometry from, and it sets React
+    // state from an effect — so this is the assertion that says the extra render cannot
+    // become a scroll.
+    daemonTranscript = JSON.stringify(
+      Array.from({ length: 10 }, (_, i) => ({ role: 'user', text: `old-${i}`, ts: 1000 + i })),
+    )
+    const { container } = await renderRefusedWithSid(held)
+    const box = fakeScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+    expect(box.height()).toBe(1000)
+    box.scrollTo(0) // reading the top of the conversation
+
+    daemonTranscript = JSON.stringify([
+      ...Array.from({ length: 10 }, (_, i) => ({ role: 'user', text: `old-${i}`, ts: 1000 + i })),
+      { role: 'assistant', text: 'arrived', ts: 9000 },
+    ])
+    daemonVersion = 2000
+    await forceProbe()
+
+    // The precondition: the trace really is on screen, so this test is about the commit
+    // that carries it rather than about a quiet one.
+    expect(container.querySelectorAll('.msg-arrived')).toHaveLength(1)
+    expect(box.top()).toBe(0)
+
+    // The CONTROL, so this assertion is known to discriminate: a reader at the bottom
+    // still follows the conversation, trace or no trace.
+    box.scrollTo(box.height() - 300)
+    daemonTranscript = JSON.stringify([
+      ...Array.from({ length: 10 }, (_, i) => ({ role: 'user', text: `old-${i}`, ts: 1000 + i })),
+      { role: 'assistant', text: 'arrived', ts: 9000 },
+      { role: 'assistant', text: 'and again', ts: 9001 },
+    ])
+    daemonVersion = 3000
+    await forceProbe()
+    expect(box.top()).toBe(box.height())
+  })
+
+  it('keeps the ids of everything already on screen when a traced message arrives', async () => {
+    // The identity property tether#106 shipped, re-pinned with the trace on screen:
+    // `key={m.id}` is React's reconciliation key and both expansion Sets are keyed by
+    // message id, so a change that re-minted ids to mark arrivals would collapse the
+    // reader's expansions every three seconds — which is exactly what tether#106 removed.
+    daemonTranscript = JSON.stringify([{ role: 'user', text: 'first', ts: 1000 }])
+    await renderRefusedWithSid(held)
+    const idsBefore = useStore.getState().messages.map(m => m.id)
+    expect(idsBefore).toHaveLength(1)
+
+    daemonTranscript = JSON.stringify([
+      { role: 'user', text: 'first', ts: 1000 },
+      { role: 'assistant', text: 'and then this', ts: 2000 },
+    ])
+    daemonVersion = 2000
+    await forceProbe()
+
+    const after = useStore.getState().messages
+    expect(after.map(m => m.id).slice(0, 1)).toEqual(idsBefore)
+    expect(new Set(after.map(m => m.id)).size).toBe(after.length)
+  })
+
+  it('still renders the top-of-transcript marker with the activity line on screen', async () => {
+    // The two features tether#108 puts in the same card as tether#107's marker, together,
+    // because "the marker is unconditional under messages.length > 0" is a property this
+    // wi must not quietly re-condition.
+    daemonActivity = { [SID]: 'working' }
+    daemonTranscript = JSON.stringify([{ role: 'user', text: 'hello', ts: 1000 }])
+    const { container } = await renderRefusedWithSid(held)
+
+    expect(activityLine()).toBe(HELD_ACTIVITY_WORKING)
+    expect(container.querySelector('.transcript-top .transcript-top-note')?.textContent)
+      .toBe(TRANSCRIPT_START_COMPLETE)
+  })
+
+  it('renders the activity line even with NO transcript, unlike the read-only note', async () => {
+    // Deliberately not gated on transcript.length. The note below it makes a claim about
+    // the screen and needs something on it; this makes a claim about the other process,
+    // and an empty transcript is precisely where a reader most needs to know whether
+    // waiting will produce anything.
+    daemonActivity = { [SID]: 'working' }
+    daemonTranscript = '[]'
+    const { container } = await renderRefusedWithSid(held)
+
+    expect(container.querySelectorAll('.msg-user, .msg-ai')).toHaveLength(0)
+    expect(container.querySelector('.state-card-read')).toBeNull()
+    expect(activityLine()).toBe(HELD_ACTIVITY_WORKING)
+  })
 })
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -636,40 +993,6 @@ describe('paging a transcript backwards (tether#107)', () => {
   const SID = 'sid-paged-0001'
   const MESSAGES_URL = `/api/v1/sessions/${SID}/messages`
 
-  /** How tall one bubble is in the geometry model below. */
-  const ROW_PX = 100
-
-  /**
-   * Give an element a scroll geometry jsdom does not have.
-   *
-   * `scrollHeight` COUNTS THE BUBBLES IN THE DOM rather than being a number the test
-   * sets, so a prepend makes the container taller with no help from the test — which is
-   * the whole point: a model the test drives by hand would let a broken correction and a
-   * correct one produce the same numbers.
-   *
-   * There is deliberately NO clamping to `scrollHeight - clientHeight`. A real browser
-   * clamps, and clamping here would hide the difference between "restored the anchor"
-   * and "jumped to the bottom" in exactly the cases where they land close together.
-   */
-  function fakeScrollBox(el: HTMLElement, clientHeight: number) {
-    let top = 0
-    Object.defineProperty(el, 'clientHeight', { configurable: true, get: () => clientHeight })
-    Object.defineProperty(el, 'scrollHeight', {
-      configurable: true,
-      get: () => el.querySelectorAll('.msg-user, .msg-ai, .msg-system').length * ROW_PX,
-    })
-    Object.defineProperty(el, 'scrollTop', {
-      configurable: true,
-      get: () => top,
-      set: (v: number) => { top = v },
-    })
-    return {
-      top: () => top,
-      scrollTo: (v: number) => { top = v },
-      height: () => el.scrollHeight,
-    }
-  }
-
   /** Per-URL daemon. The transcript route answers with real Headers so the boundary
    *  facts travel exactly as they do in production. */
   type Page = { entries: unknown[]; earlier?: number; otherRecord?: string }
@@ -681,6 +1004,9 @@ describe('paging a transcript backwards (tether#107)', () => {
       const url = String(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url)
       requested.push(`${init?.method ?? 'GET'} ${url}`)
       if (url.includes('/providers')) return new Response(JSON.stringify({ providers: ['claude-code'] }), { status: 200 })
+      // tether#108 — see the other harness: an array answer would be read as `{}`, i.e.
+      // as the daemon positively saying nothing holds this sid.
+      if (url === SESSION_ACTIVITY_PATH) return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
       const page = pages[url]
       if (page) {
         const headers = new Headers({ 'Content-Type': 'application/json' })
@@ -708,6 +1034,7 @@ describe('paging a transcript backwards (tether#107)', () => {
     requested = []
     daemonVersion = 1000
     resetTranscriptWatchForTests()
+    resetSessionActivityForTests()
     globalThis.fetch = stubDaemon() as unknown as typeof fetch
     // No remembered sid and workspaces unsettled ⇒ the first connect is DEFERRED
     // behind a store subscription and a 2s timer, neither of which fires here. That is
@@ -726,6 +1053,7 @@ describe('paging a transcript backwards (tether#107)', () => {
   afterEach(() => {
     cleanup()
     resetTranscriptWatchForTests()
+    resetSessionActivityForTests()
     globalThis.fetch = originalFetch
     useStore.setState({
       messages: [], notices: [], sessionId: null, fatal: null, streaming: false, workspacesLoaded: false,

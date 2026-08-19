@@ -11,7 +11,6 @@ import { authedFetch } from '../../lib/auth'
 import { loadEarlierTranscript, refreshTranscript, REFRESH_TRANSCRIPT_EVENT } from '../../lib/session'
 import { noteTranscriptVersion, readTranscriptBounds, readTranscriptVersion, transcriptPath, watchTranscript } from '../../lib/transcriptWatch'
 import {
-  SESSION_ACTIVITY_HELD,
   SESSION_ACTIVITY_IDLE,
   SESSION_ACTIVITY_WORKING,
   useSessionActivityAnswer,
@@ -333,18 +332,34 @@ export const HELD_ACTIVITY_GONE =
  * before anything had been asked. `answered` is set only on a SUCCESSFUL fetch
  * (sessionActivity.ts), so a daemon that never replies keeps this at null rather than
  * degrading into the one answer the reader would act on.
+ *
+ * # ABSENCE is tested first, and an unrecognised state is NOT absence
+ *
+ * The order is the whole correctness of the function. Written as a `switch` with the
+ * "nothing is holding it" sentence in the `default`, a state string this build has not
+ * been taught — a daemon newer than this bundle — would render as "nothing live is
+ * holding this conversation any more", which is the one answer a reader acts on and is
+ * false: the daemon reported something for that sid, so something IS holding it.
+ * `fetchSessionActivity` already drops unknown strings, so the case is unreachable
+ * through the poller; this is written to be right without depending on that, because
+ * "unreachable" is a property of another module that a future edit can change.
+ *
+ * Unknown therefore lands with `held`, which is exactly what the daemon does with a
+ * status IT cannot classify (ccStatusActivity's own `default`) — one sentence that is
+ * true without knowing what the word means.
  */
 export function heldActivityLine(o: {
   answered: boolean
   state: SessionActivityState | undefined
 }): string | null {
   if (!o.answered) return null
-  switch (o.state) {
-    case SESSION_ACTIVITY_WORKING: return HELD_ACTIVITY_WORKING
-    case SESSION_ACTIVITY_IDLE: return HELD_ACTIVITY_IDLE
-    case SESSION_ACTIVITY_HELD: return HELD_ACTIVITY_UNKNOWN
-    default: return HELD_ACTIVITY_GONE
-  }
+  if (o.state === undefined) return HELD_ACTIVITY_GONE
+  if (o.state === SESSION_ACTIVITY_WORKING) return HELD_ACTIVITY_WORKING
+  if (o.state === SESSION_ACTIVITY_IDLE) return HELD_ACTIVITY_IDLE
+  // Everything left: `held`, and any state string this build has not been taught. They
+  // get one sentence because they are one situation — a live process has this open and
+  // what it is doing is not readable — so there is nothing for a second branch to say.
+  return HELD_ACTIVITY_UNKNOWN
 }
 
 /**

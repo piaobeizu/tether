@@ -815,13 +815,19 @@ describe('heldActivityLine (tether#108)', () => {
     expect(heldActivityLine({ answered: false, state: SESSION_ACTIVITY_WORKING })).toBeNull()
   })
 
-  it('degrades an unrecognised state to "cannot tell", never to a claim', () => {
-    // A daemon newer than this bundle. fetchSessionActivity already drops unknown
-    // strings, so this is the second line of defence; it must not fall through to the
-    // "nothing is holding it" sentence, which would be a claim in the other direction.
-    const line = heldActivityLine({ answered: true, state: 'sprinting' as never })
-    expect(line).not.toBe(HELD_ACTIVITY_WORKING)
-    expect(line).not.toBe(HELD_ACTIVITY_IDLE)
+  it('degrades an unrecognised state to "cannot tell", NOT to "nothing is holding it"', () => {
+    // A daemon newer than this bundle. This case is the reason the absence test comes
+    // first and the fallback is `held` rather than a `switch` default: an unknown state
+    // string means the daemon reported SOMETHING for that sid, so "nothing live is
+    // holding this conversation any more" would be false — and it is the one answer a
+    // reader acts on. Asserted as the exact sentence, because the first version of this
+    // test only checked "not working and not idle", which the wrong answer satisfies.
+    expect(heldActivityLine({ answered: true, state: 'sprinting' as never }))
+      .toBe(HELD_ACTIVITY_UNKNOWN)
+    expect(heldActivityLine({ answered: true, state: 'sprinting' as never }))
+      .not.toBe(HELD_ACTIVITY_GONE)
+    // fetchSessionActivity drops unknown strings, so the poller cannot produce this —
+    // pinned anyway, because "unreachable" is a property of another module.
   })
 })
 

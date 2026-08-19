@@ -3426,3 +3426,233 @@ func TestMessagePageCursorSurvivesAMergedTurnAtTheTrimBoundary(t *testing.T) {
 		t.Errorf("the earlier page reaches turn 0 and still reports Earlier = %d", earlier.Earlier)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// tether#109 — the per-message ORDERING POSITION, and the window slide that made
+// one necessary.
+// ---------------------------------------------------------------------------
+
+// ccOrds is the Ord of every message in a page, so an assertion can be about the
+// whole sequence rather than about one element at a time.
+func ccOrds(msgs []HistoryMessage) []int64 {
+	out := make([]int64, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, m.Ord)
+	}
+	return out
+}
+
+// TestCCPageOrdIsTheRecordOffsetPlusOne pins the three claims HistoryMessage.Ord
+// makes about itself, on a page small enough that the offsets can be written down:
+//
+//  1. it is the ABSOLUTE byte offset of the record that opened the message, plus one.
+//     Absolute, because an Ord is compared against Ords from other pages of the same
+//     file, and page-relative ones would make two windows disagree about the order of
+//     the records they share;
+//  2. the +1 is real, so nothing can spend an Ord as a `?before=` cursor by accident
+//     and land one byte late (which would drop a record silently);
+//  3. a MERGED turn carries its FIRST fragment's position — the same rule its Ts
+//     already follows — so a turn is one position however many records it took.
+func TestCCPageOrdIsTheRecordOffsetPlusOne(t *testing.T) {
+	first := ccUser(t, "what did you do")
+	frag1 := ccAssistantWords(t, "I read the file", "2026-08-17T03:00:01.000Z")
+	result := ccToolResult(t, "ok")
+	frag2 := ccAssistantWords(t, "and then I wrote it", "2026-08-17T03:00:09.000Z")
+	last := ccUser(t, "thanks")
+	body := first + frag1 + result + frag2 + last
+
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", body)
+	page, ok := f.store().MessagePage("cc-session-0001", TranscriptTail)
+	if !ok {
+		t.Fatal("MessagePage reported the transcript missing")
+	}
+
+	// Three messages: the question, the merged answer, the thanks. The tool result is
+	// a type:"user" record with no words, so it emits nothing and does not break the
+	// assistant run — which is what makes the merged turn's position interesting.
+	wantOrds := []int64{
+		1,                     // `first` opens at byte 0
+		int64(len(first)) + 1, // the merged turn opens at frag1
+		int64(len(first)+len(frag1)+len(result)+len(frag2)) + 1, // `last`
+	}
+	got := ccOrds(page.Messages)
+	if len(got) != len(wantOrds) {
+		t.Fatalf("page has %d messages (ords %v), want %d (%v) — texts %q",
+			len(got), got, len(wantOrds), wantOrds, ccTexts(page.Messages))
+	}
+	for i := range wantOrds {
+		if got[i] != wantOrds[i] {
+			t.Fatalf("message %d has Ord %d, want %d (the record's byte offset + 1); all ords %v",
+				i, got[i], wantOrds[i], got)
+		}
+	}
+	// And the merged turn really is one message carrying both fragments, or the
+	// assertion above would be about a shape this store does not produce.
+	if len(page.Messages) != 3 {
+		t.Fatalf("page has %d messages, want 3 — the merge did not happen and the ords above describe nothing", len(page.Messages))
+	}
+	if !strings.Contains(page.Messages[1].Text, "I read the file") || !strings.Contains(page.Messages[1].Text, "and then I wrote it") {
+		t.Fatalf("the merged turn is missing a fragment: %q", page.Messages[1].Text)
+	}
+	// The cursor and the position are DIFFERENT numbers on purpose. This page reaches
+	// byte 0 so the cursor is 0 while the first message's Ord is 1; a test that only
+	// compared them for equality would pass on an implementation that had made the Ord
+	// spendable as a cursor.
+	if page.Earlier != 0 || page.HasEarlier {
+		t.Fatalf("a whole-file page reports Earlier=%d HasEarlier=%v, want 0/false", page.Earlier, page.HasEarlier)
+	}
+	if page.Messages[0].Ord == page.Earlier {
+		t.Fatal("the first message's Ord equals the cursor — the +1 that keeps a rank from being spendable as a byte offset is gone")
+	}
+}
+
+// TestCCPageOrdSurvivesTheWindowSlideThatBreaksRoleAndTs is the DAEMON half of
+// tether#109's reproduction.
+//
+// It builds one file and asks for two windows of the same size ending at two
+// different places — which is exactly what two consecutive fetches of a growing
+// transcript are — arranged so that the second window opens one record further into a
+// single merged assistant turn. Then it asserts both halves of the defect:
+//
+//   - role+ts is NOT stable across that slide. The same turn comes back with a
+//     different Ts, because CCStore stamps a merged turn with its FIRST fragment's
+//     time and the window decides which fragment that is. This is the mechanism
+//     behind the reported bug: to the frontend's old messageKey the re-cut turn is a
+//     message it has never seen, and it was appended at the END of a transcript whose
+//     last bubble was three and a half hours newer.
+//   - Ord places it correctly anyway: it sits strictly INSIDE the span the previous
+//     page covered, which is what lets mergeHistory classify it as "already on screen"
+//     instead of as new.
+//
+// And the reason "already on screen" is TRUE rather than convenient: the re-cut turn's
+// text is a SUFFIX of the text the previous page served for it. Asserted here, because
+// the frontend's decision to drop it rests on that and nothing on the frontend can see
+// it.
+func TestCCPageOrdSurvivesTheWindowSlideThatBreaksRoleAndTs(t *testing.T) {
+	// One merged assistant turn made of six fragments, separated by tool results so the
+	// run is not broken. cc writes exactly this shape: a record per tool call, and the
+	// call's result as a type:"user" record with no words in it.
+	const fragments = 6
+	var run strings.Builder
+	fragAt := make([]int64, fragments)
+	pad := strings.Repeat("y", 4<<10)
+
+	head := ccUser(t, "start here")
+	for i := 0; i < fragments; i++ {
+		fragAt[i] = int64(len(head) + run.Len())
+		run.WriteString(ccAssistantWords(t,
+			fmt.Sprintf("FRAGMENT-%d %s", i, pad),
+			fmt.Sprintf("2026-08-17T03:%02d:00.000Z", i)))
+		run.WriteString(ccToolResult(t, "ok"))
+	}
+	// A megabyte and a bit of ordinary conversation after the run, so that a window
+	// ending 1 MiB past a fragment is still inside the file.
+	var tail strings.Builder
+	tailPad := strings.Repeat("z", 48<<10)
+	for i := 0; tail.Len() < ccMessagesTailBytes+(64<<10); i++ {
+		tail.WriteString(ccUser(t, fmt.Sprintf("TAIL-USER-%02d %s", i, tailPad)))
+		tail.WriteString(ccAssistantWords(t, fmt.Sprintf("TAIL-ANSWER-%02d %s", i, tailPad), "2026-08-17T04:00:00.000Z"))
+	}
+	body := head + run.String() + tail.String()
+
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", body)
+	store := f.store()
+
+	// A window whose START lands one byte inside fragment k drops that fragment and
+	// opens on k+1 — see ccReadWindow, which reads to the first newline after the seek.
+	openingAt := func(k int) (CCPage, int64) {
+		until := fragAt[k] + 1 + ccMessagesTailBytes
+		if until > int64(len(body)) {
+			t.Fatalf("fixture too short: a window ending at %d does not fit in %d bytes", until, len(body))
+		}
+		page, ok := store.MessagePage("cc-session-0001", until)
+		if !ok {
+			t.Fatal("MessagePage reported the transcript missing")
+		}
+		return page, until
+	}
+
+	first, _ := openingAt(0)  // opens on fragment 1
+	second, _ := openingAt(1) // opens on fragment 2
+
+	if len(first.Messages) == 0 || len(second.Messages) == 0 {
+		t.Fatalf("empty page(s): %d and %d messages", len(first.Messages), len(second.Messages))
+	}
+	a, b := first.Messages[0], second.Messages[0]
+	if a.Role != "assistant" || b.Role != "assistant" {
+		t.Fatalf("the leading bubble is not the merged turn: %q then %q", a.Role, b.Role)
+	}
+	// The precondition, asserted rather than assumed: the two windows really did open on
+	// different fragments of the SAME turn. Without this the rest is vacuous.
+	if a.Ts == b.Ts {
+		t.Fatalf("both windows stamped the leading turn %d — the slide did not re-cut it, so this test proves nothing", a.Ts)
+	}
+	if b.Ts <= a.Ts {
+		t.Fatalf("the re-cut turn's stamp went backwards (%d then %d); the mechanism is that it moves FORWARD while the conversation does not", a.Ts, b.Ts)
+	}
+	// …while Ord places it strictly inside what the first page already covered.
+	lowest, highest := first.Messages[0].Ord, first.Messages[len(first.Messages)-1].Ord
+	if !(b.Ord > lowest && b.Ord < highest) {
+		t.Fatalf("the re-cut turn's Ord %d is not inside the previous page's span [%d, %d] — the frontend could not tell it from new content",
+			b.Ord, lowest, highest)
+	}
+	// …and dropping it hides nothing, because its text is a suffix of what is held.
+	//
+	// Taken from ONE file read twice, and that is the case rather than a shortcut — but
+	// only because of a boundary worth writing down, since review asked whether a fixture
+	// that appended to the run BETWEEN the two reads would break the relation. It would:
+	// the arriving bubble would then carry fragments the held one has never seen, and it
+	// would be a prefix-overlap rather than a suffix. That case cannot reach the
+	// frontend's skip, and the reason is a size argument, not a timing one — the window's
+	// leading edge sits a megabyte behind EOF, so a run that straddles it AND is still
+	// growing has to be longer than the whole window, which makes it the only message the
+	// window holds. Nothing then matches, and mergeHistory's no-overlap refusal fires
+	// first. A run that has already ended cannot gain fragments, so for every run this
+	// assertion covers, re-reading the same bytes IS the second fetch.
+	if !strings.HasSuffix(a.Text, b.Text) {
+		t.Fatalf("the re-cut turn's text is not a suffix of the fuller one, so skipping it would lose words\n held %.60q…\n  new %.60q…", a.Text, b.Text)
+	}
+	// Both pages are internally ordered, which is the contract the frontend's
+	// "the page is in order" check is written against.
+	for _, page := range []CCPage{first, second} {
+		ords := ccOrds(page.Messages)
+		for i := 1; i < len(ords); i++ {
+			if ords[i] <= ords[i-1] {
+				t.Fatalf("a page is not in Ord order at index %d: %v", i, ords)
+			}
+		}
+		if len(ords) > 0 && ords[0] <= 0 {
+			t.Fatalf("a page reports Ord %d — 1-based means never zero, and zero vanishes under omitempty", ords[0])
+		}
+	}
+}
+
+// TestTrimmedPageCursorIsTheFirstServedOrdMinusOne pins the one relationship that
+// exists between the cursor and the positions, in the regime where they can disagree.
+//
+// ccMessagesFromAt derives both from the same `lineAt`, so this is the guard against
+// them drifting apart in the only case that shows it: when the message cap trimmed the
+// front, the cursor is the trimmed-to message's own line, and that message is the first
+// one served. Any other pairing means "load earlier" re-serves or skips a record.
+func TestTrimmedPageCursorIsTheFirstServedOrdMinusOne(t *testing.T) {
+	// Short lines, so the COUNT cap binds before the byte window does.
+	var b strings.Builder
+	for i := 0; i < ccMessagesMax+40; i++ {
+		b.WriteString(ccUser(t, fmt.Sprintf("u%03d", i)))
+	}
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", b.String())
+	page, ok := f.store().MessagePage("cc-session-0001", TranscriptTail)
+	if !ok {
+		t.Fatal("MessagePage reported the transcript missing")
+	}
+	if !page.HasEarlier {
+		t.Fatal("the cap did not trim, so this test is vacuous — check the fixture's line length against ccMessagesMax")
+	}
+	if got, want := page.Earlier, page.Messages[0].Ord-1; got != want {
+		t.Fatalf("cursor %d, first served Ord %d — want cursor == Ord-1, or a walk backwards re-serves or skips a record",
+			got, page.Messages[0].Ord)
+	}
+}

@@ -87,6 +87,26 @@ export interface Message {
    *  a page reload (same as answerMs; `thinking` was dropped from this list in
    *  tether#98 because it is persisted, not because usage changed). */
   usage?: { input: number; output: number }
+  /** Where this message sits in the store's record of the session (tether#109) —
+   *  `HistoryMessage.Ord` (internal/session/history.go), 1-based and strictly
+   *  increasing in the order the daemon's store wrote the records.
+   *
+   *  ABSENT on a bubble the browser made: everything `handleEnvelope` and `addMessage`
+   *  build is a live bubble the daemon has not recorded yet, and there is no honest
+   *  position to give it. That is why `mergeHistory` treats an array holding one as
+   *  unverifiable rather than guessing.
+   *
+   *  It is NOT the pagination cursor. `transcriptEarlier` is a byte offset to send as
+   *  `?before=`; this is a rank, deliberately off by one from any cursor, and the only
+   *  things done to it are ordered comparison and `Map` lookup — never arithmetic, and
+   *  never a request. (An earlier version of this line said "the only operations are
+   *  `===` and `<`", which review found to be false in both halves: the code uses `<`,
+   *  `>`, `>=` and `<=`, and equality only through `Map`, i.e. SameValueZero.)
+   *
+   *  It is only comparable against another `ord` from the SAME session, and
+   *  `setSessionId` resets `transcriptPagesBack` on a change for exactly that reason —
+   *  see there. */
+  ord?: number
 }
 
 /**
@@ -103,6 +123,11 @@ export interface HistoryEntry {
   // reconstructs the turn as it rendered live (absent on pre-#44 history).
   thinking?: string
   tools?: ToolCall[]
+  /** tether#109 — `HistoryMessage.Ord`: where this entry sits in the store's record of
+   *  the session, 1-based. Optional in the TYPE because this interface is mirrored by
+   *  hand and an older daemon's response would not carry it; the daemon in THIS binary
+   *  always does, on both stores. `mergeHistory` treats absent as unverifiable. */
+  ord?: number
 }
 
 /**
@@ -124,6 +149,13 @@ export function historyEntryToMessage(m: HistoryEntry): Message {
   // ToolCallList render the same after a reload as they did live.
   if (m.thinking) msg.thinking = m.thinking
   if (m.tools && m.tools.length > 0) msg.tools = m.tools
+  // tether#109 — carried through so `mergeHistory` can check the order it used to
+  // assume. Copied on the `typeof` rather than on truthiness: the guard here has to
+  // separate "the daemon did not send one" from a value, and every other field in this
+  // function is a string or an array where falsy and absent mean the same thing. A
+  // 1-based Ord is never 0, so `if (m.ord)` would behave identically today — and would
+  // silently start dropping position 0 the day the +1 is reconsidered.
+  if (typeof m.ord === 'number') msg.ord = m.ord
   return msg
 }
 
@@ -145,9 +177,14 @@ export function historyEntryToMessage(m: HistoryEntry): Message {
 const MESSAGE_KEY_SEP = String.fromCharCode(0)
 
 /**
- * messageKey is THE definition of "these two entries are the same message", shared by
- * every reducer that has to recognise one across two fetches: `loadHistory` (which
- * carries ids over a reload), `prependHistory` and `mergeHistory` (tether#107).
+ * messageKey is THE definition of "these two entries are the same message" for the two
+ * reducers that still recognise one across two fetches by CONTENT: `loadHistory` (which
+ * carries ids over a reload) and `prependHistory` (tether#107).
+ *
+ * `mergeHistory` used to be the third, and tether#109 took it off this key: role+ts is
+ * not stable across a window slide (see the reducer), which is the defect that wi fixed.
+ * The two that remain are unchanged, deliberately — moving them would trade a measured
+ * bug for an unmeasured one.
  *
  * # role + ts, and text is deliberately NOT in it
  *
@@ -158,11 +195,34 @@ const MESSAGE_KEY_SEP = String.fromCharCode(0)
  * a cc turn's is its first record's timestamp (internal/session), so the ts identifies
  * the turn while the text is its content.
  *
- * Written once because three reducers now depend on it agreeing with itself. Two copies
- * of this rule is how `loadHistory` keeps an id that `mergeHistory` then replaces.
+ * Written once because two reducers depend on it agreeing with itself. Two copies of this
+ * rule is how `loadHistory` keeps an id that another reducer then replaces.
  */
 export function messageKey(m: { role: string; ts: number }): string {
   return `${m.role}${MESSAGE_KEY_SEP}${m.ts}`
+}
+
+/**
+ * hasOrd reports whether a message carries the daemon's ordering position (tether#109).
+ *
+ * `Number.isFinite` and not `!== undefined`: the value crosses JSON, so `null`, `NaN` and
+ * a STRING are all shapes a hand-mirrored wire type cannot rule out, and the three fail
+ * differently — which is why the loose check is not merely untidy:
+ *
+ *   - `null`, `NaN` and `undefined` compare false against every ord, so on the INCOMING
+ *     side they fall through to a refusal by accident, and on the HELD side they silently
+ *     shorten the span the interior case is measured against;
+ *   - a string is worse, and it is the one an earlier version of this comment got wrong.
+ *     `"4096" > 1000` is TRUE (JavaScript coerces), while `new Map([[4096, 0]]).get("4096")`
+ *     is undefined (Map keys do not) — so a string ord matches nothing and then appends,
+ *     producing a duplicate bubble at the end. Review found this by reading the claim
+ *     rather than the code.
+ *
+ * Exported because the check belongs to the same contract as `messageKey`, and because a
+ * test asserting the refusal has to be able to build the shape that causes it.
+ */
+export function hasOrd(m: { ord?: number }): boolean {
+  return typeof m.ord === 'number' && Number.isFinite(m.ord)
 }
 
 /**
@@ -546,7 +606,10 @@ interface AppState {
   /** How many earlier pages the reader has deliberately loaded. The refresh path reads
    *  this to decide between replacing the array (0) and merging into it (>0); a
    *  boolean would do today, but the count is what the pane would need to say how far
-   *  back it has gone and it costs the same. */
+   *  back it has gone and it costs the same.
+   *
+   *  It describes the pages of ONE session, so `setSessionId` clears it on a change
+   *  (tether#109) — see there. */
   transcriptPagesBack: number
 
   setSessionId: (id: string) => void
@@ -558,8 +621,10 @@ interface AppState {
   /** Put an older page in FRONT of the transcript (tether#107). */
   prependHistory: (msgs: Message[]) => void
   /** Fold a freshly-fetched NEWEST page into a transcript that already holds older
-   *  pages (tether#107). Returns false when the two do not overlap at all, which is
-   *  the caller's signal to fall back to loadHistory. */
+   *  pages (tether#107). Returns false when the merge cannot be shown to be safe —
+   *  four causes since tether#109, enumerated on the reducer; the original one was
+   *  "the two pages do not overlap at all". Either way, false is the caller's signal
+   *  to fall back to loadHistory. */
   mergeHistory: (msgs: Message[]) => boolean
   /** Drop the notice list when the USER deliberately opens a different session
    *  (tether#57). Not wired to setSessionId: the resume-fallback path also
@@ -670,9 +735,50 @@ export const useStore = create<AppState>((set, get) => ({
   transcriptOtherRecord: null,
   transcriptPagesBack: 0,
 
+  /**
+   * setSessionId persists the sid and, when it CHANGES, retires the page count that
+   * described the session being left (tether#109).
+   *
+   * # Why the reset is here rather than left to loadHistory
+   *
+   * Because `transcriptPagesBack > 0` is the flag that sends a refresh through
+   * `mergeHistory` instead of `loadHistory`, and `mergeHistory` compares `ord`s — which
+   * are positions in ONE store's record of ONE session. Carried across a switch, the
+   * count says "merge" while the array belongs to the previous session, and the two
+   * sessions' positions are then compared as if they described the same file.
+   *
+   * That is not a remote possibility, it is arithmetic: `ord` is 1-based and both stores
+   * number from the beginning of their record, so `ord === 1` is present in EVERY page
+   * that reaches byte 0 — which for tether's own store is every page, since LoadHistory
+   * reads the whole file. One matching ord is all `mergeHistory` needs to report success,
+   * after which every other position in the arriving page lands inside the previous
+   * session's span and is skipped as "already on screen". The result is session A's
+   * transcript displayed under session B, with A's cursor still armed. ChatPane's
+   * `[sessionId]` effect usually heals it one response later, but that effect is guarded
+   * on a non-empty payload, so a switch to a session with nothing in it does not heal.
+   *
+   * Found by review. Under tether#107's role+ts key the same sequence collided only if
+   * two sessions shared a millisecond, so this became reachable when the key changed —
+   * which makes it this wi's to fix rather than a pre-existing one to note.
+   *
+   * # What is deliberately NOT reset
+   *
+   * `transcriptEarlier` and `transcriptOtherRecord`. They come off the response that
+   * installs the messages they describe, and the switch's own `refreshTranscript` records
+   * both a moment later; clearing them here would render "this is the beginning of the
+   * conversation" over the OUTGOING session's messages for one frame — a false sentence
+   * in place of a stale one. With the count at zero the refresh takes `loadHistory` and
+   * overwrites both from the new session's response, so the stale cursor is never spent.
+   *
+   * # Why conditional
+   *
+   * `handleEnvelope`'s session_ready calls this with the sid it already has (tether#45,
+   * for localStorage), and that is not a switch. An unconditional reset would throw away
+   * the pages of a reader who is sitting in one session while it re-announces itself.
+   */
   setSessionId: (id) => {
     localStorage.setItem('tether_last_sid', id)
-    set({ sessionId: id })
+    set((s) => (s.sessionId === id ? { sessionId: id } : { sessionId: id, transcriptPagesBack: 0 }))
   },
   loadHistory: (msgs) => set((s) => {
     // Mirror the live 'fenced' replace-by-BlockID reduction (contract §3):
@@ -835,47 +941,174 @@ export const useStore = create<AppState>((set, get) => ({
    * makes HELD_SESSION_READABLE_NOTE ("tether keeps re-reading it every few seconds")
    * false for exactly that reader.
    *
-   * # The rule
+   * # The rule, and why tether#109 had to replace tether#107's
    *
-   * Match on messageKey; update matched entries IN PLACE keeping their id; append the
-   * unmatched at the end; remove nothing.
+   * tether#107 matched on messageKey and appended everything that did not match,
+   * because "every page is a contiguous range of one append-only file, so everything
+   * that does not match is strictly newer than everything that does". The premise about
+   * the FILE is true. The conclusion about MESSAGES does not follow, and the counter-
+   * example was on the owner's screen: two consecutive bubbles whose lower one was
+   * timestamped 3h16m EARLIER than the upper one.
    *
-   * Appending at the end is correct rather than convenient. Every page is a contiguous
-   * range of one append-only file, so the array covers [p, size) and the new page
-   * covers [a, size') with size' >= size: everything in the overlap matches, and
-   * everything that does not match is strictly newer than everything that does.
+   * What breaks it is that a message is not a record. CCStore merges a run of assistant
+   * records into ONE bubble stamped with its FIRST fragment's time
+   * (internal/session/ccsessions.go), so the bubble at the LEADING EDGE of the byte
+   * window is a SUFFIX of a turn, and which suffix depends on where the window opens.
+   * Slide the window one record forward — the ordinary consequence of the file growing —
+   * and the same turn comes back stamped with a later fragment: a messageKey the client
+   * has never seen, carrying a timestamp from a megabyte back. Appended at the end.
    *
-   * # Returning false when NOTHING matched
+   * Measured by replaying the reported 125 MB transcript through the real window rule:
+   * 36 of 1,031 consecutive single-record appends produce one, worst case 3h36m out of
+   * order. The window START never moved backwards once in 1,053 samples, so this needs
+   * neither the widen-once retry nor the message cap — it is what a normally sliding
+   * window does.
    *
-   * That means the two ranges do not overlap — over a megabyte was written between two
-   * three-second probes, so the new window starts after the old array ended. Merging
-   * then would splice two disjoint stretches of conversation together with an invisible
-   * hole between them, and a reader cannot see a hole. The caller falls back to
-   * `loadHistory`, which loses the loaded pages but is VISIBLE: the transcript
-   * obviously jumps. A silent hole is the worse of the two failures, so the honest one
-   * is the one to take.
+   * So the rule is now stated on the ordering key the daemon reports per message
+   * (`Message.ord`, tether#109) and CHECKED rather than assumed. For each arriving
+   * message, exactly one of:
+   *
+   *   - an `ord` already on screen — the same record, re-read: update IN PLACE, keeping
+   *     the id (that is tether#106's property, and the growing turn depends on it);
+   *   - an `ord` strictly greater than every `ord` on screen — genuinely new: append;
+   *   - an ASSISTANT `ord` INSIDE the span already on screen but matching nothing — the
+   *     re-cut leading-edge bubble above: SKIP it. Those bytes are already rendered,
+   *     inside the fuller bubble that swallowed them, and its text is a suffix of that
+   *     bubble's text — so nothing is hidden by dropping it and a duplicate is avoided;
+   *   - anything else inside the span — refuse. See the role check below;
+   *   - an `ord` BELOW everything on screen — the window really did move backwards
+   *     (widen-once fires: measured to start 15.6 MiB earlier on that same transcript).
+   *     Refuse.
+   *
+   * # Skipping rather than refusing, for the interior case
+   *
+   * Because refusing there would fire on 3.5% of appends — every few seconds for a
+   * reader of an active session — and each refusal costs the reader the pages they
+   * deliberately loaded. That is the trap the cheaper version of this fix falls into:
+   * "require the incoming page's first message to match something on screen" false-
+   * rejects whenever the file grew by less than the front the daemon trimmed, which at a
+   * three-second poll is most refreshes, i.e. it reintroduces the loss tether#107 built
+   * this reducer to prevent. The interior case is the one place where we can say
+   * something TRUE and cheap — those bytes are on screen — so we say it.
+   *
+   * # The ROLE check on the skip, which is what makes "already on screen" checkable
+   *
+   * "Those bytes are already rendered" rests on the pages on screen being contiguous, and
+   * nothing in this file enforces contiguity — `prependHistory` still dedupes by
+   * messageKey, and the pane documents a race in which a disjoint refresh lands inside an
+   * in-flight "load earlier". Review could not reach an actual loss through either, but an
+   * invariant maintained by nothing is not one to skip a message on.
+   *
+   * The role narrows it to the shape the daemon can actually produce. Only a run of
+   * ASSISTANT records merges (ccsessions.go's `m.Role == "assistant" && out[n-1].Role ==
+   * "assistant"`), so only an assistant bubble's `ord` can move when a window slides. A
+   * user or system record is its own bubble at its own offset in every window: if its
+   * position is inside a contiguous span on screen then it IS on screen and would have
+   * matched, so "interior and unmatched" proves the span is NOT contiguous — and the
+   * honest answer to that is the visible reset, not a skipped bubble.
+   *
+   * The one case where a skip could genuinely lose words is a single assistant run LONGER
+   * than the byte window, where the held bubble is a prefix rather than a superstring of
+   * the arriving one. It cannot reach the skip: such a run is the only message the window
+   * holds, so nothing matches and (1) refuses first.
+   *
+   * # Returning false, in full
+   *
+   * Four ways, and all four end at `loadHistory`: a visible reset of the transcript to
+   * the newest page. That is the honest failure. A silent hole in a conversation, or a
+   * silently scrambled one, is not something a reader can see.
+   *
+   *   1. NOTHING matched (and the array was not empty) — the two ranges are disjoint,
+   *      tether#107's case: over a megabyte written between two probes, so the new
+   *      window starts after the array ended and merging would splice two stretches
+   *      together with an invisible hole between them.
+   *   2. An arriving `ord` sits below everything on screen (above).
+   *   3. Any message on either side carries NO `ord` — the premise is then not
+   *      checkable, and this reducer's whole job since tether#109 is to check it. Both
+   *      daemon stores number every message they serve, so in practice this means the
+   *      array holds a bubble the BROWSER made (`handleEnvelope`) and the daemon has not
+   *      recorded, or a response came from a daemon older than this SPA.
+   *
+   *      Both halves of that gate earn their place, but not equally and not for the same
+   *      shapes — worth writing down, because the first version of this paragraph got it
+   *      wrong in a way only a mutant and a `node -e` caught:
+   *
+   *        - on SCREEN it is the whole defence. An unnumbered entry simply does not join
+   *          the index, so the span that (2) and the interior case are measured against is
+   *          silently short and the merge proceeds on it.
+   *        - INCOMING, it is the defence against a STRING. `undefined` and `null` do fall
+   *          through to (2) on their own — both compare false against any ord — but
+   *          `"4096" > 1000` is TRUE while a Map keyed by numbers does not find `"4096"`,
+   *          so a string ord matches nothing, passes the append branch and lands as a
+   *          duplicate bubble at the end. That is the shape `hasOrd`'s own doc names, and
+   *          it is why the gate is `Number.isFinite` rather than `!== undefined`.
+   *   4. The APPENDED TAIL of the arriving page is not in `ord` order. Only the tail: a
+   *      message that matches, or one that is skipped, is order-independent, so a page
+   *      arriving as [3000, 1000, 2000] against those same three on screen merges happily
+   *      and correctly. Both readers emit in file order, so neither case can happen from
+   *      this daemon; the check is here because "the page is sorted" is exactly the kind of
+   *      assumption this wi exists to stop making, and it is stated as narrowly as it is
+   *      implemented because review found the wider claim in this comment first.
    *
    * An EMPTY existing array is not the disjoint case — there is nothing to overlap
-   * with — so it merges (i.e. installs) rather than reporting failure.
+   * with — so it installs rather than reporting failure. It also cannot be checked, and
+   * does not need to be: one page is one contiguous range whatever is in it.
    */
   mergeHistory: (msgs) => {
     const s = get()
     if (msgs.length === 0) return true
-    const at = new Map<string, number>()
-    s.messages.forEach((m, i) => { if (!at.has(messageKey(m))) at.set(messageKey(m), i) })
+    // `.slice()`, so the store never installs an array its caller still holds. Every
+    // other exit from this reducer builds a new array; this one would not, and a store
+    // that shares an array with a caller can change without notifying any subscriber.
+    if (s.messages.length === 0) { set({ messages: msgs.slice() }); return true }
+    // (3) above. Read as one pass over each side rather than folded into the loop, so
+    // that "every message has a position" is a stated precondition of the arithmetic
+    // below instead of a case scattered through it.
+    if (!s.messages.every(hasOrd) || !msgs.every(hasOrd)) return false
+    const at = new Map<number, number>()
+    let lowest = Infinity
+    let highest = -Infinity
+    s.messages.forEach((m, i) => {
+      const o = m.ord as number
+      // First index wins, as tether#107's key map did. Unreachable for a well-formed
+      // array — an ord identifies one record — and kept because the alternative is for a
+      // repeat to silently redirect an update to a later slot.
+      if (!at.has(o)) at.set(o, i)
+      if (o < lowest) lowest = o
+      if (o > highest) highest = o
+    })
     const next = s.messages.slice()
     const fresh: Message[] = []
     let matched = 0
+    let lastAppended = highest
     for (const m of msgs) {
-      const i = at.get(messageKey(m))
-      if (i === undefined) { fresh.push(m); continue }
-      matched++
-      // Content from the new page, identity from the old one. Spreading the incoming
-      // message first is what makes a field the daemon has STOPPED sending disappear
-      // rather than linger from the previous fetch.
-      next[i] = { ...m, id: next[i].id }
+      const o = m.ord as number
+      const i = at.get(o)
+      if (i !== undefined) {
+        matched++
+        // Content from the new page, identity from the old one. Spreading the incoming
+        // message first is what makes a field the daemon has STOPPED sending disappear
+        // rather than linger from the previous fetch.
+        next[i] = { ...m, id: next[i].id }
+        continue
+      }
+      // Strict, and `>=` here would be an EQUIVALENT mutant rather than a bug: an `ord`
+      // equal to `highest` is in the index, so it was matched above and never reaches
+      // this line. Written strict because that is what the sentence "strictly newer than
+      // everything on screen" means, and the equality case being unreachable is a
+      // property of the index rather than of this comparison.
+      if (o > highest) {
+        if (o <= lastAppended) return false // (4)
+        lastAppended = o
+        fresh.push(m)
+        continue
+      }
+      // The interior case: already on screen, skip — but only for the one role whose
+      // position a sliding window can move. See "The ROLE check on the skip" above.
+      if (o >= lowest && m.role === 'assistant') continue
+      return false // (2), and the non-assistant interior case
     }
-    if (matched === 0 && s.messages.length > 0) return false
+    if (matched === 0) return false // (1)
     set({ messages: fresh.length > 0 ? [...next, ...fresh] : next })
     return true
   },

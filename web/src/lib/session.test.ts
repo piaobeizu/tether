@@ -413,7 +413,12 @@ describe('paging backwards (tether#107)', () => {
     return { calls }
   }
 
-  const entry = (role: string, text: string, ts: number) => ({ role, text, ts })
+  // `ord` defaults to `ts` so the tether#107 cases below read as they were written. That
+  // default is a convenience of this fixture and NOT a fact about the wire — the daemon's
+  // ord is a byte position in a file and its ts is a clock. tether#109's cases pass the
+  // two separately, because a fixture where they move together cannot express the bug:
+  // the whole mechanism is a ts that moves while the conversation does not.
+  const entry = (role: string, text: string, ts: number, ord: number = ts) => ({ role, text, ts, ord })
   const URL_NEWEST = '/api/v1/sessions/sid-paged-0001/messages'
 
   afterEach(() => {
@@ -577,6 +582,150 @@ describe('paging backwards (tether#107)', () => {
     await refreshTranscript('sid-paged-0001')
 
     expect(useStore.getState().messages.map(m => m.text)).toEqual(['a different conversation'])
+    expect(useStore.getState().transcriptEarlier).toBeNull()
+  })
+
+  // ── tether#109: the refresh path over a window that re-cut its leading bubble ──
+  //
+  // The reported defect, driven through the real loader rather than through the reducer:
+  // two pages on screen, then a probe whose newest window opens one record further into
+  // the assistant turn at its leading edge. cc stamps a merged turn with its FIRST
+  // fragment's time, so that turn arrives with a LATER ts and a key nothing on screen has
+  // — and tether#107 appended it, under a bubble three and a half hours newer.
+  //
+  // The ords here are byte positions a megabyte apart and the timestamps are the measured
+  // ones, so the fixture has the shape the real data has: ts and ord move independently.
+  it('keeps the reader\'s pages when the newest window re-cuts its leading bubble', async () => {
+    const TS_EDGE_FULL = Date.parse('2026-08-19T03:41:45.555Z')
+    const TS_EDGE_RECUT = Date.parse('2026-08-19T03:41:49.404Z')
+    const TS_NEWEST = Date.parse('2026-08-19T07:18:29.315Z')
+
+    mockPages({
+      [URL_NEWEST]: {
+        entries: [
+          entry('assistant', 'the whole turn, first fragment onwards', TS_EDGE_FULL, 122154092),
+          entry('assistant', 'the newest turn', TS_NEWEST, 123197925),
+        ],
+        earlier: 122154091,
+      },
+      [`${URL_NEWEST}?before=122154091`]: {
+        entries: [entry('user', 'a page the reader asked for', TS_EDGE_FULL - 3600000, 121000000)],
+        earlier: 120000000,
+      },
+    })
+    useStore.setState({ sessionId: 'sid-paged-0001' })
+    await refreshTranscript('sid-paged-0001')
+    await loadEarlierTranscript('sid-paged-0001')
+    const idsBefore = useStore.getState().messages.map(m => m.id)
+    expect(idsBefore).toHaveLength(3)
+
+    // The file grew by one record, so the window slid forward and dropped the leading
+    // fragment of the turn at its edge.
+    mockPages({
+      [URL_NEWEST]: {
+        entries: [
+          entry('assistant', 'minus its first fragment', TS_EDGE_RECUT, 122155976),
+          entry('assistant', 'the newest turn', TS_NEWEST, 123197925),
+          entry('user', 'what the other agent just wrote', TS_NEWEST + 60000, 123205000),
+        ],
+        earlier: 122155975,
+      },
+    })
+    await refreshTranscript('sid-paged-0001')
+
+    const after = useStore.getState().messages
+    // The re-cut bubble is NOT at the end. Its words are still on screen — they are a
+    // suffix of the bubble above, which the daemon-side test pins — and the new turn is
+    // where a new turn goes.
+    expect(after.map(m => m.text)).toEqual([
+      'a page the reader asked for',
+      'the whole turn, first fragment onwards',
+      'the newest turn',
+      'what the other agent just wrote',
+    ])
+    // Identity survived, so React reconciles rather than remounting: the reader keeps
+    // their expansions and their scroll position.
+    expect(after.slice(0, 3).map(m => m.id)).toEqual(idsBefore)
+    // And the merge SUCCEEDED — the reader's page is still counted and the cursor still
+    // describes the oldest page on screen rather than the newest window's.
+    expect(useStore.getState().transcriptPagesBack).toBe(1)
+    expect(useStore.getState().transcriptEarlier).toBe(120000000)
+  })
+
+  it('falls back to a visible replace when the refreshed window starts before everything on screen', async () => {
+    // widen-once: ccReadTail retries a 1 MiB window holding no conversation with a 16 MiB
+    // one. Measured on the reported transcript it fires on 9 of 1,053 sampled sizes and
+    // starts the page 15.6 MiB earlier — so this is real, even though it is not the
+    // mechanism in the screenshot. Content below everything on screen cannot be folded
+    // in: there is no guarantee the two ranges meet.
+    mockPages({
+      [URL_NEWEST]: {
+        entries: [entry('user', 'ask', 500, 122000000), entry('assistant', 'answer', 600, 122500000)],
+        earlier: 121999999,
+      },
+      [`${URL_NEWEST}?before=121999999`]: {
+        entries: [entry('user', 'a page the reader asked for', 100, 121000000)],
+        earlier: 120000000,
+      },
+    })
+    useStore.setState({ sessionId: 'sid-paged-0001' })
+    await refreshTranscript('sid-paged-0001')
+    await loadEarlierTranscript('sid-paged-0001')
+    expect(useStore.getState().messages).toHaveLength(3)
+
+    mockPages({
+      [URL_NEWEST]: {
+        entries: [
+          entry('user', '15.6 MiB earlier', 50, 105904904),
+          entry('user', 'ask', 500, 122000000),
+          entry('assistant', 'answer', 600, 122500000),
+        ],
+        earlier: 105904903,
+      },
+    })
+    await refreshTranscript('sid-paged-0001')
+
+    // The visible reset: the array is the newest page, in the daemon's order, and the
+    // page counter and the cursor both describe that one page.
+    expect(useStore.getState().messages.map(m => m.text)).toEqual(['15.6 MiB earlier', 'ask', 'answer'])
+    expect(useStore.getState().transcriptPagesBack).toBe(0)
+    expect(useStore.getState().transcriptEarlier).toBe(105904903)
+  })
+
+  it('replaces rather than merging when the reader switches session while paged back', async () => {
+    // The cross-session hole, end to end. Found by review, and it is arithmetic rather
+    // than bad luck: `ord` is 1-based and both daemon stores number from the start of
+    // their own record, so `ord === 1` appears in every page that reaches byte 0 — every
+    // page at all, for tether's own store. One matching position is all a merge needs to
+    // report success, and the rest of the arriving page then lands inside the previous
+    // session's span. Session A's transcript would render under session B, with A's byte
+    // cursor still armed against B's file.
+    //
+    // Driven through `openSession` because that is the real path: it calls setSessionId
+    // (which now retires the page count) and then refreshTranscript, and the ORDER of
+    // those two is what makes the refresh take the replace.
+    const URL_B = '/api/v1/sessions/sid-paged-0002/messages'
+    mockPages({
+      [URL_NEWEST]: { entries: [entry('user', "A's own turn", 500, 900)], earlier: 4096 },
+      [`${URL_NEWEST}?before=4096`]: { entries: [entry('user', "A's first turn ever", 100, 1)], earlier: undefined },
+      [URL_B]: { entries: [entry('user', "B's first turn ever", 700, 1)] },
+    })
+    useStore.setState({ sessionId: 'sid-paged-0001' })
+    await refreshTranscript('sid-paged-0001')
+    await loadEarlierTranscript('sid-paged-0001')
+    // The precondition, asserted: A really is paged back, and it really does hold ord 1 —
+    // the position B's page will also carry. Without both, this test proves nothing.
+    expect(useStore.getState().transcriptPagesBack).toBe(1)
+    expect(useStore.getState().messages.map(m => m.ord)).toEqual([1, 900])
+
+    openSession('sid-paged-0002')
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await refreshTranscript('sid-paged-0002')
+
+    // B's transcript, and only B's. A merge would have left "A's own turn" on screen
+    // (interior, assistant… or refused; either way the array would not be exactly B's).
+    expect(useStore.getState().messages.map(m => m.text)).toEqual(["B's first turn ever"])
+    expect(useStore.getState().transcriptPagesBack).toBe(0)
     expect(useStore.getState().transcriptEarlier).toBeNull()
   })
 })

@@ -437,3 +437,73 @@ func TestMessagesProbeCarriesNoCursor(t *testing.T) {
 		t.Errorf("HEAD with a malformed cursor -> status %d, want 200", bad.Code)
 	}
 }
+
+// TestMessagesRouteCarriesThePositionOnEveryEntry — tether#109's field has to reach the
+// BROWSER, and the route is where that stops being a claim about a struct.
+//
+// The body of this route is a bare JSON array of session.HistoryMessage, decoded on the
+// other side against a HAND-MIRRORED `HistoryEntry` (web/src/lib/store.ts). So there are
+// two ways for this to be silently wrong — the field could be omitted by `omitempty`, or
+// the mirror could not have it — and neither shows up as an error: mergeHistory reads a
+// missing position as "unverifiable" and falls back to replacing the transcript, forever,
+// which looks like a jumpy UI rather than like a bug. This test covers the first way;
+// store.test.ts's `historyEntryToMessage carries the position` covers the second.
+//
+// Asserted on the RAW BODY as well as on the decode, because unmarshalling into the same
+// struct that marshalled it cannot notice a missing key — it would read as zero.
+func TestMessagesRouteCarriesThePositionOnEveryEntry(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		seed  func(t *testing.T, tetherDir, ccProjects, workdir, sid string)
+		count int
+	}{
+		{
+			name: "cc's store",
+			seed: func(t *testing.T, _, ccProjects, workdir, sid string) {
+				seedCC(t, ccProjects, workdir, sid,
+					ccUserRecord("first"), ccUserRecord("second"), ccUserRecord("third"))
+			},
+			count: 3,
+		},
+		{
+			name: "tether's own store",
+			seed: func(t *testing.T, tetherDir, _, _, sid string) {
+				seedTetherTranscript(t, tetherDir, sid, "the only turn")
+			},
+			count: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tetherDir, ccProjects, workdir, _, sub := ccAPI(t)
+			const sid = "positioned-session-01"
+			tc.seed(t, tetherDir, ccProjects, workdir, sid)
+
+			rec := getMessages(t, sub, sid)
+			if rec.Code != 200 {
+				t.Fatalf("status = %d; body=%s", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), `"ord":`) {
+				t.Fatalf("the response body has no ord key at all:\n%s", rec.Body.String())
+			}
+			var got []session.HistoryMessage
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatalf("json.Unmarshal: %v; body=%s", err, rec.Body.String())
+			}
+			if len(got) != tc.count {
+				t.Fatalf("served %d messages, want %d: %s", len(got), tc.count, rec.Body.String())
+			}
+			// Every entry, strictly increasing, never zero. "Every" is the load-bearing
+			// word: mergeHistory refuses the whole page if ONE entry is missing a
+			// position, so a store that numbered most of them would degrade exactly as
+			// badly as one that numbered none.
+			prev := int64(0)
+			for i, m := range got {
+				if m.Ord <= prev {
+					t.Fatalf("entry %d has Ord %d, not greater than the previous %d: %s",
+						i, m.Ord, prev, rec.Body.String())
+				}
+				prev = m.Ord
+			}
+		})
+	}
+}

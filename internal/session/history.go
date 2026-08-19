@@ -95,6 +95,68 @@ type HistoryMessage struct {
 	// (omitempty) for backward compatibility with pre-#44 history lines.
 	Thinking string           `json:"thinking,omitempty"` // extended-thinking text (tether#34)
 	Tools    []ToolCallRecord `json:"tools,omitempty"`    // tool calls + results (tether#37/#38)
+	// Ord is this message's POSITION in the store's record of the session
+	// (tether#109): strictly increasing in the order the records were written, and
+	// comparable ONLY against another Ord from the same store's record of the same
+	// session. Set on the READ paths (LoadHistory, CCStore.MessagePage); never set
+	// by anything that writes.
+	//
+	// # What it is for
+	//
+	// The frontend's refresh path folds a freshly-fetched newest page into a
+	// transcript that already holds earlier pages (mergeHistory, web/src/lib/store.ts).
+	// Until tether#109 it decided "is this arriving message one I already have?" on
+	// role+ts, and assumed everything that did not match was strictly NEWER than
+	// everything that did. That assumption is false, and the way it fails was measured
+	// on the 125 MB transcript of the session that reported it: cc merges a run of
+	// assistant records into ONE bubble, so the bubble at the LEADING EDGE of the byte
+	// window is a SUFFIX of a turn and its stamp is whichever fragment the window
+	// happens to open on. Slide the window forward by one record and the same turn
+	// comes back with a LATER ts — a key the client has never seen, carrying a
+	// timestamp from a megabyte back, appended to the END of the transcript. 36 of
+	// 1,031 consecutive single-record appends did that; the worst put a bubble 3h36m
+	// older directly below the newest one.
+	//
+	// So the premise is not about pages being contiguous — they are. It is that
+	// role+ts is a property of the CONTENT a window happened to include, and it moves
+	// when the window moves. This is a property of the RECORD's place in the file, and
+	// it does not. With it on the wire the frontend can CHECK the premise instead of
+	// assuming it, which is the entire change.
+	//
+	// # 1-BASED, and that is load-bearing rather than a taste
+	//
+	// HistoryMessage is both the body shape of GET /sessions/{sid}/messages and the
+	// shape this package APPENDS to history.jsonl. `omitempty` is what keeps an
+	// appended line byte-identical to what it was before this field existed — nothing
+	// on the write path sets Ord — and the price of omitempty is that a legitimate
+	// zero would vanish on the wire. Both stores have a legitimate zero: cc's first
+	// record sits at byte 0, and tether's first line is line 0. Hence the +1, and
+	// hence "absent" means exactly "this store did not report a position", which the
+	// frontend treats as unverifiable rather than as position zero.
+	//
+	// # It is NOT a cursor
+	//
+	// What `?before=` takes is TranscriptEarlierHeader's byte offset, and an Ord is
+	// deliberately a different number from it (off by the +1 above). Nothing compares
+	// the two and nothing may: a cursor names a byte to read FROM, this names a rank
+	// to order BY. TestCCPageOrdIsTheRecordOffsetPlusOne pins both halves.
+	//
+	// # "The same record" also means "the same generation of the file"
+	//
+	// On the cc branch this is a byte offset, so it names a record only for as long as
+	// the file is append-only. MessagePage's own doc rests the cursor on exactly that
+	// ("cc appends and never rewrites"), and MessagePage itself already clamps for the
+	// case it does not hold — a client's stale offset against a truncated-and-rewritten
+	// file. If cc ever did rewrite one, the same Ord would name a DIFFERENT record and
+	// the frontend's merge would update a bubble in place with unrelated content, where
+	// the content-derived key it replaced would merely have failed to match.
+	//
+	// Stated rather than defended, because there is no evidence cc rewrites a transcript
+	// and a generation counter nobody can trigger is not worth its wire. Raised by review
+	// as a hazard, recorded here as one. If it ever needs detecting, the daemon already
+	// holds two facts that would: a newest page whose `earlier` cursor jumped BACKWARDS
+	// between two reads, and TranscriptUpdatedAt going backwards.
+	Ord int64 `json:"ord,omitempty"`
 }
 
 // ToolCallRecord mirrors the frontend ToolCall shape (store.ts) so persisted
@@ -327,6 +389,18 @@ func (h *HistoryStore) LoadHistory(sid string) []HistoryMessage {
 				"sid", sid, "line_index", i, "err", err)
 			continue
 		}
+		// tether#109 — the position, assigned AFTER the decode so that a value which
+		// somehow reached the file cannot be believed. It is the LINE's number rather
+		// than the accepted message's: a corrupt line then leaves a gap in the
+		// sequence instead of shifting every position after it, and only the ORDER of
+		// these numbers is ever read. 1-based — see HistoryMessage.Ord.
+		//
+		// This branch has no window and no cap (the whole file is read), so the
+		// premise mergeHistory checks cannot be violated here. The value is still
+		// required rather than optional: absent means "unverifiable" on the frontend,
+		// so a store that declined to number its messages would send every refresh of
+		// a paged-back reader down the visible-reset path.
+		m.Ord = int64(i) + 1
 		msgs = append(msgs, m)
 	}
 	return msgs

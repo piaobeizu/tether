@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   useStore, mergeTranscript, parseErrorPayload, rememberedWorkspaceId, WORKSPACE_ID_KEY,
   appendAgentErrorNotice, nextNoticeTs, AGENT_ERROR_NOTICE_LIMIT,
-  type Message, type Notice,
+  hasOrd, historyEntryToMessage,
+  type Message, type Notice, type HistoryEntry,
 } from './store'
 import type { Envelope } from './wire.gen'
 
@@ -2142,17 +2143,23 @@ describe('mergeHistory (tether#107)', () => {
     useStore.setState({ transcriptEarlier: null, transcriptOtherRecord: null, transcriptPagesBack: 0 })
   })
 
-  const hist = (role: Message['role'], text: string, ts: number): Message =>
-    ({ id: crypto.randomUUID(), role, text, ts })
+  // `ord` defaults to `ts` so that the tether#107 cases below read as they were
+  // written. That default is a CONVENIENCE OF THIS FIXTURE and not a fact about the
+  // wire — the daemon's ord is a file position and its ts is a clock, and tether#109's
+  // own tests below pass the two separately on purpose, because a fixture in which they
+  // move together cannot express the bug (that is exactly how the re-cut bubble got
+  // through: its ts moved while the conversation did not).
+  const hist = (role: Message['role'], text: string, ts: number, ord: number = ts): Message =>
+    ({ id: crypto.randomUUID(), role, text, ts, ord })
 
   it('keeps the older pages, updates the overlap in place, and appends what is new', () => {
     // The shape the three-second probe produces once the reader has paged back: the
     // daemon's newest window covers the tail of what is on screen plus one new turn.
     useStore.setState({
       messages: [
-        { id: 'older-1', role: 'user', text: 'page one, turn one', ts: 100 },
-        { id: 'newer-1', role: 'user', text: 'ask', ts: 500 },
-        { id: 'newer-2', role: 'assistant', text: 'partial ans', ts: 600 },
+        { id: 'older-1', role: 'user', text: 'page one, turn one', ts: 100, ord: 100 },
+        { id: 'newer-1', role: 'user', text: 'ask', ts: 500, ord: 500 },
+        { id: 'newer-2', role: 'assistant', text: 'partial ans', ts: 600, ord: 600 },
       ],
       transcriptPagesBack: 1,
     })
@@ -2186,7 +2193,7 @@ describe('mergeHistory (tether#107)', () => {
     // together with an invisible hole between them, so this refuses and the caller
     // falls back to the visible reset.
     useStore.setState({
-      messages: [{ id: 'stale', role: 'user', text: 'long ago', ts: 100 }],
+      messages: [{ id: 'stale', role: 'user', text: 'long ago', ts: 100, ord: 100 }],
       transcriptPagesBack: 2,
     })
     const ok = useStore.getState().mergeHistory([hist('user', 'much later', 90000)])
@@ -2205,9 +2212,9 @@ describe('mergeHistory (tether#107)', () => {
 
   it('drops a field the daemon has stopped sending instead of letting it linger', () => {
     useStore.setState({
-      messages: [{ id: 'keep', role: 'assistant', text: 'ans', ts: 600, thinking: 'was thinking' }],
+      messages: [{ id: 'keep', role: 'assistant', text: 'ans', ts: 600, ord: 600, thinking: 'was thinking' }],
     })
-    useStore.getState().mergeHistory([{ id: 'fresh', role: 'assistant', text: 'ans', ts: 600 }])
+    useStore.getState().mergeHistory([{ id: 'fresh', role: 'assistant', text: 'ans', ts: 600, ord: 600 }])
     const after = useStore.getState().messages
     expect(after).toHaveLength(1)
     expect(after[0].id).toBe('keep')
@@ -2221,6 +2228,398 @@ describe('mergeHistory (tether#107)', () => {
     useStore.setState({ messages: [{ id: 'only', role: 'user', text: 'hello', ts: 1 }] })
     expect(useStore.getState().mergeHistory([])).toBe(true)
     expect(useStore.getState().messages.map(m => m.id)).toEqual(['only'])
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// tether#109 — mergeHistory CHECKS the order tether#107 assumed.
+//
+// The counter-example that made this necessary was on the owner's screen: two
+// consecutive bubbles whose lower one read 3h16m EARLIER than the upper one. It was
+// reproduced by replaying the reported 125 MB cc transcript through the real window
+// rule — 36 of 1,031 consecutive single-record appends do it, worst case 3h36m — and
+// the mechanism is neither of the two the wi first proposed:
+//
+//   the window slid FORWARD by 1,600 bytes; the assistant turn straddling its leading
+//   edge lost its first fragment; CCStore stamps a merged turn with its FIRST
+//   fragment's time, so the SAME turn came back stamped 03:41:49 instead of 03:41:45
+//   — a messageKey never seen before, appended at the end, under a bubble from 07:18.
+//
+// The window start did not move backwards once in 1,053 samples, so nothing here needs
+// the widen-once retry or the message cap. Every fixture below therefore keeps `ord`
+// and `ts` INDEPENDENT: a fixture in which they move together is one in which this bug
+// cannot be written down.
+//
+// The ords are the shape the real ones have — byte positions a megabyte apart — and the
+// timestamps are the real ones, in ms, so the numbers here are the measurement rather
+// than a restatement of it.
+describe('mergeHistory checks the order it used to assume (tether#109)', () => {
+  afterEach(() => {
+    reset()
+    useStore.setState({ transcriptEarlier: null, transcriptOtherRecord: null, transcriptPagesBack: 0 })
+  })
+
+  // 2026-08-19, the reproduced case, in ms.
+  const TS_EDGE_FULL = Date.parse('2026-08-19T03:41:45.555Z')
+  const TS_EDGE_RECUT = Date.parse('2026-08-19T03:41:49.404Z')
+  const TS_MIDDLE = Date.parse('2026-08-19T04:50:48.478Z')
+  const TS_NEWEST = Date.parse('2026-08-19T07:18:29.315Z')
+
+  /** The transcript a reader of that session had on screen, with one page loaded. */
+  function seedReproduction(): void {
+    useStore.setState({
+      messages: [
+        // The leading-edge bubble of the page that was newest when it was fetched: the
+        // WHOLE turn, starting at the first fragment the window then contained.
+        { id: 'edge', role: 'assistant', text: 'the whole turn, first fragment onwards', ts: TS_EDGE_FULL, ord: 122154092 },
+        { id: 'middle', role: 'user', text: 'a question an hour later', ts: TS_MIDDLE, ord: 122378593 },
+        { id: 'newest', role: 'assistant', text: 'the newest turn', ts: TS_NEWEST, ord: 123197925 },
+      ],
+      transcriptPagesBack: 1,
+    })
+  }
+
+  it('does not append the re-cut leading-edge bubble at the end', () => {
+    // THE regression. On the code this replaces the array ends
+    // [.., 'the newest turn', 'the same turn, minus its first fragment'] — 3h36m out of
+    // order, which is what the owner photographed.
+    seedReproduction()
+
+    const ok = useStore.getState().mergeHistory([
+      // Same turn, one record later. Its ord is INSIDE the span already on screen, so
+      // its bytes are already rendered inside the bubble above that swallowed them.
+      { id: 'recut', role: 'assistant', text: 'minus its first fragment', ts: TS_EDGE_RECUT, ord: 122155976 },
+      { id: 'm2', role: 'user', text: 'a question an hour later', ts: TS_MIDDLE, ord: 122378593 },
+      { id: 'n2', role: 'assistant', text: 'the newest turn', ts: TS_NEWEST, ord: 123197925 },
+    ])
+
+    // TRUE, not false: the reader keeps the page they loaded. Refusing here would be
+    // correct-but-useless — it fires on 3.5% of appends, i.e. every few seconds on an
+    // active session, and each refusal throws away the pages tether#107 exists to keep.
+    expect(ok).toBe(true)
+    const after = useStore.getState().messages
+    // Exact texts, in order. A length check would pass on an array that kept the
+    // re-cut bubble and dropped something else.
+    expect(after.map(m => m.text)).toEqual([
+      'the whole turn, first fragment onwards',
+      'a question an hour later',
+      'the newest turn',
+    ])
+    // The ordering key is monotonic — the property the whole wi is about, stated on the
+    // thing that is actually ordered rather than on the timestamps, which cc itself
+    // writes out of order (6 reversals up to 4.5 minutes in the same tail).
+    expect(after.map(m => m.ord)).toEqual([122154092, 122378593, 123197925])
+    // …and identity survived, so React reconciles instead of remounting: the reader
+    // keeps their expanded blocks and their scroll position.
+    expect(after.map(m => m.id)).toEqual(['edge', 'middle', 'newest'])
+  })
+
+  it('keeps appending what is genuinely newer while it skips the re-cut bubble', () => {
+    // The two decisions happen in ONE merge on the real path, and a test that only
+    // showed the skip would pass on a reducer that had stopped appending anything.
+    seedReproduction()
+
+    const ok = useStore.getState().mergeHistory([
+      { id: 'recut', role: 'assistant', text: 'minus its first fragment', ts: TS_EDGE_RECUT, ord: 122155976 },
+      { id: 'm2', role: 'user', text: 'a question an hour later', ts: TS_MIDDLE, ord: 122378593 },
+      { id: 'n2', role: 'assistant', text: 'the newest turn, now longer', ts: TS_NEWEST, ord: 123197925 },
+      { id: 'brand-new', role: 'user', text: 'what the other agent just wrote', ts: TS_NEWEST + 60000, ord: 123205000 },
+    ])
+
+    expect(ok).toBe(true)
+    const after = useStore.getState().messages
+    expect(after.map(m => m.text)).toEqual([
+      'the whole turn, first fragment onwards',
+      'a question an hour later',
+      'the newest turn, now longer', // the growing turn was updated in place…
+      'what the other agent just wrote', // …and the new one is at the end
+    ])
+    expect(after.map(m => m.id)).toEqual(['edge', 'middle', 'newest', 'brand-new'])
+    expect(new Set(after.map(m => m.id)).size).toBe(4)
+  })
+
+  it('refuses when the window really did move backwards, rather than folding it in', () => {
+    // widen-once: ccReadTail retries a 1 MiB window that holds no conversation with a
+    // 16 MiB one. Measured on the same transcript, it fires on 9 of 1,053 sampled sizes
+    // and starts the page 15.6 MiB earlier — so this is the case the wi PREDICTED, and
+    // it is real even though it is not the one in the screenshot.
+    //
+    // Refused rather than skipped: content below everything on screen is content the
+    // reader has not got, and prepending it here would need a guarantee that the two
+    // ranges meet, which nothing on this side has.
+    seedReproduction()
+
+    const ok = useStore.getState().mergeHistory([
+      { id: 'way-older', role: 'user', text: '15.6 MiB earlier', ts: Date.parse('2026-08-19T00:51:49.998Z'), ord: 105904904 },
+      { id: 'm2', role: 'user', text: 'a question an hour later', ts: TS_MIDDLE, ord: 122378593 },
+      { id: 'n2', role: 'assistant', text: 'the newest turn', ts: TS_NEWEST, ord: 123197925 },
+    ])
+
+    expect(ok).toBe(false)
+    // Nothing moved. A half-merged array would leave the caller's fallback landing on a
+    // transcript this reducer had already damaged.
+    expect(useStore.getState().messages.map(m => m.id)).toEqual(['edge', 'middle', 'newest'])
+    expect(useStore.getState().transcriptPagesBack).toBe(1)
+  })
+
+  it('refuses when a message on screen carries no position to compare against', () => {
+    // The premise is then not checkable, and checking it is this reducer's job. Reachable
+    // for a bubble the BROWSER made (handleEnvelope) rather than one the daemon served.
+    useStore.setState({
+      messages: [
+        { id: 'served', role: 'user', text: 'from the daemon', ts: 100, ord: 4096 },
+        { id: 'local', role: 'assistant', text: 'a live bubble, never recorded', ts: 200 },
+      ],
+      transcriptPagesBack: 1,
+    })
+    expect(useStore.getState().mergeHistory([
+      { id: 'x', role: 'user', text: 'from the daemon', ts: 100, ord: 4096 },
+    ])).toBe(false)
+    expect(useStore.getState().messages.map(m => m.id)).toEqual(['served', 'local'])
+  })
+
+  it('refuses a page from a daemon that does not report positions at all', () => {
+    // The wire is hand-mirrored, so "the field is there" is a claim about a running
+    // binary rather than about a type. An SPA newer than its daemon takes the visible
+    // reset instead of guessing, which is the same answer every other unverifiable case
+    // gets.
+    useStore.setState({
+      messages: [{ id: 'served', role: 'user', text: 'ask', ts: 100, ord: 4096 }],
+      transcriptPagesBack: 1,
+    })
+    expect(useStore.getState().mergeHistory([
+      { id: 'x', role: 'user', text: 'ask', ts: 100 },
+    ])).toBe(false)
+    expect(useStore.getState().messages.map(m => m.id)).toEqual(['served'])
+  })
+
+  it('refuses a position that arrives as JSON null rather than treating it as zero', () => {
+    // `ord` crosses JSON, and null is the shape a hand-mirrored optional number takes
+    // when the other side stops filling it in. Written with a cast because the TYPE
+    // cannot express what the wire can send, which is the entire reason the check exists.
+    //
+    // The null is on the HELD side deliberately, and that placement is the only version
+    // of this test that discriminates. Measured: a null on the INCOMING side is refused
+    // even with the gate deleted, because `null > 1` and `null >= 1` are both false in
+    // JavaScript and the message falls through to the last refusal — i.e. that arrangement
+    // would pass on a reducer with no gate at all, and an earlier draft of this test did
+    // exactly that. Held, it is different: an entry that fails `Number.isFinite` but
+    // passes `!== undefined` joins the position index and drags `lowest` down to a
+    // coerced zero, so the span the interior case is measured against is silently wrong.
+    useStore.setState({
+      messages: [
+        { id: 'served', role: 'user', text: 'ask', ts: 100, ord: 4096 },
+        { id: 'nulled', role: 'assistant', text: 'answer', ts: 200, ord: null as unknown as number },
+      ],
+      transcriptPagesBack: 1,
+    })
+    expect(useStore.getState().mergeHistory([
+      { id: 'x', role: 'user', text: 'ask', ts: 100, ord: 4096 },
+      { id: 'y', role: 'user', text: 'newer', ts: 300, ord: 9000 },
+    ])).toBe(false)
+    expect(useStore.getState().messages.map(m => m.id)).toEqual(['served', 'nulled'])
+  })
+
+  it('refuses a page whose APPENDED TAIL is not in position order', () => {
+    // Cannot happen from this daemon — both readers emit in file order. It is checked
+    // because "the page is sorted" is precisely the kind of assumption this wi exists to
+    // stop making, and because the alternative is that a scrambled page is appended
+    // scrambled.
+    //
+    // The name says APPENDED TAIL and the fixture puts the disorder there, because that is
+    // all the check looks at and review found the reducer's comment claiming more: a page
+    // arriving as [3000, 1000, 2000] against those three ords on screen merges happily,
+    // and correctly — an in-place update and a skip are both order-independent. Asserted
+    // below, so the narrow claim is the tested one.
+    useStore.setState({
+      messages: [{ id: 'a', role: 'user', text: 'on screen', ts: 100, ord: 1000 }],
+      transcriptPagesBack: 1,
+    })
+    expect(useStore.getState().mergeHistory([
+      { id: 'a2', role: 'user', text: 'on screen', ts: 100, ord: 1000 },
+      { id: 'b', role: 'user', text: 'newer', ts: 300, ord: 3000 },
+      { id: 'c', role: 'user', text: 'newer still, out of order', ts: 200, ord: 2000 },
+    ])).toBe(false)
+    expect(useStore.getState().messages.map(m => m.id)).toEqual(['a'])
+  })
+
+  it('merges a page whose MATCHED entries arrive shuffled, because those are order-free', () => {
+    // The other side of the check above, and the reason it is stated narrowly. Nothing
+    // produces this either, but a reducer that refused here would be refusing something
+    // harmless — and the refusal costs the reader their pages.
+    useStore.setState({
+      messages: [
+        { id: 'a', role: 'user', text: 'one', ts: 100, ord: 1000 },
+        { id: 'b', role: 'assistant', text: 'two', ts: 200, ord: 2000 },
+        { id: 'c', role: 'user', text: 'three', ts: 300, ord: 3000 },
+      ],
+      transcriptPagesBack: 1,
+    })
+    expect(useStore.getState().mergeHistory([
+      { id: 'x', role: 'user', text: 'three, updated', ts: 300, ord: 3000 },
+      { id: 'y', role: 'user', text: 'one, updated', ts: 100, ord: 1000 },
+      { id: 'z', role: 'assistant', text: 'two, updated', ts: 200, ord: 2000 },
+    ])).toBe(true)
+    const after = useStore.getState().messages
+    // Positions are the array's, contents are the page's, ids are the array's.
+    expect(after.map(m => m.text)).toEqual(['one, updated', 'two, updated', 'three, updated'])
+    expect(after.map(m => m.id)).toEqual(['a', 'b', 'c'])
+  })
+
+  it('refuses an interior position that is NOT an assistant bubble', () => {
+    // The role check on the skip. Only a run of ASSISTANT records merges in CCStore, so
+    // only an assistant bubble's position can move when the window slides. A user record
+    // is its own bubble at its own offset in every window: if its position is inside a
+    // CONTIGUOUS span on screen then it is on screen and would have matched. So
+    // "interior, unmatched, not assistant" is proof that the span is not contiguous, and
+    // the honest answer to that is the visible reset rather than a skipped bubble.
+    //
+    // Without the role check this message is skipped silently — a bubble the reader never
+    // sees, in the middle of a conversation, with nothing to suggest it.
+    useStore.setState({
+      messages: [
+        { id: 'a', role: 'assistant', text: 'oldest on screen', ts: 100, ord: 1000 },
+        { id: 'b', role: 'user', text: 'newest on screen', ts: 300, ord: 3000 },
+      ],
+      transcriptPagesBack: 1,
+    })
+    expect(useStore.getState().mergeHistory([
+      { id: 'x', role: 'assistant', text: 'oldest on screen', ts: 100, ord: 1000 },
+      { id: 'y', role: 'user', text: 'a user turn nobody has', ts: 200, ord: 2000 },
+      { id: 'z', role: 'user', text: 'newest on screen', ts: 300, ord: 3000 },
+    ])).toBe(false)
+    expect(useStore.getState().messages.map(m => m.id)).toEqual(['a', 'b'])
+
+    // The CONTROL: the same shape with the same position, as an ASSISTANT bubble, is the
+    // re-cut case and IS skipped. Without this the test above would also pass on a
+    // reducer that had stopped skipping anything.
+    expect(useStore.getState().mergeHistory([
+      { id: 'x', role: 'assistant', text: 'oldest on screen', ts: 100, ord: 1000 },
+      { id: 'y', role: 'assistant', text: 'a re-cut suffix', ts: 200, ord: 2000 },
+      { id: 'z', role: 'user', text: 'newest on screen', ts: 300, ord: 3000 },
+    ])).toBe(true)
+    expect(useStore.getState().messages.map(m => m.id)).toEqual(['a', 'b'])
+  })
+
+  it('cannot merge one session\'s page into another session\'s transcript', () => {
+    // Found by review, and it is arithmetic rather than bad luck: `ord` is 1-based and
+    // both daemon stores number from the beginning of their own record, so `ord === 1` is
+    // in EVERY page that reaches byte 0 — which for tether's own store is every page,
+    // since LoadHistory reads the whole file. One matching position is all mergeHistory
+    // needs to report success, after which every other position in the arriving page
+    // lands inside the previous session's span and (as an assistant bubble) is skipped.
+    // Session A's transcript would then be displayed under session B.
+    //
+    // The fix is upstream of this reducer: `transcriptPagesBack` describes the pages of
+    // ONE session, so `setSessionId` retires it on a change and the refresh takes the
+    // wholesale replace instead. Asserted on the reducer's INPUT rather than on
+    // mergeHistory, because the merge itself cannot tell two sessions apart — nothing on
+    // a message says which session it came from — so the only checkable statement is that
+    // the flag which permits merging does not survive the switch.
+    useStore.setState({
+      sessionId: 'session-A',
+      messages: [
+        { id: 'a1', role: 'user', text: "A's first turn", ts: 100, ord: 1 },
+        { id: 'a2', role: 'assistant', text: "A's answer", ts: 200, ord: 900 },
+      ],
+      transcriptPagesBack: 1,
+    })
+    useStore.getState().setSessionId('session-B')
+    expect(useStore.getState().transcriptPagesBack).toBe(0)
+
+    // Re-announcing the SAME sid is not a switch (handleEnvelope's session_ready calls
+    // setSessionId with the sid it already has, to persist it), so the reader sitting in
+    // one session keeps their pages.
+    useStore.setState({ transcriptPagesBack: 2 })
+    useStore.getState().setSessionId('session-B')
+    expect(useStore.getState().transcriptPagesBack).toBe(2)
+
+    // The two facts that are deliberately NOT reset: they come off the response that
+    // installs the messages they describe, and the switch's own refresh records them a
+    // moment later. Clearing them here would print "this is the beginning of the
+    // conversation" over the outgoing session's messages for one frame.
+    useStore.setState({ transcriptEarlier: 4096, transcriptOtherRecord: 'cc' })
+    useStore.getState().setSessionId('session-C')
+    expect(useStore.getState().transcriptEarlier).toBe(4096)
+    expect(useStore.getState().transcriptOtherRecord).toBe('cc')
+  })
+
+  it('does not install an array the caller still holds', () => {
+    // The empty-transcript branch is the only exit that could hand the store its
+    // caller's array. A store sharing an array with a caller can change without
+    // notifying any subscriber, which renders as a transcript that is right in the
+    // devtools and stale on screen.
+    useStore.setState({ messages: [], transcriptPagesBack: 1 })
+    const page: Message[] = [{ id: 'a', role: 'user', text: 'installed', ts: 1, ord: 1 }]
+    expect(useStore.getState().mergeHistory(page)).toBe(true)
+    page.push({ id: 'b', role: 'user', text: 'never sent to the store', ts: 2, ord: 2 })
+    expect(useStore.getState().messages.map(m => m.text)).toEqual(['installed'])
+  })
+
+  it('keeps two messages that share role+ts apart, because the position is unique', () => {
+    // The secondary defect the wi measured: messageKey is role+ts, and the map behind it
+    // kept only the FIRST index per key, so two messages sharing one key had both
+    // updates land in one slot — the second overwriting the first's CONTENT while the
+    // other bubble kept stale text.
+    //
+    // Measured honestly, this is a hazard rather than an observed event: across 1,096
+    // pages of the reported transcript (15,076 served messages) the collision rate among
+    // SERVED messages is 0. The wi's "1 in 97" was counted over raw cc RECORDS, and a
+    // run of assistant records becomes one message — so that figure is over a population
+    // messageKey is never applied to.
+    useStore.setState({
+      messages: [
+        { id: 'first', role: 'assistant', text: 'stale A', ts: 700, ord: 5000 },
+        { id: 'second', role: 'assistant', text: 'stale B', ts: 700, ord: 6000 },
+      ],
+      transcriptPagesBack: 1,
+    })
+    expect(useStore.getState().mergeHistory([
+      { id: 'x', role: 'assistant', text: 'fresh A', ts: 700, ord: 5000 },
+      { id: 'y', role: 'assistant', text: 'fresh B', ts: 700, ord: 6000 },
+    ])).toBe(true)
+    const after = useStore.getState().messages
+    expect(after.map(m => m.text)).toEqual(['fresh A', 'fresh B'])
+    expect(after.map(m => m.id)).toEqual(['first', 'second'])
+  })
+
+  it('installs a page into an empty transcript without asking for positions', () => {
+    // One page is one contiguous range whatever is in it, so there is nothing to check —
+    // and refusing would send the caller to loadHistory for the ordinary case of a
+    // transcript that has not loaded yet.
+    useStore.setState({ messages: [], transcriptPagesBack: 1 })
+    expect(useStore.getState().mergeHistory([
+      { id: 'a', role: 'user', text: 'no ord anywhere', ts: 1 },
+    ])).toBe(true)
+    expect(useStore.getState().messages.map(m => m.text)).toEqual(['no ord anywhere'])
+  })
+})
+
+describe('historyEntryToMessage carries the position (tether#109)', () => {
+  it('copies ord off the entry, and leaves it absent when the daemon sent none', () => {
+    // Both halves of the two-place check this file's Message doc describes: the Go field
+    // exists AND this function copies it. Neither alone is enough — a field on the wire
+    // that this drops is a field mergeHistory can never see, and the symptom would be a
+    // permanent silent fallback to loadHistory rather than an error.
+    expect(historyEntryToMessage({ role: 'user', text: 'hi', ts: 5, ord: 4096 }).ord).toBe(4096)
+    expect(historyEntryToMessage({ role: 'user', text: 'hi', ts: 5 }).ord).toBeUndefined()
+    // A hand-mirrored wire type cannot rule out a null, and copying it would defeat the
+    // Number.isFinite gate downstream by putting a non-number where a number is declared.
+    const nulled = { role: 'user', text: 'hi', ts: 5, ord: null } as unknown as HistoryEntry
+    expect(historyEntryToMessage(nulled).ord).toBeUndefined()
+  })
+})
+
+describe('hasOrd (tether#109)', () => {
+  it('accepts a position and rejects every shape the wire can send instead', () => {
+    expect(hasOrd({ ord: 1 })).toBe(true)
+    expect(hasOrd({ ord: 0 })).toBe(true)
+    expect(hasOrd({})).toBe(false)
+    expect(hasOrd({ ord: undefined })).toBe(false)
+    expect(hasOrd({ ord: null as unknown as number })).toBe(false)
+    expect(hasOrd({ ord: '4096' as unknown as number })).toBe(false)
+    expect(hasOrd({ ord: NaN })).toBe(false)
+    expect(hasOrd({ ord: Infinity })).toBe(false)
   })
 })
 

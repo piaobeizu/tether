@@ -1655,6 +1655,19 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
    * transcript, which is what both a `WheelEvent.deltaY` and a finger travelling UP the
    * screen mean. `minToward` is the unit the caller is speaking in.
    *
+   * # A residual, named because it is invisible from the CSS and from every test here
+   *
+   * `wheel` and `touchmove` BUBBLE, and the transcript contains a nested scroller of its own:
+   * `.msg-tool-result` is `max-height: 280px; overflow: auto` (index.css). A reader wheeling
+   * inside an expanded tool result is scrolling THAT box, not overscrolling this one — but the
+   * event reaches here anyway, and if `.dt-chat` happens to be parked at its end the gesture
+   * reads as a pull. Cost: one extra re-read, floor-bounded to two a second, in the held state
+   * where a poll is already fetching every three seconds. Not fixed, deliberately: the correct
+   * test is "can any scroller between `e.target` and here still move in this direction", which
+   * is the browser's own scroll-chaining rule, and reimplementing it needs computed styles and
+   * live geometry — neither of which jsdom has, so the fix would be untestable in this repo,
+   * which is the exact trade tether#108 and tether#110 both paid for going the wrong way.
+   *
    * Returns whether a request was actually started, which is what lets the touch caller spend
    * its gesture after one load. The wheel caller ignores it, and that asymmetry is the honest
    * one: a touch gesture has boundaries (touchstart…touchend) so "once per gesture" is a thing

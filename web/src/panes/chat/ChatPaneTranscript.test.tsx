@@ -2769,6 +2769,90 @@ describe('loading a transcript by scrolling to its ends (tether#110)', () => {
       expect(countNewestGets()).toBe(gets + 1)
     })
 
+    it('stamps the floor ITSELF, so a second pull is not free after a first', async () => {
+      // The gap the mutation battery found in the case above, and it is tether#110's own
+      // lesson recurring: that test separates an ARRIVAL from a pull, so the stamp being
+      // measured is the arrival's. Deleting the gesture path's own stamp left it green.
+      // Two GESTURES in a row is the only shape that can see it — and the first is allowed
+      // to settle, so the shared in-flight ref is not the thing refusing the second either.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      const gets = countNewestGets()
+
+      pastFloor()
+      await act(async () => { box.wheel(120) })
+      await settle()
+      expect(countNewestGets()).toBe(gets + 1)
+
+      // No pastFloor: the clock has not moved since the pull above, so the ONLY thing that
+      // can refuse this one is the stamp that pull left behind.
+      await act(async () => { box.wheel(120) })
+      await settle()
+      expect(box.wheels()).toBe(2)
+      expect(countNewestGets()).toBe(gets + 1)
+
+      // The CONTROL: one floor later it is answered, so "1" is not simply a pane that has
+      // stopped responding to gestures.
+      pastFloor()
+      await act(async () => { box.wheel(120) })
+      await settle()
+      expect(countNewestGets()).toBe(gets + 2)
+    })
+
+    it('does not spend the floor on a gesture the in-flight ref refused', async () => {
+      // What the DECISION-SITE in-flight check buys over `refreshNewest`'s own duplicate one,
+      // which tether#110 documented as an accepted mutation survivor and which — measured
+      // here — is what silently absorbs the loss if this one is deleted. The request count is
+      // identical either way; what differs is whether a refused gesture burns the 500ms
+      // budget belonging to the gesture that comes after it.
+      //
+      // The construction: hold a request open at the OTHER end (the fallback button starts
+      // one from any scroll position, which is what makes this reachable while the reader
+      // stands at the bottom), pull at the bottom, then release and pull again with the clock
+      // untouched. Correctly, the refused pull left no trace and the second one is answered.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500), earlier: 4096 }
+      pages[`${MESSAGES_URL}?before=4096`] = { entries: turns('older', 5, 100), earlier: 2048 }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(300) })
+      await settle()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      const gets = countNewestGets()
+      pastFloor()
+
+      let release = () => {}
+      gates[`GET ${MESSAGES_URL}?before=4096`] = new Promise<void>(r => { release = r })
+      await act(async () => { (container.querySelector('.transcript-more') as HTMLButtonElement).click() })
+      await settle()
+      expect(countEarlierPages()).toBe(1)
+
+      await act(async () => { box.wheel(120) })
+      await settle()
+      expect(box.wheels()).toBe(1)
+      expect(countNewestGets()).toBe(gets)
+
+      await act(async () => { release(); await Promise.resolve() })
+      await settle()
+      // The anchor correction kept the reader on the same message, which is still the end:
+      // 1500 - 1200 - 300 = 0. Asserted because the pull below depends on it.
+      expect(box.top()).toBe(1200)
+      expect(box.height()).toBe(1500)
+
+      // Clock untouched since the refused pull. If that pull had stamped the floor, this one
+      // would be inside it.
+      await act(async () => { box.wheel(120) })
+      await settle()
+      expect(countNewestGets()).toBe(gets + 1)
+    })
+
     it('holds one request at a time however long the wheel spins', async () => {
       // The bound that replaces the latch on this path, and the one that matters: a continuous
       // trackpad flick is ~60 wheel events a second. The floor is stepped PAST between every

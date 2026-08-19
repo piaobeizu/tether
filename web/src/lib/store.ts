@@ -662,15 +662,21 @@ export const useStore = create<AppState>((set, get) => ({
     // failure than the remount this avoids. The queue per key is what makes that
     // impossible: an id is shifted out when it is used, and a message with no match
     // left keeps the fresh uuid historyEntryToMessage gave it.
+    //
+    // The separator is written as the ESCAPE `\u0000`, six characters of source, not a
+    // raw NUL byte. A raw one type-checks and passes every test while making the file
+    // one git treats as binary and one no reviewer can see the contents of. It is a
+    // separator rather than nothing because `role` is a closed set that never contains
+    // it, so "assistant" + 1 can never collide with "assistant1" + "".
     const idsByKey = new Map<string, string[]>()
     for (const m of s.messages) {
-      const key = `${m.role} ${m.ts}`
+      const key = `${m.role}\u0000${m.ts}`
       const q = idsByKey.get(key)
       if (q) q.push(m.id)
       else idsByKey.set(key, [m.id])
     }
     for (let i = 0; i < reduced.length; i++) {
-      const q = idsByKey.get(`${reduced[i].role} ${reduced[i].ts}`)
+      const q = idsByKey.get(`${reduced[i].role}\u0000${reduced[i].ts}`)
       const id = q?.shift()
       if (id !== undefined) reduced[i] = { ...reduced[i], id }
     }

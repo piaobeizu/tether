@@ -2787,11 +2787,16 @@ func ccCensusCapReport(t *testing.T, files []string) {
 		if err != nil {
 			t.Fatalf("stat %s: %v", path, err)
 		}
-		msgs, err := ccReadTail(f, fi.Size(), ccMessagesTailBytes)
+		// tether#107 renamed ccReadTail to ccReadWindow: the tail is the window that
+		// ends at the file size, so the census asks for exactly what it asked for
+		// before and the figures below stay comparable to the ones in ccMessagesMax's
+		// doc comment.
+		page, err := ccReadWindow(f, fi.Size(), ccMessagesTailBytes)
 		f.Close()
 		if err != nil {
 			t.Fatalf("reading %s: %v", path, err)
 		}
+		msgs := page.Messages
 		total += len(msgs)
 		if len(msgs) > maxMsgs {
 			maxMsgs = len(msgs)
@@ -3039,5 +3044,312 @@ func TestListSkipsFilesThatAreNotTranscripts(t *testing.T) {
 	rows := f.store().List()
 	if len(rows) != 1 || rows[0].Sid != "cc-session-0001" {
 		t.Errorf("List() = %+v, want only cc-session-0001", rows)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Paging BACKWARDS through a bounded transcript (tether#107)
+// ---------------------------------------------------------------------------
+
+// ccBigTranscript builds a synthetic transcript comfortably past `atLeast` bytes as
+// an alternating user/assistant conversation, and returns it plus every text it
+// wrote in order.
+//
+// Every turn is UNIQUELY numbered, which is what lets the walk test below detect a
+// gap and a duplicate as different failures. A fixture of identical turns would make
+// a lost record and a repeated one look the same (the count would be right either
+// way once, and wrong in the same direction otherwise) — and losing exactly one
+// record per page seam is the specific defect the cursor design is built against.
+//
+// # The padding is sized so the fixture stays UNDER ccMessagesMax
+//
+// The walk test's reference is a whole-file conversion, and ccMessagesFrom applies
+// the count cap to that too. A fixture of many small turns therefore produces a
+// reference that is itself trimmed to 200, which the walk then "disagrees" with for a
+// reason that has nothing to do with cursors — measured, the first version of this
+// fixture walked 744 texts against a 200-text reference. 48 KiB per record puts a
+// multi-megabyte fixture at a few dozen turns, so the BYTE window is the only cap in
+// play and the reference means what the test needs it to mean.
+func ccBigTranscript(t *testing.T, atLeast int) (string, []string) {
+	t.Helper()
+	var b strings.Builder
+	var texts []string
+	pad := strings.Repeat("x", 48<<10)
+	for i := 0; b.Len() < atLeast; i++ {
+		u := fmt.Sprintf("USER-%05d %s", i, pad)
+		a := fmt.Sprintf("ASSISTANT-%05d %s", i, pad)
+		b.WriteString(ccUser(t, u))
+		b.WriteString(ccAssistantWords(t, a, "2026-08-17T03:00:01.000Z"))
+		texts = append(texts, u, a)
+	}
+	return b.String(), texts
+}
+
+func ccTexts(msgs []HistoryMessage) []string {
+	var out []string
+	for _, m := range msgs {
+		if m.Text != "" {
+			out = append(out, m.Text)
+		}
+	}
+	return out
+}
+
+// TestMessagePageWalksBackWithoutGapOrDuplicate is THE property this cursor exists
+// to have, and the only one that can catch the off-by-one-record seam.
+//
+// It walks a transcript larger than the byte window page by page, concatenates the
+// pages oldest-first, and requires the result to equal a whole-file conversion. Both
+// halves of the equality matter:
+//
+//   - a GAP is what reporting the WINDOW START as the cursor produces — the leading
+//     fragment this page dropped is the same record the next page would truncate.
+//   - a DUPLICATE is what reporting the window start PLUS the fragment of the
+//     *previous* read would produce, or any cursor that lands mid-record.
+//
+// It also pins that the walk TERMINATES: an unbounded loop here would hang CI rather
+// than fail it, so the page budget is explicit and the assertion is that the walk
+// finished well inside it.
+func TestMessagePageWalksBackWithoutGapOrDuplicate(t *testing.T) {
+	body, _ := ccBigTranscript(t, 3*ccMessagesTailBytes)
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", body)
+	store := f.store()
+
+	whole := ccTexts(ccMessagesFrom(strings.NewReader(body)))
+	if len(whole) < 40 {
+		t.Fatalf("the fixture is too small to be paging anything: %d texts", len(whole))
+	}
+	// The reference must not itself be trimmed, or this compares a paged walk against
+	// a capped baseline and fails for a reason that is not about cursors. See
+	// ccBigTranscript.
+	if len(whole) >= ccMessagesMax {
+		t.Fatalf("the whole-file reference has %d texts and the cap is %d — the reference is capped and this test would be vacuous",
+			len(whole), ccMessagesMax)
+	}
+
+	var walked []string
+	before := TranscriptTail
+	pages := 0
+	const maxPages = 64
+	for {
+		page, ok := store.MessagePage("cc-session-0001", before)
+		if !ok {
+			t.Fatal("MessagePage reported the transcript missing")
+		}
+		pages++
+		if pages > maxPages {
+			t.Fatalf("the walk did not terminate in %d pages; last cursor %d", maxPages, page.Earlier)
+		}
+		walked = append(ccTexts(page.Messages), walked...)
+		if !page.HasEarlier {
+			break
+		}
+		if before != TranscriptTail && page.Earlier >= before {
+			t.Fatalf("cursor did not move back: %d then %d", before, page.Earlier)
+		}
+		before = page.Earlier
+	}
+
+	if pages < 3 {
+		t.Fatalf("the fixture spans %d bytes but paged in %d page(s) — the window is not binding, so this test is vacuous",
+			len(body), pages)
+	}
+	if len(walked) != len(whole) {
+		t.Fatalf("walked %d texts over %d pages, whole-file conversion has %d — a gap or a duplicate at a seam",
+			len(walked), pages, len(whole))
+	}
+	for i := range whole {
+		if walked[i] != whole[i] {
+			t.Fatalf("page walk diverges from the whole file at index %d:\n walked %.40q\n  whole %.40q",
+				i, walked[i], whole[i])
+		}
+	}
+}
+
+// TestMessagePageNewestPageIsUnchanged — the no-cursor request must be what it was
+// before tether#107, because ~74 of the 93 top-level transcripts on the reference
+// machine never reach the ceiling and must not pay for a feature they never use.
+func TestMessagePageNewestPageIsUnchanged(t *testing.T) {
+	body, _ := ccBigTranscript(t, 2*ccMessagesTailBytes)
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", body)
+	store := f.store()
+
+	page, ok := store.MessagePage("cc-session-0001", TranscriptTail)
+	if !ok {
+		t.Fatal("MessagePage reported the transcript missing")
+	}
+	msgs, ok := store.Messages("cc-session-0001")
+	if !ok {
+		t.Fatal("Messages reported the transcript missing")
+	}
+	if len(msgs) != len(page.Messages) {
+		t.Fatalf("Messages served %d, the newest page served %d — they are meant to be one implementation",
+			len(msgs), len(page.Messages))
+	}
+	if !page.HasEarlier {
+		t.Fatal("a transcript twice the window reports nothing earlier")
+	}
+	if page.Earlier <= 0 || page.Earlier >= int64(len(body)) {
+		t.Errorf("Earlier = %d, want inside (0, %d)", page.Earlier, len(body))
+	}
+}
+
+// TestMessagePageOnAWholeSmallTranscriptOffersNothingEarlier — the other half of the
+// signal, and the one a false positive would ruin: a transcript that fits reports NO
+// cursor, so the pane can say "the beginning of this conversation" and mean it.
+//
+// The fixture deliberately OPENS on records that produce no message — a tool result
+// is a type:"user" record with no text — because that is the case where returning
+// "the first message's offset" instead of zero would report a cursor above zero on a
+// complete file, offer a "load earlier" button, and answer the click with nothing.
+func TestMessagePageOnAWholeSmallTranscriptOffersNothingEarlier(t *testing.T) {
+	body := ccToolResult(t, "orphan output") +
+		ccUser(t, "the very first thing said") +
+		ccAssistantWords(t, "the answer", "2026-08-17T03:00:01.000Z")
+
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", body)
+
+	page, ok := f.store().MessagePage("cc-session-0001", TranscriptTail)
+	if !ok {
+		t.Fatal("MessagePage reported the transcript missing")
+	}
+	if page.HasEarlier {
+		t.Errorf("a whole transcript reports Earlier = %d; the pane would offer a page that does not exist",
+			page.Earlier)
+	}
+	if got := ccTexts(page.Messages); len(got) != 2 || got[0] != "the very first thing said" {
+		t.Errorf("texts = %q", got)
+	}
+}
+
+// TestMessagePageCursorSurvivesTheCOUNTCap — the second regime, which the byte
+// window hides.
+//
+// A transcript of very short lines fits inside ccMessagesTailBytes and is still
+// trimmed, by ccTrimFront. So the window reaches byte 0 while the PAGE does not, and
+// a cursor computed from the window start would be 0 — reporting "the beginning of
+// the conversation" while 200 turns of it are unreachable. Nothing in the byte-window
+// tests can see this: on the reference machine the count cap binds on 0 of 93
+// transcripts, exactly as ccMessagesMax's doc says.
+func TestMessagePageCursorSurvivesTheCOUNTCap(t *testing.T) {
+	var b strings.Builder
+	var want []string
+	total := ccMessagesMax + 40
+	for i := 0; i < total; i++ {
+		u := fmt.Sprintf("SHORT-%04d", i)
+		b.WriteString(ccUser(t, u))
+		want = append(want, u)
+	}
+	body := b.String()
+	if len(body) >= ccMessagesTailBytes {
+		t.Fatalf("the fixture is %d bytes — the BYTE window would bind and this test would be about the wrong cap", len(body))
+	}
+
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", body)
+	store := f.store()
+
+	page, ok := store.MessagePage("cc-session-0001", TranscriptTail)
+	if !ok {
+		t.Fatal("MessagePage reported the transcript missing")
+	}
+	if got := len(ccTexts(page.Messages)); got != ccMessagesMax {
+		t.Fatalf("newest page served %d texts, want the cap %d", got, ccMessagesMax)
+	}
+	if !page.HasEarlier {
+		t.Fatal("the count cap trimmed 40 turns and the page reports nothing earlier")
+	}
+
+	earlier, ok := store.MessagePage("cc-session-0001", page.Earlier)
+	if !ok {
+		t.Fatal("MessagePage reported the transcript missing on the earlier page")
+	}
+	got := ccTexts(earlier.Messages)
+	if len(got) != 40 {
+		t.Fatalf("the earlier page served %d texts, want the 40 the cap trimmed", len(got))
+	}
+	if got[0] != want[0] || got[39] != want[39] {
+		t.Errorf("earlier page = [%q … %q], want [%q … %q]", got[0], got[len(got)-1], want[0], want[39])
+	}
+	if earlier.HasEarlier {
+		t.Errorf("the earlier page reaches turn 0 and still reports Earlier = %d", earlier.Earlier)
+	}
+}
+
+// TestMessagePageClampsACursorPastTheEnd — a client holding an offset for a file
+// that has since been truncated and rewritten. The tail is the honest answer;
+// refusing would leave that reader with no transcript at all.
+func TestMessagePageClampsACursorPastTheEnd(t *testing.T) {
+	body := ccUser(t, "only turn")
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", body)
+
+	page, ok := f.store().MessagePage("cc-session-0001", int64(len(body))*100)
+	if !ok {
+		t.Fatal("MessagePage reported the transcript missing")
+	}
+	if got := ccTexts(page.Messages); len(got) != 1 || got[0] != "only turn" {
+		t.Errorf("texts = %q, want the whole (tiny) transcript", got)
+	}
+	if page.HasEarlier {
+		t.Errorf("clamped to the whole file and still reports Earlier = %d", page.Earlier)
+	}
+}
+
+// TestMessagePageAtZeroIsEmpty — `before=0` asks for the range [0,0). Absent is
+// TranscriptTail and means the opposite; conflating them would make a client that
+// sends its cursor unconditionally show the newest page when it asked for the oldest.
+func TestMessagePageAtZeroIsEmpty(t *testing.T) {
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", ccUser(t, "only turn"))
+
+	page, ok := f.store().MessagePage("cc-session-0001", 0)
+	if !ok {
+		t.Fatal("MessagePage reported the transcript missing")
+	}
+	if len(page.Messages) != 0 || page.HasEarlier {
+		t.Errorf("page = %+v, want empty with nothing earlier", page)
+	}
+}
+
+// TestMessagePageWidensAnEarlierPagePastAWallOfToolCalls — the widen retry applies to
+// a page the reader asked for, not only to the one the pane opens on.
+//
+// One rule, and the reason is the one ccMessagesTailBytes already gives: a window
+// that is all tool payload yields nothing to READ, and handing that to a reader who
+// just clicked "load earlier" is the same defect as handing it to one who just opened
+// the pane. The fixture buries the conversation more than one narrow window behind a
+// wall of calls, so only a widened read can reach it.
+func TestMessagePageWidensAnEarlierPagePastAWallOfToolCalls(t *testing.T) {
+	call := func(i int) string {
+		return ccToolUse(t, "2026-08-17T03:00:00.000Z",
+			ccCall(fmt.Sprintf("t%06d", i), "Bash", map[string]any{"command": strings.Repeat("z", 16<<10)}))
+	}
+	var b strings.Builder
+	b.WriteString(ccUser(t, "BURIED-BEHIND-THE-CALLS"))
+	for i := 0; b.Len() < ccMessagesTailBytes+(256<<10); i++ {
+		b.WriteString(call(i))
+	}
+	// The newest page is ordinary conversation, so the reader has to page back to
+	// reach the wall at all.
+	wallEnds := int64(b.Len())
+	b.WriteString(ccUser(t, "RECENT-AND-READABLE"))
+
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", b.String())
+
+	page, ok := f.store().MessagePage("cc-session-0001", wallEnds)
+	if !ok {
+		t.Fatal("MessagePage reported the transcript missing")
+	}
+	if !ccHasConversation(page.Messages) {
+		t.Fatalf("an earlier page did not widen past a wall of tool CALLS: %d messages, none with words",
+			len(page.Messages))
+	}
+	if got := ccTexts(page.Messages); len(got) != 1 || got[0] != "BURIED-BEHIND-THE-CALLS" {
+		t.Errorf("texts = %q, want the buried turn", got)
 	}
 }

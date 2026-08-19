@@ -2021,3 +2021,230 @@ describe('loadHistory message identity (tether#106)', () => {
     expect(s.pendingPermissions).toEqual([])
   })
 })
+
+// ────────────────────────────────────────────────────────────────────────────
+// tether#107 — prepending an older page, and merging a newer one into a
+// transcript that already holds older pages.
+//
+// The three properties asserted here are the three tether#106 shipped and this wi
+// had to keep, restated for the two new reducers:
+//
+//   1. a message already on screen keeps its id (React reconciles on it, and BOTH
+//      expansion Sets are keyed by it);
+//   2. nothing that is on screen disappears;
+//   3. the live turn is not touched.
+//
+// None of them is visible in a test that only counts messages, and (1) in particular
+// fails silently: the transcript still renders, it just remounts, collapsing every
+// expanded block and clamping the reader's scroll.
+describe('prependHistory (tether#107)', () => {
+  // The shared `reset()` predates these fields, so the page counter has to be cleared
+  // here or one test's count leaks into the next one's assertion. Local rather than
+  // folded into `reset()`, so nothing outside this wi's tests changes.
+  afterEach(() => {
+    reset()
+    useStore.setState({ transcriptEarlier: null, transcriptOtherRecord: null, transcriptPagesBack: 0 })
+  })
+
+  const hist = (role: Message['role'], text: string, ts: number): Message =>
+    ({ id: crypto.randomUUID(), role, text, ts })
+
+  /** Seed the transcript with known, stable ids. */
+  function seed(...msgs: Message[]): string[] {
+    useStore.setState({ messages: msgs })
+    return msgs.map(m => m.id)
+  }
+
+  it('puts the older page in front, oldest first', () => {
+    seed({ id: 'on-screen-1', role: 'user', text: 'the fifth thing', ts: 500 })
+    useStore.getState().prependHistory([
+      hist('user', 'the third thing', 300),
+      hist('assistant', 'the fourth thing', 400),
+    ])
+    expect(useStore.getState().messages.map(m => m.text))
+      .toEqual(['the third thing', 'the fourth thing', 'the fifth thing'])
+  })
+
+  it('leaves the id of every message already on screen byte-identical', () => {
+    // THE property. Exact ids, not a count: a reducer that rebuilt the array with
+    // fresh uuids would keep the length and the order and still remount the whole
+    // transcript, collapsing the reader's expanded blocks and their scroll position.
+    const kept = seed(
+      { id: 'keep-a', role: 'user', text: 'ask', ts: 500 },
+      { id: 'keep-b', role: 'assistant', text: 'answer', ts: 600 },
+    )
+    useStore.getState().prependHistory([hist('user', 'older', 100)])
+
+    const after = useStore.getState().messages
+    expect(after.map(m => m.id).slice(1)).toEqual(kept)
+    expect(after[0].id).not.toBe('keep-a')
+    // …and no duplicate keys anywhere, which is the failure that would be WORSE
+    // than the remount this avoids.
+    expect(new Set(after.map(m => m.id)).size).toBe(after.length)
+  })
+
+  it('does not touch the live turn or the permission queue', () => {
+    // loadHistory resets these, because it is the server-truth REPLACE and its array
+    // may belong to another session. This adds older history to the session already
+    // on screen and reports nothing about the live turn, so a reducer that reset here
+    // would let "load earlier messages" cancel the reader's own in-flight turn.
+    seed({ id: 'live', role: 'assistant', text: 'mid-turn', ts: 900 })
+    useStore.setState({
+      streaming: true, streamingMsgId: 'live', curTurnId: 'live', answerStartTs: 800,
+      pendingPermissions: [{ id: 'p1', toolName: 'Bash', input: {} }],
+    })
+    useStore.getState().prependHistory([hist('user', 'older', 100)])
+
+    const s = useStore.getState()
+    expect(s.streaming).toBe(true)
+    expect(s.streamingMsgId).toBe('live')
+    expect(s.curTurnId).toBe('live')
+    expect(s.answerStartTs).toBe(800)
+    expect(s.pendingPermissions).toHaveLength(1)
+  })
+
+  it('counts the pages the reader has gone back', () => {
+    // The refresh path branches on this, so it is behaviour rather than bookkeeping.
+    expect(useStore.getState().transcriptPagesBack).toBe(0)
+    seed({ id: 'on-screen', role: 'user', text: 'newest', ts: 500 })
+    useStore.getState().prependHistory([hist('user', 'p1', 400)])
+    expect(useStore.getState().transcriptPagesBack).toBe(1)
+    useStore.getState().prependHistory([hist('user', 'p2', 300)])
+    expect(useStore.getState().transcriptPagesBack).toBe(2)
+    // …and loadHistory, being the wholesale replace, puts it back to zero: the array
+    // it installs is one page, so no earlier page is on screen any more.
+    useStore.getState().loadHistory([hist('user', 'fresh', 900)])
+    expect(useStore.getState().transcriptPagesBack).toBe(0)
+  })
+
+  it('drops an entry the transcript already holds rather than duplicating a key', () => {
+    seed({ id: 'dupe-target', role: 'user', text: 'same turn', ts: 500 })
+    useStore.getState().prependHistory([
+      hist('user', 'genuinely older', 100),
+      hist('user', 'same turn', 500),
+    ])
+    const after = useStore.getState().messages
+    expect(after.map(m => m.text)).toEqual(['genuinely older', 'same turn'])
+    expect(after[1].id).toBe('dupe-target')
+  })
+
+  it('is a no-op for an empty page', () => {
+    const kept = seed({ id: 'only', role: 'user', text: 'hello', ts: 1 })
+    useStore.getState().prependHistory([])
+    expect(useStore.getState().messages.map(m => m.id)).toEqual(kept)
+    expect(useStore.getState().transcriptPagesBack).toBe(0)
+  })
+})
+
+describe('mergeHistory (tether#107)', () => {
+  afterEach(() => {
+    reset()
+    useStore.setState({ transcriptEarlier: null, transcriptOtherRecord: null, transcriptPagesBack: 0 })
+  })
+
+  const hist = (role: Message['role'], text: string, ts: number): Message =>
+    ({ id: crypto.randomUUID(), role, text, ts })
+
+  it('keeps the older pages, updates the overlap in place, and appends what is new', () => {
+    // The shape the three-second probe produces once the reader has paged back: the
+    // daemon's newest window covers the tail of what is on screen plus one new turn.
+    useStore.setState({
+      messages: [
+        { id: 'older-1', role: 'user', text: 'page one, turn one', ts: 100 },
+        { id: 'newer-1', role: 'user', text: 'ask', ts: 500 },
+        { id: 'newer-2', role: 'assistant', text: 'partial ans', ts: 600 },
+      ],
+      transcriptPagesBack: 1,
+    })
+
+    const ok = useStore.getState().mergeHistory([
+      hist('user', 'ask', 500),
+      hist('assistant', 'partial answer, now complete', 600),
+      hist('user', 'and one more', 700),
+    ])
+    expect(ok).toBe(true)
+
+    const after = useStore.getState().messages
+    // Nothing removed — the page the reader loaded is still there.
+    expect(after.map(m => m.text)).toEqual([
+      'page one, turn one',
+      'ask',
+      'partial answer, now complete',
+      'and one more',
+    ])
+    // …and identity survived for everything that was already on screen, including the
+    // GROWING turn, whose text changed. That is why messageKey excludes text.
+    expect(after[0].id).toBe('older-1')
+    expect(after[1].id).toBe('newer-1')
+    expect(after[2].id).toBe('newer-2')
+    expect(new Set(after.map(m => m.id)).size).toBe(4)
+  })
+
+  it('reports false when the new window does not overlap what is on screen', () => {
+    // Over a megabyte written between two three-second probes: the daemon's window now
+    // starts after the loaded array ended. A merge would splice two disjoint stretches
+    // together with an invisible hole between them, so this refuses and the caller
+    // falls back to the visible reset.
+    useStore.setState({
+      messages: [{ id: 'stale', role: 'user', text: 'long ago', ts: 100 }],
+      transcriptPagesBack: 2,
+    })
+    const ok = useStore.getState().mergeHistory([hist('user', 'much later', 90000)])
+    expect(ok).toBe(false)
+    // And it changed NOTHING: refusing has to leave the decision entirely to the
+    // caller, or the fallback would land on a half-merged array.
+    expect(useStore.getState().messages.map(m => m.id)).toEqual(['stale'])
+    expect(useStore.getState().transcriptPagesBack).toBe(2)
+  })
+
+  it('installs into an EMPTY transcript rather than calling that disjoint', () => {
+    useStore.setState({ messages: [] })
+    expect(useStore.getState().mergeHistory([hist('user', 'first ever', 1)])).toBe(true)
+    expect(useStore.getState().messages.map(m => m.text)).toEqual(['first ever'])
+  })
+
+  it('drops a field the daemon has stopped sending instead of letting it linger', () => {
+    useStore.setState({
+      messages: [{ id: 'keep', role: 'assistant', text: 'ans', ts: 600, thinking: 'was thinking' }],
+    })
+    useStore.getState().mergeHistory([{ id: 'fresh', role: 'assistant', text: 'ans', ts: 600 }])
+    const after = useStore.getState().messages
+    expect(after).toHaveLength(1)
+    expect(after[0].id).toBe('keep')
+    expect(after[0].thinking).toBeUndefined()
+  })
+
+  it('is a no-op for an empty page, and reports success', () => {
+    // An empty newest page is not a disjoint window, it is a transcript with nothing
+    // new in it. Reporting false would send the caller to loadHistory([]), which
+    // would blank a transcript the reader has pages of.
+    useStore.setState({ messages: [{ id: 'only', role: 'user', text: 'hello', ts: 1 }] })
+    expect(useStore.getState().mergeHistory([])).toBe(true)
+    expect(useStore.getState().messages.map(m => m.id)).toEqual(['only'])
+  })
+})
+
+describe('setTranscriptBounds (tether#107)', () => {
+  afterEach(() => {
+    reset()
+    useStore.setState({ transcriptEarlier: null, transcriptOtherRecord: null, transcriptPagesBack: 0 })
+  })
+
+  it('records both facts', () => {
+    useStore.getState().setTranscriptBounds({ earlier: 4096, otherRecord: 'cc' })
+    expect(useStore.getState().transcriptEarlier).toBe(4096)
+    expect(useStore.getState().transcriptOtherRecord).toBe('cc')
+  })
+
+  it('does not publish a new state object when nothing moved', () => {
+    // ChatPane subscribes without a selector, so an unconditional set() re-renders it
+    // — and invalidates the transcript memo — on every one of the three-second
+    // probe's reloads. Same argument, and same construction, as clearNotices.
+    useStore.getState().setTranscriptBounds({ earlier: 4096, otherRecord: null })
+    let updates = 0
+    const off = useStore.subscribe(() => { updates++ })
+    useStore.getState().setTranscriptBounds({ earlier: 4096, otherRecord: null })
+    off()
+    expect(updates).toBe(0)
+  })
+})

@@ -1,6 +1,6 @@
 import { useStore, historyEntryToMessage, type HistoryEntry } from './store'
 import { authedFetch } from './auth'
-import { noteTranscriptVersion, readTranscriptVersion, transcriptPath } from './transcriptWatch'
+import { noteTranscriptVersion, readTranscriptBounds, readTranscriptVersion, transcriptPath } from './transcriptWatch'
 
 /**
  * The window event a click on the ALREADY-OPEN session raises (tether#106).
@@ -67,11 +67,43 @@ export function refreshTranscript(sid: string): Promise<void> {
       // header. That direction costs one redundant reload; the other direction would
       // lose a write outright. See session_api.go.)
       const version = readTranscriptVersion(r)
-      return r.json().then((msgs: HistoryEntry[]) => ({ version, msgs }))
+      // tether#107 — off the SAME response, for the same reason as the version. These
+      // describe the page in the body; taken from any other request they would describe
+      // a different one.
+      const bounds = readTranscriptBounds(r)
+      return r.json().then((msgs: HistoryEntry[]) => ({ version, bounds, msgs }))
     })
-    .then(({ version, msgs }: { version: number; msgs: HistoryEntry[] }) => {
-      if (useStore.getState().sessionId !== sid) return
-      useStore.getState().loadHistory(msgs.map(historyEntryToMessage))
+    .then(({ version, bounds, msgs }: { version: number; bounds: ReturnType<typeof readTranscriptBounds>; msgs: HistoryEntry[] }) => {
+      const store = useStore.getState()
+      if (store.sessionId !== sid) return
+      const next = msgs.map(historyEntryToMessage)
+      // tether#107 — this is the NEWEST page. Whether it may replace the array depends
+      // on whether the reader has paged back, and only the store knows that.
+      //
+      // `pagesBack === 0` keeps the byte-for-byte behaviour every caller had before:
+      // the wholesale server-truth replace, which is what a deliberate session switch
+      // needs. Above zero, replacing would throw away pages the reader loaded on
+      // purpose — every three seconds, while they read them — so the page is merged in
+      // instead, and `mergeHistory` reporting disjoint windows sends us back to the
+      // replace because a visible jump beats an invisible hole.
+      const pagesBack = store.transcriptPagesBack
+      const merged = pagesBack > 0 && store.mergeHistory(next)
+      if (!merged) store.loadHistory(next)
+      // The CURSOR is kept on a successful merge and taken on a replace, and getting
+      // this backwards is a real defect rather than untidiness: the cursor in the store
+      // describes the OLDEST page on screen, while this response's cursor describes the
+      // newest. Overwriting it with the newest page's would make the next "load earlier"
+      // jump forward and re-serve pages the reader is already looking at.
+      //
+      // `otherRecord` is taken either way — it is a fact about the sid, not the page.
+      //
+      // Re-read rather than using the snapshot above: `store` is the state as it was
+      // BEFORE the merge, and a reducer that ever does touch this field would make the
+      // snapshot silently one update stale.
+      store.setTranscriptBounds({
+        earlier: merged ? useStore.getState().transcriptEarlier : bounds.earlier,
+        otherRecord: bounds.otherRecord,
+      })
       noteTranscriptVersion(sid, version)
     })
     .catch(() => {})
@@ -82,6 +114,76 @@ export function refreshTranscript(sid: string): Promise<void> {
     })
   inFlightSid = sid
   inFlightLoad = load
+  return load
+}
+
+/** The earlier-page load in flight, keyed by sid — see loadEarlierTranscript. */
+let earlierSid: string | null = null
+let earlierLoad: Promise<void> | null = null
+
+/**
+ * loadEarlierTranscript fetches the page BEFORE the oldest one on screen and prepends
+ * it (tether#107).
+ *
+ * This is the whole point of the wi: before it, the top of a cc-served transcript was a
+ * hard ceiling with nothing on screen to say so, and the reader of the 117 MiB session
+ * that prompted it could see the last 0.85%.
+ *
+ * # It reads the cursor from the store, not from an argument
+ *
+ * So that the cursor spent is provably the one the response that installed the oldest
+ * page reported. A caller-supplied offset is a caller-computed offset, and a cursor
+ * computed anywhere but on the daemon's side of this route is one that can land
+ * mid-record.
+ *
+ * # Guards, and why each is here
+ *
+ *  - No cursor: a no-op that resolves. The pane does not render the button in that
+ *    state, so reaching this means something raced (a refresh landed between the render
+ *    and the click) and the honest answer is "there is nothing earlier".
+ *  - `!r.ok` THROWS rather than falling back to an empty page, the same reasoning
+ *    refreshTranscript states: an empty page would advance nothing but WOULD look like
+ *    "you have reached the beginning", turning a failed request into a false claim.
+ *  - The sid is re-checked after the await, so a page for a session the reader has left
+ *    cannot be prepended to the one they are now looking at.
+ *  - One load at a time per sid: the button is disabled while one is in flight, but the
+ *    disable is a render away and the cursor only advances when a response lands, so two
+ *    fast clicks would otherwise spend the SAME cursor twice — prepending the same page
+ *    twice, which prependHistory would then discard, i.e. a request that cost a megabyte
+ *    and did nothing.
+ *
+ * The returned promise resolves either way; the caller uses it to re-enable the button.
+ */
+export function loadEarlierTranscript(sid: string): Promise<void> {
+  if (!sid) return Promise.resolve()
+  if (earlierSid === sid && earlierLoad) return earlierLoad
+  const before = useStore.getState().transcriptEarlier
+  if (before === null) return Promise.resolve()
+  const load = authedFetch(transcriptPath(sid, before))
+    .then(r => {
+      if (!r.ok) throw new Error(`messages: HTTP ${r.status}`)
+      const bounds = readTranscriptBounds(r)
+      return r.json().then((msgs: HistoryEntry[]) => ({ bounds, msgs }))
+    })
+    .then(({ bounds, msgs }: { bounds: ReturnType<typeof readTranscriptBounds>; msgs: HistoryEntry[] }) => {
+      const store = useStore.getState()
+      if (store.sessionId !== sid) return
+      store.prependHistory(msgs.map(historyEntryToMessage))
+      // The cursor MOVES BACK to this page's own, so the next click goes one page
+      // further rather than re-fetching this one. `otherRecord` is carried through
+      // unchanged — it is a fact about the sid, and this response reports the same one.
+      store.setTranscriptBounds({ earlier: bounds.earlier, otherRecord: bounds.otherRecord })
+      // Deliberately NOT noteTranscriptVersion: that records which version of the
+      // transcript is ON SCREEN for the three-second probe to compare against, and an
+      // older page says nothing about how recently the file was written. Recording it
+      // here would let a "load earlier" suppress the next reload of NEW messages.
+    })
+    .catch(() => {})
+    .finally(() => {
+      if (earlierLoad === load) { earlierSid = null; earlierLoad = null }
+    })
+  earlierSid = sid
+  earlierLoad = load
   return load
 }
 

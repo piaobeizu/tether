@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { TetherWT } from '../../lib/wt'
 import { ControlClient } from '../../lib/control'
 import { chatURL } from '../../lib/chatUrl'
@@ -8,8 +8,8 @@ import { Icon } from '../../lib/icons'
 import type { FencedBlock, ProviderListResponse } from '../../lib/wire.gen'
 import { ClientFrameAction, ErrCodeSessionHeldByBackgroundAgent } from '../../lib/wire.gen'
 import { authedFetch } from '../../lib/auth'
-import { refreshTranscript, REFRESH_TRANSCRIPT_EVENT } from '../../lib/session'
-import { noteTranscriptVersion, readTranscriptVersion, transcriptPath, watchTranscript } from '../../lib/transcriptWatch'
+import { loadEarlierTranscript, refreshTranscript, REFRESH_TRANSCRIPT_EVENT } from '../../lib/session'
+import { noteTranscriptVersion, readTranscriptBounds, readTranscriptVersion, transcriptPath, watchTranscript } from '../../lib/transcriptWatch'
 import { DagBlock } from '../../fenced-blocks/DagBlock'
 import { FormBlock } from '../../fenced-blocks/FormBlock'
 import { CandidatesBlock } from '../../fenced-blocks/CandidatesBlock'
@@ -196,6 +196,60 @@ export function transcriptTextLength(messages: { text: string }[]): number {
   return n
 }
 
+// tether#107 — where the scroll container must land after an older page is prepended.
+//
+// Pure and extracted for the same reason as its four neighbours above: the effect that
+// applies it needs a mounted pane and a real scrollable element, so the only part a unit
+// test can reach is the arithmetic.
+//
+// Prepending grows the content ABOVE the viewport, so keeping the reader on the message
+// they were looking at means moving scrollTop down by exactly what was inserted. Doing
+// nothing leaves them looking at the top of the newly-arrived page — which is not
+// nothing, but it is not where they were, and on a 25-bubble page it is a long way from
+// it. The clamp at 0 is for the degenerate case where the container SHRANK (it cannot
+// here, but a negative scrollTop is silently clamped by the browser and loudly wrong in
+// a test, and the test is the thing that has to be able to tell).
+export function scrollAfterPrepend(prev: { top: number; height: number }, nextHeight: number): number {
+  return Math.max(0, prev.top + (nextHeight - prev.height))
+}
+
+// tether#107 — the two things the top of a transcript can say when there is nothing
+// earlier to fetch, which before this change were the same thing: nothing.
+//
+// Exported so the render tests can pin them by identity as well as by literal, the same
+// reason HELD_SESSION_PLACEHOLDER is.
+export const TRANSCRIPT_START_COMPLETE = 'the beginning of this conversation'
+
+// The other one, and the only sentence in this file that exists for a population that is
+// currently EMPTY.
+//
+// SessionIndex.Messages prefers tether's own history whenever it has any, and
+// `history.jsonl` is written only by this daemon's fan-out — so for a sid tether once
+// recorded and a terminal-launched background job later resumed, the transcript served
+// is tether's short record while cc holds the long one (sessionlist.go states this
+// combination as TranscriptUpdatedAt's second residual). tether#107 measured that
+// combination at zero sessions on the reference machine, and built for it anyway,
+// because the alternative is for the pane to say TRANSCRIPT_START_COMPLETE there — a
+// claim about the conversation that would be false.
+//
+// It names Claude Code because `cc` is the only value the daemon can emit for that
+// header (session.TranscriptPage.OtherRecord says why the symmetric case is
+// unreachable); describeOtherRecord below is what keeps an unknown value honest instead
+// of printing it.
+export const TRANSCRIPT_START_TETHER_RECORD_ONLY =
+  'the beginning of what tether recorded for this session — Claude Code has its own, separate record of it'
+
+// The generic form, for a store name this build does not know. Same shape as
+// FATAL_CODE_MESSAGES' fallback and for the same reason: a frontend build can be older
+// than the daemon it is embedded next to only if someone splits them, but rendering a
+// raw identifier at the reader is never the right answer to that.
+export const TRANSCRIPT_START_OTHER_RECORD_GENERIC =
+  'the beginning of what tether recorded for this session — another agent has its own, separate record of it'
+
+export function describeOtherRecord(store: string): string {
+  return store === 'cc' ? TRANSCRIPT_START_TETHER_RECORD_ONLY : TRANSCRIPT_START_OTHER_RECORD_GENERIC
+}
+
 // tether#63 — code→sentence map for the failed-connection card. Only the
 // codes wire.ErrorCode classifies Terminal=true (errors.go's
 // terminalCodes) need an entry; any other code (including one this frontend
@@ -375,7 +429,8 @@ interface Props {
 }
 
 export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
-  const { messages, notices, sessionId, pendingPermissions, resolvePermission, streaming, streamingMsgId, curTurnId, fatal } = useStore()
+  const { messages, notices, sessionId, pendingPermissions, resolvePermission, streaming, streamingMsgId, curTurnId, fatal,
+    transcriptEarlier, transcriptOtherRecord } = useStore()
   // tether#57 — what the pane actually renders: server-truth `messages` and
   // locally-originated `notices` recombined here, at render time. They are kept
   // apart in the store precisely so the history refetch that session_ready
@@ -442,6 +497,17 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   const firstConnectedRef = useRef(false)
   const chatRef = useRef<HTMLDivElement>(null)
   const taRef = useRef<HTMLTextAreaElement>(null)
+  // tether#107 — "load earlier messages" is in flight. Local, not store state: it is
+  // about this pane's button, and nothing else has any use for it.
+  const [loadingEarlier, setLoadingEarlier] = useState(false)
+  // Where the scroll box was standing when the reader asked for an older page, so the
+  // layout effect below can put them back on the same message. Null when no prepend is
+  // pending, which is also what makes that effect a no-op on every other commit.
+  const prependAnchorRef = useRef<{ top: number; height: number } | null>(null)
+  // One-shot: the commit that lands a prepended page must not also autoscroll. Consumed
+  // by the autoscroll effect — see the anchor effect for why the flag is necessary and
+  // not merely defensive.
+  const skipAutoscrollRef = useRef(false)
   const [providers, setProviders] = useState<string[]>(['claude-code'])
   const [selectedProvider, setSelectedProvider] = useState(
     () => localStorage.getItem('tether_default_provider') ?? 'claude-code'
@@ -496,8 +562,15 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
       // knew. Recorded only where loadHistory actually runs: the version describes
       // what is ON SCREEN, so recording it next to a load that was skipped would be a
       // claim about a transcript this effect declined to install.
-      .then(r => r.ok ? r.json().then((msgs: HistoryEntry[]) => ({ v: readTranscriptVersion(r), msgs })) : { v: 0, msgs: [] as HistoryEntry[] })
-      .then(({ v, msgs }: { v: number; msgs: HistoryEntry[] }) => {
+      // tether#107 — the boundary headers ride along on the same response, because this
+      // effect is the other way a transcript gets on screen (a page reload restores
+      // tether_last_sid and lands here, never in openSession). Without them a reloaded
+      // page would render no top-of-transcript marker at all until something else
+      // refetched — i.e. the reader would be back to an unlabelled ceiling.
+      .then(r => r.ok
+        ? r.json().then((msgs: HistoryEntry[]) => ({ v: readTranscriptVersion(r), b: readTranscriptBounds(r), msgs }))
+        : { v: 0, b: { earlier: null, otherRecord: null }, msgs: [] as HistoryEntry[] })
+      .then(({ v, b, msgs }: { v: number; b: { earlier: number | null; otherRecord: string | null }; msgs: HistoryEntry[] }) => {
         // Don't clobber an in-flight turn (tether#42 fix). On the FIRST send of
         // a new session, session_ready sets sessionId and fires this effect;
         // /messages already has the just-persisted user msg, so loadHistory
@@ -507,6 +580,11 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
         // authoritative, so skip the reload.
         if (msgs.length > 0 && !useStore.getState().streaming) {
           useStore.getState().loadHistory(msgs.map(historyEntryToMessage))
+          // Recorded only where loadHistory actually runs, for the reason the version
+          // comment above gives: these describe what is ON SCREEN, and recording them
+          // next to a load this effect declined to install would be a claim about a
+          // transcript that is not there.
+          useStore.getState().setTranscriptBounds(b)
           noteTranscriptVersion(sessionId, v)
         }
       })
@@ -525,11 +603,43 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
     return () => clearInterval(id)
   }, [sessionStart])
 
+  // tether#107 — put the reader back on the message they were looking at after an older
+  // page lands above it.
+  //
+  // A LAYOUT effect, and that is the whole reason it can work: it runs after the DOM has
+  // the new bubbles and before the browser paints, so the correction is invisible. In a
+  // passive effect the reader would see the transcript jump and then jump back.
+  //
+  // It also sets skipAutoscrollRef, which is NECESSARY rather than defensive. The
+  // autoscroll effect below fires on this same commit (both `transcript.length` and
+  // `grown` moved) and decides from the post-correction geometry. For a transcript that
+  // FITTED THE VIEWPORT before the prepend, oldScrollHeight === clientHeight, so after
+  // the correction `scrollHeight - scrollTop - clientHeight` is exactly 0 — under the
+  // 120px `nearBottom` threshold — and the pane would snap to the bottom of the page the
+  // reader just asked to see the top of. The threshold itself is untouched: this skips
+  // one commit, the one whose entire purpose is to not move.
+  useLayoutEffect(() => {
+    const anchor = prependAnchorRef.current
+    if (anchor === null) return
+    prependAnchorRef.current = null
+    const el = chatRef.current
+    if (!el) return
+    el.scrollTop = scrollAfterPrepend(anchor, el.scrollHeight)
+    skipAutoscrollRef.current = true
+  }, [messages])
+
   // Scroll to bottom on new messages AND when streaming text accumulates
   const grown = transcriptTextLength(transcript)
   useEffect(() => {
     const el = chatRef.current
     if (!el) return
+    // tether#107 — the prepend commit already decided where this container stands. One
+    // commit only, consumed here, so the next arriving message autoscrolls exactly as it
+    // always has.
+    if (skipAutoscrollRef.current) {
+      skipAutoscrollRef.current = false
+      return
+    }
     // Always scroll during streaming; otherwise only if already near bottom
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120
     if (streaming || nearBottom) {
@@ -780,6 +890,38 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   const checkAgain = () => {
     if (sessionId) void refreshTranscript(sessionId)
     manualRetry()
+  }
+
+  // tether#107 — the action the top of a truncated transcript offers.
+  //
+  // The scroll box is measured BEFORE the request, not in the .then: by the time the
+  // response lands the reader may have scrolled on, and the anchor has to be where they
+  // were when they asked. It is read straight off the element rather than from React
+  // state because scroll position is not React's to know.
+  const loadEarlier = () => {
+    if (!sessionId || loadingEarlier) return
+    const el = chatRef.current
+    prependAnchorRef.current = el ? { top: el.scrollTop, height: el.scrollHeight } : null
+    // Read BEFORE the request, so the settle below can tell whether a page actually
+    // landed. `transcriptPagesBack` is the honest measure of that: prependHistory is the
+    // only thing that raises it, and it raises it only when it prepends.
+    const pagesAtClick = useStore.getState().transcriptPagesBack
+    setLoadingEarlier(true)
+    void loadEarlierTranscript(sessionId).finally(() => {
+      setLoadingEarlier(false)
+      // A request that failed must leave NO anchor pending, or the next unrelated
+      // commit would apply a stale correction to a scroll position it has nothing to do
+      // with. loadEarlierTranscript swallows its own errors, so this is the only place
+      // that can tell — and it works whichever side of React's commit this callback
+      // lands on: after it, the layout effect has already cleared the anchor, and
+      // clearing an already-null ref is nothing.
+      //
+      // The residual, stated: a DISJOINT refresh landing inside this window resets the
+      // counter to 0, so a click made at pagesBack > 0 leaves the anchor pending. The
+      // next commit then shifts the reader by that commit's height delta. Cosmetic, in
+      // a state where the transcript has just visibly reset anyway.
+      if (useStore.getState().transcriptPagesBack === pagesAtClick) prependAnchorRef.current = null
+    })
   }
 
   // tether#52 — first-connect ordering (see shouldDeferFirstConnect above).
@@ -1123,6 +1265,47 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
                 the reader has at that moment (see its definition); every other code
                 still gets `manualRetry` and nothing else. */}
             <button onClick={readingHeldSession ? checkAgain : manualRetry} className="btn-ghost-sm">{readingHeldSession ? 'Check again' : 'Retry'}</button>
+          </div>
+        )}
+
+        {/* ── The top of the transcript (tether#107) ──────────────────────────
+            Before this there was NOTHING here, and that absence was the bug: a
+            reader who scrolled to the top of a 117 MiB conversation saw the same
+            screen whether they had reached the beginning or hit a 1 MiB ceiling.
+
+            Three states, and it renders in ALL THREE. That is the point rather than
+            thoroughness: if the "you have reached the beginning" line were
+            conditional, its absence would be ambiguous again, which is the state
+            this element exists to end.
+
+            Gated on there being messages. "The beginning of this conversation" above
+            an empty transcript is a new false claim, and an empty transcript is a
+            normal answer here — SessionIndex.MessagePage returns SourceNone with no
+            messages for a sid neither store has, which is exactly what openSession
+            fetches for a session created moments ago. Same gate, same argument, as
+            HELD_SESSION_READABLE_NOTE.
+
+            Gated on `messages` and not `transcript`: a session whose only content is
+            a locally-originated notice has no transcript to be at the top of. */}
+        {messages.length > 0 && (
+          <div className="transcript-top">
+            {transcriptEarlier !== null ? (
+              // The label swaps and the button disables while a real request is in
+              // flight. This is NOT the loading spinner tether#107 rules out: that
+              // objection is about the CEILING, where "wait and it will arrive" is
+              // false and a spinner therefore misinforms. Here a request exists and
+              // will settle, the label reports that request, and it appears only in
+              // the state that has one. Same construction as EventTimeline's
+              // `load more` / `loading…`, which is the repo's existing pagination
+              // button.
+              <button className="transcript-more" onClick={loadEarlier} disabled={loadingEarlier}>
+                {loadingEarlier ? 'loading…' : 'load earlier messages'}
+              </button>
+            ) : (
+              <span className="transcript-top-note">
+                {transcriptOtherRecord ? describeOtherRecord(transcriptOtherRecord) : TRANSCRIPT_START_COMPLETE}
+              </span>
+            )}
           </div>
         )}
 

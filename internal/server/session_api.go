@@ -142,14 +142,43 @@ func sessionAPIHandlers(idx *session.SessionIndex, wis *session.WIBindingStore) 
 				w.WriteHeader(http.StatusOK)
 				return
 			}
+			// tether#107 — the ONE query parameter this route reads.
+			//
+			// Refused rather than ignored when it is malformed. An ignored cursor
+			// serves the newest page instead, which looks to the reader exactly like
+			// "there is nothing earlier" — i.e. pagination silently reverting to the
+			// ceiling it exists to remove. A 400 is a thing the caller can see.
+			//
+			// Read AFTER the HEAD return above, because the probe has no use for it:
+			// HEAD answers from a stat and never selects a page, so validating it there
+			// would only add a way for the probe to fail.
+			before, ok := parseTranscriptBefore(r.URL.Query().Get("before"))
+			if !ok {
+				http.Error(w, "bad before", http.StatusBadRequest)
+				return
+			}
 			// One call, because "which store answers for this sid" is one rule and
 			// it lives on the index next to the list that applies the same rule —
-			// see session.SessionIndex.Messages. This route deliberately does not
+			// see session.SessionIndex.MessagePage. This route deliberately does not
 			// reach for HistoryStore and then fall back itself: that is how a row
-			// labelled "tether" ends up serving cc's transcript.
-			msgs, source := idx.Messages(sid)
+			// labelled "tether" ends up serving cc's transcript. Since tether#107 the
+			// same call also answers "how far back does this store go", for the same
+			// reason: a cursor minted against one store's file must not be spendable
+			// against the other's.
+			page := idx.MessagePage(sid, before)
+			msgs, source := page.Messages, page.Source
 			if msgs == nil {
 				msgs = []session.HistoryMessage{}
+			}
+			// Set before writeJSON, which writes the body. Present only when there IS
+			// an earlier page: the header's ABSENCE is what tells the reader it has
+			// reached the beginning of this store's record, so emitting a zero would
+			// turn the one unambiguous signal into a value to be interpreted.
+			if page.HasEarlier {
+				w.Header().Set(session.TranscriptEarlierHeader, strconv.FormatInt(page.Earlier, 10))
+			}
+			if page.OtherRecord != "" {
+				w.Header().Set(session.TranscriptOtherRecordHeader, page.OtherRecord)
 			}
 			// tether#92 — this route logged NOTHING, and the daemon was blind to
 			// the exact path a user's bug report was about ("clicking a session
@@ -158,7 +187,8 @@ func sessionAPIHandlers(idx *session.SessionIndex, wis *session.WIBindingStore) 
 			// which store they came from. `source` distinguishes the three answers
 			// that look identical from outside — tether had it, cc had it, nobody
 			// had it — which is the whole reason 0 messages is not enough to log.
-			slog.Info("session transcript served", "sid", sid, "count", len(msgs), "source", source)
+			slog.Info("session transcript served", "sid", sid, "count", len(msgs), "source", source,
+				"before", before, "earlier", page.Earlier, "has_earlier", page.HasEarlier)
 			writeJSON(w, msgs)
 		case "wi":
 			if r.Method != http.MethodPut {
@@ -172,6 +202,26 @@ func sessionAPIHandlers(idx *session.SessionIndex, wis *session.WIBindingStore) 
 	}
 
 	return
+}
+
+// parseTranscriptBefore reads the transcript route's `before` cursor (tether#107).
+//
+// Absent is session.TranscriptTail — "the newest page" — and NOT 0. Those are
+// different requests: 0 asks for the page ending at byte zero, which is empty.
+//
+// A negative number is refused rather than clamped. The only cursor a client should
+// ever hold came out of TranscriptEarlierHeader, which is emitted only when it is
+// positive, so a negative one means the caller computed it, and a caller computing
+// cursors is the case worth failing loudly for.
+func parseTranscriptBefore(raw string) (int64, bool) {
+	if raw == "" {
+		return session.TranscriptTail, true
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
 }
 
 // putSessionWI records which work item a session belongs to.

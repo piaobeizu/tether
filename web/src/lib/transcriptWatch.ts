@@ -59,19 +59,49 @@ import { authedFetch } from './auth'
  */
 export const TRANSCRIPT_UPDATED_AT_HEADER = 'X-Tether-Transcript-Updated-At'
 
+/**
+ * The header carrying the byte offset to ask for to read the page BEFORE the one in the
+ * response (tether#107). Absent when there is no such page.
+ *
+ * Mirrored BY HAND from `session.TranscriptEarlierHeader` (Go), and
+ * `TestTranscriptPageHeadersAreMirroredInTypeScript` requires the literal to appear
+ * here. The consequence of a one-sided rename is worse for this header than for the one
+ * above it: the version header going quiet freezes the transcript, which a reader
+ * eventually notices, whereas this one going quiet makes the pane stop offering the
+ * button AND start asserting, at the top of a 117 MiB transcript, that this is where
+ * the conversation began. A confident false statement, at exit code 0.
+ */
+export const TRANSCRIPT_EARLIER_HEADER = 'X-Tether-Transcript-Earlier'
+
+/**
+ * The header naming a store OTHER than the one that answered which also holds a record
+ * for this session (tether#107), or absent when there is none.
+ *
+ * Mirrored by hand, same guard. `cc` is the only value the daemon can currently produce
+ * — see session.TranscriptPage.OtherRecord.
+ */
+export const TRANSCRIPT_OTHER_RECORD_HEADER = 'X-Tether-Transcript-Other-Record'
+
 /** How often the probe runs while a session with no live stream is on screen. */
 export const TRANSCRIPT_POLL_MS = 3000
 
 /**
- * The transcript route, for both the probe (HEAD) and the load (GET).
+ * The transcript route, for the probe (HEAD), the load (GET) and — since tether#107 —
+ * one page further back (`before`).
  *
- * One function so those two cannot address different resources. The daemon refuses any
+ * One function so those cannot address different resources. The daemon refuses any
  * sid session.ValidSessionID rejects — outside [A-Za-z0-9_-], or outside 8..128
  * characters (history.go) — so the encoding is defence in depth, but a sid reaching
  * this module from localStorage or a work-item record is not one this module verified.
+ *
+ * `before` is omitted entirely when it is not given, rather than sent as an empty or
+ * zero value. Not cosmetic: the daemon reads an absent parameter as "the newest page"
+ * and `before=0` as "the page ending at byte zero", which is empty — so a caller that
+ * always appended the parameter would blank the transcript of every session it opened.
  */
-export function transcriptPath(sid: string): string {
-  return `/api/v1/sessions/${encodeURIComponent(sid)}/messages`
+export function transcriptPath(sid: string, before?: number): string {
+  const base = `/api/v1/sessions/${encodeURIComponent(sid)}/messages`
+  return before === undefined ? base : `${base}?before=${encodeURIComponent(String(before))}`
 }
 
 /**
@@ -89,6 +119,39 @@ export function readTranscriptVersion(res: { headers?: { get(name: string): stri
   if (!raw) return 0
   const n = Number(raw)
   return Number.isFinite(n) && n > 0 ? n : 0
+}
+
+/** A response's two transcript BOUNDARY facts (tether#107) — see readTranscriptBounds. */
+export interface TranscriptBounds {
+  earlier: number | null
+  otherRecord: string | null
+}
+
+/**
+ * readTranscriptBounds pulls the boundary facts out of a response.
+ *
+ * `null` means "no such page" / "no other record", NOT "unknown", and the difference
+ * from readTranscriptVersion's 0 is deliberate. A version of 0 is a value the reader
+ * refreshes to learn; these two have no such fallback — the pane RENDERS the absence,
+ * as "the beginning of this conversation". So the parse is strict in the one direction
+ * that matters: anything that is not a positive finite integer reads as null, because
+ * showing "the beginning of the conversation" for a header we could not parse is the
+ * same claim as showing it for a header that was legitimately absent, and both are
+ * better than a button whose cursor is NaN and whose click serves the newest page again.
+ *
+ * Both are read off ONE response together, and returned as one object, because they and
+ * the messages describe the same page. Reading them separately is how a page's cursor
+ * ends up recorded next to another page's messages.
+ */
+export function readTranscriptBounds(res: { headers?: { get(name: string): string | null } }): TranscriptBounds {
+  const rawEarlier = res.headers?.get(TRANSCRIPT_EARLIER_HEADER)
+  let earlier: number | null = null
+  if (rawEarlier) {
+    const n = Number(rawEarlier)
+    if (Number.isInteger(n) && n > 0) earlier = n
+  }
+  const other = res.headers?.get(TRANSCRIPT_OTHER_RECORD_HEADER)
+  return { earlier, otherRecord: other ? other : null }
 }
 
 /**

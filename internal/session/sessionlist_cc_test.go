@@ -386,3 +386,105 @@ func TestSessionSummaryRunningAsIsOmittedWhenEmpty(t *testing.T) {
 		t.Errorf("a held row serialised %s, want a `\"runningAs\":\"bg\"` member", held)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Which kind of "top" is this? (tether#107)
+// ---------------------------------------------------------------------------
+
+// TestMessagePageNamesTheOtherRecordWhenBothStoresHaveTheSid — the field that stops
+// the top of a transcript claiming to be the beginning of the conversation when it is
+// only the beginning of tether's record.
+//
+// This combination is EMPTY on the reference machine (tether#107 measured 0 sessions
+// with both a tether record and a cc side over the window), so it can only be pinned
+// synthetically, and the mechanism is real: TranscriptUpdatedAt's second residual is
+// the same combination — a sid tether once recorded that a `claude -p` job later
+// resumed into cc.
+//
+// It is deliberately NOT an offer to serve cc's record. Which store wins is the rule
+// Messages states, and tether#107 left it exactly as it was.
+func TestMessagePageNamesTheOtherRecordWhenBothStoresHaveTheSid(t *testing.T) {
+	const shared = "shared-session-0001"
+	dir := t.TempDir()
+	writeTranscript(t, dir, "tttt1111", time.Now(), userLine("tether only"))
+	writeTranscript(t, dir, shared, time.Now(), userLine("tether's short record"))
+
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", ccUser(t, "cc only"))
+	f.write(t, "/w", shared+".jsonl", ccUser(t, "cc's much longer record"))
+
+	idx := ccIndex(t, dir, f)
+
+	both := idx.MessagePage(shared, TranscriptTail)
+	if both.Source != SourceTether {
+		t.Fatalf("source = %q, want %q — tether#107 must not have changed which store wins", both.Source, SourceTether)
+	}
+	if both.OtherRecord != SourceCC {
+		t.Errorf("OtherRecord = %q, want %q; the pane would claim this is the beginning of the conversation",
+			both.OtherRecord, SourceCC)
+	}
+	if len(both.Messages) == 0 || both.Messages[0].Text != "tether's short record" {
+		t.Errorf("messages = %+v, want tether's copy", both.Messages)
+	}
+
+	// Only tether has it: there is no other record, so the top of the transcript
+	// really is the beginning of the conversation.
+	if only := idx.MessagePage("tttt1111", TranscriptTail); only.OtherRecord != "" {
+		t.Errorf("OtherRecord = %q for a sid only tether has, want empty", only.OtherRecord)
+	}
+	// Only cc has it. The symmetric case is unreachable rather than unimplemented —
+	// tether having the sid is what selects tether — so this pins "" and says why.
+	if only := idx.MessagePage("cc-session-0001", TranscriptTail); only.OtherRecord != "" {
+		t.Errorf("OtherRecord = %q for a cc-only sid, want empty", only.OtherRecord)
+	}
+}
+
+// TestMessagePageOnTetherHistoryHasNothingEarlier — tether's own store has no
+// ceiling to remove: LoadHistory is an os.ReadFile of the whole file.
+//
+// And a cursor spent against that branch returns an EMPTY page, not the file again.
+// Serving the whole transcript for a `before` would append a second copy of every
+// message already on screen, which is a worse answer than nothing and would look like
+// the transcript had doubled.
+func TestMessagePageOnTetherHistoryHasNothingEarlier(t *testing.T) {
+	dir := t.TempDir()
+	writeTranscript(t, dir, "tttt1111", time.Now(), userLine("first"), aiLine("second"))
+	idx := &SessionIndex{History: NewHistoryStore(dir)}
+
+	newest := idx.MessagePage("tttt1111", TranscriptTail)
+	if newest.Source != SourceTether || len(newest.Messages) != 2 {
+		t.Fatalf("newest page = %+v", newest)
+	}
+	if newest.HasEarlier {
+		t.Errorf("HasEarlier = true on an unbounded store; Earlier = %d", newest.Earlier)
+	}
+
+	paged := idx.MessagePage("tttt1111", 4096)
+	if len(paged.Messages) != 0 {
+		t.Errorf("a cursor on tether's branch served %d messages, want 0 — the transcript would double on screen",
+			len(paged.Messages))
+	}
+	if paged.Source != SourceTether {
+		t.Errorf("source = %q, want %q even for an empty page", paged.Source, SourceTether)
+	}
+	if paged.HasEarlier {
+		t.Errorf("HasEarlier = true on the empty page; Earlier = %d", paged.Earlier)
+	}
+}
+
+// TestMessagePageOnAnUnknownSidIsNotAnError — openSession asks for exactly this the
+// moment a session is created, and the answer must carry no cursor and no other
+// record, or the pane would render a top-of-transcript marker for a transcript that
+// does not exist.
+func TestMessagePageOnAnUnknownSidIsNotAnError(t *testing.T) {
+	f := newCCFixture(t, "/w")
+	idx := ccIndex(t, t.TempDir(), f)
+
+	page := idx.MessagePage("nobody-has-this-1", TranscriptTail)
+	if page.Source != SourceNone || len(page.Messages) != 0 || page.HasEarlier || page.OtherRecord != "" {
+		t.Errorf("page = %+v, want an empty %q page", page, SourceNone)
+	}
+	if page := (*SessionIndex)(nil).MessagePage("tttt1111", TranscriptTail); page.Source != SourceNone {
+		t.Errorf("nil index = %+v", page)
+	}
+}

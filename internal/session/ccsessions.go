@@ -572,32 +572,84 @@ func (s *CCStore) Has(sid string) bool {
 // session" and "cc has it and nothing in the window converts to a turn" are
 // different answers, and the route above this one uses the difference to decide
 // whether it is looking at a session it should be serving at all.
+//
+// It is the newest page of MessagePage, kept as a name because "the tail" is what
+// most callers want and because its own tests are the ones that pin the tail's
+// content. There is one implementation, not two.
 func (s *CCStore) Messages(sid string) ([]HistoryMessage, bool) {
+	page, ok := s.MessagePage(sid, TranscriptTail)
+	return page.Messages, ok
+}
+
+// CCPage is one window of a cc transcript, plus where in the file it began.
+//
+// Earlier is a BYTE OFFSET into the transcript, and it is the offset of the first
+// byte this page served — not of the window this page read. Those differ whenever
+// the message cap trimmed the front (see ccMessagesFromAt), which is one of the two
+// regimes a cursor has to survive.
+type CCPage struct {
+	Messages   []HistoryMessage
+	Earlier    int64
+	HasEarlier bool
+}
+
+// MessagePage returns the page of a cc transcript that ENDS at byte `before`, or
+// the newest page when before is TranscriptTail (tether#107).
+//
+// # Why the cursor is a byte offset
+//
+// Because it is the only cursor this store can produce without reading the whole
+// file, which is the cost the window exists to avoid. cc appends and never
+// rewrites, so an offset keeps naming the same record for as long as the file
+// lives. A message INDEX would need a full replay to compute; a TIMESTAMP is
+// neither unique (ccMessagesFrom stamps a merged turn with its first fragment's
+// time) nor monotonic across a --resume.
+//
+// The page size is ccMessagesTailBytes for every page, including this one, so the
+// first fetch of a session costs exactly what it costs today and a session that
+// never asks for an earlier page never pays for the feature. Measured on the
+// largest real transcript (117.2 MiB, 2026-08-19) one such window holds 196 JSONL
+// lines — 25 type:"user" and 57 type:"assistant" records, ~5.3 KB per line — so a
+// page is roughly 25 bubbles: a page-sized amount of reading rather than a
+// technicality. It also means ccMessagesMax does not bind there, which is what
+// ccMessagesMax's own doc says about this store.
+func (s *CCStore) MessagePage(sid string, before int64) (CCPage, bool) {
 	path := s.find(sid)
 	if path == "" {
-		return nil, false
+		return CCPage{}, false
 	}
 	f, err := os.Open(path)
 	if err != nil {
 		slog.Warn("cc sessions: open transcript failed", "sid", sid, "err", err)
-		return nil, false
+		return CCPage{}, false
 	}
 	defer f.Close()
 
 	fi, err := f.Stat()
 	if err != nil {
 		slog.Warn("cc sessions: stat transcript failed", "sid", sid, "err", err)
-		return nil, false
+		return CCPage{}, false
 	}
 
-	msgs, err := ccReadTail(f, fi.Size(), ccMessagesTailBytes)
+	// The window's far end. Clamped to the file rather than refused: a cursor past
+	// the end is what a client holding a stale offset for a truncated-and-rewritten
+	// file would send, and the tail is the honest answer to it.
+	until := fi.Size()
+	if before != TranscriptTail && before < until {
+		until = before
+	}
+	if until < 0 {
+		until = 0
+	}
+
+	page, err := ccReadWindow(f, until, ccMessagesTailBytes)
 	if err != nil {
 		slog.Warn("cc sessions: read transcript failed", "sid", sid, "err", err)
-		return nil, false
+		return CCPage{}, false
 	}
-	// No CONVERSATION in the window, and the window was not the whole file: the
-	// tail was all tool payload. Widen once — see ccMessagesTailBytes for why an
-	// empty answer here would be the original bug wearing a different hat.
+	// No CONVERSATION in the window, and the window did not reach the start of the
+	// file: the range was all tool payload. Widen once — see ccMessagesTailBytes for
+	// why an empty answer here would be the original bug wearing a different hat.
 	//
 	// The test is "no message carrying words", not "no messages", and tether#96 is
 	// why: once tool activity produces bubbles, a tail that is nothing but tool
@@ -606,16 +658,30 @@ func (s *CCStore) Messages(sid string) ([]HistoryMessage, bool) {
 	// That is this whole change failing in the one way that looks like success in a
 	// screenshot. 0 of 39 real transcripts widen today, so no test that only counts
 	// today's store would have noticed — see TestMessagesWidensPastAWallOfToolCalls.
-	if !ccHasConversation(msgs) && fi.Size() > ccMessagesTailBytes {
-		msgs, err = ccReadTail(f, fi.Size(), ccMessagesWideTailBytes)
+	//
+	// tether#107: the trigger was `fi.Size() > ccMessagesTailBytes` and is now
+	// `until > ccMessagesTailBytes`, which is the SAME condition for the newest page
+	// (until is then the size) and the right generalisation for an earlier one — the
+	// question is whether this window reached byte 0, not how big the file is. It
+	// applies to earlier pages deliberately: one rule, and a page with nothing to
+	// read is no better a thing to hand a reader who clicked than to hand one who
+	// opened the pane.
+	if !ccHasConversation(page.Messages) && until > ccMessagesTailBytes {
+		wide, err := ccReadWindow(f, until, ccMessagesWideTailBytes)
 		if err != nil {
 			slog.Warn("cc sessions: wide read failed", "sid", sid, "err", err)
-			return nil, true
+			// The NARROW page, not an empty one. Before tether#107 this returned
+			// nothing at all, which is now a worse answer than it was: an empty page
+			// with no cursor is indistinguishable from "the conversation starts here",
+			// so a failed widen would make the pane state a falsehood rather than show
+			// tool cards. The narrow page's cursor is true whatever the wide read did.
+			return page, true
 		}
 		slog.Debug("cc sessions: widened the transcript window", "sid", sid,
-			"size", fi.Size(), "found", len(msgs))
+			"size", fi.Size(), "until", until, "found", len(wide.Messages))
+		page = wide
 	}
-	return msgs, true
+	return page, true
 }
 
 // ccHasConversation reports whether any of these messages carries words.
@@ -632,26 +698,63 @@ func ccHasConversation(msgs []HistoryMessage) bool {
 	return false
 }
 
-// ccReadTail converts the last `window` bytes of f.
-func ccReadTail(f *os.File, size, window int64) ([]HistoryMessage, error) {
-	if size <= window {
-		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			return nil, err
+// ccReadWindow converts the `window` bytes of f that END at `until`.
+//
+// Was ccReadTail(f, size, window) until tether#107; the tail is now the case where
+// `until` is the file size, so there is one reader rather than a tail reader and a
+// page reader that could disagree about where a record begins.
+//
+// # The io.LimitReader is load-bearing, not hygiene
+//
+// Without it an earlier page would seek back and then read to EOF — i.e. serve the
+// whole rest of the file — and the symptom would be a "load earlier" that appears
+// to work while quietly costing what the unbounded read this store exists to avoid
+// costs.
+//
+// # Why the reported offset is where the page's FIRST SERVED BYTE is
+//
+// So that page N+1 = [cursor-window, cursor) meets page N exactly, with no gap and
+// no duplicate. `cursor` always sits immediately after a '\n' (or at 0), so the
+// record that ends at `cursor` is complete in page N+1 and absent from page N.
+//
+// Reporting the WINDOW START instead is the obvious version and it silently loses
+// one record per seam: this function drops the fragment the window opens on, and
+// the next page — reading up to the window start — would truncate that same record
+// into an unterminated final line, which ccMessagesFromAt discards. One record
+// missing per megabyte, in the middle of a conversation, with nothing on screen to
+// suggest it. TestMessagePageWalksBackWithoutGapOrDuplicate is the guard.
+func ccReadWindow(f *os.File, until, window int64) (CCPage, error) {
+	if until <= 0 {
+		return CCPage{}, nil
+	}
+	start := until - window
+	if start < 0 {
+		start = 0
+	}
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return CCPage{}, err
+	}
+	br := bufio.NewReader(io.LimitReader(f, until-start))
+	// Where the first COMPLETE record in this window begins.
+	base := start
+	if start > 0 {
+		// The window almost certainly opens mid-line. Drop that fragment: a truncated
+		// JSON object would merely fail to parse, but the point of dropping it
+		// explicitly is that a fragment which happens to parse would contribute half a
+		// record to the transcript the user reads.
+		frag, err := br.ReadBytes('\n')
+		if err != nil {
+			// A whole window with no line terminator in it: one record longer than the
+			// window. Nothing to serve, and the cursor still has to make progress or
+			// "load earlier" would be a button that does nothing forever — so it is the
+			// window start, and the next page reads the megabyte before this one.
+			return CCPage{Earlier: start, HasEarlier: start > 0}, nil
 		}
-		return ccMessagesFrom(f), nil
+		base += int64(len(frag))
 	}
-	if _, err := f.Seek(size-window, io.SeekStart); err != nil {
-		return nil, err
-	}
-	br := bufio.NewReader(f)
-	// The window almost certainly opens mid-line. Drop that fragment: a truncated
-	// JSON object would merely fail to parse, but the point of dropping it
-	// explicitly is that a fragment which happens to parse would contribute half a
-	// record to the transcript the user reads.
-	if _, err := br.ReadBytes('\n'); err != nil {
-		return nil, nil
-	}
-	return ccMessagesFrom(br), nil
+	msgs, off := ccMessagesFromAt(br)
+	at := base + off
+	return CCPage{Messages: msgs, Earlier: at, HasEarlier: at > 0}, nil
 }
 
 // find resolves sid to a transcript path, or "" when no known directory has one.
@@ -901,14 +1004,45 @@ func ccUserTextFromLine(line []byte) string {
 // began. TestToolsMergeWithoutALeadingBlankLine asserts the stamp explicitly, so this
 // is a decision rather than a side effect.
 func ccMessagesFrom(r io.Reader) []HistoryMessage {
+	msgs, _ := ccMessagesFromAt(r)
+	return msgs
+}
+
+// ccMessagesFromAt is ccMessagesFrom plus the offset, relative to r's first byte,
+// at which the page it returns begins (tether#107).
+//
+// # The offset answers "what do I ask for to get the page before this one"
+//
+// It is 0 whenever nothing was trimmed, and that is not the same as "the first
+// message's offset". A window can legitimately open on records that produce no
+// message at all — a tool result is a type:"user" record with no text, and
+// ccUserShapes drops several more — so the first message may sit some way in. If
+// this returned that message's offset, a COMPLETE transcript whose first line is one
+// of those would report a cursor above zero, the pane would offer to load earlier
+// messages, and the click would return nothing. A false "there is more" is the exact
+// failure mode tether#107 exists to remove, in the opposite direction.
+//
+// When the cap DID trim, the offset is the trimmed-to message's own line, because
+// then there really is earlier content and it really does start there.
+//
+// starts is index-aligned with out: a line that opens a NEW message appends to both,
+// a line that MERGES into the previous assistant turn appends to neither. That
+// alignment is what makes starts[drop] the right answer for ccTrimFront's index, and
+// it is why the append lives in the else branch rather than after the if.
+func ccMessagesFromAt(r io.Reader) ([]HistoryMessage, int64) {
 	br, ok := r.(*bufio.Reader)
 	if !ok {
 		br = bufio.NewReader(r)
 	}
 	var out []HistoryMessage
+	var starts []int64
+	// Bytes consumed before the line about to be read.
+	var pos int64
 	at := make(map[string]ccToolPos)
 	for {
 		line, err := br.ReadBytes('\n')
+		lineAt := pos
+		pos += int64(len(line))
 		// Only a terminated line is a line — the same rule ccFirstUserText uses,
 		// and for the same reason. An earlier version accepted an unterminated
 		// final line here while rejecting it there; real cc files end with a
@@ -932,6 +1066,7 @@ func ccMessagesFrom(r io.Reader) []HistoryMessage {
 					out[idx].Tools = append(out[idx].Tools, m.Tools...)
 				} else {
 					out = append(out, m)
+					starts = append(starts, lineAt)
 				}
 				// Index only the calls this line contributed. Re-indexing the whole
 				// message would be quadratic in a turn that calls 61 things.
@@ -960,7 +1095,12 @@ func ccMessagesFrom(r io.Reader) []HistoryMessage {
 	// Newest turns win when there are more than the cap: the tail is what the
 	// window was chosen to preserve, so trimming from the front keeps that
 	// decision consistent instead of silently reversing it.
-	return out[ccTrimFront(out, ccMessagesMax):]
+	drop := ccTrimFront(out, ccMessagesMax)
+	first := int64(0)
+	if drop > 0 && drop < len(starts) {
+		first = starts[drop]
+	}
+	return out[drop:], first
 }
 
 // ccTrimFront returns how many messages to drop from the front so that at most max

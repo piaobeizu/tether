@@ -647,6 +647,31 @@ body {
 /* Daemon notice line (tether#50) — e.g. "the previous context could not be
    restored". Centred and muted so it reads as chrome, not as either party's
    turn; no avatar, no bubble, no timestamp. */
+/* ── Top of the transcript (tether#107) ──────────────────────────
+   Centred and quiet, like .msg-system, because it is the same KIND of thing: a line
+   about the conversation rather than a part of it. It sits above the first bubble, so
+   in the overwhelmingly common case (a session that fits) nobody scrolls far enough to
+   see it — which is the right cost for a marker whose job is to be there when someone
+   does look. */
+.transcript-top { display: flex; justify-content: center; padding: 4px 0 2px; }
+.transcript-top-note {
+  font-family: var(--font-mono); font-size: 11px; color: var(--ink-quat);
+  text-align: center; max-width: 86%; line-height: 1.5;
+}
+/* Same construction as .work-activity-more (the Work pane's "load more"), because it is
+   the same control: one page further back, disabled while a request is in flight. */
+.transcript-more {
+  padding: 3px 10px;
+  font-family: var(--font-mono); font-size: 11.5px;
+  color: var(--ink-secondary);
+  background: var(--bg-surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-2);
+  cursor: pointer;
+}
+.transcript-more:hover:not(:disabled) { border-color: var(--accent); color: var(--ink-primary); }
+.transcript-more:disabled { opacity: .55; cursor: default; }
+
 .msg-system { display: flex; justify-content: center; padding: 2px 0; }
 .msg-system-text {
   font-family: var(--font-mono); font-size: 11px; color: var(--ink-tertiary);

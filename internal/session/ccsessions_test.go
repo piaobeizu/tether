@@ -3353,3 +3353,76 @@ func TestMessagePageWidensAnEarlierPagePastAWallOfToolCalls(t *testing.T) {
 		t.Errorf("texts = %q, want the buried turn", got)
 	}
 }
+
+// TestMessagePageCursorSurvivesAMergedTurnAtTheTrimBoundary — the gap a mutation
+// battery found, and it is exactly the kind this file's other comments warn about.
+//
+// `starts` is index-aligned with `out`, which means it must be appended to when a line
+// OPENS a message and not when a line MERGES into the previous assistant turn. Every
+// other cursor test here uses a fixture with no merges — TestMessagePageCursorSurvives-
+// TheCOUNTCap is all user turns, and the walk fixture alternates user/assistant so no
+// two assistant records are adjacent — so appending on the merge path as well left every
+// one of them green while the cursor pointed at the wrong record.
+//
+// This fixture is three records per turn (user, assistant, assistant) so that every turn
+// contributes TWO messages from THREE lines, and it goes past the count cap so that
+// starts[drop] is the value under test rather than a constant zero. Misalignment then
+// puts the cursor too early and the earlier page serves more than the cap trimmed.
+func TestMessagePageCursorSurvivesAMergedTurnAtTheTrimBoundary(t *testing.T) {
+	const turnCount = 120
+	const overflow = 2*turnCount - ccMessagesMax // texts the cap must trim
+	var b strings.Builder
+	var want []string
+	for i := 0; i < turnCount; i++ {
+		u := fmt.Sprintf("U-%04d", i)
+		a1 := fmt.Sprintf("A-%04d-first", i)
+		a2 := fmt.Sprintf("A-%04d-second", i)
+		b.WriteString(ccUser(t, u))
+		b.WriteString(ccAssistantWords(t, a1, "2026-08-17T03:00:01.000Z"))
+		b.WriteString(ccAssistantWords(t, a2, "2026-08-17T03:00:02.000Z"))
+		// The two assistant records MERGE into one bubble, joined by ccTurnJoin.
+		want = append(want, u, a1+ccTurnJoin+a2)
+	}
+	body := b.String()
+	if len(body) >= ccMessagesTailBytes {
+		t.Fatalf("the fixture is %d bytes — the BYTE window would bind and the count cap would not", len(body))
+	}
+
+	f := newCCFixture(t, "/w")
+	f.write(t, "/w", "cc-session-0001.jsonl", body)
+	store := f.store()
+
+	page, ok := store.MessagePage("cc-session-0001", TranscriptTail)
+	if !ok {
+		t.Fatal("MessagePage reported the transcript missing")
+	}
+	// The precondition that makes this test about merging at all: two assistant records
+	// per turn really did become ONE message.
+	if got := len(ccTexts(page.Messages)); got != ccMessagesMax {
+		t.Fatalf("newest page served %d texts, want the cap %d (if it is ~%d the merge did not happen)",
+			got, ccMessagesMax, 3*turnCount-ccMessagesMax)
+	}
+	if !page.HasEarlier {
+		t.Fatal("the cap trimmed and the page reports nothing earlier")
+	}
+
+	earlier, ok := store.MessagePage("cc-session-0001", page.Earlier)
+	if !ok {
+		t.Fatal("MessagePage reported the transcript missing on the earlier page")
+	}
+	got := ccTexts(earlier.Messages)
+	// EXACT, and exactness is the whole guard: a cursor computed from a misaligned
+	// starts[] lands on an earlier record, so the earlier page serves MORE than the cap
+	// trimmed — which a length-or-more assertion would accept.
+	if len(got) != overflow {
+		t.Fatalf("the earlier page served %d texts, want exactly the %d the cap trimmed", len(got), overflow)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("earlier page diverges at index %d:\n got %.40q\nwant %.40q", i, got[i], want[i])
+		}
+	}
+	if earlier.HasEarlier {
+		t.Errorf("the earlier page reaches turn 0 and still reports Earlier = %d", earlier.Earlier)
+	}
+}

@@ -792,6 +792,27 @@ describe('paging a transcript backwards (tether#107)', () => {
     expect(document.querySelector('.transcript-top')).toBeNull()
   })
 
+  it('renders no marker when the only thing on screen is a locally-originated notice', async () => {
+    // The gate is on `messages`, not on `transcript`, and this is what makes the
+    // difference observable: mergeTranscript projects a notice into the rendered
+    // transcript, so a pane gated on `transcript.length` would announce "the beginning
+    // of this conversation" above a daemon banner and no conversation at all. Found by
+    // a mutation battery — the empty case above passes either way, because with no
+    // notices the two lengths are equal.
+    pages[MESSAGES_URL] = { entries: [] }
+    useStore.setState({
+      notices: [{ id: 'n1', text: 'the previous context could not be restored', ts: 1000, kind: 'session' }],
+    })
+    const { container } = render(<ChatPane />)
+    await settle()
+
+    // The precondition: the notice really is rendered, so the two gates really do
+    // disagree here.
+    expect(container.querySelectorAll('.msg-system-text')).toHaveLength(1)
+    expect(useStore.getState().messages).toHaveLength(0)
+    expect(document.querySelector('.transcript-top')).toBeNull()
+  })
+
   // ── 2. the click, end to end ──────────────────────────────────────────────
   it('renders the earlier page above the one on screen, and moves the cursor back', async () => {
     pages[MESSAGES_URL] = { entries: turns('recent', 3, 500), earlier: 4096 }

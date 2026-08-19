@@ -5,7 +5,7 @@
 // tether_last_sid) behind a non-empty history. Each test below pins one half of
 // that divergence, or one of the hazards centralising it made cheap to close.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { openSession, refreshTranscript, REFRESH_TRANSCRIPT_EVENT } from './session'
+import { loadEarlierTranscript, openSession, refreshTranscript, REFRESH_TRANSCRIPT_EVENT } from './session'
 import { useStore, type Message } from './store'
 import {
   TRANSCRIPT_UPDATED_AT_HEADER,
@@ -384,5 +384,199 @@ describe('refreshTranscript (tether#106)', () => {
     // And the slot is released, so the NEXT click really does re-read.
     await refreshTranscript('sid-a')
     expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// tether#107 — reading BACKWARDS, and what the three-second refresh is allowed to
+// do to pages the reader loaded on purpose.
+//
+// The second half is the one nothing else can catch. tether#106's probe reloads a
+// held session's transcript whenever the other agent writes, through `loadHistory`,
+// which REPLACES the array. Left alone, that discards every earlier page — every
+// three seconds, while the reader is reading them — and the suite would stay green,
+// because no existing test ever has two pages loaded.
+describe('paging backwards (tether#107)', () => {
+  /** A /messages stub that answers with real Headers, so the boundary facts travel. */
+  function mockPages(pages: Record<string, { entries: unknown[]; earlier?: number; otherRecord?: string }>) {
+    const calls: string[] = []
+    const fetchMock = vi.fn(async (url: string) => {
+      calls.push(url)
+      const page = pages[url]
+      if (!page) throw new Error(`no stub for ${url}`)
+      const headers = new Headers()
+      if (page.earlier !== undefined) headers.set('X-Tether-Transcript-Earlier', String(page.earlier))
+      if (page.otherRecord !== undefined) headers.set('X-Tether-Transcript-Other-Record', page.otherRecord)
+      return { ok: true, status: 200, headers, json: async () => page.entries }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    return { calls }
+  }
+
+  const entry = (role: string, text: string, ts: number) => ({ role, text, ts })
+  const URL_NEWEST = '/api/v1/sessions/sid-paged-0001/messages'
+
+  afterEach(() => {
+    useStore.setState({
+      messages: [], sessionId: null,
+      transcriptEarlier: null, transcriptOtherRecord: null, transcriptPagesBack: 0,
+    })
+  })
+
+  it('records the cursor and the other-record store off the response that loaded the page', async () => {
+    mockPages({ [URL_NEWEST]: { entries: [entry('user', 'newest', 900)], earlier: 4096, otherRecord: 'cc' } })
+    useStore.setState({ sessionId: 'sid-paged-0001' })
+
+    await refreshTranscript('sid-paged-0001')
+
+    expect(useStore.getState().transcriptEarlier).toBe(4096)
+    expect(useStore.getState().transcriptOtherRecord).toBe('cc')
+  })
+
+  it('fetches the page BEFORE the oldest one and prepends it', async () => {
+    const { calls } = mockPages({
+      [URL_NEWEST]: { entries: [entry('user', 'newest', 900)], earlier: 4096 },
+      [`${URL_NEWEST}?before=4096`]: { entries: [entry('user', 'older', 100)], earlier: 2048 },
+    })
+    useStore.setState({ sessionId: 'sid-paged-0001' })
+    await refreshTranscript('sid-paged-0001')
+
+    await loadEarlierTranscript('sid-paged-0001')
+
+    expect(calls).toEqual([URL_NEWEST, `${URL_NEWEST}?before=4096`])
+    expect(useStore.getState().messages.map(m => m.text)).toEqual(['older', 'newest'])
+    // The cursor MOVED BACK, so the next click goes one page further rather than
+    // re-fetching the page just loaded. Exact value, not "changed": a cursor that
+    // stayed at 4096 would loop on one page forever while looking like it worked.
+    expect(useStore.getState().transcriptEarlier).toBe(2048)
+    expect(useStore.getState().transcriptPagesBack).toBe(1)
+  })
+
+  it('stops offering earlier pages when the daemon omits the cursor', async () => {
+    mockPages({
+      [URL_NEWEST]: { entries: [entry('user', 'newest', 900)], earlier: 4096 },
+      [`${URL_NEWEST}?before=4096`]: { entries: [entry('user', 'the very first', 100)] },
+    })
+    useStore.setState({ sessionId: 'sid-paged-0001' })
+    await refreshTranscript('sid-paged-0001')
+    await loadEarlierTranscript('sid-paged-0001')
+
+    // null, which is what the pane renders as "the beginning of this conversation".
+    expect(useStore.getState().transcriptEarlier).toBeNull()
+    // …and a further call is a no-op rather than a request with no cursor in it.
+    const before = useStore.getState().messages.length
+    await loadEarlierTranscript('sid-paged-0001')
+    expect(useStore.getState().messages).toHaveLength(before)
+  })
+
+  it('spends one cursor once however fast the reader clicks', async () => {
+    // The button disables while a load is in flight, but the disable is a render away
+    // and the cursor only advances when a response lands. Two synchronous clicks would
+    // otherwise both spend 4096 — a second megabyte fetched to be discarded.
+    mockPages({
+      [URL_NEWEST]: { entries: [entry('user', 'newest', 900)], earlier: 4096 },
+      [`${URL_NEWEST}?before=4096`]: { entries: [entry('user', 'older', 100)], earlier: 2048 },
+    })
+    useStore.setState({ sessionId: 'sid-paged-0001' })
+    await refreshTranscript('sid-paged-0001')
+
+    const { calls } = mockPages({
+      [`${URL_NEWEST}?before=4096`]: { entries: [entry('user', 'older', 100)], earlier: 2048 },
+    })
+    await Promise.all([
+      loadEarlierTranscript('sid-paged-0001'),
+      loadEarlierTranscript('sid-paged-0001'),
+    ])
+    expect(calls).toEqual([`${URL_NEWEST}?before=4096`])
+    expect(useStore.getState().transcriptPagesBack).toBe(1)
+  })
+
+  it('does not prepend a page for a session the reader has already left', async () => {
+    mockPages({
+      [URL_NEWEST]: { entries: [entry('user', 'newest', 900)], earlier: 4096 },
+      [`${URL_NEWEST}?before=4096`]: { entries: [entry('user', 'older', 100)] },
+    })
+    useStore.setState({ sessionId: 'sid-paged-0001' })
+    await refreshTranscript('sid-paged-0001')
+
+    const p = loadEarlierTranscript('sid-paged-0001')
+    useStore.setState({ sessionId: 'sid-somewhere-else', messages: [] })
+    await p
+
+    expect(useStore.getState().messages).toHaveLength(0)
+  })
+
+  // ── The refresh, with pages loaded. THE property this wi had to keep. ──────
+  it('keeps the loaded pages when the transcript is refreshed, and appends what is new', async () => {
+    mockPages({
+      [URL_NEWEST]: { entries: [entry('user', 'ask', 500), entry('assistant', 'partial', 600)], earlier: 4096 },
+      [`${URL_NEWEST}?before=4096`]: { entries: [entry('user', 'page one', 100)], earlier: 2048 },
+    })
+    useStore.setState({ sessionId: 'sid-paged-0001' })
+    await refreshTranscript('sid-paged-0001')
+    await loadEarlierTranscript('sid-paged-0001')
+    expect(useStore.getState().messages.map(m => m.text)).toEqual(['page one', 'ask', 'partial'])
+    const idsBefore = useStore.getState().messages.map(m => m.id)
+
+    // The other agent writes: the newest window now covers the same tail plus one new
+    // turn, and the growing bubble has more text in it.
+    mockPages({
+      [URL_NEWEST]: {
+        entries: [entry('user', 'ask', 500), entry('assistant', 'partial answer, complete', 600), entry('user', 'and more', 700)],
+        earlier: 5120,
+      },
+    })
+    await refreshTranscript('sid-paged-0001')
+
+    const after = useStore.getState().messages
+    // 1. the page the reader loaded is still there;
+    // 2. the growing turn's text was updated;
+    // 3. the new turn is at the end.
+    expect(after.map(m => m.text)).toEqual(['page one', 'ask', 'partial answer, complete', 'and more'])
+    // 4. and the ids of everything that was already on screen are byte-identical, so
+    //    React reconciles rather than remounts and the reader keeps their expansions
+    //    and their scroll position.
+    expect(after.slice(0, 3).map(m => m.id)).toEqual(idsBefore)
+    // 5. the cursor still describes the OLDEST page on screen, not the newest window.
+    //    Taking the refresh's 5120 would send the next "load earlier" forward, to
+    //    re-serve pages the reader is already looking at.
+    expect(useStore.getState().transcriptEarlier).toBe(2048)
+    expect(useStore.getState().transcriptPagesBack).toBe(1)
+  })
+
+  it('falls back to a visible replace when the refreshed window does not overlap', async () => {
+    mockPages({
+      [URL_NEWEST]: { entries: [entry('user', 'ask', 500)], earlier: 4096 },
+      [`${URL_NEWEST}?before=4096`]: { entries: [entry('user', 'page one', 100)], earlier: 2048 },
+    })
+    useStore.setState({ sessionId: 'sid-paged-0001' })
+    await refreshTranscript('sid-paged-0001')
+    await loadEarlierTranscript('sid-paged-0001')
+    expect(useStore.getState().messages).toHaveLength(2)
+
+    // Over a megabyte written between two probes: the window has slid past everything
+    // on screen. A merge here would splice two disjoint stretches together with an
+    // invisible hole; the replace is a jump the reader can SEE.
+    mockPages({ [URL_NEWEST]: { entries: [entry('user', 'much later', 90000)], earlier: 9999 } })
+    await refreshTranscript('sid-paged-0001')
+
+    expect(useStore.getState().messages.map(m => m.text)).toEqual(['much later'])
+    expect(useStore.getState().transcriptPagesBack).toBe(0)
+    // …and the cursor is now the NEW window's, because the array is now one page.
+    expect(useStore.getState().transcriptEarlier).toBe(9999)
+  })
+
+  it('still replaces wholesale when no earlier page has been loaded', async () => {
+    // The unchanged path, and most sessions are on it. A refresh with pagesBack 0 must
+    // behave byte-for-byte as it did before tether#107: the server-truth replace.
+    mockPages({ [URL_NEWEST]: { entries: [entry('user', 'first fetch', 100)], earlier: 4096 } })
+    useStore.setState({ sessionId: 'sid-paged-0001' })
+    await refreshTranscript('sid-paged-0001')
+
+    mockPages({ [URL_NEWEST]: { entries: [entry('user', 'a different conversation', 700)] } })
+    await refreshTranscript('sid-paged-0001')
+
+    expect(useStore.getState().messages.map(m => m.text)).toEqual(['a different conversation'])
+    expect(useStore.getState().transcriptEarlier).toBeNull()
   })
 })

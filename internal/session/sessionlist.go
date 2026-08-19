@@ -349,19 +349,106 @@ func (x *SessionIndex) List() []SessionSummary {
 // SourceNone with a nil slice means neither store has it. That is not an error:
 // openSession fetches this route for a session that was created moments ago and
 // has not spoken yet, and the answer is an empty transcript.
+// It is the newest page of MessagePage below. Kept as its own name because "give me
+// this session's transcript" is what most callers mean, and because the tests that
+// pin WHICH STORE ANSWERS are written against it.
 func (x *SessionIndex) Messages(sid string) ([]HistoryMessage, string) {
+	page := x.MessagePage(sid, TranscriptTail)
+	return page.Messages, page.Source
+}
+
+// TranscriptTail is the `before` value that asks MessagePage for the newest page.
+//
+// A sentinel rather than a second boolean parameter, because every caller either has
+// a cursor or wants the end, and `MessagePage(sid, TranscriptTail)` reads as that
+// while `MessagePage(sid, 0, false)` reads as neither.
+const TranscriptTail int64 = -1
+
+// TranscriptPage is one page of a session's transcript, plus the three facts a
+// reader needs in order to know WHAT IT IS LOOKING AT (tether#107).
+//
+// Before this, the transcript route answered with messages and nothing else, so
+// "you are at the top of a truncated window" and "you are at the beginning of the
+// conversation" arrived as the identical response and rendered as the identical
+// screen. Everything except Messages here exists to separate those.
+type TranscriptPage struct {
+	Messages []HistoryMessage
+	// Source names the store that answered: SourceTether, SourceCC, or SourceNone.
+	Source string
+	// Earlier is the byte offset to pass back as `before` for the page before this
+	// one. Meaningful only when HasEarlier.
+	Earlier    int64
+	HasEarlier bool
+	// OtherRecord names a store OTHER than Source that also holds a record for this
+	// sid, or "" when there is none.
+	//
+	// This is the field that keeps the top of the transcript honest for the one
+	// combination sessionlist's own open question is about. It is NOT an offer to
+	// serve that other record — which store wins is the rule stated above, and
+	// tether#107 deliberately did not touch it — it is the difference between
+	// "this is the beginning of the conversation" and "this is the beginning of what
+	// tether recorded", one of which would be a lie.
+	OtherRecord string
+}
+
+// MessagePage returns one page of a session's transcript (tether#107).
+//
+// # Why pagination lives here rather than in the route
+//
+// Because "which store answers for this sid" is one rule (see Messages above), and
+// "how far back can this store go, and what do I ask for next" is a second question
+// about the SAME choice. Answered in the HTTP handler they would be two rules, and
+// the symptom of them drifting is a cursor minted against one store's file being
+// spent against the other's — i.e. a "load earlier" that serves a different
+// conversation. That is the same failure Messages' own doc argues about, one level
+// up.
+//
+// # The two branches page differently because the two stores are bounded differently
+//
+//   - tether's own history has NO ceiling: LoadHistory is an os.ReadFile of the whole
+//     history.jsonl (history.go). So HasEarlier is always false and there is nothing
+//     to page. A `before` on this branch returns an EMPTY page rather than the file
+//     again: there is genuinely nothing earlier, and re-serving the whole transcript
+//     for a cursor would duplicate every message already on screen.
+//   - cc's is a bounded tail, and CCStore.MessagePage is where the window and the
+//     cursor live.
+//
+// OtherRecord is only ever set on the tether branch, and that is not an omission:
+// tether HAVING the sid is exactly what selects tether, so a cc-served page cannot
+// have a tether record sitting behind it. Stated rather than left implicit because
+// the symmetric-looking code would be wrong.
+//
+// # Cost
+//
+// One extra CCStore.Has — a stat per known workspace directory — on the tether
+// branch of a GET. That branch's other cost is the unbounded os.ReadFile above it,
+// so this is noise against what it sits next to; it is NOT paid by the HEAD probe,
+// which returns before reaching here (session_api.go).
+func (x *SessionIndex) MessagePage(sid string, before int64) TranscriptPage {
 	if x == nil {
-		return nil, SourceNone
+		return TranscriptPage{Source: SourceNone}
 	}
 	if x.History != nil && x.History.HasHistory(sid) {
-		return x.History.LoadHistory(sid), SourceTether
+		page := TranscriptPage{Source: SourceTether}
+		if before == TranscriptTail {
+			page.Messages = x.History.LoadHistory(sid)
+		}
+		if x.CC != nil && x.CC.Has(sid) {
+			page.OtherRecord = SourceCC
+		}
+		return page
 	}
 	if x.CC != nil {
-		if msgs, ok := x.CC.Messages(sid); ok {
-			return msgs, SourceCC
+		if cc, ok := x.CC.MessagePage(sid, before); ok {
+			return TranscriptPage{
+				Messages:   cc.Messages,
+				Source:     SourceCC,
+				Earlier:    cc.Earlier,
+				HasEarlier: cc.HasEarlier,
+			}
 		}
 	}
-	return nil, SourceNone
+	return TranscriptPage{Source: SourceNone}
 }
 
 // TranscriptUpdatedAtHeader carries, on the transcript route, when the transcript
@@ -390,6 +477,45 @@ func (x *SessionIndex) Messages(sid string) ([]HistoryMessage, string) {
 // reason TestSessionActivityContractIsMirroredInTypeScript gives — a rename on
 // either side alone compiles, type-checks and passes every fixture test.
 const TranscriptUpdatedAtHeader = "X-Tether-Transcript-Updated-At"
+
+// TranscriptEarlierHeader carries, on a GET of the transcript route, the byte offset
+// to send back as `?before=` to read the page BEFORE the one in the response
+// (tether#107). Decimal, and present if and only if there is such a page.
+//
+// # Why the pagination facts ride in headers and not in a body envelope
+//
+// The route's body is a bare JSON array of HistoryMessage, decoded by two fetch
+// sites in the SPA against a hand-mirrored `HistoryEntry` (web/src/lib/store.ts) and
+// by six Go test files. Wrapping it in {messages, earlier, …} would change all of
+// them for facts that are not messages, and internal/wire cannot hold the wrapper
+// (session imports wire, so tygo cannot generate it and the TypeScript side would be
+// hand-written either way). Keeping the array is what lets "did the transcript
+// endpoint change?" still be answered with "no" — the argument session_api.go
+// already makes about this route's parsing.
+//
+// The honest cost of that choice, written down rather than discovered later: an
+// envelope makes the PAIRING structural — you cannot install a page's messages
+// without its cursor — whereas a header is a second read a future edit can forget,
+// exactly as refreshTranscript's doc warns about the version header. The mitigation
+// is the same one that header already has: this name is mirrored by hand in
+// web/src/lib/transcriptWatch.ts and TestTranscriptPageHeadersAreMirroredInTypeScript
+// fails if either side is renamed alone.
+const TranscriptEarlierHeader = "X-Tether-Transcript-Earlier"
+
+// TranscriptOtherRecordHeader names a store OTHER than the one that answered which
+// also holds a record for this session, or is absent when there is none
+// (tether#107). Its value is a Source constant, and `cc` is the only one the daemon
+// can currently produce — see TranscriptPage.OtherRecord for why the symmetric case
+// is unreachable rather than merely unimplemented.
+//
+// It exists so that the top of a transcript can say which KIND of top it is. Reaching
+// the first message of a session tether recorded in full is the beginning of what
+// tether recorded, and — when cc has its own record of the same sid — is not the
+// beginning of the conversation. The population that combination describes is empty
+// on the reference machine today (tether#107 measured it), and the mechanism is not:
+// TranscriptUpdatedAt's second residual, a few lines below, is the same combination
+// arrived at from the other side.
+const TranscriptOtherRecordHeader = "X-Tether-Transcript-Other-Record"
 
 // TranscriptUpdatedAt reports when the transcript Messages would serve for sid was
 // last written, in Unix milliseconds, or 0 when neither store has one.

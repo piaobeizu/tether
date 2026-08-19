@@ -128,6 +128,44 @@ export function historyEntryToMessage(m: HistoryEntry): Message {
 }
 
 /**
+ * MESSAGE_KEY_SEP is the separator inside `messageKey`.
+ *
+ * `String.fromCharCode(0)` and NOT the six-character escape it replaces, and that is a
+ * tooling decision with a measured cause rather than a style choice. tether#106 wrote
+ * the escape inline here; the editor that wrote it folded those six characters into a
+ * RAW NUL BYTE on disk, which type-checked, passed all 688 tests, passed a full-diff
+ * review, and rendered normally in `git diff` — git only calls a file binary when a NUL
+ * lands in its first 8000 bytes. The only thing that caught it was a mutation script
+ * reporting "pattern occurs 0 times". `fromCharCode` cannot be folded by anything,
+ * because there is no escape in the source to fold.
+ *
+ * It is a separator rather than nothing because `role` is a closed set that never
+ * contains it, so "assistant" + 1 can never collide with "assistant1" + "".
+ */
+const MESSAGE_KEY_SEP = String.fromCharCode(0)
+
+/**
+ * messageKey is THE definition of "these two entries are the same message", shared by
+ * every reducer that has to recognise one across two fetches: `loadHistory` (which
+ * carries ids over a reload), `prependHistory` and `mergeHistory` (tether#107).
+ *
+ * # role + ts, and text is deliberately NOT in it
+ *
+ * Because the message that is GROWING is the one whose identity matters most. The other
+ * agent's current turn gains text on every write, so a key including text would give
+ * that message a new id every three seconds — collapsing the thinking block of the only
+ * turn anyone is watching. A tether entry's ts is `time.Now().UnixMilli()` at append and
+ * a cc turn's is its first record's timestamp (internal/session), so the ts identifies
+ * the turn while the text is its content.
+ *
+ * Written once because three reducers now depend on it agreeing with itself. Two copies
+ * of this rule is how `loadHistory` keeps an id that `mergeHistory` then replaces.
+ */
+export function messageKey(m: { role: string; ts: number }): string {
+  return `${m.role}${MESSAGE_KEY_SEP}${m.ts}`
+}
+
+/**
  * A daemon session-lifecycle notice (tether#50) — e.g. "the previous
  * conversation's context could not be restored".
  *
@@ -489,8 +527,40 @@ interface AppState {
   // (the 2s fallback timer in ChatPane is the other half of that guarantee).
   workspacesLoaded: boolean
 
+  // ── The transcript's own boundaries (tether#107) ────────────────────────────
+  //
+  // In the store rather than in ChatPane because three parties read them: the pane
+  // renders the top-of-transcript marker, `loadEarlierTranscript` spends the cursor,
+  // and `refreshTranscript` needs to know whether the reader has paged back before it
+  // decides whether it may replace the array.
+
+  /** The byte offset to ask for to get the page before the oldest one loaded, or null
+   *  when the oldest message on screen is the beginning of this store's record.
+   *  Straight off X-Tether-Transcript-Earlier. */
+  transcriptEarlier: number | null
+  /** A store OTHER than the one that served this transcript which also holds a record
+   *  for this sid (X-Tether-Transcript-Other-Record), or null. What makes the
+   *  difference between "the beginning of the conversation" and "the beginning of what
+   *  tether recorded" sayable. */
+  transcriptOtherRecord: string | null
+  /** How many earlier pages the reader has deliberately loaded. The refresh path reads
+   *  this to decide between replacing the array (0) and merging into it (>0); a
+   *  boolean would do today, but the count is what the pane would need to say how far
+   *  back it has gone and it costs the same. */
+  transcriptPagesBack: number
+
   setSessionId: (id: string) => void
   loadHistory: (msgs: Message[]) => void
+  /** Record the two boundary facts off the response that installed the messages they
+   *  describe (tether#107) — the argument noteTranscriptVersion makes about the version
+   *  header. */
+  setTranscriptBounds: (b: { earlier: number | null; otherRecord: string | null }) => void
+  /** Put an older page in FRONT of the transcript (tether#107). */
+  prependHistory: (msgs: Message[]) => void
+  /** Fold a freshly-fetched NEWEST page into a transcript that already holds older
+   *  pages (tether#107). Returns false when the two do not overlap at all, which is
+   *  the caller's signal to fall back to loadHistory. */
+  mergeHistory: (msgs: Message[]) => boolean
   /** Drop the notice list when the USER deliberately opens a different session
    *  (tether#57). Not wired to setSessionId: the resume-fallback path also
    *  changes the sid, and clearing there would discard the very notice that
@@ -596,6 +666,9 @@ export const useStore = create<AppState>((set, get) => ({
   workProject: '',
   activeWorkspace: null,
   workspacesLoaded: false,
+  transcriptEarlier: null,
+  transcriptOtherRecord: null,
+  transcriptPagesBack: 0,
 
   setSessionId: (id) => {
     localStorage.setItem('tether_last_sid', id)
@@ -663,20 +736,19 @@ export const useStore = create<AppState>((set, get) => ({
     // impossible: an id is shifted out when it is used, and a message with no match
     // left keeps the fresh uuid historyEntryToMessage gave it.
     //
-    // The separator is written as the ESCAPE `\u0000`, six characters of source, not a
-    // raw NUL byte. A raw one type-checks and passes every test while making the file
-    // one git treats as binary and one no reviewer can see the contents of. It is a
-    // separator rather than nothing because `role` is a closed set that never contains
-    // it, so "assistant" + 1 can never collide with "assistant1" + "".
+    // The key itself is `messageKey`, shared with prependHistory and mergeHistory
+    // (tether#107) — one definition of "the same message", and one occurrence of the
+    // separator. See messageKey for why the separator is now String.fromCharCode(0)
+    // rather than the escape that used to be written inline here.
     const idsByKey = new Map<string, string[]>()
     for (const m of s.messages) {
-      const key = `${m.role}\u0000${m.ts}`
+      const key = messageKey(m)
       const q = idsByKey.get(key)
       if (q) q.push(m.id)
       else idsByKey.set(key, [m.id])
     }
     for (let i = 0; i < reduced.length; i++) {
-      const q = idsByKey.get(`${reduced[i].role}\u0000${reduced[i].ts}`)
+      const q = idsByKey.get(messageKey(reduced[i]))
       const id = q?.shift()
       if (id !== undefined) reduced[i] = { ...reduced[i], id }
     }
@@ -687,8 +759,126 @@ export const useStore = create<AppState>((set, get) => ({
     // the server-truth replace, and it does not own the notice list, so it
     // cannot drop it. Do not add `notices` here to "reset" it; use clearNotices
     // at the deliberate session-switch call sites instead.
-    return { messages: reduced, streamingMsgId: null, streaming: false, curTurnId: null, thinkingStartTs: null, answerStartTs: null, stopped: false, pendingPermissions: [] }
+    //
+    // tether#107 — transcriptPagesBack IS reset, and that follows from what this
+    // reducer is: the array it installs is one page, so no earlier page is on screen
+    // any more. The two boundary FACTS are not reset here, because they come off the
+    // response and the caller records them with setTranscriptBounds immediately after;
+    // clearing them here would blank the marker for one render on every reload.
+    return { messages: reduced, streamingMsgId: null, streaming: false, curTurnId: null, thinkingStartTs: null, answerStartTs: null, stopped: false, pendingPermissions: [], transcriptPagesBack: 0 }
   }),
+  setTranscriptBounds: ({ earlier, otherRecord }) => set((s) => (
+    // A real no-op when neither fact moved: ChatPane subscribes without a selector, so
+    // a set() here re-renders it — and invalidates the transcript memo — on every one
+    // of the three-second probe's reloads, which is most of the time.
+    //
+    // It returns `s` ITSELF and not `{}`, and that difference is measured rather than
+    // stylistic. zustand's setState compares `Object.is(nextState, state)` and only
+    // skips the notify when they are the same object; a returned `{}` is a different
+    // object, so it merges (Object.assign({}, state, {})) and notifies anyway. Probed
+    // on zustand 5 in this repo: `clearNotices` on an already-empty list produces 1
+    // subscriber call and a fresh state object, while `set((s) => s)` produces 0 and
+    // preserves identity. The `{}` idiom this file uses elsewhere (clearNotices,
+    // clearFatal) therefore does NOT have the property its comments claim — left alone
+    // here because changing them is not this wi's, but not copied either.
+    s.transcriptEarlier === earlier && s.transcriptOtherRecord === otherRecord
+      ? s
+      : { transcriptEarlier: earlier, transcriptOtherRecord: otherRecord }
+  )),
+  /**
+   * prependHistory puts an older page in FRONT of what is on screen (tether#107).
+   *
+   * # What it deliberately does NOT do, and why each omission is load-bearing
+   *
+   *  - It does not touch the id of anything already in the array. `key={m.id}` is what
+   *    React reconciles the transcript on, and both `expandedBlocks` and
+   *    `expandedThinking` are Sets keyed by message id, so re-minting an id collapses
+   *    the reader's expansions and clamps the scroll container — the exact damage
+   *    tether#106 removed from the reload path, which it would be absurd to
+   *    reintroduce on the path whose whole purpose is to keep the reader in place.
+   *  - It does not reset `streaming`, `curTurnId`, the turn clocks or
+   *    `pendingPermissions`. loadHistory resets those because it is the server-truth
+   *    REPLACE and the array it installs may belong to another session; this adds
+   *    older history to the session already on screen and reports nothing about the
+   *    live turn. Resetting here would let a click on "load earlier messages" cancel
+   *    the reader's own in-flight turn.
+   *  - It does not sort. Every page is a contiguous byte range of one append-only file,
+   *    so an earlier page is entirely older than what it is prepended to. Sorting the
+   *    union by ts would ALSO reorder the messages themselves, which mergeTranscript's
+   *    doc explains is never safe here: live bubbles carry the browser's clock and
+   *    fetched history the daemon's.
+   *
+   * It DOES drop anything whose messageKey is already present. The cursor is exact, so
+   * an overlap should not happen; if one does — a rewritten transcript, a cursor spent
+   * twice — a duplicate React key is a broken list, which is worse than a missing
+   * bubble, and this is the cheapest place to make it impossible.
+   */
+  prependHistory: (msgs) => set((s) => {
+    // `s` and not `{}` — see setTranscriptBounds for the measurement.
+    if (msgs.length === 0) return s
+    const have = new Set(s.messages.map(messageKey))
+    const older = msgs.filter((m) => !have.has(messageKey(m)))
+    if (older.length === 0) return { transcriptPagesBack: s.transcriptPagesBack + 1 }
+    return { messages: [...older, ...s.messages], transcriptPagesBack: s.transcriptPagesBack + 1 }
+  }),
+  /**
+   * mergeHistory folds a freshly-fetched NEWEST page into a transcript that already
+   * holds pages the reader loaded (tether#107).
+   *
+   * # Why the refresh path needs a second reducer at all
+   *
+   * tether#106's three-second probe reloads a held session's transcript whenever the
+   * other agent writes, and it does that through `loadHistory`, which REPLACES the
+   * array. Once the reader has paged back, replacing would discard the pages they
+   * deliberately loaded — every three seconds, while they are reading them. The
+   * alternative considered and rejected was to stop refreshing while paged back, which
+   * makes HELD_SESSION_READABLE_NOTE ("tether keeps re-reading it every few seconds")
+   * false for exactly that reader.
+   *
+   * # The rule
+   *
+   * Match on messageKey; update matched entries IN PLACE keeping their id; append the
+   * unmatched at the end; remove nothing.
+   *
+   * Appending at the end is correct rather than convenient. Every page is a contiguous
+   * range of one append-only file, so the array covers [p, size) and the new page
+   * covers [a, size') with size' >= size: everything in the overlap matches, and
+   * everything that does not match is strictly newer than everything that does.
+   *
+   * # Returning false when NOTHING matched
+   *
+   * That means the two ranges do not overlap — over a megabyte was written between two
+   * three-second probes, so the new window starts after the old array ended. Merging
+   * then would splice two disjoint stretches of conversation together with an invisible
+   * hole between them, and a reader cannot see a hole. The caller falls back to
+   * `loadHistory`, which loses the loaded pages but is VISIBLE: the transcript
+   * obviously jumps. A silent hole is the worse of the two failures, so the honest one
+   * is the one to take.
+   *
+   * An EMPTY existing array is not the disjoint case — there is nothing to overlap
+   * with — so it merges (i.e. installs) rather than reporting failure.
+   */
+  mergeHistory: (msgs) => {
+    const s = get()
+    if (msgs.length === 0) return true
+    const at = new Map<string, number>()
+    s.messages.forEach((m, i) => { if (!at.has(messageKey(m))) at.set(messageKey(m), i) })
+    const next = s.messages.slice()
+    const fresh: Message[] = []
+    let matched = 0
+    for (const m of msgs) {
+      const i = at.get(messageKey(m))
+      if (i === undefined) { fresh.push(m); continue }
+      matched++
+      // Content from the new page, identity from the old one. Spreading the incoming
+      // message first is what makes a field the daemon has STOPPED sending disappear
+      // rather than linger from the previous fetch.
+      next[i] = { ...m, id: next[i].id }
+    }
+    if (matched === 0 && s.messages.length > 0) return false
+    set({ messages: fresh.length > 0 ? [...next, ...fresh] : next })
+    return true
+  },
   // No-op when there is nothing to clear: ChatPane subscribes without a selector,
   // so an unconditional set() would re-render it (and invalidate the transcript
   // memo) on every session switch whether or not a notice existed.

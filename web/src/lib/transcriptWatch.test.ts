@@ -11,6 +11,7 @@ import {
   TRANSCRIPT_UPDATED_AT_HEADER,
   fetchTranscriptVersion,
   noteTranscriptVersion,
+  readTranscriptBounds,
   readTranscriptVersion,
   resetTranscriptWatchForTests,
   transcriptPath,
@@ -303,5 +304,73 @@ describe('watchTranscript', () => {
     expect(calls).toBe(1)          // still stuck in the first one
     await vi.advanceTimersByTimeAsync(TRANSCRIPT_POLL_MS * 2)
     expect(calls).toBeGreaterThan(1) // the deadline fired and the module resumed
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// tether#107 — the two BOUNDARY headers, and the URL that spends the cursor.
+//
+// These are the smallest units of the change, and the reason they get their own
+// assertions is that both of their failure modes are silent-and-confident rather
+// than loud: a cursor that reads as null makes the pane state that a truncated
+// transcript is complete, and a `before` that is dropped from the URL makes every
+// "load earlier" serve the newest page again.
+describe('readTranscriptBounds (tether#107)', () => {
+  const res = (h: Record<string, string>) => ({ headers: new Headers(h) })
+
+  it('reads a positive cursor and the other-record store name', () => {
+    const b = readTranscriptBounds(res({
+      'X-Tether-Transcript-Earlier': '1048576',
+      'X-Tether-Transcript-Other-Record': 'cc',
+    }))
+    expect(b.earlier).toBe(1048576)
+    expect(b.otherRecord).toBe('cc')
+  })
+
+  it('reads BOTH as null when neither header is there — the daemon omits them to mean "no"', () => {
+    const b = readTranscriptBounds(res({}))
+    expect(b.earlier).toBeNull()
+    expect(b.otherRecord).toBeNull()
+  })
+
+  it('reads null from a response with no headers at all', () => {
+    // A stub Response (this repo's fetch mocks) or a non-browser import.
+    expect(readTranscriptBounds({}).earlier).toBeNull()
+    expect(readTranscriptBounds({}).otherRecord).toBeNull()
+  })
+
+  // The strictness is the point. Every one of these would otherwise become a
+  // cursor the button sends, and `?before=NaN` is a 400 — a "load earlier" that
+  // can never succeed, offered forever.
+  it.each([
+    ['not a number', 'soon'],
+    ['zero', '0'],
+    ['negative', '-8'],
+    ['fractional', '1.5'],
+    ['infinite', 'Infinity'],
+    ['empty', ''],
+  ])('reads %s (%j) as no earlier page', (_name, raw) => {
+    expect(readTranscriptBounds(res({ 'X-Tether-Transcript-Earlier': raw })).earlier).toBeNull()
+  })
+})
+
+describe('transcriptPath carries the cursor (tether#107)', () => {
+  it('omits `before` entirely when there is none', () => {
+    // Not `?before=` and not `?before=0`: the daemon reads an absent parameter as
+    // "the newest page" and 0 as "the page ending at byte zero", which is EMPTY. A
+    // caller that always appended it would blank every transcript it opened.
+    expect(transcriptPath('sid-abcdefgh')).toBe('/api/v1/sessions/sid-abcdefgh/messages')
+  })
+
+  it('appends the cursor when there is one', () => {
+    expect(transcriptPath('sid-abcdefgh', 1048576)).toBe('/api/v1/sessions/sid-abcdefgh/messages?before=1048576')
+  })
+
+  it('still encodes the sid with a cursor present', () => {
+    expect(transcriptPath('a/b', 12)).toBe('/api/v1/sessions/a%2Fb/messages?before=12')
+  })
+
+  it('sends 0 when asked for 0 — absent and zero are different requests', () => {
+    expect(transcriptPath('sid-abcdefgh', 0)).toBe('/api/v1/sessions/sid-abcdefgh/messages?before=0')
   })
 })

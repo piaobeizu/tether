@@ -167,3 +167,36 @@ func TestTranscriptUpdatedAtHeaderIsMirroredInTypeScript(t *testing.T) {
 			TranscriptUpdatedAtHeader, transcriptWatchTSPath)
 	}
 }
+
+// TestTranscriptPageHeadersAreMirroredInTypeScript — the same guard as
+// TestTranscriptUpdatedAtHeaderIsMirroredInTypeScript, for the two names tether#107
+// adds, and it matters MORE for these two than for the version header.
+//
+// A renamed version header degrades the transcript to a still frame, which a reader
+// eventually notices. A renamed `Earlier` header degrades the pane to "there is
+// nothing before this" — the pane stops offering the button and starts claiming, at
+// the top of a 117 MiB transcript, that this is where the conversation began. That is
+// not a feature going quiet; it is the daemon's honest answer being replaced by a
+// confident false one, with `tsc -b` at exit 0 and every fixture test green.
+func TestTranscriptPageHeadersAreMirroredInTypeScript(t *testing.T) {
+	src, err := os.ReadFile(transcriptWatchTSPath)
+	if err != nil {
+		t.Fatalf("read the hand-written mirror at %s: %v", transcriptWatchTSPath, err)
+	}
+	for _, h := range []string{TranscriptEarlierHeader, TranscriptOtherRecordHeader} {
+		if !tsHasStringLiteral(string(src), h) {
+			t.Errorf("%q does not appear as a quoted literal in %s; the daemon would set a header the SPA never reads, and nothing in either language fails",
+				h, transcriptWatchTSPath)
+		}
+	}
+	// The three transcript headers must stay DISTINCT names. A copy-paste that left
+	// two of them equal would make one of the facts unreadable while every mirror
+	// check above still passed.
+	names := map[string]bool{}
+	for _, h := range []string{TranscriptUpdatedAtHeader, TranscriptEarlierHeader, TranscriptOtherRecordHeader} {
+		if names[h] {
+			t.Errorf("two transcript headers share the name %q", h)
+		}
+		names[h] = true
+	}
+}

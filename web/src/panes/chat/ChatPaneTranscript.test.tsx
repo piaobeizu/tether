@@ -1975,11 +1975,24 @@ describe('loading a transcript by scrolling to its ends (tether#110)', () => {
     const container = await renderIdle()
     const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
 
-    // One act, no settle between: the four positions are delivered synchronously, so the
-    // wall clock barely moves and the floor is the only thing that can be doing the work.
+    // TWO round trips, and the first one is allowed to SETTLE before the second starts.
+    // That separation is the whole test. Written without it — all four positions inside one
+    // act — this passed with the floor deleted, because the first request was still in
+    // flight and the shared in-flight ref refused the second: the assertion was measuring
+    // that guard, not this one. The mutation battery is what said so.
+    //
+    // `settle()` costs no simulated time (the clock is a frozen spy, stepped only by
+    // pastFloor), so the second round trip arms honestly, finds nothing in flight, and has
+    // `sinceLastMs === 0`. The floor is then the only thing left that can refuse it.
     await act(async () => {
       box.scrollTo(200)
       box.scrollTo(0)
+    })
+    await settle()
+    expect(countEarlierPages()).toBe(1)
+    expect(useStore.getState().transcriptEarlier).toBe(2048)
+
+    await act(async () => {
       box.scrollTo(200)
       box.scrollTo(0)
     })
@@ -1987,6 +2000,17 @@ describe('loading a transcript by scrolling to its ends (tether#110)', () => {
 
     expect(countEarlierPages()).toBe(1)
     expect(countReq(`GET ${MESSAGES_URL}?before=2048`)).toBe(0)
+
+    // The CONTROL: the same round trip, one floor later, loads. Without it "1" would also
+    // be what a pane that had stopped triggering entirely reports.
+    pastFloor()
+    await act(async () => {
+      box.scrollTo(200)
+      box.scrollTo(0)
+    })
+    await settle()
+    expect(countEarlierPages()).toBe(2)
+    expect(countReq(`GET ${MESSAGES_URL}?before=2048`)).toBe(1)
   })
 
   // ── 2. the dots: exactly while a request exists, and never at a ceiling ────

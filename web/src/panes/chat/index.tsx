@@ -1435,6 +1435,20 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
    * click-the-open-row path already make for a deliberate gesture, and arriving at the
    * bottom is one.
    */
+  //
+  // WHICH of the two in-flight checks is doing the work, stated because a mutation
+  // battery had to establish it and the answer is "not this one": deleting
+  // `requestInFlightRef.current` from the line below leaves the whole suite green,
+  // because the only caller — `onTranscriptScroll` — has already refused through
+  // `transcriptEdgeAction`'s `inFlight`. Kept anyway, and the distinction from the inert
+  // `!streaming` guard `refreshTranscript` argues against is that this condition is
+  // reachable rather than dead (the ref is genuinely set for the duration of a load at
+  // the other end): it makes "this may not be entered while a request is in flight" a
+  // property of the function that sets the flag, not of whoever calls it, and it keeps
+  // this the same shape as `loadEarlier`, where the duplicate IS live because the button
+  // is a second caller. The decision-site check is not redundant with it either — that
+  // one is also what stops the latch being consumed and the floor stamped for a request
+  // that is never going to happen.
   const refreshNewest = () => {
     if (!sessionId || requestInFlightRef.current) return
     requestInFlightRef.current = true

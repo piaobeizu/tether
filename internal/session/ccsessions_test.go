@@ -3592,17 +3592,25 @@ func TestCCPageOrdSurvivesTheWindowSlideThatBreaksRoleAndTs(t *testing.T) {
 	if b.Ts <= a.Ts {
 		t.Fatalf("the re-cut turn's stamp went backwards (%d then %d); the mechanism is that it moves FORWARD while the conversation does not", a.Ts, b.Ts)
 	}
-	// 1. role+ts made it look brand new…
-	if a.Role == b.Role && a.Ts == b.Ts {
-		t.Fatal("unreachable given the check above; kept so the claim is written where it is used")
-	}
-	// 2. …while Ord places it strictly inside what the first page already covered.
+	// …while Ord places it strictly inside what the first page already covered.
 	lowest, highest := first.Messages[0].Ord, first.Messages[len(first.Messages)-1].Ord
 	if !(b.Ord > lowest && b.Ord < highest) {
 		t.Fatalf("the re-cut turn's Ord %d is not inside the previous page's span [%d, %d] — the frontend could not tell it from new content",
 			b.Ord, lowest, highest)
 	}
-	// 3. …and dropping it hides nothing, because its text is a suffix of what is held.
+	// …and dropping it hides nothing, because its text is a suffix of what is held.
+	//
+	// Taken from ONE file read twice, and that is the case rather than a shortcut — but
+	// only because of a boundary worth writing down, since review asked whether a fixture
+	// that appended to the run BETWEEN the two reads would break the relation. It would:
+	// the arriving bubble would then carry fragments the held one has never seen, and it
+	// would be a prefix-overlap rather than a suffix. That case cannot reach the
+	// frontend's skip, and the reason is a size argument, not a timing one — the window's
+	// leading edge sits a megabyte behind EOF, so a run that straddles it AND is still
+	// growing has to be longer than the whole window, which makes it the only message the
+	// window holds. Nothing then matches, and mergeHistory's no-overlap refusal fires
+	// first. A run that has already ended cannot gain fragments, so for every run this
+	// assertion covers, re-reading the same bytes IS the second fetch.
 	if !strings.HasSuffix(a.Text, b.Text) {
 		t.Fatalf("the re-cut turn's text is not a suffix of the fuller one, so skipping it would lose words\n held %.60q…\n  new %.60q…", a.Text, b.Text)
 	}

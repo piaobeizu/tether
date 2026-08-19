@@ -2420,11 +2420,17 @@ describe('mergeHistory checks the order it used to assume (tether#109)', () => {
     expect(useStore.getState().messages.map(m => m.id)).toEqual(['served', 'nulled'])
   })
 
-  it('refuses a page that is not itself in position order', () => {
+  it('refuses a page whose APPENDED TAIL is not in position order', () => {
     // Cannot happen from this daemon — both readers emit in file order. It is checked
     // because "the page is sorted" is precisely the kind of assumption this wi exists to
     // stop making, and because the alternative is that a scrambled page is appended
     // scrambled.
+    //
+    // The name says APPENDED TAIL and the fixture puts the disorder there, because that is
+    // all the check looks at and review found the reducer's comment claiming more: a page
+    // arriving as [3000, 1000, 2000] against those three ords on screen merges happily,
+    // and correctly — an in-place update and a skip are both order-independent. Asserted
+    // below, so the narrow claim is the tested one.
     useStore.setState({
       messages: [{ id: 'a', role: 'user', text: 'on screen', ts: 100, ord: 1000 }],
       transcriptPagesBack: 1,
@@ -2435,6 +2441,119 @@ describe('mergeHistory checks the order it used to assume (tether#109)', () => {
       { id: 'c', role: 'user', text: 'newer still, out of order', ts: 200, ord: 2000 },
     ])).toBe(false)
     expect(useStore.getState().messages.map(m => m.id)).toEqual(['a'])
+  })
+
+  it('merges a page whose MATCHED entries arrive shuffled, because those are order-free', () => {
+    // The other side of the check above, and the reason it is stated narrowly. Nothing
+    // produces this either, but a reducer that refused here would be refusing something
+    // harmless — and the refusal costs the reader their pages.
+    useStore.setState({
+      messages: [
+        { id: 'a', role: 'user', text: 'one', ts: 100, ord: 1000 },
+        { id: 'b', role: 'assistant', text: 'two', ts: 200, ord: 2000 },
+        { id: 'c', role: 'user', text: 'three', ts: 300, ord: 3000 },
+      ],
+      transcriptPagesBack: 1,
+    })
+    expect(useStore.getState().mergeHistory([
+      { id: 'x', role: 'user', text: 'three, updated', ts: 300, ord: 3000 },
+      { id: 'y', role: 'user', text: 'one, updated', ts: 100, ord: 1000 },
+      { id: 'z', role: 'assistant', text: 'two, updated', ts: 200, ord: 2000 },
+    ])).toBe(true)
+    const after = useStore.getState().messages
+    // Positions are the array's, contents are the page's, ids are the array's.
+    expect(after.map(m => m.text)).toEqual(['one, updated', 'two, updated', 'three, updated'])
+    expect(after.map(m => m.id)).toEqual(['a', 'b', 'c'])
+  })
+
+  it('refuses an interior position that is NOT an assistant bubble', () => {
+    // The role check on the skip. Only a run of ASSISTANT records merges in CCStore, so
+    // only an assistant bubble's position can move when the window slides. A user record
+    // is its own bubble at its own offset in every window: if its position is inside a
+    // CONTIGUOUS span on screen then it is on screen and would have matched. So
+    // "interior, unmatched, not assistant" is proof that the span is not contiguous, and
+    // the honest answer to that is the visible reset rather than a skipped bubble.
+    //
+    // Without the role check this message is skipped silently — a bubble the reader never
+    // sees, in the middle of a conversation, with nothing to suggest it.
+    useStore.setState({
+      messages: [
+        { id: 'a', role: 'assistant', text: 'oldest on screen', ts: 100, ord: 1000 },
+        { id: 'b', role: 'user', text: 'newest on screen', ts: 300, ord: 3000 },
+      ],
+      transcriptPagesBack: 1,
+    })
+    expect(useStore.getState().mergeHistory([
+      { id: 'x', role: 'assistant', text: 'oldest on screen', ts: 100, ord: 1000 },
+      { id: 'y', role: 'user', text: 'a user turn nobody has', ts: 200, ord: 2000 },
+      { id: 'z', role: 'user', text: 'newest on screen', ts: 300, ord: 3000 },
+    ])).toBe(false)
+    expect(useStore.getState().messages.map(m => m.id)).toEqual(['a', 'b'])
+
+    // The CONTROL: the same shape with the same position, as an ASSISTANT bubble, is the
+    // re-cut case and IS skipped. Without this the test above would also pass on a
+    // reducer that had stopped skipping anything.
+    expect(useStore.getState().mergeHistory([
+      { id: 'x', role: 'assistant', text: 'oldest on screen', ts: 100, ord: 1000 },
+      { id: 'y', role: 'assistant', text: 'a re-cut suffix', ts: 200, ord: 2000 },
+      { id: 'z', role: 'user', text: 'newest on screen', ts: 300, ord: 3000 },
+    ])).toBe(true)
+    expect(useStore.getState().messages.map(m => m.id)).toEqual(['a', 'b'])
+  })
+
+  it('cannot merge one session\'s page into another session\'s transcript', () => {
+    // Found by review, and it is arithmetic rather than bad luck: `ord` is 1-based and
+    // both daemon stores number from the beginning of their own record, so `ord === 1` is
+    // in EVERY page that reaches byte 0 — which for tether's own store is every page,
+    // since LoadHistory reads the whole file. One matching position is all mergeHistory
+    // needs to report success, after which every other position in the arriving page
+    // lands inside the previous session's span and (as an assistant bubble) is skipped.
+    // Session A's transcript would then be displayed under session B.
+    //
+    // The fix is upstream of this reducer: `transcriptPagesBack` describes the pages of
+    // ONE session, so `setSessionId` retires it on a change and the refresh takes the
+    // wholesale replace instead. Asserted on the reducer's INPUT rather than on
+    // mergeHistory, because the merge itself cannot tell two sessions apart — nothing on
+    // a message says which session it came from — so the only checkable statement is that
+    // the flag which permits merging does not survive the switch.
+    useStore.setState({
+      sessionId: 'session-A',
+      messages: [
+        { id: 'a1', role: 'user', text: "A's first turn", ts: 100, ord: 1 },
+        { id: 'a2', role: 'assistant', text: "A's answer", ts: 200, ord: 900 },
+      ],
+      transcriptPagesBack: 1,
+    })
+    useStore.getState().setSessionId('session-B')
+    expect(useStore.getState().transcriptPagesBack).toBe(0)
+
+    // Re-announcing the SAME sid is not a switch (handleEnvelope's session_ready calls
+    // setSessionId with the sid it already has, to persist it), so the reader sitting in
+    // one session keeps their pages.
+    useStore.setState({ transcriptPagesBack: 2 })
+    useStore.getState().setSessionId('session-B')
+    expect(useStore.getState().transcriptPagesBack).toBe(2)
+
+    // The two facts that are deliberately NOT reset: they come off the response that
+    // installs the messages they describe, and the switch's own refresh records them a
+    // moment later. Clearing them here would print "this is the beginning of the
+    // conversation" over the outgoing session's messages for one frame.
+    useStore.setState({ transcriptEarlier: 4096, transcriptOtherRecord: 'cc' })
+    useStore.getState().setSessionId('session-C')
+    expect(useStore.getState().transcriptEarlier).toBe(4096)
+    expect(useStore.getState().transcriptOtherRecord).toBe('cc')
+  })
+
+  it('does not install an array the caller still holds', () => {
+    // The empty-transcript branch is the only exit that could hand the store its
+    // caller's array. A store sharing an array with a caller can change without
+    // notifying any subscriber, which renders as a transcript that is right in the
+    // devtools and stale on screen.
+    useStore.setState({ messages: [], transcriptPagesBack: 1 })
+    const page: Message[] = [{ id: 'a', role: 'user', text: 'installed', ts: 1, ord: 1 }]
+    expect(useStore.getState().mergeHistory(page)).toBe(true)
+    page.push({ id: 'b', role: 'user', text: 'never sent to the store', ts: 2, ord: 2 })
+    expect(useStore.getState().messages.map(m => m.text)).toEqual(['installed'])
   })
 
   it('keeps two messages that share role+ts apart, because the position is unique', () => {

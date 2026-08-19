@@ -691,4 +691,41 @@ describe('paging backwards (tether#107)', () => {
     expect(useStore.getState().transcriptPagesBack).toBe(0)
     expect(useStore.getState().transcriptEarlier).toBe(105904903)
   })
+
+  it('replaces rather than merging when the reader switches session while paged back', async () => {
+    // The cross-session hole, end to end. Found by review, and it is arithmetic rather
+    // than bad luck: `ord` is 1-based and both daemon stores number from the start of
+    // their own record, so `ord === 1` appears in every page that reaches byte 0 — every
+    // page at all, for tether's own store. One matching position is all a merge needs to
+    // report success, and the rest of the arriving page then lands inside the previous
+    // session's span. Session A's transcript would render under session B, with A's byte
+    // cursor still armed against B's file.
+    //
+    // Driven through `openSession` because that is the real path: it calls setSessionId
+    // (which now retires the page count) and then refreshTranscript, and the ORDER of
+    // those two is what makes the refresh take the replace.
+    const URL_B = '/api/v1/sessions/sid-paged-0002/messages'
+    mockPages({
+      [URL_NEWEST]: { entries: [entry('user', "A's own turn", 500, 900)], earlier: 4096 },
+      [`${URL_NEWEST}?before=4096`]: { entries: [entry('user', "A's first turn ever", 100, 1)], earlier: undefined },
+      [URL_B]: { entries: [entry('user', "B's first turn ever", 700, 1)] },
+    })
+    useStore.setState({ sessionId: 'sid-paged-0001' })
+    await refreshTranscript('sid-paged-0001')
+    await loadEarlierTranscript('sid-paged-0001')
+    // The precondition, asserted: A really is paged back, and it really does hold ord 1 —
+    // the position B's page will also carry. Without both, this test proves nothing.
+    expect(useStore.getState().transcriptPagesBack).toBe(1)
+    expect(useStore.getState().messages.map(m => m.ord)).toEqual([1, 900])
+
+    openSession('sid-paged-0002')
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await refreshTranscript('sid-paged-0002')
+
+    // B's transcript, and only B's. A merge would have left "A's own turn" on screen
+    // (interior, assistant… or refused; either way the array would not be exactly B's).
+    expect(useStore.getState().messages.map(m => m.text)).toEqual(["B's first turn ever"])
+    expect(useStore.getState().transcriptPagesBack).toBe(0)
+    expect(useStore.getState().transcriptEarlier).toBeNull()
+  })
 })

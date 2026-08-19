@@ -1506,13 +1506,24 @@ describe('paging a transcript backwards (tether#107)', () => {
     newest: Date.parse('2026-08-19T07:18:29.315Z'),
   }
 
-  /** Drive the pane into the held state with one earlier page loaded. */
+  /** Drive the pane into the held state with one earlier page loaded.
+   *
+   * SIX bubbles, and the count is load-bearing rather than arbitrary: `fakeScrollBox`
+   * models `scrollHeight` as rows × 100 and the tests below set `clientHeight` to 300, so
+   * a reader at `scrollTop = 0` is "not near the bottom" only once
+   * `scrollHeight - clientHeight > 120`, i.e. from 5 rows up. A 3-bubble fixture makes
+   * `scrollHeight - scrollTop - clientHeight` exactly 0 — which IS `nearBottom` — so the
+   * scroll assertion would have been vacuous while its comment claimed the opposite.
+   * Found by review; the same shape the pre-existing 10-row scroll test already uses. */
   async function heldWithAPageLoaded() {
     useStore.setState({ workspacesLoaded: true })
     localStorage.setItem('tether_last_sid', SID)
     pages[MESSAGES_URL] = {
       entries: [
         entry('assistant', 'the whole turn, first fragment onwards', recut.edgeFull, 122154092),
+        entry('user', 'filler-a', recut.edgeFull + 1000, 122500000),
+        entry('user', 'filler-b', recut.edgeFull + 2000, 122600000),
+        entry('user', 'filler-c', recut.edgeFull + 3000, 122700000),
         entry('user', 'the newest turn', recut.newest, 123197925),
       ],
       earlier: 122154091,
@@ -1543,15 +1554,20 @@ describe('paging a transcript backwards (tether#107)', () => {
   it('does not move a reader who has scrolled up when the window re-cuts its leading bubble', async () => {
     const container = await heldWithAPageLoaded()
     const box = fakeScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
-    expect(box.height()).toBe(300) // three bubbles
+    expect(box.height()).toBe(600) // six bubbles
     box.scrollTo(0) // reading the page they just asked for
-    // The precondition that makes this discriminating: the reader is NOT near the bottom,
-    // so an autoscroll would be visible as a jump to 300.
-    expect(box.height() - box.top() - 300).toBe(0)
+    // The precondition that makes the scroll assertion discriminating: the reader is NOT
+    // near the bottom — 600 - 0 - 300 = 300, well over the pane's 120px threshold — so an
+    // autoscroll would be visible as a jump to 600.
+    expect(box.height() - box.top() - 300).toBe(300)
+    expect(box.height() - box.top() - 300).toBeGreaterThan(120)
 
     pages[MESSAGES_URL] = {
       entries: [
         entry('assistant', 'minus its first fragment', recut.edgeRecut, 122155976),
+        entry('user', 'filler-a', recut.edgeFull + 1000, 122500000),
+        entry('user', 'filler-b', recut.edgeFull + 2000, 122600000),
+        entry('user', 'filler-c', recut.edgeFull + 3000, 122700000),
         entry('user', 'the newest turn', recut.newest, 123197925),
       ],
       earlier: 122155975,
@@ -1561,9 +1577,9 @@ describe('paging a transcript backwards (tether#107)', () => {
     // The transcript is unchanged and IN ORDER: the re-cut bubble did not land at the end
     // under a bubble three hours newer.
     expect([...container.querySelectorAll('.msg-user-bubble')].map(e => e.textContent))
-      .toEqual(['older-0', 'the newest turn'])
+      .toEqual(['older-0', 'filler-a', 'filler-b', 'filler-c', 'the newest turn'])
     expect(useStore.getState().messages.map(m => m.text)).toEqual([
-      'older-0', 'the whole turn, first fragment onwards', 'the newest turn',
+      'older-0', 'the whole turn, first fragment onwards', 'filler-a', 'filler-b', 'filler-c', 'the newest turn',
     ])
     // The reader is where they were, and the cursor still describes the oldest page.
     expect(box.top()).toBe(0)
@@ -1578,24 +1594,21 @@ describe('paging a transcript backwards (tether#107)', () => {
     const container = await heldWithAPageLoaded()
     expect(container.querySelectorAll('.msg-arrived')).toHaveLength(0)
 
-    pages[MESSAGES_URL] = {
-      entries: [
-        entry('assistant', 'minus its first fragment', recut.edgeRecut, 122155976),
-        entry('user', 'the newest turn', recut.newest, 123197925),
-      ],
-      earlier: 122155975,
-    }
+    const recutPage = [
+      entry('assistant', 'minus its first fragment', recut.edgeRecut, 122155976),
+      entry('user', 'filler-a', recut.edgeFull + 1000, 122500000),
+      entry('user', 'filler-b', recut.edgeFull + 2000, 122600000),
+      entry('user', 'filler-c', recut.edgeFull + 3000, 122700000),
+      entry('user', 'the newest turn', recut.newest, 123197925),
+    ]
+    pages[MESSAGES_URL] = { entries: recutPage, earlier: 122155975 }
     await probe()
     expect(container.querySelectorAll('.msg-arrived')).toHaveLength(0)
 
     // The CONTROL, so the assertion above is known to discriminate: a turn that really
     // did arrive, in the same state, over the same path, IS traced.
     pages[MESSAGES_URL] = {
-      entries: [
-        entry('assistant', 'minus its first fragment', recut.edgeRecut, 122155976),
-        entry('user', 'the newest turn', recut.newest, 123197925),
-        entry('user', 'what the other agent just wrote', recut.newest + 60000, 123205000),
-      ],
+      entries: [...recutPage, entry('user', 'what the other agent just wrote', recut.newest + 60000, 123205000)],
       earlier: 122155975,
     }
     await probe()
@@ -1614,6 +1627,9 @@ describe('paging a transcript backwards (tether#107)', () => {
     pages[MESSAGES_URL] = {
       entries: [
         entry('assistant', 'minus its first fragment', recut.edgeRecut, 122155976),
+        entry('user', 'filler-a', recut.edgeFull + 1000, 122500000),
+        entry('user', 'filler-b', recut.edgeFull + 2000, 122600000),
+        entry('user', 'filler-c', recut.edgeFull + 3000, 122700000),
         entry('user', 'the newest turn', recut.newest, 123197925),
       ],
       earlier: 122155975,
@@ -1621,6 +1637,15 @@ describe('paging a transcript backwards (tether#107)', () => {
     await probe()
 
     expect(container.querySelector('.transcript-more')).toBeTruthy()
-    expect(useStore.getState().messages.length).toBeGreaterThan(0)
+    // …and the button is there because the MERGE kept the reader's page, not because a
+    // fallback installed a fresh one that happens to carry a cursor too. Review found the
+    // earlier version of this test could not tell those apart: `loadHistory` + the new
+    // page's own `earlier` renders an identical button. `pagesBack` and the prepended
+    // bubble are what distinguish them — the fallback zeroes the first and drops the
+    // second.
+    expect(useStore.getState().transcriptPagesBack).toBe(1)
+    expect(container.querySelector('.transcript-more')?.textContent).toBe('load earlier messages')
+    expect(useStore.getState().messages.map(m => m.text)).toContain('older-0')
+    expect(useStore.getState().transcriptEarlier).toBe(120000000)
   })
 })

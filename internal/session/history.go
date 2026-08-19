@@ -140,6 +140,22 @@ type HistoryMessage struct {
 	// deliberately a different number from it (off by the +1 above). Nothing compares
 	// the two and nothing may: a cursor names a byte to read FROM, this names a rank
 	// to order BY. TestCCPageOrdIsTheRecordOffsetPlusOne pins both halves.
+	//
+	// # "The same record" also means "the same generation of the file"
+	//
+	// On the cc branch this is a byte offset, so it names a record only for as long as
+	// the file is append-only. MessagePage's own doc rests the cursor on exactly that
+	// ("cc appends and never rewrites"), and MessagePage itself already clamps for the
+	// case it does not hold — a client's stale offset against a truncated-and-rewritten
+	// file. If cc ever did rewrite one, the same Ord would name a DIFFERENT record and
+	// the frontend's merge would update a bubble in place with unrelated content, where
+	// the content-derived key it replaced would merely have failed to match.
+	//
+	// Stated rather than defended, because there is no evidence cc rewrites a transcript
+	// and a generation counter nobody can trigger is not worth its wire. Raised by review
+	// as a hazard, recorded here as one. If it ever needs detecting, the daemon already
+	// holds two facts that would: a newest page whose `earlier` cursor jumped BACKWARDS
+	// between two reads, and TranscriptUpdatedAt going backwards.
 	Ord int64 `json:"ord,omitempty"`
 }
 

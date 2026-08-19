@@ -1988,6 +1988,29 @@ describe('loadHistory message identity (tether#106)', () => {
     }
   })
 
+  it('STOPS at the first mismatch — it does not resume matching further down', () => {
+    // The test above cannot tell "stop at the first mismatch" from "skip the ones
+    // that differ and carry on": every element differs there, so both answers look
+    // identical. Measured — a `break` -> `continue` mutant survived the whole suite
+    // until this case existed.
+    //
+    // The distinction is real. Past a divergence, index i no longer names the same
+    // message: when cc's 200-message tail slides by one, every later index shifts by
+    // one, so a match further down is a DIFFERENT turn that happens to have the same
+    // role, timestamp and text — two identical short prompts are not rare. Carrying
+    // the id over there moves the reader's expanded block onto the wrong message,
+    // which is worse than the remount it was avoiding, because it is wrong quietly.
+    useStore.getState().loadHistory([hist('user', 'first draft', 1), hist('assistant', 'shared line', 2)])
+    const before = useStore.getState().messages.map(m => m.id)
+
+    // Index 0 differs; index 1 is byte-identical to the one before it.
+    useStore.getState().loadHistory([hist('user', 'second draft', 1), hist('assistant', 'shared line', 2)])
+    const after = useStore.getState().messages.map(m => m.id)
+
+    expect(after[0]).not.toBe(before[0])
+    expect(after[1]).not.toBe(before[1])
+  })
+
   it('still resets the turn state and the permission queue', () => {
     // The identity carry-over must not turn the replace into a merge. loadHistory is
     // also what drops the prior session's pending permission cards and turn cursor

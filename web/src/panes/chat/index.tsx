@@ -1627,7 +1627,10 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
     // transcript short enough that BOTH distances read as "at the end" (which is the case
     // for any conversation that does not overfill the viewport — where, incidentally, no
     // scroll event can ever fire, so this path is the only one there is). The `return` is
-    // therefore a saved measurement rather than a precedence rule.
+    // therefore a saved measurement rather than a precedence rule: `minToward` is never
+    // negative, so `toward > minToward` forces `-toward < 0` and the second test cannot pass.
+    // Deleting the `return` is a mutant that survives the suite, and correctly so — it
+    // changes nothing except the work done.
     //
     // `armed: true` is the only field either call states rather than reads, and the argument
     // for it is in transcriptOverscrolled's header. The real `distance` is passed, not a
@@ -1661,6 +1664,14 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
       const top = transcriptEdgeAction({
         distance: topDistance,
         armed: true,
+        // Deleting the cursor half leaves the suite green here for exactly the reason it does
+        // on the scroll path above (tether#110's accepted survivor, one layer up): the dots
+        // are kept off the ceiling by the render gate, which has no slot to put them in when
+        // `transcriptEarlier` is null, and the request by `loadEarlierTranscript`'s own
+        // no-cursor early return. Kept for the same reason too — that early return is another
+        // module's property and one edit from changing, and what this half alone buys is that
+        // pulling at a ceiling does not stamp this end's floor or hold the shared in-flight
+        // ref against the other end for a microtask. Real, and unobservable from here.
         available: transcriptEarlier !== null && !!sessionId,
         inFlight: requestInFlightRef.current,
         sinceLastMs: now - topFiredAtRef.current,

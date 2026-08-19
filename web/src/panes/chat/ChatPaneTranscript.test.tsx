@@ -2360,6 +2360,58 @@ describe('loading a transcript by scrolling to its ends (tether#110)', () => {
     expect(new Set(after.map(m => m.id)).size).toBe(after.length)
   })
 
+  it('retires both latches on a session switch, so the switch cannot re-read its own fetch', async () => {
+    // What the reset is FOR, which is not what it first looks like. A latch describes where
+    // the reader has been in ONE conversation. Carried across a switch, an ARMED bottom
+    // turns the reader's next arrival at the bottom of the new session into a re-read of
+    // the page the switch itself has just fetched — up to a megabyte on the wire and an
+    // unbounded read on the daemon, for a transcript that is already on screen.
+    //
+    // The construction: arm in session A without firing, switch, then arrive at the bottom
+    // of session B in ONE scroll event (a single event delivers one position, so it cannot
+    // arm and fire in the same breath). With the reset the arrival finds a cold latch; the
+    // battery's M10 mutant — deleting the reset — makes it find A's.
+    const SID2 = 'sid-edges-0002'
+    const MESSAGES_URL2 = `/api/v1/sessions/${SID2}/messages`
+    pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+    pages[MESSAGES_URL2] = { entries: turns('second', 10, 500) }
+    const container = await renderHeld()
+    const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+    // Arm, and ask for nothing — the precondition that makes this about the carry-over.
+    const getsA = countNewestGets()
+    await act(async () => { box.scrollTo(300) })
+    await settle()
+    expect(countNewestGets()).toBe(getsA)
+
+    await act(async () => { useStore.setState({ sessionId: SID2 }) })
+    await settle()
+    expect(screen.getByText('second-0')).toBeTruthy()
+    const getsB = countReq(`GET ${MESSAGES_URL2}`)
+    expect(getsB).toBeGreaterThan(0)
+
+    // One event, landing at the bottom, with the floor long since elapsed so that it is
+    // not the thing refusing.
+    pastFloor()
+    const el = container.querySelector('.dt-chat') as HTMLElement
+    await act(async () => { box.scrollTo(el.scrollHeight - 300) })
+    await settle()
+
+    expect(countReq(`GET ${MESSAGES_URL2}`)).toBe(getsB)
+    expect(container.querySelectorAll('.transcript-bottom')).toHaveLength(0)
+
+    // The CONTROL: once the reader has moved in THIS session, arriving at the bottom does
+    // ask. Without it, "no extra request" would also be what a pane with the bottom
+    // trigger switched off entirely reports.
+    pastFloor()
+    await act(async () => { box.scrollTo(300) })
+    await settle()
+    pastFloor()
+    await act(async () => { box.scrollTo(el.scrollHeight - 300) })
+    await settle()
+    expect(countReq(`GET ${MESSAGES_URL2}`)).toBe(getsB + 1)
+  })
+
   it('still lets the fallback button load a page, for a transcript that cannot scroll', async () => {
     // Why the button did not simply go away. A newest page that does not overfill the
     // viewport produces NO scroll events at all — there is nothing to scroll — so the

@@ -1482,8 +1482,17 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
     const top = transcriptEdgeAction({
       distance: el.scrollTop,
       armed: topArmedRef.current,
-      // A cursor is the whole of "there is an earlier page". At the ceiling this is null,
-      // which is what stops the pane from spinning where nothing more can arrive.
+      // A cursor is the whole of "there is an earlier page". At the ceiling this is null.
+      //
+      // Deleting the cursor half leaves the suite green (mutation battery), and that is
+      // worth writing down rather than treating as a gap, because it says where the
+      // user-visible property actually lives: the DOTS are kept off the ceiling by the
+      // render gate below (`transcriptEarlier !== null ? slots : note`, which a mutant does
+      // kill), and the REQUEST by `loadEarlierTranscript`'s own no-cursor early return
+      // (tether#107). What this half alone buys is that arriving at a ceiling does not
+      // consume the latch, stamp the floor, or hold `requestInFlightRef` for a microtask
+      // against the other end — real but unobservable from any test in this repo. Not free
+      // to remove, therefore, and not load-bearing either.
       available: transcriptEarlier !== null && !!sessionId,
       inFlight,
       sinceLastMs: now - topFiredAtRef.current,

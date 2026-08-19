@@ -871,6 +871,18 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
     const prev = seenRef.current
     const ids = new Set(messages.map(m => m.id))
     seenRef.current = { sid: sessionId, ids }
+    // "Have we seen THIS sid's transcript?" — the definition of first sight, and the
+    // reason the ref carries a sid at all rather than a bare Set.
+    //
+    // Measured honestly: dropping the `prev.sid !== sessionId` half is a mutant that
+    // SURVIVES this repo's suite, and it survives because it cannot be reached rather
+    // than because nothing looks. Message ids are per-load `crypto.randomUUID()`s
+    // (historyEntryToMessage) and `loadHistory` only ever carries an id forward to a
+    // message with the same role+ts, so no id can cross a session switch — which makes
+    // the arrivals for a freshly-switched sid the WHOLE array, which the repopulation
+    // rule below already drops. Kept anyway because it says the invariant where it is
+    // decided instead of leaving it to be re-derived from two other facts, and noted
+    // here so the next reader does not have to rediscover that it is not falsifiable.
     if (prev === null || prev.sid !== sessionId) return
     const fresh = trailingArrivals(prev.ids, messages)
     if (fresh.length === 0 || fresh.length === messages.length) return

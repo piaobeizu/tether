@@ -919,6 +919,36 @@ describe('a held transcript keeps up, and a live one is still left alone (tether
     expect(box.top()).toBe(box.height())
   })
 
+  it('does NOT trace an arrival in a connected session', async () => {
+    // The trace's gate, and the one this suite could not see until a mutation battery
+    // pointed it out: dropping `readingHeldSession` from the trace effect survived
+    // everything else here.
+    //
+    // It matters because the connected pane is where the arrivals are the READER'S OWN.
+    // A live session announces motion already — the thinking dots, the streaming answer
+    // body, and the send the user just made — so a highlight there flashes the user's own
+    // message back at them and says a stranger's turn just landed.
+    ;(globalThis as { WebTransport?: unknown }).WebTransport = FakeWebTransport
+    daemonTranscript = JSON.stringify([{ role: 'user', text: 'earlier prompt', ts: 1000 }])
+    const { container } = render(<ChatPane />)
+    await settle()
+    // Preconditions: really connected, and a non-empty transcript on screen — so the next
+    // message is an APPEND rather than the repopulation the other rule drops anyway.
+    const box = container.querySelector('.composer-input') as HTMLTextAreaElement
+    expect(box.disabled).toBe(false)
+    expect(container.querySelectorAll('.msg-user')).toHaveLength(1)
+
+    await act(async () => {
+      useStore.getState().addMessage({ id: 'live-1', role: 'assistant', text: 'a live reply', ts: 9000 })
+    })
+
+    // It arrived and rendered…
+    expect(container.querySelectorAll('.msg-ai')).toHaveLength(1)
+    expect(screen.getByText('a live reply')).toBeTruthy()
+    // …and wears nothing.
+    expect(container.querySelectorAll('.msg-arrived')).toHaveLength(0)
+  })
+
   it('keeps the ids of everything already on screen when a traced message arrives', async () => {
     // The identity property tether#106 shipped, re-pinned with the trace on screen:
     // `key={m.id}` is React's reconciliation key and both expansion Sets are keyed by

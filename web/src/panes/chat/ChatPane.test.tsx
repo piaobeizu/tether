@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, fmtTokens, summarizeToolInput, summarizeToolResult, truncateResult, shouldSendOnEnter, growHeight, parseAtQuery, fuzzyRankFiles, shouldDeferFirstConnect, shouldReconnectAfterClose, shouldRefundAttemptBudget, transcriptTextLength, FATAL_CODE_MESSAGES, heldActivityLine, trailingArrivals, HELD_ACTIVITY_WORKING, HELD_ACTIVITY_IDLE, HELD_ACTIVITY_UNKNOWN, HELD_ACTIVITY_GONE } from './index'
+import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, fmtTokens, summarizeToolInput, summarizeToolResult, truncateResult, shouldSendOnEnter, growHeight, parseAtQuery, fuzzyRankFiles, shouldDeferFirstConnect, shouldReconnectAfterClose, shouldRefundAttemptBudget, transcriptTextLength, transcriptEdgeAction, TRANSCRIPT_EDGE_MIN_INTERVAL_MS, TRANSCRIPT_EDGE_PX, FATAL_CODE_MESSAGES, heldActivityLine, trailingArrivals, HELD_ACTIVITY_WORKING, HELD_ACTIVITY_IDLE, HELD_ACTIVITY_UNKNOWN, HELD_ACTIVITY_GONE } from './index'
 import { SESSION_ACTIVITY_HELD, SESSION_ACTIVITY_IDLE, SESSION_ACTIVITY_WORKING } from '../../lib/sessionActivity'
 import { PermissionQueue, postDecide } from '../../fenced-blocks/PermissionBlock'
 import {
@@ -871,5 +871,85 @@ describe('trailingArrivals (tether#108)', () => {
     // and flashing an entire transcript on open is the failure mode.
     expect(trailingArrivals(new Set(), msgs('a', 'b'))).toEqual(['a', 'b'])
     expect(trailingArrivals(new Set(['a']), msgs())).toEqual([])
+  })
+})
+
+describe('transcriptEdgeAction (tether#110)', () => {
+  // The base case: at an end, armed, something to fetch, nothing in flight, and the floor
+  // long since elapsed. Every test below flips ONE field of this, so what each assertion
+  // is about is the field it names.
+  const at = {
+    distance: 0, armed: true, available: true, inFlight: false,
+    sinceLastMs: TRANSCRIPT_EDGE_MIN_INTERVAL_MS * 10,
+  }
+
+  it('loads when the reader has arrived at an end with something to fetch', () => {
+    expect(transcriptEdgeAction(at)).toBe('load')
+  })
+
+  it('ARMS whenever the reader is further away than the threshold, whatever else is true', () => {
+    // Arming is a record that the reader moved, so nothing about a request in flight or a
+    // ceiling is a reason to withhold it. Written as three separate flips rather than one
+    // combined case, because a `distance` check placed AFTER any of them would still pass
+    // a single combined assertion that only tried the happy field.
+    expect(transcriptEdgeAction({ ...at, distance: TRANSCRIPT_EDGE_PX + 1 })).toBe('arm')
+    expect(transcriptEdgeAction({ ...at, distance: TRANSCRIPT_EDGE_PX + 1, inFlight: true })).toBe('arm')
+    expect(transcriptEdgeAction({ ...at, distance: TRANSCRIPT_EDGE_PX + 1, available: false })).toBe('arm')
+    expect(transcriptEdgeAction({ ...at, distance: TRANSCRIPT_EDGE_PX + 1, armed: false })).toBe('arm')
+    expect(transcriptEdgeAction({ ...at, distance: 9_999, sinceLastMs: 0 })).toBe('arm')
+  })
+
+  it('treats the threshold itself as being AT the end, and one px past it as away', () => {
+    // The boundary, both sides, exactly. `>=` in place of `>` is the classic off-by-one
+    // here and it is not cosmetic: it would arm the latch at the very position the
+    // prepend anchor can leave a reader standing, which is one half of the loop.
+    expect(transcriptEdgeAction({ ...at, distance: TRANSCRIPT_EDGE_PX })).toBe('load')
+    expect(transcriptEdgeAction({ ...at, distance: TRANSCRIPT_EDGE_PX + 1 })).toBe('arm')
+  })
+
+  it('treats a NEGATIVE distance as being at the end', () => {
+    // Reachable from both directions. A real browser rubber-bands past an end on touch,
+    // and `scrollHeight - scrollTop - clientHeight` goes negative for the bottom whenever
+    // the autoscroll effect writes `scrollTop = scrollHeight` (which no browser clamps for
+    // us in this repo's test geometry — fakeScrollBox deliberately does not clamp either).
+    expect(transcriptEdgeAction({ ...at, distance: -300 })).toBe('load')
+  })
+
+  it('does NOTHING for a reader parked at an end who has not moved since it last fired', () => {
+    // THE loop bound. Parking at an end must fire once, not once per scroll event: a flick
+    // to the top of a long transcript produces dozens of events, and each one costs about
+    // a megabyte of server-side reading.
+    expect(transcriptEdgeAction({ ...at, armed: false })).toBe('idle')
+  })
+
+  it('does NOTHING at a ceiling, which is what keeps the dots from lying', () => {
+    // `available` is false at the top of a complete transcript (no cursor) and at the
+    // bottom of any session that is not being read without a stream. A 'load' here would
+    // put three dots somewhere nothing can ever arrive.
+    expect(transcriptEdgeAction({ ...at, available: false })).toBe('idle')
+  })
+
+  it('does NOTHING while a request is already in flight, at EITHER end', () => {
+    // One shared flag, so this is also the mutual exclusion: the two ends cannot both have
+    // a request out, which is what stops one end's indicator from changing the scroll
+    // height the other end's anchor arithmetic was measured against.
+    expect(transcriptEdgeAction({ ...at, inFlight: true })).toBe('idle')
+  })
+
+  it('does NOTHING inside the interval floor, and loads the moment it elapses', () => {
+    // Both sides of the boundary, exactly, because this is the guard that survives a
+    // reader oscillating across the threshold faster than the latch can see.
+    expect(transcriptEdgeAction({ ...at, sinceLastMs: 0 })).toBe('idle')
+    expect(transcriptEdgeAction({ ...at, sinceLastMs: TRANSCRIPT_EDGE_MIN_INTERVAL_MS - 1 })).toBe('idle')
+    expect(transcriptEdgeAction({ ...at, sinceLastMs: TRANSCRIPT_EDGE_MIN_INTERVAL_MS })).toBe('load')
+  })
+
+  it('has a threshold and a floor a caller can rely on', () => {
+    // Pinned by value, because both numbers are load-bearing elsewhere and silently:
+    // the bottom indicator must be SHORTER than the threshold or its own appearance
+    // re-arms the latch it just consumed (index.css states the ~13px it costs), and the
+    // floor has to stay well above one frame to be worth anything.
+    expect(TRANSCRIPT_EDGE_PX).toBe(48)
+    expect(TRANSCRIPT_EDGE_MIN_INTERVAL_MS).toBe(500)
   })
 })

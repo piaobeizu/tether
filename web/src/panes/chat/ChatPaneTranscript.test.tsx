@@ -4,6 +4,8 @@ import ChatPane, {
   ARRIVAL_TRACE_MS,
   HELD_ACTIVITY_GONE, HELD_ACTIVITY_IDLE, HELD_ACTIVITY_UNKNOWN, HELD_ACTIVITY_WORKING,
   HELD_SESSION_PLACEHOLDER, HELD_SESSION_READABLE_NOTE,
+  TRANSCRIPT_DOTS_EARLIER_LABEL, TRANSCRIPT_DOTS_NEWER_LABEL,
+  TRANSCRIPT_EDGE_MIN_INTERVAL_MS,
   TRANSCRIPT_START_COMPLETE, TRANSCRIPT_START_TETHER_RECORD_ONLY,
 } from './index'
 import { useStore } from '../../lib/store'
@@ -77,6 +79,64 @@ function fakeScrollBox(el: HTMLElement, clientHeight: number) {
     top: () => top,
     scrollTo: (v: number) => { top = v },
     height: () => el.scrollHeight,
+  }
+}
+
+/**
+ * fakeScrollBox, plus the half of a browser jsdom leaves out: **scrolling fires `scroll`
+ * events, including when the scroll came from code** (tether#110).
+ *
+ * Per CSSOM View, assigning `scrollTop` performs a scroll, and the scroll steps that run
+ * afterwards fire the event. That is not a detail — it is the mechanism of the loop this
+ * wi has to bound. `scrollAfterPrepend`'s correction is a `scrollTop` write, so a
+ * prepend re-enters the scroll handler on its own, and the autoscroll effect's
+ * `scrollTop = scrollHeight` does the same at the other end. A fixture that only fired
+ * events the test dispatched by hand could not express the difference between a latch
+ * that works and no latch at all: both would look bounded, because nothing would ever
+ * re-enter.
+ *
+ * Fired on a MACROTASK rather than synchronously, because the real one is not
+ * synchronous either: a synchronous dispatch inside the layout effect's own write would
+ * re-enter React during commit, which no browser does. `settle()` flushes five rounds of
+ * `setTimeout(0)`, so a scroll that begets a scroll is followed to a fixed point.
+ *
+ * `scrollTo` goes through the property rather than the closure, so a reader's scroll
+ * fires an event too — which is what the handler is attached for.
+ */
+function liveScrollBox(el: HTMLElement, clientHeight: number) {
+  const box = fakeScrollBox(el, clientHeight)
+  const desc = Object.getOwnPropertyDescriptor(el, 'scrollTop')
+  const get = desc?.get as () => number
+  const set = desc?.set as (v: number) => void
+  let events = 0
+  el.addEventListener('scroll', () => { events++ })
+  Object.defineProperty(el, 'scrollTop', {
+    configurable: true,
+    get: () => get.call(el),
+    set: (v: number) => {
+      set.call(el, v)
+      setTimeout(() => el.dispatchEvent(new Event('scroll')), 0)
+    },
+  })
+  return {
+    top: box.top,
+    height: box.height,
+    /**
+     * The reader scrolls: move, then deliver the event SYNCHRONOUSLY.
+     *
+     * Deliberately not the same timing as the wrapped setter above. The test is standing
+     * in for the browser's scroll machinery here, so a sequence of positions the handler
+     * must see one at a time has to be delivered one at a time — four queued events would
+     * all read the final position and the sequence would be untestable. The PANE's own
+     * writes keep the asynchronous timing, because that is the timing the loop needs.
+     */
+    scrollTo: (v: number) => { box.scrollTo(v); el.dispatchEvent(new Event('scroll')) },
+    /** A scroll event with no movement — momentum settling, a rubber-band release. */
+    fire: () => el.dispatchEvent(new Event('scroll')),
+    /** How many scroll events this element has seen, from ANY source — the test's, the
+     *  prepend anchor's, and the autoscroll's. Exposed so a test can assert the fixture
+     *  really is re-entrant rather than assuming it. */
+    events: () => events,
   }
 }
 
@@ -1647,5 +1707,656 @@ describe('paging a transcript backwards (tether#107)', () => {
     expect(container.querySelector('.transcript-more')?.textContent).toBe('load earlier messages')
     expect(useStore.getState().messages.map(m => m.text)).toContain('older-0')
     expect(useStore.getState().transcriptEarlier).toBe(120000000)
+  })
+})
+
+// ── tether#110 — both ends of the transcript load by being scrolled to ────────────
+//
+// Three things this file could not say before, and each one is a loop or a lie:
+//
+//   1. arriving at an end must start a request, and arriving at it AGAIN without having
+//      left must not — because the correction that follows a prepend is itself a scroll,
+//      and the autoscroll that follows an append is itself a scroll;
+//   2. the bottom must go through the SAME refresh path tether#109 taught to check its
+//      ordering, not a second one beside it;
+//   3. the dots must exist exactly while a request does, and never at a ceiling.
+//
+// `liveScrollBox` is what makes (1) expressible at all: jsdom fires no scroll event for a
+// `scrollTop` write, so with the plain `fakeScrollBox` a pane with NO latch and a pane
+// with a correct one produce identical numbers.
+describe('loading a transcript by scrolling to its ends (tether#110)', () => {
+  const SID = 'sid-edges-0001'
+  const MESSAGES_URL = `/api/v1/sessions/${SID}/messages`
+
+  type Page = { entries: unknown[]; earlier?: number; otherRecord?: string }
+  let pages: Record<string, Page> = {}
+  let requested: string[] = []
+  let daemonVersion = 1000
+  /** URLs whose response is held open until the test releases it, so the in-flight state
+   *  is observable rather than inferred. Checked at REQUEST time, so one can be installed
+   *  after the mount fetches have already gone through. */
+  let gates: Record<string, Promise<void>> = {}
+
+  function stubDaemon() {
+    return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url)
+      requested.push(`${init?.method ?? 'GET'} ${url}`)
+      if (url.includes('/providers')) return new Response(JSON.stringify({ providers: ['claude-code'] }), { status: 200 })
+      if (url === SESSION_ACTIVITY_PATH) return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      const gate = gates[`${init?.method ?? 'GET'} ${url}`]
+      if (gate) await gate
+      const page = pages[url]
+      if (page) {
+        const headers = new Headers({ 'Content-Type': 'application/json' })
+        headers.set('X-Tether-Transcript-Updated-At', String(daemonVersion))
+        if (page.earlier !== undefined) headers.set('X-Tether-Transcript-Earlier', String(page.earlier))
+        if (page.otherRecord !== undefined) headers.set('X-Tether-Transcript-Other-Record', page.otherRecord)
+        return new Response(init?.method === 'HEAD' ? null : JSON.stringify(page.entries), { status: 200, headers })
+      }
+      return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+  }
+
+  const entry = (role: string, text: string, ts: number, ord: number = ts) => ({ role, text, ts, ord })
+  const turns = (label: string, n: number, firstTs: number) =>
+    Array.from({ length: n }, (_, i) => entry('user', `${label}-${i}`, firstTs + i))
+
+  const settle = async () => {
+    for (let i = 0; i < 5; i++) {
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)) })
+    }
+  }
+
+  /**
+   * Step the wall clock past the interval floor.
+   *
+   * A `Date.now` spy and NOT `vi.useFakeTimers`, and not a real sleep either. The floor is
+   * the only thing in this feature that reads a clock; everything else — `settle`, and the
+   * scroll events `liveScrollBox` queues for the pane's own `scrollTop` writes — rides
+   * real `setTimeout`, so faking timers would replace the machinery under test. A real
+   * sleep works but costs this file about thirteen seconds of wall time, and paying it in
+   * a parallel worker is not free for the rest of the suite: it changes when every other
+   * file's promise chains interleave. Advancing a counter is exact, instant, and cannot
+   * make another test flaky.
+   *
+   * Monotonic forward only, which is what makes it safe here: the other `Date.now`
+   * readers this pane reaches (`sessionStart`, `fmtElapsed`) only ever compute an elapsed
+   * time from it.
+   */
+  const pastFloor = () => { clock += TRANSCRIPT_EDGE_MIN_INTERVAL_MS + 20 }
+
+  const countReq = (r: string) => requested.filter(x => x === r).length
+  const countEarlierPages = () => requested.filter(x => x.startsWith('GET ') && x.includes('before=')).length
+  const countNewestGets = () => countReq(`GET ${MESSAGES_URL}`)
+
+  const dots = (root: ParentNode) => root.querySelectorAll('.transcript-top-slots .transcript-dots.on')
+  const fallbackButton = (root: ParentNode) => root.querySelectorAll('.transcript-top-slots .transcript-more.on')
+
+  let clock = 0
+  let clockSpy: ReturnType<typeof vi.spyOn> | null = null
+
+  beforeEach(() => {
+    localStorage.clear()
+    pages = {}
+    requested = []
+    gates = {}
+    daemonVersion = 1000
+    clock = 1_760_000_000_000
+    clockSpy = vi.spyOn(Date, 'now').mockImplementation(() => clock)
+    resetTranscriptWatchForTests()
+    resetSessionActivityForTests()
+    globalThis.fetch = stubDaemon() as unknown as typeof fetch
+    useStore.setState({
+      messages: [], notices: [], pendingPermissions: [], fatal: null,
+      streaming: false, streamingMsgId: null, curTurnId: null,
+      sessionId: SID, workspacesLoaded: false, activeWorkspace: null,
+      transcriptEarlier: null, transcriptOtherRecord: null, transcriptPagesBack: 0,
+    })
+  })
+
+  afterEach(() => {
+    cleanup()
+    clockSpy?.mockRestore()
+    clockSpy = null
+    resetTranscriptWatchForTests()
+    resetSessionActivityForTests()
+    globalThis.fetch = originalFetch
+    useStore.setState({
+      messages: [], notices: [], sessionId: null, fatal: null, streaming: false, workspacesLoaded: false,
+      transcriptEarlier: null, transcriptOtherRecord: null, transcriptPagesBack: 0,
+    })
+    localStorage.clear()
+  })
+
+  /** The deferred-connect pane: no remembered sid, workspaces unsettled ⇒ no WebTransport
+   *  attempt, no watcher, no probes. Everything requested is therefore attributable. */
+  const renderIdle = async () => {
+    const { container } = render(<ChatPane />)
+    await settle()
+    return container
+  }
+
+  /**
+   * The held-session pane, which is the only state with a three-second poll to pre-empt.
+   * Same construction as tether#106's cases: workspaces settled ⇒ the mount connects,
+   * jsdom has no WebTransport ⇒ the connect rejects, and the refusal on the store makes
+   * connState 'failed'.
+   */
+  const renderHeld = async () => {
+    useStore.setState({ workspacesLoaded: true })
+    localStorage.setItem('tether_last_sid', SID)
+    const { container } = render(<ChatPane />)
+    useStore.setState({ fatal: { code: ErrCodeSessionHeldByBackgroundAgent, message: 'a background agent is using this conversation' } })
+    await settle()
+    // Preconditions, asserted rather than assumed: without both, everything below is
+    // exercising a pane in a different state than the assertions describe.
+    expect(container.querySelectorAll('.failed-card')).toHaveLength(1)
+    expect(requested.filter(r => r === `HEAD ${MESSAGES_URL}`).length).toBeGreaterThan(0)
+    return container
+  }
+
+  // ── 1. the top: scrolling there loads ─────────────────────────────────────
+  it('loads the earlier page when the reader scrolls to the top, with no click at all', async () => {
+    pages[MESSAGES_URL] = { entries: turns('recent', 10, 500), earlier: 4096 }
+    pages[`${MESSAGES_URL}?before=4096`] = { entries: turns('older', 5, 100), earlier: 2048 }
+    const container = await renderIdle()
+    const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+    expect(box.height()).toBe(1000)
+    expect(countEarlierPages()).toBe(0)
+
+    // Reading somewhere in the middle. This ARMS the top end and asks for nothing —
+    // pinned, because a trigger that fired on any scroll at all would pass every other
+    // assertion in this test.
+    await act(async () => { box.scrollTo(400) })
+    await settle()
+    expect(countEarlierPages()).toBe(0)
+
+    await act(async () => { box.scrollTo(0) })
+    await settle()
+
+    expect(countEarlierPages()).toBe(1)
+    expect(countReq(`GET ${MESSAGES_URL}?before=4096`)).toBe(1)
+    expect([...container.querySelectorAll('.msg-user-bubble')].map(e => e.textContent).slice(0, 5))
+      .toEqual(['older-0', 'older-1', 'older-2', 'older-3', 'older-4'])
+    // The reader stayed on the message they were looking at: 5 bubbles × 100px went in
+    // above scrollTop 0. Exact, because every wrong answer here is also greater than 0.
+    expect(box.height()).toBe(1500)
+    expect(box.top()).toBe(500)
+    // …and the cursor moved back, so a second visit goes one page further rather than
+    // re-serving this one.
+    expect(useStore.getState().transcriptEarlier).toBe(2048)
+  })
+
+  it('does not chain-load: the correction that follows a prepend is a scroll, and it stops there', async () => {
+    // The loop the wi names, in its first form. `scrollAfterPrepend` writes `scrollTop`;
+    // a `scrollTop` write IS a scroll, so the browser re-enters this handler with no help
+    // from the reader. The latch is what makes the re-entry land on "away from the end"
+    // instead of on another request.
+    pages[MESSAGES_URL] = { entries: turns('recent', 10, 500), earlier: 4096 }
+    pages[`${MESSAGES_URL}?before=4096`] = { entries: turns('older', 5, 100), earlier: 2048 }
+    pages[`${MESSAGES_URL}?before=2048`] = { entries: turns('oldest', 5, 10), earlier: 1024 }
+    const container = await renderIdle()
+    const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+    const eventsBefore = box.events()
+
+    await act(async () => { box.scrollTo(400) })
+    await settle()
+    await act(async () => { box.scrollTo(0) })
+    await settle()
+
+    // The FIXTURE's own precondition: more scroll events happened than the two this test
+    // dispatched, i.e. the pane's correction really did re-enter the handler. Without
+    // this, "exactly one page" would be true of a fixture that simply never re-entered,
+    // and the latch would be untested.
+    expect(box.events()).toBeGreaterThan(eventsBefore + 2)
+    expect(countEarlierPages()).toBe(1)
+    expect(useStore.getState().transcriptPagesBack).toBe(1)
+    // Specifically: the SECOND page was never asked for.
+    expect(countReq(`GET ${MESSAGES_URL}?before=2048`)).toBe(0)
+  })
+
+  it('asks once for a reader parked at the top, however many scroll events arrive', async () => {
+    // The loop in its worst form: an earlier page that adds NO height (every record on it
+    // is already on screen, so prependHistory drops the lot) while the daemon keeps
+    // handing back a fresh cursor. The correction therefore leaves the reader at the top,
+    // and every further scroll event — momentum, a rubber-band release, a finger resting
+    // on the glass — is another arrival at an end that still has something to fetch.
+    //
+    // The events are spaced past the interval floor ON PURPOSE. Bunched together the floor
+    // alone would hold them, and this assertion would be measuring the floor rather than
+    // the latch it is written for.
+    const sameFive = turns('recent', 5, 500)
+    pages[MESSAGES_URL] = { entries: sameFive, earlier: 4096 }
+    pages[`${MESSAGES_URL}?before=4096`] = { entries: sameFive, earlier: 2048 }
+    pages[`${MESSAGES_URL}?before=2048`] = { entries: sameFive, earlier: 1024 }
+    pages[`${MESSAGES_URL}?before=1024`] = { entries: sameFive, earlier: 512 }
+    const container = await renderIdle()
+    const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+    await act(async () => { box.scrollTo(400) })
+    await settle()
+    await act(async () => { box.scrollTo(0) })
+    await settle()
+    expect(countEarlierPages()).toBe(1)
+
+    for (let i = 0; i < 2; i++) {
+      pastFloor()
+      await act(async () => { box.fire() })
+      await settle()
+    }
+
+    // The preconditions that make this the PARKED case: the reader never moved, and the
+    // pane still believes there is something to fetch. Either one failing would make the
+    // count below true for a reason that has nothing to do with the latch.
+    expect(box.top()).toBe(0)
+    expect(box.height()).toBe(500)
+    expect(useStore.getState().transcriptEarlier).toBe(2048)
+    expect(countEarlierPages()).toBe(1)
+
+    // The CONTROL, so the assertion above is known to discriminate: leaving the end and
+    // coming back is a new arrival, and it loads.
+    pastFloor()
+    await act(async () => { box.scrollTo(200) })
+    await settle()
+    await act(async () => { box.scrollTo(0) })
+    await settle()
+    expect(countEarlierPages()).toBe(2)
+    expect(countReq(`GET ${MESSAGES_URL}?before=2048`)).toBe(1)
+  })
+
+  it('holds the floor when a reader oscillates across the threshold faster than it', async () => {
+    // What the latch alone cannot stop, and therefore the only thing this test is about:
+    // crossing out of the zone and back in re-arms honestly, so two full round trips
+    // inside the floor would be two requests without it. On touch this is one shaky flick.
+    const sameFive = turns('recent', 5, 500)
+    pages[MESSAGES_URL] = { entries: sameFive, earlier: 4096 }
+    pages[`${MESSAGES_URL}?before=4096`] = { entries: sameFive, earlier: 2048 }
+    pages[`${MESSAGES_URL}?before=2048`] = { entries: sameFive, earlier: 1024 }
+    const container = await renderIdle()
+    const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+    // One act, no settle between: the four positions are delivered synchronously, so the
+    // wall clock barely moves and the floor is the only thing that can be doing the work.
+    await act(async () => {
+      box.scrollTo(200)
+      box.scrollTo(0)
+      box.scrollTo(200)
+      box.scrollTo(0)
+    })
+    await settle()
+
+    expect(countEarlierPages()).toBe(1)
+    expect(countReq(`GET ${MESSAGES_URL}?before=2048`)).toBe(0)
+  })
+
+  // ── 2. the dots: exactly while a request exists, and never at a ceiling ────
+  it('shows the dots only while an earlier page is genuinely in flight', async () => {
+    pages[MESSAGES_URL] = { entries: turns('recent', 10, 500), earlier: 4096 }
+    pages[`${MESSAGES_URL}?before=4096`] = { entries: turns('older', 5, 100), earlier: 2048 }
+    const container = await renderIdle()
+    const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+    // Idle: the fallback is showing, the dots are not.
+    expect(dots(container)).toHaveLength(0)
+    expect(fallbackButton(container)).toHaveLength(1)
+
+    let release = () => {}
+    gates[`GET ${MESSAGES_URL}?before=4096`] = new Promise<void>(r => { release = r })
+    await act(async () => { box.scrollTo(400) })
+    await settle()
+    await act(async () => { box.scrollTo(0) })
+    await settle()
+
+    // In flight: the dots are on, the button is off — and it is still in the DOM, which
+    // is the constant-height construction rather than an accident.
+    expect(countEarlierPages()).toBe(1)
+    expect(dots(container)).toHaveLength(1)
+    expect(dots(container)[0].getAttribute('aria-label')).toBe(TRANSCRIPT_DOTS_EARLIER_LABEL)
+    expect(dots(container)[0].querySelectorAll('.transcript-dot')).toHaveLength(3)
+    expect(fallbackButton(container)).toHaveLength(0)
+    expect(container.querySelectorAll('.transcript-top-slots .transcript-more')).toHaveLength(1)
+
+    await act(async () => { release(); await Promise.resolve() })
+    await settle()
+
+    // Settled: back to the fallback, no dots.
+    expect(dots(container)).toHaveLength(0)
+    expect(fallbackButton(container)).toHaveLength(1)
+  })
+
+  it('puts NO dots at the ceiling, where waiting can never produce anything', async () => {
+    // The judgement this lane keeps re-making: a spinner where nothing more can arrive is
+    // a lie. At the true top the pane says which kind of top it is — tether#107's three
+    // sentences — and scrolling into it must not turn that into a wait.
+    pages[MESSAGES_URL] = { entries: turns('recent', 10, 500), earlier: 4096 }
+    pages[`${MESSAGES_URL}?before=4096`] = { entries: turns('older', 5, 100) } // no cursor: the beginning
+    const container = await renderIdle()
+    const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+    await act(async () => { box.scrollTo(400) })
+    await settle()
+    await act(async () => { box.scrollTo(0) })
+    await settle()
+    expect(countEarlierPages()).toBe(1)
+
+    // At the ceiling now. Scroll into it as hard as the reader likes.
+    pastFloor()
+    for (let i = 0; i < 3; i++) {
+      await act(async () => { box.scrollTo(0) })
+      await settle()
+    }
+
+    expect(container.querySelectorAll('.transcript-dots')).toHaveLength(0)
+    expect(container.querySelectorAll('.transcript-top-slots')).toHaveLength(0)
+    expect(container.querySelector('.transcript-top .transcript-top-note')?.textContent).toBe(TRANSCRIPT_START_COMPLETE)
+    // …and nothing was requested for it. A request that could not advance anything is the
+    // same lie one layer down.
+    expect(countEarlierPages()).toBe(1)
+  })
+
+  it('keeps the top marker to ONE cell with exactly one visible child, in both states', async () => {
+    // The constant-height property, expressed as the only thing a test in this repo can
+    // reach. jsdom computes no layout, so `visibility: hidden` and the grid cell itself
+    // are invisible from here; what IS checkable is the STRUCTURE that produces them —
+    // both children always present, exactly one carrying `.on`. tether#108 paid for the
+    // alternative (a `min-height` in px, green everywhere, wrong at every other width).
+    pages[MESSAGES_URL] = { entries: turns('recent', 10, 500), earlier: 4096 }
+    pages[`${MESSAGES_URL}?before=4096`] = { entries: turns('older', 5, 100), earlier: 2048 }
+    const container = await renderIdle()
+    const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+    const slots = () => container.querySelector('.transcript-top-slots') as HTMLElement
+    expect(slots().children).toHaveLength(2)
+    expect(slots().querySelectorAll(':scope > .on')).toHaveLength(1)
+
+    let release = () => {}
+    gates[`GET ${MESSAGES_URL}?before=4096`] = new Promise<void>(r => { release = r })
+    await act(async () => { box.scrollTo(400) })
+    await settle()
+    await act(async () => { box.scrollTo(0) })
+    await settle()
+
+    expect(slots().children).toHaveLength(2)
+    expect(slots().querySelectorAll(':scope > .on')).toHaveLength(1)
+    // …and it is the OTHER one this time. A cell whose `.on` never moved would satisfy
+    // the count above forever.
+    expect(slots().querySelector(':scope > .on')?.classList.contains('transcript-dots')).toBe(true)
+
+    await act(async () => { release(); await Promise.resolve() })
+    await settle()
+    expect(slots().querySelector(':scope > .on')?.classList.contains('transcript-more')).toBe(true)
+  })
+
+  // ── 3. the bottom ─────────────────────────────────────────────────────────
+  it('re-reads the newest page on arriving at the bottom, without waiting for the poll', async () => {
+    pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+    const container = await renderHeld()
+    const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+    expect(box.height()).toBe(1000)
+
+    // The other agent writes a turn — and the daemon's VERSION does not move, so the
+    // three-second probe has no reason to reload. This is what makes the assertion below
+    // about this wi's trigger rather than about tether#106's poll: give the poll its
+    // chance first (a visibility return probes immediately) and watch it decline.
+    pages[MESSAGES_URL] = { entries: [...turns('recent', 10, 500), entry('assistant', 'brand new', 9000)] }
+    for (const state of ['hidden', 'visible'] as const) {
+      Object.defineProperty(document, 'visibilityState', { value: state, configurable: true })
+      await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
+    }
+    await settle()
+    expect(screen.queryByText('brand new')).toBeNull()
+
+    const getsBefore = countNewestGets()
+    await act(async () => { box.scrollTo(300) })   // away from the bottom: arms
+    await settle()
+    expect(countNewestGets()).toBe(getsBefore)
+    await act(async () => { box.scrollTo(700) })   // 1000 - 700 - 300 = 0: arrived
+    await settle()
+
+    expect(countNewestGets()).toBe(getsBefore + 1)
+    expect(screen.getByText('brand new')).toBeTruthy()
+  })
+
+  it('asks once for a reader parked at the bottom, autoscroll included', async () => {
+    // The second loop, and it is a different mechanism from the first: `nearBottom` is
+    // ALSO the stick-to-bottom condition, so an append writes `scrollTop = scrollHeight`,
+    // which is a scroll, which arrives back here at distance ≤ 0. Bounded by the same
+    // latch: the reader never went further than the threshold, so nothing re-armed.
+    pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+    const container = await renderHeld()
+    const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+    pages[MESSAGES_URL] = { entries: [...turns('recent', 10, 500), entry('assistant', 'brand new', 9000)] }
+    const getsBefore = countNewestGets()
+    await act(async () => { box.scrollTo(300) })
+    await settle()
+    await act(async () => { box.scrollTo(700) })
+    await settle()
+    expect(countNewestGets()).toBe(getsBefore + 1)
+
+    // The append landed and the pane followed it to the bottom — the precondition that
+    // makes this the loop case rather than a reader who happens to be standing still.
+    expect(box.height()).toBe(1100)
+    expect(box.top()).toBe(1100)
+
+    for (let i = 0; i < 2; i++) {
+      pastFloor()
+      await act(async () => { box.fire() })
+      await settle()
+    }
+    expect(countNewestGets()).toBe(getsBefore + 1)
+
+    // The CONTROL: leaving the bottom and returning is a new arrival, and it asks again.
+    pastFloor()
+    await act(async () => { box.scrollTo(300) })
+    await settle()
+    await act(async () => { box.scrollTo(800) })
+    await settle()
+    expect(countNewestGets()).toBe(getsBefore + 2)
+  })
+
+  it('never re-reads on scroll in a session that has a live stream', async () => {
+    // The gate, and it is not caution. `refreshTranscript` has no `!streaming` guard on
+    // purpose — its doc says every caller is a state in which a turn cannot be in flight —
+    // and scrolling to the bottom of a connected session is the most ordinary thing there
+    // is to do while a turn streams. Wiring this end everywhere would hand back tether#42.
+    // There is also nothing to pre-empt: the three-second poll only exists in the held
+    // state.
+    pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+    const container = await renderIdle()
+    const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+    const getsBefore = countNewestGets()
+
+    for (const top of [300, 700, 300, 700]) {
+      pastFloor()
+      await act(async () => { box.scrollTo(top) })
+      await settle()
+    }
+
+    expect(countNewestGets()).toBe(getsBefore)
+    expect(container.querySelectorAll('.transcript-bottom')).toHaveLength(0)
+  })
+
+  it('re-reads through the merge, so the pages the reader loaded survive it', async () => {
+    // What "reuse the existing refresh path" has to MEAN, rather than what it looks like.
+    // `refreshTranscript` is the only caller that consults `transcriptPagesBack` and
+    // therefore the only one that merges instead of replacing; a second fetch beside it
+    // would look identical on the wire and throw away every earlier page — and would skip
+    // tether#109's `ord` check on the way.
+    pages[MESSAGES_URL] = { entries: turns('recent', 5, 500), earlier: 4096 }
+    pages[`${MESSAGES_URL}?before=4096`] = { entries: turns('older', 3, 100), earlier: 2048 }
+    const container = await renderHeld()
+    const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+    await act(async () => { box.scrollTo(300) })
+    await settle()
+    await act(async () => { box.scrollTo(0) })
+    await settle()
+    expect(useStore.getState().transcriptPagesBack).toBe(1)
+    expect([...container.querySelectorAll('.msg-user-bubble')].map(e => e.textContent))
+      .toEqual(['older-0', 'older-1', 'older-2', 'recent-0', 'recent-1', 'recent-2', 'recent-3', 'recent-4'])
+
+    pages[MESSAGES_URL] = { entries: [...turns('recent', 5, 500), entry('assistant', 'brand new', 9000)], earlier: 5120 }
+    pastFloor()
+    const el = container.querySelector('.dt-chat') as HTMLElement
+    await act(async () => { box.scrollTo(el.scrollHeight - 300) })
+    await settle()
+
+    expect(screen.getByText('brand new')).toBeTruthy()
+    // The reader's page is still there, above the newest one…
+    expect([...container.querySelectorAll('.msg-user-bubble')].map(e => e.textContent))
+      .toEqual(['older-0', 'older-1', 'older-2', 'recent-0', 'recent-1', 'recent-2', 'recent-3', 'recent-4'])
+    expect(useStore.getState().transcriptPagesBack).toBe(1)
+    // …and the cursor still describes the OLDEST page on screen rather than the refresh's
+    // own 5120, which would send the next load forward over pages already rendered.
+    expect(useStore.getState().transcriptEarlier).toBe(2048)
+  })
+
+  it('shows the bottom dots only while the re-read is in flight', async () => {
+    pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+    const container = await renderHeld()
+    const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+    expect(container.querySelectorAll('.transcript-bottom')).toHaveLength(0)
+
+    let release = () => {}
+    gates[`GET ${MESSAGES_URL}`] = new Promise<void>(r => { release = r })
+    await act(async () => { box.scrollTo(300) })
+    await settle()
+    await act(async () => { box.scrollTo(700) })
+    await settle()
+
+    const bottom = container.querySelectorAll('.transcript-bottom .transcript-dots')
+    expect(bottom).toHaveLength(1)
+    expect(bottom[0].getAttribute('aria-label')).toBe(TRANSCRIPT_DOTS_NEWER_LABEL)
+    expect(bottom[0].querySelectorAll('.transcript-dot')).toHaveLength(3)
+    // It is the LAST thing in the scroll container — where the message will appear, which
+    // is the whole argument for its position.
+    const rows = container.querySelectorAll('.dt-chat > *')
+    expect(rows[rows.length - 1].classList.contains('transcript-bottom')).toBe(true)
+
+    await act(async () => { release(); await Promise.resolve() })
+    await settle()
+    expect(container.querySelectorAll('.transcript-bottom')).toHaveLength(0)
+  })
+
+  it('holds one request at a time across BOTH ends', async () => {
+    // One shared in-flight flag rather than one per end, and the reason is the anchor:
+    // the bottom indicator changes the scroll height, and `scrollAfterPrepend` compares a
+    // height captured before the top's request with one measured after it. If the two ends
+    // could overlap, that comparison would silently carry the other end's indicator.
+    pages[MESSAGES_URL] = { entries: turns('recent', 10, 500), earlier: 4096 }
+    pages[`${MESSAGES_URL}?before=4096`] = { entries: turns('older', 5, 100), earlier: 2048 }
+    const container = await renderHeld()
+    const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+    let release = () => {}
+    gates[`GET ${MESSAGES_URL}?before=4096`] = new Promise<void>(r => { release = r })
+    await act(async () => { box.scrollTo(400) })
+    await settle()
+    await act(async () => { box.scrollTo(0) })
+    await settle()
+    expect(countEarlierPages()).toBe(1)
+    const getsBefore = countNewestGets()
+
+    // Standing at the top of a 1000px box with a 300px viewport, the bottom end is 700px
+    // away — so it armed on the way — and arriving there is a genuine arrival that only
+    // the shared flag refuses.
+    pastFloor()
+    await act(async () => { box.scrollTo(700) })
+    await settle()
+    expect(countNewestGets()).toBe(getsBefore)
+    expect(container.querySelectorAll('.transcript-bottom')).toHaveLength(0)
+
+    await act(async () => { release(); await Promise.resolve() })
+    await settle()
+
+    // …and once it settles, the other end works again: leaving and returning asks.
+    pastFloor()
+    await act(async () => { box.scrollTo(400) })
+    await settle()
+    const el = container.querySelector('.dt-chat') as HTMLElement
+    await act(async () => { box.scrollTo(el.scrollHeight - 300) })
+    await settle()
+    expect(countNewestGets()).toBe(getsBefore + 1)
+  })
+
+  // ── 4. what must not change ───────────────────────────────────────────────
+  it('does not mark an automatically prepended page as having just arrived', async () => {
+    // tether#108's trace means "one just landed", and a page the reader scrolled to is not
+    // one. `trailingArrivals` excludes it by SHAPE — older records go in at the front, and
+    // the walk from the end stops at the first id already on screen — so this pins that
+    // the new trigger did not find a way around that shape.
+    pages[MESSAGES_URL] = { entries: turns('recent', 10, 500), earlier: 4096 }
+    pages[`${MESSAGES_URL}?before=4096`] = { entries: turns('older', 5, 100), earlier: 2048 }
+    const container = await renderHeld()
+    const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+    expect(container.querySelectorAll('.msg-arrived')).toHaveLength(0)
+
+    await act(async () => { box.scrollTo(400) })
+    await settle()
+    await act(async () => { box.scrollTo(0) })
+    await settle()
+
+    // The page really landed…
+    expect(useStore.getState().transcriptPagesBack).toBe(1)
+    expect(screen.getByText('older-0')).toBeTruthy()
+    // …and none of it is wearing a trace.
+    expect(container.querySelectorAll('.msg-arrived')).toHaveLength(0)
+
+    // The CONTROL, over the OTHER new trigger, so the assertion above is known to
+    // discriminate: a turn that genuinely arrived — pulled in by the bottom re-read — is
+    // traced, and only that one.
+    pages[MESSAGES_URL] = { entries: [...turns('recent', 10, 500), entry('assistant', 'brand new', 9000)], earlier: 4096 }
+    pastFloor()
+    const el = container.querySelector('.dt-chat') as HTMLElement
+    await act(async () => { box.scrollTo(el.scrollHeight - 300) })
+    await settle()
+    expect([...container.querySelectorAll('.msg-arrived')].map(e => e.textContent?.includes('brand new')))
+      .toEqual([true])
+  })
+
+  it('keeps the ids of everything on screen when a page arrives by scrolling', async () => {
+    // `key={m.id}` is React's reconciliation key and both expansion Sets are keyed by id,
+    // so re-minting one collapses the reader's expansions and clamps the scroll — on the
+    // path whose entire purpose is to leave them where they were.
+    pages[MESSAGES_URL] = { entries: turns('recent', 10, 500), earlier: 4096 }
+    pages[`${MESSAGES_URL}?before=4096`] = { entries: turns('older', 5, 100), earlier: 2048 }
+    const container = await renderIdle()
+    const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+    const idsBefore = useStore.getState().messages.map(m => m.id)
+    expect(idsBefore).toHaveLength(10)
+
+    await act(async () => { box.scrollTo(400) })
+    await settle()
+    await act(async () => { box.scrollTo(0) })
+    await settle()
+
+    const after = useStore.getState().messages
+    expect(after.map(m => m.id).slice(5)).toEqual(idsBefore)
+    expect(new Set(after.map(m => m.id)).size).toBe(after.length)
+  })
+
+  it('still lets the fallback button load a page, for a transcript that cannot scroll', async () => {
+    // Why the button did not simply go away. A newest page that does not overfill the
+    // viewport produces NO scroll events at all — there is nothing to scroll — so the
+    // automatic trigger can never fire and every earlier page would be unreachable. It is
+    // also the only keyboard-reachable path: `.dt-chat` is a plain div and takes no focus.
+    pages[MESSAGES_URL] = { entries: turns('recent', 2, 500), earlier: 4096 }
+    pages[`${MESSAGES_URL}?before=4096`] = { entries: turns('older', 2, 100), earlier: 2048 }
+    const container = await renderIdle()
+    // The precondition: this container genuinely cannot scroll (200px of content in a
+    // 300px viewport), so no amount of scrolling could have loaded anything.
+    const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+    expect(box.height()).toBe(200)
+    await act(async () => { box.fire() })
+    await settle()
+    expect(countEarlierPages()).toBe(0)
+
+    await act(async () => { (container.querySelector('.transcript-more') as HTMLButtonElement).click() })
+    await settle()
+
+    expect(countEarlierPages()).toBe(1)
+    expect([...container.querySelectorAll('.msg-user-bubble')].map(e => e.textContent))
+      .toEqual(['older-0', 'older-1', 'recent-0', 'recent-1'])
   })
 })

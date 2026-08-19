@@ -661,8 +661,20 @@ func ccReadTail(f *os.File, size, window int64) ([]HistoryMessage, error) {
 // without the guard a `..`-shaped sid turns this into a reader for any .jsonl
 // file on the host. The same reason HistoryStore.HasHistory checks it.
 func (s *CCStore) find(sid string) string {
+	path, _ := s.findStat(sid)
+	return path
+}
+
+// findStat is find plus the FileInfo the search already had to read.
+//
+// Split out for ModTime (tether#106), which wants the mtime of exactly the file
+// find selects. Returning it from here rather than stat-ing again in ModTime is
+// not about the syscall: a second stat is a second observation, and between the
+// two the file could be replaced, so the timestamp would describe a file this
+// function did not choose.
+func (s *CCStore) findStat(sid string) (string, os.FileInfo) {
 	if s == nil || s.projectsDir == "" || s.dirs == nil || !ValidSessionID(sid) {
-		return ""
+		return "", nil
 	}
 	for _, wd := range s.dirs() {
 		dir := s.resolveProjectDir(wd)
@@ -671,10 +683,23 @@ func (s *CCStore) find(sid string) string {
 		}
 		path := filepath.Join(dir, sid+".jsonl")
 		if fi, err := os.Stat(path); err == nil && !fi.IsDir() && fi.Size() > 0 {
-			return path
+			return path, fi
 		}
 	}
-	return ""
+	return "", nil
+}
+
+// ModTime reports when cc last wrote this session's transcript, in Unix
+// milliseconds, and whether cc has one at all (tether#106).
+//
+// Same shape and same reasoning as HistoryStore.ModTime — see there for why the
+// bool is separate from the timestamp instead of "0 means no".
+func (s *CCStore) ModTime(sid string) (int64, bool) {
+	_, fi := s.findStat(sid)
+	if fi == nil {
+		return 0, false
+	}
+	return fi.ModTime().UnixMilli(), true
 }
 
 // ccSidFromFile extracts the session id from a transcript file name, and reports

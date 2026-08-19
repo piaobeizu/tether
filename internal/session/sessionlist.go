@@ -364,6 +364,79 @@ func (x *SessionIndex) Messages(sid string) ([]HistoryMessage, string) {
 	return nil, SourceNone
 }
 
+// TranscriptUpdatedAtHeader carries, on the transcript route, when the transcript
+// that route would serve was last written — Unix milliseconds, decimal (tether#106).
+//
+// # Why the transcript route grew a cheap answer instead of a new endpoint
+//
+// A session a background agent holds has no live stream (tether#101 refuses the
+// attach), so the one GET this pane makes at open time used to be the whole of what
+// the reader ever saw. Following along needs a "has it changed?" that does not cost
+// what "give it to me" costs, and the honest place for that is the SAME route:
+// Messages picks between two stores by a rule stated once above, and a probe on a
+// route of its own would be free to answer for the other one.
+//
+// # Milliseconds in a header of our own, rather than only Last-Modified
+//
+// Last-Modified is set too and is the standard thing, but its granularity is one
+// SECOND. A change landing in the same second as the reader's last sample is
+// invisible to it, and — because the comparison is against the last sample rather
+// than against now — it stays invisible until the NEXT write. On a conversation
+// whose next write may be minutes away that is a transcript that silently stops at
+// a message the reader can see is not the last one.
+//
+// The name is mirrored by hand in web/src/lib/transcriptWatch.ts;
+// TestTranscriptUpdatedAtHeaderIsMirroredInTypeScript reads both sides, for the
+// reason TestSessionActivityContractIsMirroredInTypeScript gives — a rename on
+// either side alone compiles, type-checks and passes every fixture test.
+const TranscriptUpdatedAtHeader = "X-Tether-Transcript-Updated-At"
+
+// TranscriptUpdatedAt reports when the transcript Messages would serve for sid was
+// last written, in Unix milliseconds, or 0 when neither store has one.
+//
+// # It is the same store choice Messages makes, and that is structural here
+//
+// Not "the same rule restated" — the branch conditions ARE the two stores' own
+// has-it predicates, the ones HasHistory and find already were. So a reader that
+// gets a timestamp from tether's history is a reader whose next GET is served from
+// tether's history. If these could disagree, the failure would be invisible in the
+// worst way: a probe that watches a file nobody is reading reports "nothing
+// changed" forever, and the feature degrades to exactly the bug it fixes.
+//
+// # The one residual, named
+//
+// CCStore.Messages can return ok=false for a file findStat accepted (unreadable,
+// or nothing in the tail window converts to a turn), in which case Messages answers
+// SourceNone while this answers with cc's mtime. That direction is harmless: it
+// makes the reader refetch an empty transcript it already has. The opposite
+// direction — a timestamp from a store that is not serving — is the one that would
+// freeze the pane, and it cannot happen, because selection here is only ever the
+// has-it predicate.
+//
+// Cost is one stat (see HistoryStore.ModTime / CCStore.ModTime), which is what
+// makes this affordable to poll and what a HEAD on the transcript route spends.
+// The thing it avoids spending is not small: Messages prefers
+// HistoryStore.LoadHistory, an os.ReadFile of the WHOLE history.jsonl with no tail
+// and no cap, and falls through to a cc read bounded at ccMessagesTailBytes (1 MiB)
+// widening once to ccMessagesWideTailBytes (16 MiB). The cc transcript of the very
+// session that prompted tether#104 was 103,388,175 bytes.
+func (x *SessionIndex) TranscriptUpdatedAt(sid string) int64 {
+	if x == nil {
+		return 0
+	}
+	if x.History != nil {
+		if ts, ok := x.History.ModTime(sid); ok {
+			return ts
+		}
+	}
+	if x.CC != nil {
+		if ts, ok := x.CC.ModTime(sid); ok {
+			return ts
+		}
+	}
+	return 0
+}
+
 // title derives a human-readable description of a session from the session
 // itself: what the user opened with, else where the session runs.
 //

@@ -357,6 +357,38 @@ func (h *HistoryStore) LoadHistory(sid string) []HistoryMessage {
 // "is it non-empty" would be wasted work. A zero-length file counts as no
 // history, which is also what LoadHistory would conclude.
 func (h *HistoryStore) HasHistory(sid string) bool {
+	_, ok := h.transcriptStat(sid)
+	return ok
+}
+
+// ModTime reports when this store's transcript for sid was last written, in Unix
+// milliseconds, and whether this store has one at all (tether#106).
+//
+// The bool is not redundant with a zero timestamp, and keeping them separate is
+// what stops this from disagreeing with HasHistory: a non-empty transcript whose
+// mtime is the epoch would otherwise read as "no transcript", and
+// SessionIndex.TranscriptUpdatedAt would then answer from the OTHER store while
+// SessionIndex.Messages served this one. The pathological mtime is not the point;
+// the point is that "does this store have it" is one question and "when did it
+// last change" is another, and only the first one selects a store.
+//
+// Same stat, same predicate, one syscall — see transcriptStat.
+func (h *HistoryStore) ModTime(sid string) (int64, bool) {
+	fi, ok := h.transcriptStat(sid)
+	if !ok {
+		return 0, false
+	}
+	return fi.ModTime().UnixMilli(), true
+}
+
+// transcriptStat is THE predicate "this store has a transcript for sid", and the
+// two exported readers above are its two questions. Written once rather than
+// twice because the alternative is two copies of a rule — validate the sid, stat,
+// require a non-empty file — that must stay identical for SessionIndex.Messages
+// and SessionIndex.TranscriptUpdatedAt to keep choosing the same store, and the
+// symptom of them drifting is a transcript served from one store with a
+// change-signal read off the other.
+func (h *HistoryStore) transcriptStat(sid string) (os.FileInfo, bool) {
 	// ValidSessionID, not just a non-empty check: this is the one HistoryStore
 	// entry point reached with a RAW client-supplied sid — Attachment.resolve asks
 	// it about a.reqSID straight off `/wt/chat?sid=` — so without the guard a
@@ -364,16 +396,19 @@ func (h *HistoryStore) HasHistory(sid string) bool {
 	// history.jsonl outside the sessions directory. A rejected sid simply has no
 	// history, which suppresses the notice and nothing else.
 	if !ValidSessionID(sid) {
-		return false
+		return nil, false
 	}
 	fi, err := os.Stat(h.historyPath(sid))
 	if err != nil {
 		if !os.IsNotExist(err) {
 			slog.Warn("history: stat failed", "sid", sid, "err", err)
 		}
-		return false
+		return nil, false
 	}
-	return fi.Size() > 0
+	if fi.Size() == 0 {
+		return nil, false
+	}
+	return fi, true
 }
 
 // (ListSessions used to live here, returning []string and backing

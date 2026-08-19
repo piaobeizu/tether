@@ -1,4 +1,62 @@
 import { useStore, historyEntryToMessage, type HistoryEntry } from './store'
+import { noteTranscriptVersion, readTranscriptVersion, transcriptPath } from './transcriptWatch'
+
+/**
+ * The window event a click on the ALREADY-OPEN session raises (tether#106).
+ *
+ * Deliberately an offer, not an instruction. `openSession` cannot know whether that
+ * click has anything to do: whether a live WebTransport exists is ChatPane's fact — it
+ * owns the connection — and ChatPane ignores this event in every state where there is
+ * one. Same channel and same argument as `tether:retry-connection`, which this module
+ * already uses rather than reaching into the pane.
+ */
+export const REFRESH_TRANSCRIPT_EVENT = 'tether:refresh-transcript'
+
+/**
+ * refreshTranscript re-reads one session's transcript into the store.
+ *
+ * The loader `openSession` has always had, extracted so the two callers cannot drift
+ * (which is the whole argument openSession's own doc makes about the switch). Its
+ * guards are stated where they are decided:
+ *
+ *   - `!r.ok` THROWS rather than falling back to `[]`, so "this session has no messages"
+ *     (200 []) stays distinguishable from "we could not ask" (5xx / offline). Collapsing
+ *     the two forces a `msgs.length > 0` guard downstream, which silently keeps the
+ *     PREVIOUS session's transcript — and `loadHistory` is also what clears
+ *     pendingPermissions and the turn cursor, so that residue is interactive, not merely
+ *     stale text.
+ *   - The sid is re-checked after the await, because two loads can be in flight and a
+ *     slower earlier one must not land on top of a later one.
+ *   - There is NO `!streaming` guard, and its absence is deliberate rather than
+ *     overlooked. ChatPane's `[sessionId]` effect has one (tether#42) so that
+ *     session_ready's refetch cannot wipe an in-flight turn's optimistic bubble. Here
+ *     both callers are states in which a turn cannot be in flight — a deliberate switch
+ *     means the user has left that turn, and a session a background agent holds has no
+ *     stream to have a turn on — so the check would never be false. An inert guard is
+ *     worse than none: it reads like protection at the exact place a future caller would
+ *     look for it.
+ *
+ * A failure leaves what is on screen readable rather than blanking it.
+ */
+export function refreshTranscript(sid: string): Promise<void> {
+  if (!sid) return Promise.resolve()
+  return fetch(transcriptPath(sid))
+    .then(r => {
+      if (!r.ok) throw new Error(`messages: HTTP ${r.status}`)
+      // Read BEFORE the body: this is the version the messages below came from, and
+      // recording it is what lets the next probe compare against something real
+      // instead of establishing its own baseline and losing everything written in
+      // between (see transcriptWatch.noteTranscriptVersion).
+      const version = readTranscriptVersion(r)
+      return r.json().then((msgs: HistoryEntry[]) => ({ version, msgs }))
+    })
+    .then(({ version, msgs }: { version: number; msgs: HistoryEntry[] }) => {
+      if (useStore.getState().sessionId !== sid) return
+      useStore.getState().loadHistory(msgs.map(historyEntryToMessage))
+      noteTranscriptVersion(sid, version)
+    })
+    .catch(() => {})
+}
 
 /**
  * openSession — THE operation for "the user deliberately opened a different
@@ -36,13 +94,30 @@ import { useStore, historyEntryToMessage, type HistoryEntry } from './store'
 export function openSession(sid: string): void {
   if (!sid) return
 
-  // Opening the session you are already in is nothing to do — and doing it
-  // anyway is destructive: the reconnect below would tear down a live
+  // Opening the session you are already in is NOT A SWITCH — and performing the
+  // switch anyway is destructive: the reconnect below would tear down a live
   // WebTransport mid-turn, and the reload would drop the in-flight turn's
   // bubble. The session list renders the current session highlighted, so that
   // click is an easy one to make. A connection that has genuinely dropped is
   // the error banner / WT pill's job; they dispatch the reconnect themselves.
-  if (sid === useStore.getState().sessionId) return
+  //
+  // tether#106 — but "not a switch" is not the same as "nothing", and reading it
+  // as nothing is what left a session a background agent holds frozen at the
+  // moment it was opened. That session has no live stream to protect (tether#101
+  // refuses the attach), so the transcript below it is a still frame and the one
+  // thing the click can still mean is "re-read it". This function does not get
+  // to decide that: whether a live stream exists is ChatPane's fact, so the click
+  // is OFFERED on the same window-event channel the reconnect uses, and ChatPane
+  // ignores it in every state where there is something to protect.
+  //
+  // Everything below this line still does not happen: no clearNotices, no
+  // setSessionId, no reconnect, no unconditional reload. That is the part
+  // SessionRow's misclick depends on, and the part
+  // "is a no-op when that session is already open" pins.
+  if (sid === useStore.getState().sessionId) {
+    window.dispatchEvent(new CustomEvent(REFRESH_TRANSCRIPT_EVENT))
+    return
+  }
 
   // tether#57 — a notice describes the session you are LEAVING, so a deliberate
   // switch retires it. Cleared here, synchronously, NOT in the .then below: a
@@ -57,30 +132,11 @@ export function openSession(sid: string): void {
   // /messages request that fails, still switches.
   useStore.getState().setSessionId(sid)
 
-  void fetch(`/api/v1/sessions/${encodeURIComponent(sid)}/messages`)
-    .then(r => {
-      // Tell "this session has no messages" (200 []) apart from "we could not
-      // ask" (5xx / offline). Collapsing the two — `r.ok ? r.json() : []` —
-      // forces a `msgs.length > 0` guard downstream, which silently keeps the
-      // PREVIOUS session's transcript. And loadHistory is also what clears
-      // pendingPermissions and the turn cursor (store.ts), so that residue is
-      // interactive, not merely stale text: the old session's permission cards
-      // stay clickable, and the new session's first delta accumulates into the
-      // old session's assistant bubble.
-      if (!r.ok) throw new Error(`messages: HTTP ${r.status}`)
-      return r.json()
-    })
-    .then((msgs: HistoryEntry[]) => {
-      // Two switches in quick succession: a slower earlier response must not
-      // land on top of a later one. Also covers the sid moving underneath us
-      // via the resume-fallback (session_ready).
-      if (useStore.getState().sessionId !== sid) return
-      useStore.getState().loadHistory(msgs.map(historyEntryToMessage))
-    })
-    // Could not reach the daemon: leave what is on screen readable rather than
-    // blanking it. The sid has still moved, and ChatPane's own [sessionId]
-    // effect re-requests the same URL (see below), so this self-heals.
-    .catch(() => {})
+  // The load itself lives in refreshTranscript (tether#106) — same request, same
+  // guards, one copy. Could not reach the daemon: it leaves what is on screen
+  // readable rather than blanking it. The sid has still moved, and ChatPane's own
+  // [sessionId] effect re-requests the same URL (see below), so this self-heals.
+  void refreshTranscript(sid)
 
   // NOTE on the second request: setSessionId re-fires ChatPane's [sessionId]
   // effect, which fetches the same URL again. That effect is guarded on

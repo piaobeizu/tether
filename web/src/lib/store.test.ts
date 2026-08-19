@@ -1912,3 +1912,97 @@ describe('mergeTranscript renders a repeat count (tether#80)', () => {
     expect(mergeTranscript(msgs, notices).map((m) => m.text)).toEqual(['once', 'twice (×2)', 'plain'])
   })
 })
+
+// tether#106 — loadHistory keeps the identity of what is already on screen.
+//
+// The reload is still the wholesale server-truth replace it has always been. What
+// changed is that a message identical to the one already in its slot keeps its id,
+// and the reason is not tidiness. `key={m.id}` is what React reconciles the
+// transcript on, `historyEntryToMessage` mints a fresh crypto.randomUUID() for every
+// entry on every load, and both "which blocks are expanded" Sets in ChatPane are
+// keyed by message id. So before this, every reload remounted the entire transcript:
+// expansions collapsed and the scroll container's scrollHeight collapsed mid-commit,
+// clamping scrollTop to the top of the conversation.
+//
+// That was survivable while a reload only happened on a deliberate switch. tether#106
+// reloads a held session's transcript whenever the other agent writes, so without
+// this the reader is bounced to the top every few seconds by the feature that exists
+// to let them follow along. jsdom reports every scroll metric as 0, so the scroll
+// itself is not assertable here — the ids are the mechanism, and they are.
+describe('loadHistory message identity (tether#106)', () => {
+  afterEach(reset)
+
+  const hist = (role: Message['role'], text: string, ts: number): Message =>
+    ({ id: crypto.randomUUID(), role, text, ts })
+
+  it('keeps the ids of an unchanged prefix when a message is appended', () => {
+    const first = [hist('user', 'ask', 1), hist('assistant', 'answer', 2)]
+    useStore.getState().loadHistory(first)
+    const before = useStore.getState().messages.map(m => m.id)
+
+    // The same two turns plus a new one — what an append actually looks like.
+    useStore.getState().loadHistory([
+      hist('user', 'ask', 1), hist('assistant', 'answer', 2), hist('user', 'and again', 3),
+    ])
+    const after = useStore.getState().messages.map(m => m.id)
+
+    expect(after.slice(0, 2)).toEqual(before)
+    expect(after).toHaveLength(3)
+    // The appended one is genuinely new, not a recycled id.
+    expect(after[2]).not.toBe(before[0])
+    expect(after[2]).not.toBe(before[1])
+  })
+
+  it('keeps the ids when the reload is byte-identical', () => {
+    const same = () => [hist('user', 'ask', 1), hist('assistant', 'answer', 2)]
+    useStore.getState().loadHistory(same())
+    const before = useStore.getState().messages.map(m => m.id)
+    useStore.getState().loadHistory(same())
+    expect(useStore.getState().messages.map(m => m.id)).toEqual(before)
+  })
+
+  it('takes the NEW content, not just the old id — this is not a cache', () => {
+    // The last message of a turn in progress grows between reloads. It must keep its
+    // slot and show the longer text; keeping the id must never mean keeping the body.
+    useStore.getState().loadHistory([hist('user', 'ask', 1), hist('assistant', 'partial', 2)])
+    const before = useStore.getState().messages.map(m => m.id)
+    useStore.getState().loadHistory([hist('user', 'ask', 1), hist('assistant', 'partial and then some', 2)])
+
+    const after = useStore.getState().messages
+    expect(after.map(m => m.text)).toEqual(['ask', 'partial and then some'])
+    expect(after[0].id).toBe(before[0])
+    // Its text changed, so it is NOT the same message and does not keep its id —
+    // stopping at the first mismatch is what makes the alignment honest rather than
+    // a guess.
+    expect(after[1].id).not.toBe(before[1])
+  })
+
+  it('gives every message a fresh id once the prefix diverges', () => {
+    // A session switch, and cc's 200-message tail sliding, both look like this. The
+    // old ids belong to a different conversation and must not survive it.
+    useStore.getState().loadHistory([hist('user', 'session A', 1), hist('assistant', 'A reply', 2)])
+    const before = useStore.getState().messages.map(m => m.id)
+    useStore.getState().loadHistory([hist('user', 'session B', 1), hist('assistant', 'B reply', 2)])
+    for (const id of useStore.getState().messages.map(m => m.id)) {
+      expect(before).not.toContain(id)
+    }
+  })
+
+  it('still resets the turn state and the permission queue', () => {
+    // The identity carry-over must not turn the replace into a merge. loadHistory is
+    // also what drops the prior session's pending permission cards and turn cursor
+    // (tether#40), and an "unchanged prefix" is the case most likely to skip it.
+    useStore.getState().loadHistory([hist('user', 'ask', 1)])
+    useStore.setState({
+      streaming: true, streamingMsgId: 'x', curTurnId: 'x',
+      pendingPermissions: [{ id: 'p1', toolName: 'Bash', input: {} }],
+    })
+    useStore.getState().loadHistory([hist('user', 'ask', 1)])
+
+    const s = useStore.getState()
+    expect(s.streaming).toBe(false)
+    expect(s.streamingMsgId).toBeNull()
+    expect(s.curTurnId).toBeNull()
+    expect(s.pendingPermissions).toEqual([])
+  })
+})

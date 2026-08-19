@@ -8,6 +8,8 @@ import { Icon } from '../../lib/icons'
 import type { FencedBlock, ProviderListResponse } from '../../lib/wire.gen'
 import { ClientFrameAction, ErrCodeSessionHeldByBackgroundAgent } from '../../lib/wire.gen'
 import { authedFetch } from '../../lib/auth'
+import { refreshTranscript, REFRESH_TRANSCRIPT_EVENT } from '../../lib/session'
+import { watchTranscript } from '../../lib/transcriptWatch'
 import { DagBlock } from '../../fenced-blocks/DagBlock'
 import { FormBlock } from '../../fenced-blocks/FormBlock'
 import { CandidatesBlock } from '../../fenced-blocks/CandidatesBlock'
@@ -288,12 +290,20 @@ export const HELD_SESSION_PLACEHOLDER = 'read-only — a background agent is usi
 // bound that is true under either store and refines into that one rather than
 // contradicting it.
 //
-// "as it stood when this pane fetched it" is the other half: the transcript is one
-// HTTP GET at open time, and with the connection refused nothing updates it. A
-// reader who assumed it followed the other agent's work would be watching a still
-// frame for news.
+// The second half used to read "as it stood when this pane fetched it", and it was
+// true: the transcript was one HTTP GET at open time and, with the connection
+// refused, nothing updated it. tether#106 made that false — the pane now probes the
+// transcript's mtime every few seconds (transcriptWatch.ts) and re-reads it when the
+// other agent writes — so the sentence had to change with the behaviour. Leaving it
+// would have been the worse defect of the two: a reader who believes they are looking
+// at a still frame will go and refresh the page to check, which is the exact effort
+// this change removes.
+//
+// "every few seconds", not the number: TRANSCRIPT_POLL_MS is a tuning decision and a
+// sentence naming it becomes false the moment it is tuned. The claim that has to hold
+// is that new messages arrive without the reader doing anything.
 export const HELD_SESSION_READABLE_NOTE =
-  'You can read it: what tether has of this conversation is below, as it stood when this pane fetched it.'
+  'You can read it: what tether has of this conversation is below, and tether re-checks it every few seconds, so new messages appear as that agent writes them.'
 const FATAL_GENERIC_MESSAGE = 'This connection was refused and cannot be retried automatically.'
 
 // tether#47 — @-file mention. parseAtQuery locates the @token the caret is
@@ -703,6 +713,52 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
     return () => window.removeEventListener('tether:retry-connection', onRetry)
   }, [])
 
+  // tether#106 — follow a transcript that has no live stream behind it.
+  //
+  // Gated on `readingHeldSession` and nothing weaker. That flag is #104's conjunction
+  // (the ladder has actually stopped AND the daemon said a background agent holds this
+  // conversation), so it is the one state in which two things are simultaneously true:
+  // there is provably no stream that could deliver the new messages, and there is
+  // provably no in-flight turn whose optimistic bubble a reload could wipe. Every other
+  // state — connected, reconnecting, or failed for one of the other four terminal codes
+  // — keeps today's behaviour exactly, which is what makes this change unable to
+  // reintroduce the tether#42 / tether#57 class of regression.
+  //
+  // The watcher owns the interval, the visibility pause and the "did it actually
+  // change" comparison; all that is left here is what to do when it did.
+  useEffect(() => {
+    if (!readingHeldSession || !sessionId) return
+    return watchTranscript(sessionId, () => { void refreshTranscript(sessionId) })
+  }, [readingHeldSession, sessionId])
+
+  // tether#106 — the same gate, for the click on the already-open row.
+  //
+  // lib/session.ts's openSession raises this rather than reloading itself, because
+  // "is there a live stream" is a fact this pane holds and that module does not (see
+  // REFRESH_TRANSCRIPT_EVENT). Ignoring the event outside this state is therefore not
+  // a missing feature — it is the tether#61 guard still doing its job: clicking the
+  // highlighted row while connected must remain, as it always was, nothing at all.
+  //
+  // Unconditional where it does fire: this is a deliberate act by the reader, and it is
+  // the path that still works when the automatic one could not complete (a probe that
+  // saw a change and a reload that then failed leaves the version already advanced —
+  // see transcriptWatch's probe).
+  useEffect(() => {
+    if (!readingHeldSession || !sessionId) return
+    const onRefresh = () => { void refreshTranscript(sessionId) }
+    window.addEventListener(REFRESH_TRANSCRIPT_EVENT, onRefresh)
+    return () => window.removeEventListener(REFRESH_TRANSCRIPT_EVENT, onRefresh)
+  }, [readingHeldSession, sessionId])
+
+  // tether#104 named this button "Check again" because the question it asks is "has
+  // that agent's process exited yet". tether#106 makes it ask the other question the
+  // reader has at the same moment — "and is there anything new to read" — because the
+  // two are one gesture, and the connection attempt alone answers only the first.
+  const checkAgain = () => {
+    if (sessionId) void refreshTranscript(sessionId)
+    manualRetry()
+  }
+
   // tether#52 — first-connect ordering (see shouldDeferFirstConnect above).
   // Only the sid-less path defers, and only until `workspacesLoaded` flips
   // true or a 2s fallback elapses — whichever comes first — so a hung/failed
@@ -1041,7 +1097,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
                 thing to attempt again; here the attempt is a question — has that
                 agent's process exited yet — and the answer is not tether's to
                 predict. */}
-            <button onClick={manualRetry} className="btn-ghost-sm">{readingHeldSession ? 'Check again' : 'Retry'}</button>
+            <button onClick={readingHeldSession ? checkAgain : manualRetry} className="btn-ghost-sm">{readingHeldSession ? 'Check again' : 'Retry'}</button>
           </div>
         )}
 

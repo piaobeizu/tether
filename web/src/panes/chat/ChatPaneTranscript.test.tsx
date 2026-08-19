@@ -334,3 +334,215 @@ describe('a session held by a background agent reads as a state, not a failure (
     expect(screen.getByText('hello')).toBeTruthy()
   })
 })
+
+// ────────────────────────────────────────────────────────────────────────────
+// tether#106 — the transcript follows the other agent, and the click on the
+// highlighted row still does nothing when there is something to protect.
+//
+// Both halves are wiring, and wiring is this repo's most reliable blind spot: the
+// watcher is unit-tested in transcriptWatch.test.ts and the click is unit-tested in
+// session.test.ts, and BOTH can be perfect while the pane subscribes to neither.
+// Nothing else in the suite would notice — a transcript frozen at the moment it was
+// fetched renders exactly like one that is up to date.
+//
+// The gate under test is `readingHeldSession`, i.e. the conjunction
+// `connState === 'failed' && fatal.code === session_held_by_background_agent`. So the
+// cases below are chosen to break it in each direction independently: connected (the
+// first conjunct false, and the state the tether#61 guard exists for), another
+// terminal code (the second false), and held (both true).
+describe('a held transcript keeps up, and a live one is still left alone (tether#106)', () => {
+  const held = {
+    code: ErrCodeSessionHeldByBackgroundAgent,
+    message: 'session e4d1f668 is being used by a live background agent (kind bg, job e4d1f668)',
+  }
+  const owned = { code: ErrCodeSessionOwned, message: 'session is owned by client abc' }
+  const SID = 'sid-held-0001'
+  const MESSAGES_URL = `/api/v1/sessions/${SID}/messages`
+
+  /** Every request the pane issued, so a test can count the ones it cares about. */
+  let seen: { method: string; url: string }[] = []
+  const transcriptGets = () => seen.filter(r => r.url === MESSAGES_URL && r.method === 'GET').length
+  const transcriptProbes = () => seen.filter(r => r.url === MESSAGES_URL && r.method === 'HEAD').length
+
+  /**
+   * A daemon that answers everything the pane asks on its way to a live connection,
+   * and reports a transcript version the test can move.
+   */
+  function stubDaemon(version: () => number) {
+    return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url)
+      seen.push({ method: init?.method ?? 'GET', url })
+      if (url.includes('/providers')) return new Response(JSON.stringify({ providers: ['claude-code'] }), { status: 200 })
+      if (url.includes('/wt-ticket')) return new Response(JSON.stringify({ ticket: 'tkt' }), { status: 200 })
+      if (url.includes('/cert-hash')) return new Response('', { status: 404 })
+      if (url === MESSAGES_URL) {
+        const headers = new Headers({ 'Content-Type': 'application/json' })
+        headers.set('X-Tether-Transcript-Updated-At', String(version()))
+        return new Response(init?.method === 'HEAD' ? null : '[]', { status: 200, headers })
+      }
+      return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+  }
+
+  /**
+   * The minimum WebTransport that lets doConnect reach connState 'connected'.
+   *
+   * jsdom has none, which is why every other test in this file exercises the FAILED
+   * path — and why "clicking the current row while connected does nothing" could not
+   * be asserted before. `closed` never settles, so onClose never fires and the pane
+   * stays connected for the length of the test; the incoming stream never yields, so
+   * no envelope arrives to move the store underneath the assertions.
+   */
+  class FakeWebTransport {
+    ready = Promise.resolve()
+    closed = new Promise<never>(() => {})
+    incomingUnidirectionalStreams = new ReadableStream({ start() { /* silent */ } })
+    createBidirectionalStream() {
+      return Promise.resolve({ writable: new WritableStream(), readable: new ReadableStream({ start() { } }) })
+    }
+    close() { /* no-op */ }
+  }
+
+  /** Let every promise chain the connect path strings together settle. */
+  const settle = async () => {
+    for (let i = 0; i < 5; i++) {
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)) })
+    }
+  }
+
+  beforeEach(() => {
+    localStorage.clear()
+    seen = []
+    globalThis.fetch = stubDaemon(() => 1000) as unknown as typeof fetch
+    localStorage.setItem('tether_last_sid', SID)
+    useStore.setState({
+      messages: [], notices: [], pendingPermissions: [], fatal: null,
+      streaming: false, streamingMsgId: null, curTurnId: null,
+      sessionId: SID, workspacesLoaded: true, activeWorkspace: null,
+    })
+  })
+
+  afterEach(() => {
+    cleanup()
+    globalThis.fetch = originalFetch
+    delete (globalThis as { WebTransport?: unknown }).WebTransport
+    useStore.setState({ messages: [], notices: [], sessionId: null, fatal: null, streaming: false, workspacesLoaded: false })
+    localStorage.clear()
+  })
+
+  async function renderRefusedWithSid(fatal: { code: string; message: string }) {
+    const r = render(<ChatPane />)
+    useStore.setState({ fatal })
+    await settle()
+    return r
+  }
+
+  it('probes the transcript and reloads it while a background agent holds the session', async () => {
+    const { container } = await renderRefusedWithSid(held)
+    // The harness's precondition: the refusal really landed. Without this the
+    // assertions below would pass just as well on a pane that never reached 'failed'.
+    expect(container.querySelectorAll('.failed-card')).toHaveLength(1)
+
+    // Exact counts, not "at least one". A watcher wired twice, or one that reloads on
+    // every tick instead of on a change, satisfies "at least one" and is a defect —
+    // tether#102 measured a property assertion in this very suite keeping a real
+    // mutant alive. Two GETs: the pane's own [sessionId] load at mount, then the
+    // reload the probe decided on because the version it saw is not one this pane had
+    // recorded. Deleting the effect that wires the watcher leaves every unit test in
+    // transcriptWatch.test.ts green and fails exactly here.
+    expect(transcriptProbes()).toBe(1)
+    expect(transcriptGets()).toBe(2)
+    const probeAt = seen.findIndex(r => r.url === MESSAGES_URL && r.method === 'HEAD')
+    const reloadAfterProbe = seen.slice(probeAt).some(r => r.url === MESSAGES_URL && r.method === 'GET')
+    expect(reloadAfterProbe).toBe(true)
+  })
+
+  it('reloads on a click on the row that is already open', async () => {
+    await renderRefusedWithSid(held)
+    const before = transcriptGets()
+
+    // What SessionRow's click reaches this pane as (lib/session.ts openSession).
+    await act(async () => { window.dispatchEvent(new CustomEvent('tether:refresh-transcript')) })
+    await settle()
+
+    expect(transcriptGets()).toBe(before + 1)
+  })
+
+  it('asks both questions when "Check again" is pressed', async () => {
+    // tether#104 named the button for the connection question. The reader pressing it
+    // wants the other one too, and the connection attempt alone answers only the first.
+    const { container } = await renderRefusedWithSid(held)
+    const before = transcriptGets()
+
+    const button = container.querySelector('.failed-card .btn-ghost-sm') as HTMLButtonElement
+    expect(button.textContent).toBe('Check again')
+    await act(async () => { button.click() })
+    await settle()
+
+    expect(transcriptGets()).toBe(before + 1)
+  })
+
+  it('does NOT follow or reload for another terminal code', async () => {
+    // The gate is one code's. A watcher that ran for every refusal would poll — and
+    // reload — sessions whose transcripts nothing is writing.
+    await renderRefusedWithSid(owned)
+    const before = transcriptGets()
+    expect(transcriptProbes()).toBe(0)
+
+    await act(async () => { window.dispatchEvent(new CustomEvent('tether:refresh-transcript')) })
+    await settle()
+    expect(transcriptGets()).toBe(before)
+  })
+
+  it('does NOTHING when the row that is already open is CONNECTED', async () => {
+    // THE regression guard for this change (tether#61's rule, narrowed rather than
+    // removed). The session list highlights the current row, so this click is easy to
+    // make by accident, and reloading here would replace `messages` wholesale on top
+    // of a turn the daemon is still streaming — dropping the optimistic bubble
+    // tether#42 exists to keep, and doing it from the one path tether#57 showed can
+    // silently eat state.
+    ;(globalThis as { WebTransport?: unknown }).WebTransport = FakeWebTransport
+    render(<ChatPane />)
+    await settle()
+
+    // The harness's precondition, asserted rather than assumed: the pane really is
+    // connected. `disabled={connState !== 'connected'}` is the only observable that
+    // says so, and without this check a pane stuck in 'connecting' would satisfy
+    // every assertion below while testing nothing.
+    const box = document.querySelector('.composer-input') as HTMLTextAreaElement
+    expect(box.disabled).toBe(false)
+
+    useStore.setState({
+      streaming: true,
+      messages: [{ id: 'live-bubble', role: 'assistant', text: 'mid-turn', ts: 1 }],
+    })
+    const before = transcriptGets()
+
+    await act(async () => { window.dispatchEvent(new CustomEvent('tether:refresh-transcript')) })
+    await settle()
+
+    // Exactly the one load the pane's own [sessionId] effect made at mount, and not
+    // one byte more.
+    expect(before).toBe(1)
+    expect(transcriptGets()).toBe(1)
+    // No probe either: a session with a live stream has nothing to poll for.
+    expect(transcriptProbes()).toBe(0)
+    // And the in-flight turn is untouched — the actual harm, stated as itself.
+    expect(useStore.getState().messages.map(m => m.id)).toEqual(['live-bubble'])
+    expect(useStore.getState().streaming).toBe(true)
+  })
+
+  it('no longer tells the reader the transcript is a still frame', async () => {
+    // The copy is part of the behaviour here. tether#104's line was true when the
+    // transcript was one GET at open time; leaving it after this change would be the
+    // worse of the two defects, because a reader who believes they are looking at a
+    // frozen snapshot goes and reloads the page — the exact effort this removes.
+    useStore.setState({ messages: [{ id: 'u1', role: 'user', text: 'hello', ts: 1000 }] })
+    const { container } = await renderRefusedWithSid(held)
+
+    const note = container.querySelector('.failed-card .state-card-read')
+    expect(note?.textContent).toBe(HELD_SESSION_READABLE_NOTE)
+    expect(HELD_SESSION_READABLE_NOTE).not.toContain('as it stood when this pane fetched it')
+    expect(HELD_SESSION_READABLE_NOTE).toContain('what tether has of this conversation')
+  })
+})

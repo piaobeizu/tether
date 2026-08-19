@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/piaobeizu/tether/internal/session"
 )
@@ -89,6 +91,40 @@ func sessionAPIHandlers(idx *session.SessionIndex, wis *session.WIBindingStore) 
 		case "messages":
 			if r.Method != http.MethodGet && r.Method != http.MethodHead {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			// tether#106 — the change signal, on both methods.
+			//
+			// On the GET it tells the reader WHICH version of the transcript it is
+			// now holding, so the first probe afterwards compares against a real
+			// baseline instead of having to establish one (and miss whatever landed
+			// in between). On the HEAD it is the whole answer.
+			//
+			// no-store because the point of the probe is that the answer changes;
+			// a revalidating cache in front of it would report a version that is
+			// as stale as the transcript the reader is complaining about. Same
+			// reasoning handleSessionActivity states for the same header.
+			w.Header().Set("Cache-Control", "no-store")
+			if ts := idx.TranscriptUpdatedAt(sid); ts > 0 {
+				w.Header().Set(session.TranscriptUpdatedAtHeader, strconv.FormatInt(ts, 10))
+				// The standard field as well, in the standard unit. It is one
+				// SECOND coarse, which is why it is not the one the SPA reads —
+				// see session.TranscriptUpdatedAtHeader.
+				w.Header().Set("Last-Modified", time.UnixMilli(ts).UTC().Format(http.TimeFormat))
+			}
+			if r.Method == http.MethodHead {
+				// Returning HERE is the entire cost argument. Falling through
+				// would call idx.Messages — the unbounded os.ReadFile of
+				// history.jsonl — and net/http would then throw the body away,
+				// i.e. the probe would cost exactly what the fetch it exists to
+				// avoid costs, and nothing would show it.
+				//
+				// It also has to return before the Info line below: a browser
+				// reading a held session probes this route every three seconds,
+				// and logging that would be 1,200 lines an hour whose content is
+				// "still nothing".
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
 				return
 			}
 			// One call, because "which store answers for this sid" is one rule and

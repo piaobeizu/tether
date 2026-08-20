@@ -268,6 +268,14 @@ func TestFenceParser_BlockIDResetsPerTurn(t *testing.T) {
 // TestFenceParser_OversizeBodyFlushedAsPassthrough — a fence body that
 // exceeds the cap is treated as not-a-fence: the opening marker + buffered
 // body are surfaced as text, and no block is emitted.
+//
+// The passthrough assertion here is deliberately EXACT (whole-input
+// round-trip, not a substring probe). This fixture crosses the cap
+// mid-line — with 1025-byte lines the cap is reached 962 bytes into line
+// 64, i.e. on bailFenceAsText's partial-tail path — so a substring check
+// like strings.Contains(pt, "xxxx") passed happily while those 962 bytes
+// were being emitted twice (71,759 bytes of input came out as 72,721).
+// Byte-exactness is the only assertion that sees that class of bug.
 func TestFenceParser_OversizeBodyFlushedAsPassthrough(t *testing.T) {
 	p := NewFenceParser()
 
@@ -280,18 +288,18 @@ func TestFenceParser_OversizeBodyFlushedAsPassthrough(t *testing.T) {
 		sb.WriteString(line)
 	}
 	// No closing "```" — the oversize bail-out must trigger before any close.
+	input := sb.String()
 
-	segs := p.Feed(sb.String())
+	segs := p.Feed(input)
 
 	if len(blocksOf(segs)) != 0 {
 		t.Errorf("blocks = %v, want none (oversize, not a fence)", blocksOf(segs))
 	}
-	pt := texts(segs)
-	if !strings.HasPrefix(pt, "```dag:s\n") {
-		t.Errorf("text missing opening marker line: %q", truncStr(pt, 80))
-	}
-	if !strings.Contains(pt, "xxxx") {
-		t.Errorf("text missing buffered body content")
+	pt := texts(segs) + texts(p.Flush())
+	if pt != input {
+		t.Errorf("passthrough = %d bytes, want exactly the %d input bytes "+
+			"(x-count %d, want %d)",
+			len(pt), len(input), strings.Count(pt, "x"), strings.Count(input, "x"))
 	}
 
 	// Parser must have abandoned fence-tracking: a later, well-formed block
@@ -303,6 +311,103 @@ func TestFenceParser_OversizeBodyFlushedAsPassthrough(t *testing.T) {
 	blocks2 := blocksOf(segs2)
 	if len(blocks2) != 1 {
 		t.Errorf("blocks after recovery = %d, want 1 (parser recovered)", len(blocks2))
+	}
+}
+
+// TestFenceParser_OversizeBailEmitsTailExactlyOnce — the partial-tail bail
+// path (stepInFence's pre-'\n' cap check) must emit the held tail line once,
+// not twice. bailFenceAsText writes pending into the output, and
+// resetFenceState does NOT clear pending, so without an explicit clear the
+// next stepOutsideFence/Flush re-emits the very same bytes. Segments fan out
+// to the chat channel AND history.jsonl, so a duplicate here is both shown
+// to the user and persisted.
+//
+// Measured before the fix: 65,549 expected bytes came out as 131,086.
+func TestFenceParser_OversizeBailEmitsTailExactlyOnce(t *testing.T) {
+	p := NewFenceParser()
+
+	// A body that is one enormous line with no '\n' at all: the whole
+	// overrun sits in pending, which makes the duplicate maximal and the
+	// byte count unambiguous.
+	body := strings.Repeat("x", maxHoldBytes+4)
+	p.Feed("```dag:s\n")
+	got := texts(p.Feed(body))
+	got += texts(p.Flush())
+
+	want := "```dag:s\n" + body
+	if got != want {
+		t.Errorf("passthrough = %d bytes, want %d (x-count %d, want %d) — "+
+			"a doubled length means the buffered tail was emitted twice",
+			len(got), len(want), strings.Count(got, "x"), strings.Count(want, "x"))
+	}
+}
+
+// TestFenceParser_OversizeMidLineBailDoesNotReopenFence — after a
+// partial-tail bail the emitted text stops MID physical line, so the
+// remainder of that line must stream through as ordinary text. A fence-OPEN
+// marker only counts at the start of a physical line (that is exactly what
+// lineDisproved enforces on the ordinary path), so "```form:t" arriving
+// straight after the bailed-out bytes is not a marker.
+//
+// This is the assertion that pins the lineDisproved half of the fix:
+// clearing pending alone makes this regress from 0 blocks to 1, because the
+// stale pending used to disprove the line by accident.
+func TestFenceParser_OversizeMidLineBailDoesNotReopenFence(t *testing.T) {
+	p := NewFenceParser()
+
+	// maxHoldBytes+1 bytes with no '\n' trips the pre-'\n' cap check, then
+	// the rest of the SAME physical line looks exactly like a fence open.
+	rest := strings.Repeat("x", maxHoldBytes+1) + "```form:t\nBODY\n```\n"
+	p.Feed("```dag:s\n")
+	segs := append(p.Feed(rest), p.Flush()...)
+
+	if blocks := blocksOf(segs); len(blocks) != 0 {
+		t.Errorf("blocks = %v, want none: \"```form:t\" sits mid-physical-line "+
+			"after the bail, so it is not a fence-open marker", blocks)
+	}
+	want := "```dag:s\n" + rest
+	if got := texts(segs); got != want {
+		t.Errorf("passthrough = %d bytes, want %d (verbatim round-trip)",
+			len(got), len(want))
+	}
+}
+
+// TestFenceParser_OversizeLineBoundaryBailKeepsMarkerDetection — the
+// complementary case, and the reason bailFenceAsText sets lineDisproved
+// conditionally rather than unconditionally.
+//
+// stepInFence's post-'\n' cap check bails with pending already empty and
+// fenceBody ending in '\n', so the emitted text stops exactly ON a line
+// boundary and the next byte does begin a fresh physical line. A
+// well-formed block there must still be recognized. (Setting lineDisproved
+// unconditionally swallows it: 1 block becomes 0 and the marker text leaks
+// into passthrough instead.)
+//
+// Reaching this branch needs the cap to land on a line boundary exactly:
+// the pre-'\n' check fires whenever fenceBody+line exceeds the cap, so the
+// post-'\n' check is only reachable when fenceBody+line == maxHoldBytes.
+func TestFenceParser_OversizeLineBoundaryBailKeepsMarkerDetection(t *testing.T) {
+	p := NewFenceParser()
+
+	oversizeLine := strings.Repeat("y", maxHoldBytes) + "\n"
+	segs := append(
+		p.Feed("```dag:s\n"+oversizeLine+"```form:t\nBODY\n```\n"),
+		p.Flush()...,
+	)
+
+	blocks := blocksOf(segs)
+	if len(blocks) != 1 {
+		t.Fatalf("blocks = %d, want 1: the marker after a line-boundary bail "+
+			"starts a fresh physical line and must still be parsed", len(blocks))
+	}
+	if blocks[0].Skill != "t" || blocks[0].Content != "BODY" {
+		t.Errorf("block = {skill:%q content:%q}, want {skill:\"t\" content:\"BODY\"}",
+			blocks[0].Skill, blocks[0].Content)
+	}
+	want := "```dag:s\n" + oversizeLine
+	if got := texts(segs); got != want {
+		t.Errorf("passthrough = %d bytes, want %d (bailed fence only; the "+
+			"trailing block must not leak into text)", len(got), len(want))
 	}
 }
 

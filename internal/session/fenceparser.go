@@ -288,13 +288,32 @@ func (p *FenceParser) stepInFence(text string, textBuf *[]byte) (consumed int, b
 // cap in maxHoldBytes is exceeded with no closing marker found — the
 // contract's "daemon-side buffering must be bounded" requirement takes
 // priority over suppressing an unterminated fence's raw text.
+//
+// Both of the state updates below are load-bearing, and both are about the
+// tail line held in pending, which this function EMITS:
+//
+//   - pending must be cleared. resetFenceState does not touch it, so
+//     leaving it set makes the next stepOutsideFence (or Flush) emit those
+//     same bytes a SECOND time — and segments fan out to chat *and*
+//     history.jsonl, so the duplicate is both shown and persisted.
+//   - lineDisproved must be set IFF that tail was non-empty, i.e. iff the
+//     text just emitted stopped mid-physical-line. A fence-OPEN marker is
+//     only a marker at the start of a physical line, so the remainder of a
+//     half-emitted line must stream straight through rather than be
+//     re-examined as a marker prefix. Conversely, the post-'\n' cap check
+//     bails with pending empty and fenceBody ending in '\n' — there the
+//     next byte does begin a fresh line, and marker detection must stay
+//     enabled or a well-formed block on the very next line is swallowed.
 func (p *FenceParser) bailFenceAsText(textBuf *[]byte) {
 	slog.Debug("fenceparser: buffered fence content exceeded cap, flushed as passthrough",
 		"skill", p.fenceSkill, "kind", p.fenceKind, "cap_bytes", maxHoldBytes)
 	*textBuf = append(*textBuf, p.openLine...)
 	*textBuf = append(*textBuf, '\n')
 	*textBuf = append(*textBuf, p.fenceBody.String()...)
+	partialTail := len(p.pending) > 0
 	*textBuf = append(*textBuf, p.pending...)
+	p.pending = p.pending[:0]
+	p.lineDisproved = partialTail
 	p.resetFenceState()
 }
 

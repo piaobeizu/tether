@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -165,6 +166,53 @@ func TestHistory_ToolResultCap(t *testing.T) {
 // The payload is 好 (U+597D, three bytes) so that the cap always lands inside a
 // rune: 16,384 mod 3 == 1 and 4,194,304 mod 3 == 1.
 
+// TestTruncateAtRuneBoundaryKeepsAsMuchAsItCan asserts the EXACT number of bytes
+// kept, which the three end-to-end tests below deliberately cannot.
+//
+// It exists because "contains no U+FFFD" is satisfied by a truncation that keeps
+// NOTHING, and so is "is a prefix of the input" (every string has the empty
+// prefix). Review demonstrated that: a helper rewritten to `return ""` passed the
+// entire package, as did `cut := max - 1`, which silently drops one extra rune
+// whenever the cap already lands on a boundary. Absence of corruption and
+// preservation of content are two properties, and only the first one survives
+// being measured by looking for a bad byte.
+//
+// The 2-byte-rune rows are what cover the exact-boundary shape: both caps are
+// even, so a cap-aligned cut is legal there and any off-by-one shows up as a
+// deficit of 2.
+func TestTruncateAtRuneBoundaryKeepsAsMuchAsItCan(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		s    string
+		max  int
+		want int // EXACT bytes expected out
+	}{
+		{"ascii cuts exactly at the cap", strings.Repeat("a", 100), 10, 10},
+		{"two-byte runes on an even cap keep all of it", strings.Repeat("é", 100), 10, 10},
+		{"two-byte runes on an odd cap give back one", strings.Repeat("é", 100), 11, 10},
+		{"three-byte runes: 10 is 1 mod 3", strings.Repeat("好", 100), 10, 9},
+		{"three-byte runes: 11 is 2 mod 3", strings.Repeat("好", 100), 11, 9},
+		{"three-byte runes: 12 is a multiple", strings.Repeat("好", 100), 12, 12},
+		{"four-byte rune backs over three bytes", strings.Repeat("😀", 100), 7, 4},
+		{"max at len is the whole string", "好好", 6, 6},
+		{"max past len is the whole string", "好好", 99, 6},
+		{"one byte of a three-byte rune keeps nothing", "好", 1, 0},
+		{"zero keeps nothing", strings.Repeat("a", 10), 0, 0},
+		{"negative keeps nothing rather than panicking", strings.Repeat("a", 10), -5, 0},
+		{"empty input", "", 0, 0},
+	} {
+		got := truncateAtRuneBoundary(tc.s, tc.max)
+		if len(got) != tc.want {
+			t.Errorf("%s: truncateAtRuneBoundary(%d bytes, max=%d) kept %d bytes, want %d",
+				tc.name, len(tc.s), tc.max, len(got), tc.want)
+		}
+		if !strings.HasPrefix(tc.s, got) {
+			t.Errorf("%s: result is not a prefix of the input", tc.name)
+		}
+		assertNoReplacementChar(t, tc.name, got)
+	}
+}
+
 // TestHistory_ToolResultCapNeverCutsARune — MaxToolResultBytes, RecordToolResult.
 func TestHistory_ToolResultCapNeverCutsARune(t *testing.T) {
 	dir := t.TempDir()
@@ -181,12 +229,19 @@ func TestHistory_ToolResultCapNeverCutsARune(t *testing.T) {
 	}
 	got := msgs[0].Tools[0].Result.Content
 	assertNoReplacementChar(t, "tool result", got)
-	// Still capped, and still a PREFIX of what was recorded — a rune-boundary cut
-	// that dropped or reordered content would satisfy the assertion above.
-	if len(got) > MaxToolResultBytes+64 {
-		t.Errorf("content is %d bytes, cap is %d — not truncated at all?", len(got), MaxToolResultBytes)
+	kept := strings.TrimSuffix(got, ccTruncated)
+	if kept == got {
+		t.Errorf("content does not end in the truncation marker — not truncated at all?")
 	}
-	if !strings.HasPrefix(body, strings.TrimSuffix(got, "\n[... truncated ...]")) {
+	// Bounded on BOTH sides. The upper bound alone is what let the pre-existing
+	// TestHistory_ToolResultCap pass on the broken code; the lower bound is what
+	// stops "keep nothing" from passing this one. The cap is 1 mod 3 and the
+	// payload is three-byte runes, so exactly one byte is given back.
+	if len(kept) != MaxToolResultBytes-1 {
+		t.Errorf("kept %d bytes, want exactly %d (the cap less the one byte a "+
+			"three-byte rune gives back)", len(kept), MaxToolResultBytes-1)
+	}
+	if !strings.HasPrefix(body, kept) {
 		t.Error("the kept part is not a prefix of the recorded result")
 	}
 }
@@ -208,8 +263,19 @@ func TestHistory_AssistantOverflowNeverCutsARune(t *testing.T) {
 		t.Fatalf("len(msgs) = %d, want 1", len(msgs))
 	}
 	assertNoReplacementChar(t, "assistant text", msgs[0].Text)
-	if !strings.Contains(msgs[0].Text, "response truncated") {
-		t.Error("text is missing its truncation marker — the cap did not bind")
+	marker := "\n\n[... response truncated at " + strconv.Itoa(MaxAssistantBufBytes) + " bytes ...]"
+	kept, ok := strings.CutSuffix(msgs[0].Text, marker)
+	if !ok {
+		t.Fatal("text is missing its truncation marker — the cap did not bind")
+	}
+	// Exactly the cap less one byte: 3 MiB of the first chunk, then a second cut
+	// at remaining == 1,048,576, which is 1 mod 3. Asserting the exact figure
+	// rather than an upper bound is what kills a truncation that keeps nothing.
+	if len(kept) != MaxAssistantBufBytes-1 {
+		t.Errorf("kept %d bytes, want exactly %d", len(kept), MaxAssistantBufBytes-1)
+	}
+	if !strings.HasPrefix(chunk+chunk, kept) {
+		t.Error("the kept text is not a prefix of what was streamed")
 	}
 }
 
@@ -228,8 +294,17 @@ func TestHistory_ThinkingOverflowNeverCutsARune(t *testing.T) {
 		t.Fatalf("len(msgs) = %d, want 1", len(msgs))
 	}
 	assertNoReplacementChar(t, "thinking", msgs[0].Thinking)
-	if got := len(msgs[0].Thinking); got > MaxThinkingBufBytes {
-		t.Errorf("thinking is %d bytes, cap is %d — the cap did not bind", got, MaxThinkingBufBytes)
+	// This path appends no marker, so the length IS the whole assertion, and it is
+	// exact for the same reason as the two above. Note the upper bound alone used
+	// to FAIL here rather than merely pass weakly: the broken code persisted
+	// 4,194,306 bytes against a 4,194,304 cap, because the byte it dropped came
+	// back as a three-byte U+FFFD.
+	if got := len(msgs[0].Thinking); got != MaxThinkingBufBytes-1 {
+		t.Errorf("thinking is %d bytes, want exactly %d (cap %d less the one byte a "+
+			"three-byte rune gives back)", got, MaxThinkingBufBytes-1, MaxThinkingBufBytes)
+	}
+	if !strings.HasPrefix(chunk+chunk, msgs[0].Thinking) {
+		t.Error("the kept thinking is not a prefix of what was streamed")
 	}
 }
 

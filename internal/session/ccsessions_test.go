@@ -455,6 +455,13 @@ func TestEncodeProjectDirCountsUTF16CodeUnits(t *testing.T) {
 		// class or plainer, so no amount of sampling there could express it.
 		{"/root/café/x", "-root-caf--x"},
 		{"/root/你好", "-root---"},
+		// The threshold's two neighbours. Without these, `r >= 0xFFFF`,
+		// `r > 0xFFFE` and `r > 0x10000` all pass the rest of this table — the
+		// dash-count cases above are all far from the boundary, so they pin the
+		// RULE and say nothing about where it switches over. Both values were
+		// checked against cc's encoder in node.
+		{"/a/￿", "-a--"},           // last BMP code point: one code unit, one dash
+		{"/a/\U00010000", "-a---"}, // first non-BMP: a surrogate pair, two dashes
 	} {
 		if got := EncodeProjectDir(tc.path); got != tc.want {
 			t.Errorf("EncodeProjectDir(%q) = %q (%d chars), want %q (%d chars)",

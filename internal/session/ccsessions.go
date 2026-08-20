@@ -413,16 +413,33 @@ const ccDirNameMaxLen = 200
 //	function W9(e){let t=z$o(e);if(t.length<=kie)return t;
 //	               return `${t.slice(0,kie)}-${y__(e)}`}
 //	function rS(){return d$.join(Tn(),"projects")}
+//	function xN(e){return nlu()??W9(e)}
+//	function bD(e){return d$.join(rS(),xN(e))}
 //	kie=200
 //
-// (Claude Code 2.1.237, read from the installed binary on 2026-08-20; identical
-// in 2.1.233 down to the minified names, and 2.1.233 is what the paragraph below
-// was originally written against.) The first version mapped only '/' and '.' —
-// which matched all 37 real project directories on this machine, because not one
-// of those paths contains a character outside [a-zA-Z0-9/.-]. A workspace at
-// /root/my_project would have produced `-root-my_project` against cc's
-// `-root-my-project` and listed ZERO sessions: no error, no log line, no failing
-// test. Underscores in a repository path are not exotic.
+// (Claude Code 2.1.237, read from the installed binary on 2026-08-20. The
+// SEMANTICS are the same in 2.1.233 and 2.1.222 — same character class, same
+// 200, same hash suffix — but nothing else is: every minified name differs,
+// 2.1.233 calls it `mAo`/`WE`/`qre` and inlines the pair, and 2.1.222 inlines it
+// again as `r0`. Do not read this quote as a version-stable string to grep for.)
+//
+// `xN` is quoted because W9 is NOT the whole rule in 2.1.237: `nlu` reads
+// CLAUDE_CODE_PROJECT_DIR_NAME when CLAUDE_CONFIG_DIR is set and overrides the
+// encoding entirely. That override is NEW in 2.1.237 (the string appears 6 times
+// there and 0 times in 2.1.233 and 2.1.222), and it is out of scope here: nothing
+// in this repo sets either variable, and CCProjectsDir is derived from a config
+// directory the daemon itself chose. It is written down because the first draft of
+// this comment quoted W9 alone and called it "cc's own encoder" — which is the
+// same shape of miss as the one the next paragraph apologises for, one function
+// further out.
+//
+// The first version of this function mapped only '/' and '.' — which matched all
+// 37 real project directories present on this machine when that was measured (36
+// today), because not one of those paths contains a character outside
+// [a-zA-Z0-9/.-]. A workspace at /root/my_project would have produced
+// `-root-my_project` against cc's `-root-my-project` and listed ZERO sessions: no
+// error, no log line, no failing test. Underscores in a repository path are not
+// exotic.
 //
 // The lesson generalises past this function: a claim about a third party's
 // behaviour has to come from the third party, and agreement with a sample is not
@@ -452,12 +469,35 @@ const ccDirNameMaxLen = 200
 // the encoded name is ASCII — which, since every byte written below is ASCII, is
 // now unconditionally true.
 //
-// Runs of invalid UTF-8 in the input are the one remaining place the two sides
-// could in principle disagree, since Go's range yields one U+FFFD per bad byte
-// and a JS runtime's own lossy decode need not group them the same way. Not
-// reachable through this daemon — a workspace path comes from config the user
-// typed — and stated rather than handled because guessing at another decoder's
+// # What this function still does NOT guarantee: the INPUT
+//
+// Everything above is about the ENCODER. Given the same input string, the only
+// remaining way the two sides can disagree is a run of invalid UTF-8, where Go's
+// range yields one U+FFFD per bad byte and another runtime's lossy decode need
+// not group them the same way. Unreachable here — a workspace path comes from
+// config — and stated rather than handled, because guessing at a third party's
 // error recovery is how the first version of this function went wrong.
+//
+// But the two sides are NOT always given the same input string, and that is a
+// separate matter from the encoding:
+//
+//   - filepath.Clean below has no counterpart in cc's encoder, which is handed a
+//     string cc has already resolved. This is deliberate and it CLOSES a gap
+//     rather than opening one: a workspace registered as `/w/repo/` would
+//     otherwise encode to `-w-repo-` while cc, running with cwd `/w/repo`, wrote
+//     `-w-repo`. TestEncodeProjectDirMatchesRealSamples pins the trailing-slash
+//     case for exactly that reason. Compare the two functions on a raw
+//     un-normalised string and they will differ; that comparison is not the one
+//     that matters.
+//
+//   - cc canonicalises with realpathSync before encoding (`g4m` in 2.1.237);
+//     tether's workspace paths get filepath.Abs and nothing more
+//     (internal/workspace/state.go). So a workspace registered THROUGH A SYMLINK
+//     encodes to a name cc never wrote, and produces the same silent zero rows
+//     this whole comment is about. That is a real gap, it is NOT fixed here, and
+//     it cannot be fixed here — the normalisation belongs where the path is
+//     recorded, not in this function, and tether#120 was scoped to two files.
+//     Raised by review and written down rather than left in a PR thread.
 //
 // # Forward only. There is deliberately no decoder in this package.
 //

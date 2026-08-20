@@ -28,6 +28,10 @@ afterEach(() => {
   cleanup()
   localStorage.clear()
   useStore.getState().select(null)
+  // tether#129 — the theme lives on documentElement, which cleanup() does not
+  // touch. A test that turns it dark would otherwise hand the next one a dark
+  // document it never asked for.
+  document.documentElement.removeAttribute('data-theme')
 })
 
 const activityBtn = (label: string) => screen.getByRole('button', { name: label })
@@ -337,5 +341,142 @@ describe('the left divider holds the MIN_MID floor too (tether#129)', () => {
     const before = rightW(container)
     dragDivider(container, 0, 1000)
     expect(rightW(container)).toBe(before)
+  })
+})
+
+// tether#129 defect 4 — Settings' dark-mode flag was a MOUNT SNAPSHOT.
+//
+// `useState(document.documentElement.getAttribute('data-theme') === 'dark')`
+// samples the theme once, on open, and then nothing re-reads it. The other writer
+// is main.tsx's document-level ⌘⇧D / Ctrl+Shift+D handler, which sets that
+// attribute directly and knows nothing about this panel. So pressing the shortcut
+// with Settings open really did flip the theme while the copy went stale: the
+// appearance row's sub-label read the opposite of the screen, and `toggleTheme`
+// computed `!isDark` from the stale value, so the switch could ask for the theme
+// already in effect and appear to do nothing.
+//
+// Driven through App, because that is where Settings actually mounts, and asserted
+// on what a user can see — the nav row's sub-label and the switch's `on` class —
+// rather than on the hook.
+//
+// The other writer is simulated as a bare setAttribute, which is exactly what
+// main.tsx does, and deliberately not as a tether-specific event: main.tsx is the
+// entry module and calls createRoot at import time, so it cannot be imported
+// here, and the claim under test is that Settings follows the ATTRIBUTE whoever
+// wrote it. A test that went through an event would only prove Settings follows
+// that event.
+//
+// Every mutation is awaited inside `act` because MutationObserver delivers its
+// records on a MICROTASK, not synchronously. That is a real one-microtask delay
+// and not a test artefact — it is also why it is invisible in a browser, where the
+// checkpoint runs before the next paint.
+describe('Settings tracks the theme it does not own (tether#129)', () => {
+  const openSettings = () => {
+    // Settings fetches providers and skills on mount; both are caught, but stub
+    // them so this is not making network calls to a relative URL.
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => [] })))
+    const { container } = render(<App />)
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    return container
+  }
+
+  const navBtn = (c: HTMLElement, name: string) =>
+    [...c.querySelectorAll('.settings-nav-btn')]
+      .find((b) => b.querySelector('.settings-nav-name')?.textContent === name)!
+
+  const navSub = (c: HTMLElement, name: string) =>
+    navBtn(c, name).querySelector('.settings-nav-sub')?.textContent
+
+  /** Open Settings on the appearance sub-page, where the switch lives. */
+  const openAppearance = () => {
+    const c = openSettings()
+    fireEvent.click(navBtn(c, 'appearance'))
+    return c
+  }
+
+  const toggle = (c: HTMLElement) => c.querySelector('.set-toggle')
+
+  /** What main.tsx's ⌘⇧D handler does to the document, and nothing else. */
+  const flipThemeElsewhere = (to: 'dark' | 'light') => act(async () => {
+    if (to === 'dark') document.documentElement.setAttribute('data-theme', 'dark')
+    else document.documentElement.removeAttribute('data-theme')
+  })
+
+  const clickSwitch = (c: HTMLElement) => act(async () => { fireEvent.click(toggle(c)!) })
+
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  it('re-reads the theme when something else changes it', async () => {
+    const c = openSettings()
+    expect(navSub(c, 'appearance')).toBe('light')
+
+    await flipThemeElsewhere('dark')
+    expect(navSub(c, 'appearance')).toBe('dark')
+
+    await flipThemeElsewhere('light')
+    expect(navSub(c, 'appearance')).toBe('light')
+  })
+
+  it('moves the switch with it, not just the label', async () => {
+    const c = openAppearance()
+    expect(toggle(c)!.className).not.toContain('on')
+
+    await flipThemeElsewhere('dark')
+    expect(toggle(c)!.className).toContain('on')
+  })
+
+  // The half a user actually hits. Once the theme had moved underneath it,
+  // Settings' switch computed its next value from the stale flag: the document
+  // had gone dark, the flag still said light, so the switch asked for dark and
+  // landed on the theme it was meant to leave.
+  it('its own switch turns the theme OFF after something else turned it on', async () => {
+    const c = openAppearance()
+
+    await flipThemeElsewhere('dark')
+    await clickSwitch(c)
+
+    expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+    expect(localStorage.getItem('tether_theme')).toBe('light')
+    expect(navSub(c, 'appearance')).toBe('light')
+  })
+
+  // Settings still WRITES the theme; only the reading changed. Without this a fix
+  // that made the flag read-only would satisfy everything above.
+  it('still writes the theme itself when nothing else has touched it', async () => {
+    const c = openAppearance()
+
+    await clickSwitch(c)
+    expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+    expect(localStorage.getItem('tether_theme')).toBe('dark')
+    expect(navSub(c, 'appearance')).toBe('dark')
+    expect(toggle(c)!.className).toContain('on')
+
+    await clickSwitch(c)
+    expect(document.documentElement.getAttribute('data-theme')).toBeNull()
+    expect(localStorage.getItem('tether_theme')).toBe('light')
+    expect(toggle(c)!.className).not.toContain('on')
+  })
+
+  // Opening onto an already-dark document has to read dark. This is the one case
+  // the mount snapshot got right, so it guards the fix rather than gating the bug.
+  it('opens on the theme already in effect', () => {
+    document.documentElement.setAttribute('data-theme', 'dark')
+    const c = openSettings()
+    expect(navSub(c, 'appearance')).toBe('dark')
+  })
+
+  // The subscription must not outlive the panel. Settings unmounts on close, and a
+  // MutationObserver held past unmount would keep calling into a dead tree — the
+  // failure mode is a React warning and a leak, neither of which shows up as a
+  // wrong label. Asserted as "closing, then flipping the theme, is quiet".
+  it('stops observing when the panel closes', async () => {
+    const c = openSettings()
+    const warn = vi.spyOn(console, 'error').mockImplementation(() => {})
+    fireEvent.click(c.querySelector('.settings-header .icon-btn')!)
+    expect(c.querySelector('.settings-panel')).toBeNull()
+
+    await flipThemeElsewhere('dark')
+    expect(warn).not.toHaveBeenCalled()
+    warn.mockRestore()
   })
 })

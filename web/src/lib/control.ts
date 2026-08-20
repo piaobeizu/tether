@@ -48,21 +48,59 @@ export class ControlClient {
     await this.connect()
   }
 
+  /**
+   * connect opens the transport, the stream and the ping loop.
+   *
+   * Every await here is a window stop() can land in, and stop() can only close
+   * what has already been published to `this.wt` — so a transport lives in
+   * `pending` until connect() is sure it still wants it, and the stopped flag is
+   * re-read after each await (tether#128).
+   *
+   * Without that, a stop inside the FIRST await closed null and then stood by
+   * while this function finished building a live WebTransport and a 5s ping
+   * interval that nothing could reach anymore — `active` is null by then, and
+   * handleLine's own stopped check kept the latency number clean, so the leak
+   * left no visible trace. A stop inside the second await did close the
+   * transport, but this function still took a writer, installed the interval and
+   * pinged; the interval survived only until `this.wt.closed` threw on the field
+   * stop() had just nulled, which cleared it by accident in connect's catch.
+   *
+   * Both windows have a real trigger. React's StrictMode runs an effect, its
+   * cleanup, then the effect again, so every dev load put a stop() inside the
+   * first connect's awaits; and ChatPane's reconnect path stops the outgoing
+   * ControlClient without knowing whether it ever finished connecting.
+   * transcriptWatch.ts's watchToken and wiSession.ts's module-level `migrated`
+   * are this same defence, already written twice in this codebase.
+   */
   private async connect(): Promise<void> {
     if (this.stopped) return
+    let pending: WebTransport | null = null
     try {
       const url = `https://${location.host}/wt/control`
-      this.wt = await createWT(url)
-      const stream = await this.wt.createBidirectionalStream()
+      const wt = await createWT(url)
+      pending = wt
+      if (this.stopped) return
+      const stream = await wt.createBidirectionalStream()
+      if (this.stopped) return
+      // Published: stop() and onTransportClosed() can see it from here on, so
+      // the finally below must not close it too.
+      pending = null
+      this.wt = wt
       this.writer = stream.writable.getWriter()
       void this.readPongs(stream.readable)
       this.timer = setInterval(() => { void this.sendPing() }, PING_INTERVAL_MS)
       void this.sendPing()
       // On transport close, retry unless the caller stopped us.
-      this.wt.closed.catch(() => {}).finally(() => this.onTransportClosed())
+      wt.closed.catch(() => {}).finally(() => this.onTransportClosed())
     } catch {
       // connect failed — schedule a retry (best-effort; never breaks chat).
       this.onTransportClosed()
+    } finally {
+      // Anything still in `pending` is a transport nobody else holds a
+      // reference to: either a stop landed in one of the awaits above, or the
+      // bidi stream failed to open on it. Closing it here covers both, and is
+      // the only chance to — no other code path knows it exists.
+      pending?.close({ closeCode: 0, reason: 'client close' })
     }
   }
 

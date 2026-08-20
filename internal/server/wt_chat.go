@@ -219,7 +219,7 @@ func readPromptLine(br *bufio.Reader, max int) (line []byte, size int, err error
 			// Copy: the slice ReadSlice returned is invalidated by the next read.
 			line = append(line, take...)
 		}
-		if rerr == bufio.ErrBufferFull {
+		if errors.Is(rerr, bufio.ErrBufferFull) {
 			continue // more of this same line to come
 		}
 		if rerr == nil {
@@ -336,8 +336,8 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 	// attachment (not the Entry) additionally re-registers subCh if a failed
 	// resume swaps the Entry underneath us.
 	//
-	// KNOWN, NOT FIXED (tether#119, deliberately left for its own work item —
-	// every candidate repair is outside this file). The 32 is a drop threshold,
+	// KNOWN, NOT FIXED — found by tether#119 and left to tether#124, because
+	// every candidate remedy is outside this file. The 32 is a drop threshold,
 	// not a queue depth: Registry.broadcast's producer is
 	// `select { case ch <- env: default: slog.Warn("slow subscriber, envelope
 	// dropped") }`, so a full channel loses envelopes rather than blocking.
@@ -358,7 +358,7 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 	// history refetch repairs it. This is not data loss, it is a view that has
 	// silently diverged from a transcript that is intact.
 	//
-	// Three repairs were considered and none belongs in this change:
+	// Three remedies were weighed and none belongs in this change:
 	//   - Raise the 32. Moves the threshold without removing it, and there is no
 	//     measurement of how deep is deep enough, so the number would be as
 	//     arbitrary as the one it replaced.
@@ -657,8 +657,8 @@ func errorEnvelope(err error) wire.Envelope {
 // OpenUniStreamSync BLOCKS when the peer has no stream credit left, and this is
 // called from serveChat's own loop, so a stalled browser stalls that loop and
 // costs the connection every envelope that arrives while it is stopped. See the
-// subCh declaration in serveChat for the whole mechanism, why it is a
-// rendering gap rather than lost text, and why the repair is its own work item.
+// subCh declaration in serveChat for the whole mechanism, why it is a rendering
+// gap rather than lost text, and why it is tether#124 and not this change.
 func sendEnvelope(wtsess *webtransport.Session, env wire.Envelope) {
 	stream, err := wtsess.OpenUniStreamSync(wtsess.Context())
 	if err != nil {

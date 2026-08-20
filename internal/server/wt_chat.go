@@ -107,6 +107,149 @@ func promptErrorEnvelope(err error) (wire.Envelope, bool) {
 	return errorEnvelope(err), true
 }
 
+// maxPromptLine caps ONE browser→daemon prompt line, terminator excluded. It is
+// the only limit on this reader, and both halves of that sentence were bugs
+// until tether#119.
+//
+// # Why there was a cap nobody chose
+//
+// The reader was a bufio.Scanner with no scanner.Buffer(...) call anywhere in
+// this file, which means its real ceiling was bufio.MaxScanTokenSize — 64 KiB,
+// picked by the standard library for a general-purpose line scanner and never by
+// anyone reasoning about prompts. A 70 KB stack trace pasted into the composer
+// (which imposes no limit of its own — web/src/panes/chat/index.tsx just
+// JSON.stringifies and writes) exceeded it.
+//
+// # Why 1 MiB
+//
+// Bounded by what it protects against — one line is held in memory whole, so the
+// cap is the per-connection memory this reader can be made to hold — and set
+// well past any prompt a person composes: a megabyte of text is roughly a
+// quarter-million tokens, already past the context window of most models this
+// daemon talks to. The nearest neighbour is deliberately much larger:
+// internal/agent/claude_provider.go's scanBufMax allows 100 MB per line the
+// other way, because a single agent line can carry a whole file as a
+// tool_result. Prompts are typed and pasted by a human; answers are not.
+//
+// The 4 MiB that used to appear here was NOT this limit. It was
+// io.LimitReader(stream, 4<<20), and an io.LimitReader counts every byte it has
+// ever handed out, so it was a budget for the CONNECTION's whole lifetime — 200
+// ordinary 32 KB pastes reached it — after which the reader saw EOF and died the
+// same silent death an over-long line caused. It is gone rather than raised: per
+// line is the unit that bounds memory, and a total is only a bound on how much a
+// tab may be used. Nothing new is spent by removing it, either, since an
+// authenticated client that wants to stream bytes at this daemon can already
+// open connections.
+const maxPromptLine = 1 << 20
+
+// promptReadBuf sizes readPrompts's bufio.Reader. It bounds nothing (see
+// readPromptLine — an over-long line is consumed across as many buffer-fulls as
+// it takes); it only keeps an ordinary prompt inside one read.
+const promptReadBuf = 64 << 10
+
+// readPrompts reads newline-delimited prompt lines from r — the browser's half
+// of the chat bidi stream — calling onPrompt with the text of each one and
+// onOversize for each line past maxPromptLine. It returns when r ends.
+//
+// # The property this function exists to have
+//
+// It does not stop for anything except the end of r. Before tether#119 the loop
+// here was `for scanner.Scan()`, which is the ENTIRE body of the goroutine
+// serveChat starts, so any reason Scan() had to answer false — an over-long
+// line, a spent LimitReader — ended the goroutine. scanner.Err() was never
+// consulted, and serveChat's own loop kept running: the WebTransport session
+// stayed open, the tab still showed a live connection, and every prompt typed
+// from then on was written into a stream with no reader. Not one byte of that is
+// visible to the person typing, and only a page reload recovers.
+//
+// So the two failures a line can have are both LOCAL to that line. That is also
+// why bufio.Scanner is gone rather than given a bigger Buffer: ErrTooLong is
+// terminal for a Scanner by construction AND leaves the tail of the offending
+// line unread, so even a caller willing to continue has no way back to a line
+// boundary. readPromptLine discards to the next '\n' itself, which is what makes
+// "refuse this one, keep the connection" something that can be said at all.
+//
+// It is a free function taking an io.Reader, rather than a method or a closure
+// inside serveChat, for the reason admitChat and promptErrorEnvelope above give:
+// serveChat takes a concrete *webtransport.Session, so nothing reachable only
+// from inside it can be pinned by a test without a live QUIC connection. Both
+// defects tether#119 fixed lived in code of exactly that shape.
+func readPrompts(r io.Reader, onOversize func(size int), onPrompt func(text string)) {
+	br := bufio.NewReaderSize(r, promptReadBuf)
+	for {
+		line, size, err := readPromptLine(br, maxPromptLine)
+		if size > maxPromptLine {
+			onOversize(size)
+		} else if text, ok := decodePrompt(line); ok {
+			onPrompt(text)
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// readPromptLine reads one '\n'-terminated line from br, returning at most max
+// bytes of it.
+//
+// size is the TRUE length of the line with its terminator excluded, whether or
+// not that is more than max — the excess is read and discarded so the next call
+// starts on a line boundary, and the count survives so the caller can tell the
+// user how much too long their message was. A caller seeing size > max must
+// treat line as meaningless: it holds the first max bytes of a frame whose rest
+// is gone.
+//
+// err is non-nil only for the end of br (or a transport failure). It can arrive
+// TOGETHER with a line, which is the unterminated-final-line case bufio.Scanner
+// also delivered as a token; callers must therefore handle the line before
+// acting on the error, not instead of it.
+func readPromptLine(br *bufio.Reader, max int) (line []byte, size int, err error) {
+	for {
+		// ReadSlice, not ReadBytes or ReadString: it returns br's own buffer, so
+		// the bytes of a line being DISCARDED for length are never copied
+		// anywhere. That is the difference between an over-long line costing its
+		// own length in memory and costing max.
+		chunk, rerr := br.ReadSlice('\n')
+		size += len(chunk)
+		if len(line) < max {
+			take := chunk
+			if over := len(line) + len(take) - max; over > 0 {
+				take = take[:len(take)-over]
+			}
+			// Copy: the slice ReadSlice returned is invalidated by the next read.
+			line = append(line, take...)
+		}
+		if errors.Is(rerr, bufio.ErrBufferFull) {
+			continue // more of this same line to come
+		}
+		if rerr == nil {
+			// Drop the terminator from both answers, so `size > max` is a
+			// statement about the prompt rather than about the framing. The
+			// byte is present in line only when nothing was truncated.
+			size--
+			if n := len(line); n > 0 && line[n-1] == '\n' {
+				line = line[:n-1]
+			}
+		}
+		return line, size, rerr
+	}
+}
+
+// decodePrompt pulls the prompt text out of one browser line. The second return
+// is false for a line that carries none — malformed JSON, or a text field that
+// is absent, empty, or not a string — each of which is skipped, exactly as the
+// `err != nil || msg.Text == ""` continue did before tether#119. An empty line
+// lands here too and fails the same way, so it needs no case of its own.
+func decodePrompt(line []byte) (string, bool) {
+	var msg struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(line, &msg); err != nil || msg.Text == "" {
+		return "", false
+	}
+	return msg.Text, true
+}
+
 func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Registry, clientID string) {
 	defer wtsess.CloseWithError(0, "")
 	ctx := wtsess.Context()
@@ -192,6 +335,43 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 	// emits has a destination from the moment it's emitted. Going through the
 	// attachment (not the Entry) additionally re-registers subCh if a failed
 	// resume swaps the Entry underneath us.
+	//
+	// KNOWN, NOT FIXED — found by tether#119 and left to tether#124, because
+	// every candidate remedy is outside this file. The 32 is a drop threshold,
+	// not a queue depth: Registry.broadcast's producer is
+	// `select { case ch <- env: default: slog.Warn("slow subscriber, envelope
+	// dropped") }`, so a full channel loses envelopes rather than blocking.
+	// Filling it is ordinary, not adversarial — cc runs with
+	// --include-partial-messages, so KindMessage envelopes are token-level
+	// increments, and sendEnvelope opens a fresh unidirectional stream per
+	// envelope. A browser that stalls for a moment (a long transcript
+	// re-rendering, a throttled background tab, a slow mobile link) exhausts its
+	// peer's uni-stream credit, OpenUniStreamSync blocks, this function's loop
+	// below stops draining, and the increments after the 32nd are dropped. The
+	// user sees an answer with a hole in it; the only record is one server-side
+	// slog.Warn.
+	//
+	// What IS true and narrows the fix, verified rather than assumed:
+	// Registry.emitSegments writes every segment to HistoryStore
+	// (AccumulateAssistant / AppendBlock) BEFORE calling broadcast, so a dropped
+	// envelope loses the LIVE rendering only — the full answer is on disk and a
+	// history refetch repairs it. This is not data loss, it is a view that has
+	// silently diverged from a transcript that is intact.
+	//
+	// Three remedies were weighed and none belongs in this change:
+	//   - Raise the 32. Moves the threshold without removing it, and there is no
+	//     measurement of how deep is deep enough, so the number would be as
+	//     arbitrary as the one it replaced.
+	//   - Drain subCh into an unbounded local queue. Would stop the drop, and
+	//     trades a bounded per-connection rendering gap for unbounded daemon
+	//     memory growth under exactly the condition that triggers it.
+	//   - Give OpenUniStreamSync a deadline so a wedged browser is disconnected
+	//     and its reconnect repairs the transcript from history. This is the
+	//     promising one — it reuses machinery that already exists and the
+	//     paragraph above is why it works — but picking the deadline needs a
+	//     measurement against a real slow link, and too short a value means
+	//     spurious reconnects mid-answer on mobile, which is this product's
+	//     primary case.
 	subCh := make(chan wire.Envelope, 32)
 	att.Subscribe(subCh)
 	defer att.Unsubscribe(subCh)
@@ -211,16 +391,36 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 
 	// Goroutine: read prompts from browser and forward to cc stdin.
 	// This must run in parallel with the SessionID() wait below.
-	go func() {
-		scanner := bufio.NewScanner(io.LimitReader(stream, 4<<20))
-		for scanner.Scan() {
-			var msg struct {
-				Text string `json:"text"`
-			}
-			if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil || msg.Text == "" {
-				continue
-			}
-			slog.Info("chat prompt received", "len", len(msg.Text))
+	go readPrompts(stream,
+		// An over-cap line (see maxPromptLine). The prompt is gone and no
+		// machinery anywhere will retry it, so the browser has to be told — the
+		// tether#119 failure was not the rejection, it was that a rejection
+		// looked identical to a healthy idle tab.
+		//
+		// ErrCodePromptUndelivered because that code's meaning is exactly what
+		// happened: the words the user pressed enter on reached no agent, and
+		// nothing is coming for them. Retryable, correctly — the session is
+		// untouched and a shorter message will work, so nothing should stop the
+		// browser's ladder. It is also the one code web/src/lib/store.ts renders
+		// as a durable "Message not delivered — …" notice that a history refetch
+		// cannot eat; an unclassified envelope would clear the spinner and say
+		// nothing, which is the tether#77 silence this route already fixed once.
+		//
+		// NOTE for whoever next reads wire/errors.go: that code's doc comment
+		// attributes it to "session/attach.go reopen", which was true when it was
+		// written and is now incomplete — this is a second producer. Left as-is
+		// only because internal/wire is outside this change's file scope.
+		//
+		// sendEnvelope, not refuse(): refuse ends the connection and pays 300ms
+		// of drain grace for the close race that implies. This connection is
+		// fine. Same reasoning as the SendPrompt failure below.
+		func(size int) {
+			slog.Warn("chat prompt refused: over the per-line cap", "bytes", size, "cap", maxPromptLine)
+			sendEnvelope(wtsess, wire.NewErrorEnvelope(wire.ErrCodePromptUndelivered,
+				fmt.Sprintf("this message is %d bytes and the limit is %d; nothing reached the agent, so shorten it and resend", size, maxPromptLine)))
+		},
+		func(text string) {
+			slog.Info("chat prompt received", "len", len(text))
 			// An error here is EXPECTED on the failed-resume path: cc exited
 			// without reading its stdin, so this write hits a broken pipe. The
 			// attachment buffered the prompt and Resolve replays it onto a fresh
@@ -265,7 +465,7 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 			// standing up a WebTransport session — same reason and same residual as
 			// admitChat above: what is pinned is the decision, not that this call
 			// site still makes it.
-			if err := att.SendPrompt(ctx, msg.Text); err != nil {
+			if err := att.SendPrompt(ctx, text); err != nil {
 				slog.Warn("send prompt", "err", err)
 				if env, ok := promptErrorEnvelope(err); ok {
 					sendEnvelope(wtsess, env)
@@ -278,9 +478,8 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 			// user's own first message from the transcript a reload replays.
 			go func(text string) {
 				reg.RecordUserMessage(att.WaitSID(), text)
-			}(msg.Text)
-		}
-	}()
+			}(text)
+		})
 
 	// Now confirm the session (cc's system/init only arrives AFTER the first
 	// prompt is delivered on cc stdin by the goroutine above). If this connection
@@ -453,6 +652,13 @@ func errorEnvelope(err error) wire.Envelope {
 	return wire.NewErrorEnvelope(wire.ErrorCode(""), err.Error())
 }
 
+// sendEnvelope writes env to the browser on a fresh unidirectional stream.
+//
+// OpenUniStreamSync BLOCKS when the peer has no stream credit left, and this is
+// called from serveChat's own loop, so a stalled browser stalls that loop and
+// costs the connection every envelope that arrives while it is stopped. See the
+// subCh declaration in serveChat for the whole mechanism, why it is a rendering
+// gap rather than lost text, and why it is tether#124 and not this change.
 func sendEnvelope(wtsess *webtransport.Session, env wire.Envelope) {
 	stream, err := wtsess.OpenUniStreamSync(wtsess.Context())
 	if err != nil {

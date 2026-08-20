@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, fmtTokens, summarizeToolInput, summarizeToolResult, truncateResult, shouldSendOnEnter, growHeight, parseAtQuery, fuzzyRankFiles, shouldDeferFirstConnect, shouldReconnectAfterClose, shouldRefundAttemptBudget, transcriptTextLength, transcriptEdgeAction, TRANSCRIPT_EDGE_MIN_INTERVAL_MS, TRANSCRIPT_EDGE_PX, transcriptOverscrolled, TRANSCRIPT_OVERSCROLL_SLACK_PX, TRANSCRIPT_OVERSCROLL_TOUCH_PX, FATAL_CODE_MESSAGES, heldActivityLine, trailingArrivals, HELD_ACTIVITY_WORKING, HELD_ACTIVITY_IDLE, HELD_ACTIVITY_UNKNOWN, HELD_ACTIVITY_GONE } from './index'
+import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, fmtTokens, summarizeToolInput, summarizeToolResult, truncateResult, shouldSendOnEnter, growHeight, parseAtQuery, fuzzyRankFiles, shouldDeferFirstConnect, shouldReconnectAfterClose, shouldRefundAttemptBudget, transcriptTextLength, transcriptEdgeAction, TRANSCRIPT_EDGE_MIN_INTERVAL_MS, TRANSCRIPT_EDGE_PX, transcriptOverscrolled, TRANSCRIPT_OVERSCROLL_SLACK_PX, TRANSCRIPT_OVERSCROLL_TOUCH_PX, transcriptJumpVisible, TRANSCRIPT_JUMP_SCREENS, TRANSCRIPT_JUMP_LABEL, FATAL_CODE_MESSAGES, heldActivityLine, trailingArrivals, HELD_ACTIVITY_WORKING, HELD_ACTIVITY_IDLE, HELD_ACTIVITY_UNKNOWN, HELD_ACTIVITY_GONE } from './index'
 import { SESSION_ACTIVITY_HELD, SESSION_ACTIVITY_IDLE, SESSION_ACTIVITY_WORKING } from '../../lib/sessionActivity'
 import { PermissionQueue, postDecide } from '../../fenced-blocks/PermissionBlock'
 import {
@@ -1039,5 +1039,92 @@ describe('transcriptOverscrolled (tether#112)', () => {
     expect(transcriptEdgeAction({ ...armedAtSlack, available: false })).toBe('idle')
     expect(transcriptEdgeAction({ ...armedAtSlack, inFlight: true })).toBe('idle')
     expect(transcriptEdgeAction({ ...armedAtSlack, sinceLastMs: 0 })).toBe('idle')
+  })
+})
+
+describe('transcriptJumpVisible (tether#114)', () => {
+  // "The reader has scrolled up a long way" — the only condition the jump button has. The
+  // base case is a 600px viewport with the reader one and a half screens above the bottom;
+  // every test below flips ONE field, so what each assertion is about is the field it names.
+  const up = { distance: 900, viewport: 600 }
+
+  it('offers the jump once the newest message is more than a screenful away', () => {
+    expect(transcriptJumpVisible(up)).toBe(true)
+  })
+
+  it('stays away for a reader who is at or near the bottom', () => {
+    // The three positions the autoscroll and the arrival latch leave a reader standing in.
+    // A button that appeared here would be permanently on screen during a live stream, which
+    // is the one place it has nothing to offer.
+    expect(transcriptJumpVisible({ ...up, distance: 0 })).toBe(false)
+    expect(transcriptJumpVisible({ ...up, distance: 119 })).toBe(false)
+    expect(transcriptJumpVisible({ ...up, distance: -300 })).toBe(false)
+  })
+
+  it('measures the threshold in SCREENS, not in pixels', () => {
+    // The same distance answers differently in two panes, which is the whole point of the
+    // unit: 700px is more than a screenful in a phone-height pane and less than one in a
+    // desktop-height pane, and "a long way" is what the reader cannot see, not a constant.
+    // A px threshold would pass a single-viewport test and be wrong in the other pane.
+    expect(transcriptJumpVisible({ distance: 700, viewport: 320 })).toBe(true)
+    expect(transcriptJumpVisible({ distance: 700, viewport: 900 })).toBe(false)
+  })
+
+  it('treats exactly one screenful as NOT yet a long way, and one px past it as one', () => {
+    // The boundary, both sides, exactly, at two viewports so that `>=` cannot survive by
+    // being right about one of them. At `distance === viewport` the newest message is one
+    // pixel from entering the viewport — the reader is about to see it by scrolling the way
+    // they are already scrolling, so there is nothing to offer yet.
+    expect(transcriptJumpVisible({ distance: 600, viewport: 600 })).toBe(false)
+    expect(transcriptJumpVisible({ distance: 601, viewport: 600 })).toBe(true)
+    expect(transcriptJumpVisible({ distance: 300, viewport: 300 })).toBe(false)
+    expect(transcriptJumpVisible({ distance: 301, viewport: 300 })).toBe(true)
+  })
+
+  it('offers nothing at all when there is no viewport to offer it in', () => {
+    // `clientHeight` is 0 for a pane that has not been laid out: a hidden tab, a
+    // `display: none` ancestor, or jsdom before a fixture installs a geometry. Without the
+    // guard the threshold is `distance > 0`, which every scroll position but the exact bottom
+    // satisfies — so the button would be "shown" in a pane with no viewport, and the very
+    // large distance in the second case is what that failure would look like.
+    expect(transcriptJumpVisible({ distance: 1, viewport: 0 })).toBe(false)
+    expect(transcriptJumpVisible({ distance: 99_999, viewport: 0 })).toBe(false)
+    expect(transcriptJumpVisible({ distance: 900, viewport: -1 })).toBe(false)
+  })
+
+  it('is one screen, and that is what keeps it clear of BOTH of its neighbours', () => {
+    // Pinned by value, and pinned against the two thresholds it deliberately is not the
+    // inverse of. `nearBottom` is 120px (should an arriving message pull the view down) and
+    // TRANSCRIPT_EDGE_PX is 48px (has the reader arrived at this end). Inverting either would
+    // pop the button 121px or 49px up — one flick of a wheel. At the smallest pane this ships
+    // in the threshold is still multiples of both.
+    expect(TRANSCRIPT_JUMP_SCREENS).toBe(1)
+    const smallestViewport = 300
+    expect(transcriptJumpVisible({ distance: 120, viewport: smallestViewport })).toBe(false)
+    expect(transcriptJumpVisible({ distance: TRANSCRIPT_EDGE_PX, viewport: smallestViewport })).toBe(false)
+  })
+
+  it('can only ever be visible where transcriptEdgeAction would ARM, never where it would load', () => {
+    // THE loop bound, as arithmetic rather than as a rendered click. The button exists only
+    // at distances past one viewport; the bottom latch fires at distances within 48px. So on
+    // any pane taller than 48px the two regions are disjoint, and the press cannot be issued
+    // from a position where the bottom end is already loading. What the press then does — one
+    // `scrollTop` write, one `scroll` event, one arrival — is bounded by the latch itself,
+    // which is pinned in the tether#110 block above.
+    const viewport = 300
+    expect(viewport).toBeGreaterThan(TRANSCRIPT_EDGE_PX)
+    const justVisible = viewport * TRANSCRIPT_JUMP_SCREENS + 1
+    expect(transcriptJumpVisible({ distance: justVisible, viewport })).toBe(true)
+    expect(transcriptEdgeAction({
+      distance: justVisible, armed: true, available: true, inFlight: false,
+      sinceLastMs: TRANSCRIPT_EDGE_MIN_INTERVAL_MS * 10,
+    })).toBe('arm')
+  })
+
+  it('has an accessible name that says where it goes', () => {
+    // The button's only content is an arrow glyph, which is `aria-hidden`, so this string is
+    // the entire accessible name — there is no visible text to fall back on. Pinned here so
+    // the render tests can assert by identity rather than repeating a literal.
+    expect(TRANSCRIPT_JUMP_LABEL).toBe('jump to the latest message')
   })
 })

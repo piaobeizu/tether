@@ -1162,6 +1162,27 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
         ? r.json().then((msgs: HistoryEntry[]) => ({ v: readTranscriptVersion(r), b: readTranscriptBounds(r), msgs }))
         : { v: 0, b: { earlier: null, otherRecord: null }, msgs: [] as HistoryEntry[] })
       .then(({ v, b, msgs }: { v: number; b: { earlier: number | null; otherRecord: string | null }; msgs: HistoryEntry[] }) => {
+        // tether#127 — is this answer still ABOUT the session on screen? This effect has
+        // no cleanup and no abort, so a switch from A to B re-runs it while A's request is
+        // still on the wire, and A's `.then` then runs with A captured in its closure and
+        // B in the store. `loadHistory` and `setTranscriptBounds` are GLOBAL writes taking
+        // no sid, so without this the reader lands on B and gets A's transcript — after
+        // which B's streamed deltas append to A's array. Same shape and same reason as
+        // lib/session.ts's refreshTranscript, which is the OTHER path a transcript reaches
+        // the screen by (a deliberate switch, via openSession) and has had this check
+        // since tether#106. This one is the path a page reload takes — see the tether#106
+        // note above, "never in openSession" — and was the one of the two left undefended.
+        //
+        // A SEPARATE question from the `!streaming` check below, asked first, and not to be
+        // collapsed into it: this one is about IDENTITY (whose transcript is this?), that
+        // one about LIVENESS (is a turn in flight for the session on screen?). Neither
+        // implies the other. `streaming` is one global flag describing the CURRENT session,
+        // so consulting it to decide the fate of a response belonging to a DIFFERENT one is
+        // a category error even where it happens to answer correctly — and in the reported
+        // case it does not even do that: clicking a row of an idle session leaves it false,
+        // which is exactly why tether#42's guard stopped nothing here. Asking identity
+        // first is what makes the liveness question meaningful when it is reached.
+        if (useStore.getState().sessionId !== sessionId) return
         // Don't clobber an in-flight turn (tether#42 fix). On the FIRST send of
         // a new session, session_ready sets sessionId and fires this effect;
         // /messages already has the just-persisted user msg, so loadHistory

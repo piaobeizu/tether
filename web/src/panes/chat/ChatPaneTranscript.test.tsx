@@ -3601,3 +3601,205 @@ describe('loading a transcript by scrolling to its ends (tether#110)', () => {
     })
   })
 })
+
+// tether#127 — the pane's `[sessionId]` history-load effect has no cleanup and no abort,
+// so switching sessions leaves the OLD session's `/messages` request in flight. Its
+// `.then` closes over the sid it was issued for, but the two things it calls —
+// `loadHistory` and `setTranscriptBounds` — are GLOBAL store writes that take no sid. So
+// a late answer for A installs A's transcript while the store's `sessionId` is already B,
+// and B's streamed deltas then append to A's array.
+//
+// The other path a transcript reaches the screen by — `refreshTranscript` in
+// lib/session.ts, which is what a deliberate switch through `openSession` uses — has
+// checked `store.sessionId !== sid` at exactly this point since tether#106, pinned by
+// session.test.ts's "ignores a response that arrives after the sid has moved on". This
+// effect is the path a PAGE RELOAD takes (`tether_last_sid`, "never in openSession" per
+// the effect's own comment), and it was the one of the two left undefended. So these
+// cases are that file's two, transplanted onto this path — the guard is not a new design,
+// it is one guard that was missing its second call site.
+//
+// The construction, and why it needs the deferred-connect pane: A's response is held open
+// at REQUEST time, the switch to B is a plain store write (so `openSession`'s own guard is
+// not in the picture and this effect is the only loader running), and A is released last.
+// With no remembered sid and `workspacesLoaded` false there is no WebTransport attempt and
+// no watcher, so the only `/messages` requests in the test are this effect's two.
+describe('a late /messages answer cannot land under the session the reader switched to (tether#127)', () => {
+  const SID_A = 'sid-late-000a'
+  const SID_B = 'sid-late-000b'
+  const URL_A = `/api/v1/sessions/${SID_A}/messages`
+  const URL_B = `/api/v1/sessions/${SID_B}/messages`
+
+  /** A's boundary headers, deliberately DIFFERENT from B's absent ones, so that
+   *  `setTranscriptBounds` is pinned independently of `loadHistory`. A fix that guarded
+   *  only the message load would leave the reader on B's transcript with A's "load
+   *  earlier" cursor — a click that serves a page from another conversation. */
+  const A_EARLIER = 4096
+  const A_OTHER_RECORD = 'cc-record-for-a'
+
+  let requested: string[] = []
+  /** Held open until the test releases it — the in-flight window is observable rather
+   *  than inferred, so this cannot pass by winning a race by accident. */
+  let releaseA: () => void = () => {}
+  let gateA: Promise<void> = Promise.resolve()
+  /** Same discipline as tether#110's harness: a gate the test never released must not
+   *  outlive it as a live promise. Abandoning answers 499, which this effect's `.catch`
+   *  swallows, so nothing can be written into the next test's store. */
+  let abandonGates: () => void = () => {}
+  let gatesAbandoned: Promise<void> = Promise.resolve()
+
+  const entry = (role: string, text: string, ts: number) => ({ role, text, ts, ord: ts })
+
+  function stubDaemon() {
+    return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url)
+      const method = init?.method ?? 'GET'
+      requested.push(`${method} ${url}`)
+      if (url.includes('/providers')) return new Response(JSON.stringify({ providers: ['claude-code'] }), { status: 200 })
+      if (url === SESSION_ACTIVITY_PATH) return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (url === URL_A) {
+        const abandoned = await Promise.race([gateA.then(() => false), gatesAbandoned.then(() => true)])
+        if (abandoned) return new Response(null, { status: 499 })
+        const headers = new Headers({ 'Content-Type': 'application/json' })
+        headers.set('X-Tether-Transcript-Updated-At', '1000')
+        headers.set('X-Tether-Transcript-Earlier', String(A_EARLIER))
+        headers.set('X-Tether-Transcript-Other-Record', A_OTHER_RECORD)
+        return new Response(JSON.stringify([entry('user', 'A-only prompt', 1000)]), { status: 200, headers })
+      }
+      if (url === URL_B) {
+        const headers = new Headers({ 'Content-Type': 'application/json' })
+        headers.set('X-Tether-Transcript-Updated-At', '2000')
+        return new Response(JSON.stringify([entry('user', 'B-only prompt', 2000)]), { status: 200, headers })
+      }
+      return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+  }
+
+  const settle = async () => {
+    for (let i = 0; i < 5; i++) {
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)) })
+    }
+  }
+
+  const texts = () => useStore.getState().messages.map(m => m.text)
+
+  beforeEach(() => {
+    localStorage.clear()
+    requested = []
+    gateA = new Promise<void>(r => { releaseA = r })
+    gatesAbandoned = new Promise<void>(r => { abandonGates = r })
+    resetTranscriptWatchForTests()
+    resetSessionActivityForTests()
+    globalThis.fetch = stubDaemon() as unknown as typeof fetch
+    useStore.setState({
+      messages: [], notices: [], pendingPermissions: [], fatal: null,
+      streaming: false, streamingMsgId: null, curTurnId: null, thinkingStartTs: null,
+      sessionId: SID_A, workspacesLoaded: false, activeWorkspace: null,
+      transcriptEarlier: null, transcriptOtherRecord: null, transcriptPagesBack: 0,
+    })
+  })
+
+  afterEach(() => {
+    abandonGates()
+    cleanup()
+    resetTranscriptWatchForTests()
+    resetSessionActivityForTests()
+    globalThis.fetch = originalFetch
+    useStore.setState({
+      messages: [], notices: [], sessionId: null, fatal: null, streaming: false, workspacesLoaded: false,
+      streamingMsgId: null, curTurnId: null, thinkingStartTs: null,
+      transcriptEarlier: null, transcriptOtherRecord: null, transcriptPagesBack: 0,
+    })
+    localStorage.clear()
+  })
+
+  it('ignores a response that arrives after the sid has moved on', async () => {
+    render(<ChatPane />)
+    await settle()
+
+    // Preconditions, asserted rather than assumed: A's request really went out, and it is
+    // really still open. Without both, everything below would hold just as well for a
+    // pane that never asked for A at all.
+    expect(requested.filter(r => r === `GET ${URL_A}`)).toHaveLength(1)
+    expect(texts()).toEqual([])
+
+    // The switch, as a plain store write — the case the field report describes is clicking
+    // a row of a session that is NOT streaming, so `streaming` stays false throughout and
+    // the tether#42 guard is not what is being tested here.
+    await act(async () => { useStore.setState({ sessionId: SID_B }) })
+    await settle()
+
+    // The CONTROL: this harness does load transcripts. Without it, "the store still holds
+    // B" below would also be what a pane whose history effect had been deleted reports.
+    expect(texts()).toEqual(['B-only prompt'])
+    expect(useStore.getState().streaming).toBe(false)
+
+    // A answers last.
+    await act(async () => { releaseA(); await Promise.resolve() })
+    await settle()
+
+    // The stale answer must not overwrite the session the user actually landed on.
+    // Leaving A's messages up under B's sid is not merely stale text: `loadHistory` is
+    // also what resets the turn cursor and drops pending permission cards, and B's
+    // streamed deltas would append to A's array from here on.
+    expect(useStore.getState().sessionId).toBe(SID_B)
+    expect(texts()).toEqual(['B-only prompt'])
+    // …and neither may A's boundary facts, which travel through a second global write.
+    expect(useStore.getState().transcriptEarlier).toBeNull()
+    expect(useStore.getState().transcriptOtherRecord).toBeNull()
+  })
+
+  it('still installs a transcript for a response that arrives while its own sid is current', async () => {
+    // The other direction, so the guard is known to be a guard and not an off switch: the
+    // SAME held-open request, released with no switch in between, still lands. A fix that
+    // dropped every late answer would pass the case above and fail this one.
+    render(<ChatPane />)
+    await settle()
+    expect(texts()).toEqual([])
+
+    await act(async () => { releaseA(); await Promise.resolve() })
+    await settle()
+
+    expect(useStore.getState().sessionId).toBe(SID_A)
+    expect(texts()).toEqual(['A-only prompt'])
+    expect(useStore.getState().transcriptEarlier).toBe(A_EARLIER)
+    expect(useStore.getState().transcriptOtherRecord).toBe(A_OTHER_RECORD)
+  })
+
+  it('leaves an in-flight turn of its OWN session alone (tether#42, the other guard)', async () => {
+    // The second guard on this `.then`, pinned here because nothing pinned it: deleting
+    // `!streaming` from the condition left the entire frontend suite green while this wi
+    // was being built. That matters more than usual now, because the identity check added
+    // beside it makes it easy to read the two as one — and they are not. This case is the
+    // one where identity SAYS YES and the answer must still be refused: the response is
+    // for the session on screen, and installing it would wipe a live turn.
+    //
+    // tether#42's own scenario, which is why the guard exists: on the first send of a new
+    // session, session_ready sets the sid and fires this effect; `/messages` already holds
+    // the just-persisted user message, so `loadHistory` runs and resets
+    // `streaming`/`curTurnId`/`thinkingStartTs` (see the reducer) — putting out the
+    // optimistic "thinking" indicator in the gap before the first token.
+    await act(async () => {
+      useStore.setState({
+        messages: [{ id: 'optimistic-1', role: 'user', text: 'live prompt', ts: 3000 }],
+        streaming: true, streamingMsgId: 'assistant-1', curTurnId: 'turn-1', thinkingStartTs: 3001,
+      })
+    })
+    render(<ChatPane />)
+    await settle()
+
+    // A's OWN response lands, with no switch anywhere: the identity check passes and the
+    // liveness check is the only thing standing between the live turn and `loadHistory`.
+    await act(async () => { releaseA(); await Promise.resolve() })
+    await settle()
+
+    expect(useStore.getState().sessionId).toBe(SID_A)
+    expect(texts()).toEqual(['live prompt'])
+    expect(useStore.getState().streaming).toBe(true)
+    expect(useStore.getState().curTurnId).toBe('turn-1')
+    expect(useStore.getState().thinkingStartTs).toBe(3001)
+    // The precondition that makes the refusal meaningful: the request really was made and
+    // really did come back with something installable. Without this the assertions above
+    // would also hold for a pane that never asked.
+    expect(requested.filter(r => r === `GET ${URL_A}`)).toHaveLength(1)
+  })
+})

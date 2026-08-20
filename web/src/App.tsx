@@ -3,7 +3,7 @@ import { useStore } from './lib/store'
 import { Icon, type IconName } from './lib/icons'
 import { Settings, type SettingsTab } from './Settings'
 import { useAppVersion } from './lib/version'
-import { clampRightWidth, loadRightWidth, DEFAULT_LEFT } from './lib/layout'
+import { clampLeftWidth, clampRightWidth, loadRightWidth, DEFAULT_LEFT } from './lib/layout'
 import WorkspacePane from './panes/workspace'
 import SkillPane from './panes/skill'
 import ChatPane from './panes/chat'
@@ -61,8 +61,9 @@ export function loadMainView(): MainView {
   return saved != null && (MAIN_VIEWS as string[]).includes(saved) ? (saved as MainView) : 'canvas'
 }
 
-const MIN_LEFT  = 160
-const MAX_LEFT  = 480
+// MIN_LEFT / MAX_LEFT used to live here, read by the one line in `resizeLeft`
+// below. tether#129 moved them into lib/layout beside the rule that applies
+// them — see clampLeftWidth.
 
 function loadWidth(key: string, fallback: number): number {
   const v = localStorage.getItem(key)
@@ -280,9 +281,21 @@ export default function App() {
     return () => document.removeEventListener('keydown', onKey)
   }, [showCatchupFailed, settingsTab])
 
+  // tether#129 — through lib/layout, like its sibling below. This used to be
+  // `Math.max(MIN_LEFT, Math.min(MAX_LEFT, w + dx))` inline: the constant bounds
+  // and nothing else, so it never saw the window or the right pane and dragging
+  // the tree to MAX_LEFT walked straight through the MIN_MID floor that
+  // `resizeRight` — eight lines down, on the other divider — was holding.
+  //
+  // Both handlers read the OTHER column's width out of the render closure, which
+  // is captured when the drag starts (ColResizer's onMouseDown keeps the
+  // `onDelta` it was handed). That is correct rather than merely tolerable: only
+  // one divider moves per drag, so the column this one is clamping against is by
+  // definition not moving while it does. `window.innerWidth` is read fresh on
+  // every frame because a window resize mid-drag is possible.
   const resizeLeft = (dx: number) => {
     setLeftW(w => {
-      const next = Math.max(MIN_LEFT, Math.min(MAX_LEFT, w + dx))
+      const next = clampLeftWidth(w + dx, window.innerWidth, rightW)
       localStorage.setItem(STORAGE_KEY_LEFT, String(next))
       return next
     })

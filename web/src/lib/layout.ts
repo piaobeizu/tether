@@ -97,6 +97,25 @@ export const DEFAULT_RIGHT_SHARE = 0.56
 export const DEFAULT_LEFT = 240
 
 /**
+ * Left pane (workspace tree) — the narrowest and widest the user may drag it to.
+ *
+ * These lived in App.tsx until tether#129, next to the only line that read them.
+ * They moved here for the same reason ACTIVITY_W stopped being exported: the
+ * bounds and the MIN_MID guarantee have to be applied by ONE function, or a call
+ * site can apply half of them. App.tsx's `resizeLeft` used to be that half —
+ * `Math.max(MIN_LEFT, Math.min(MAX_LEFT, w + dx))` inline, with no idea what the
+ * middle column was left with — while `resizeRight` eight lines below it went
+ * through clampRightWidth. Passing the bounds in as arguments instead would have
+ * kept exactly the thing worth removing: a caller able to name them, and
+ * therefore able to name the wrong ones.
+ *
+ * MAX_LEFT is a preference, not the guarantee: reaching it is only allowed when
+ * the middle column can spare the room. clampLeftWidth is where that is decided.
+ */
+export const MIN_LEFT = 160
+export const MAX_LEFT = 480
+
+/**
  * Width of the activity bar, mirroring `.dt-activity` in index.css. Duplicated
  * because the rules below are arithmetic over the space the middle column is
  * left with, and that arithmetic cannot read a stylesheet. Change both.
@@ -246,6 +265,60 @@ export function clampRightWidth(desired: number, windowWidth: number, treeWidth:
   // it below usable would trade one broken pane for two.
   if (room < MIN_RIGHT) return MIN_RIGHT
   return Math.min(bounded, room)
+}
+
+/**
+ * clampLeftWidth returns the workspace-tree width to actually use — the mirror of
+ * clampRightWidth for the OTHER divider, and the whole of tether#129 defect 1.
+ *
+ * Bounded by MIN_LEFT/MAX_LEFT, and additionally by what the middle column would
+ * be left with once this tree and the current right pane are taken out of the
+ * window. Before this existed the left divider had the constant bounds and
+ * nothing else, so dragging the tree to MAX_LEFT walked through the MIN_MID floor
+ * its sibling handler was holding: at a 1280px window with the default right pane
+ * (556) the middle got 1280 - (480 + 48) - 556 = 196 against a promised 320.
+ * Measured through App.test.tsx, not derived here.
+ *
+ * `rightWidth` is the right pane as it currently stands — the caller's live
+ * value, not a bound. A drag on the left divider must not silently re-clamp the
+ * right pane; see below.
+ *
+ * Two things are deliberately NOT symmetric with clampRightWidth, both because
+ * this divider is on the other side of the pane it protects:
+ *
+ *   · The DEFICIT is charged to the tree, never to the right pane. The left
+ *     divider is adjacent to the tree and the middle, so a drag on it may grow
+ *     the tree until the middle hits its floor and must then stop. Paying for the
+ *     floor by shrinking the right pane would make a divider move a column it
+ *     does not touch. It is also the choice clampRightWidth already made in the
+ *     mirror case — that function caps the RIGHT pane rather than shrinking the
+ *     tree — so between the two, each divider only ever moves its own two panes.
+ *   · There is no read-side twin (no `loadLeftWidth`). The persisted tree width
+ *     needs no clamp on load because loadRightWidth already takes one against it:
+ *     it is handed the stored tree width and reduces the RIGHT pane until the
+ *     middle clears MIN_MID. App.tsx's `rightW` initializer is that call. Adding
+ *     a second read-side clamp would have the two fighting over which pane pays.
+ *
+ * The floor is conditional in the same way and for the same reason as
+ * clampRightWidth's: when even MIN_LEFT cannot leave the middle MIN_MID, MIN_LEFT
+ * wins rather than collapsing the tree further. In that region clampRightWidth
+ * has already returned MIN_RIGHT and given up on the floor, so there is nothing
+ * for this function to rescue — only a third unusable pane to create.
+ *
+ * A non-finite or non-positive windowWidth yields the constant bounds only, and
+ * NaN propagates, both matching the rules above.
+ */
+export function clampLeftWidth(desired: number, windowWidth: number, rightWidth: number): number {
+  const bounded = Math.max(MIN_LEFT, Math.min(MAX_LEFT, Math.round(desired) || MIN_LEFT))
+  if (!Number.isFinite(windowWidth) || windowWidth <= 0) return bounded
+
+  const middle = windowWidth - chromeLeftOfMiddle(bounded) - rightWidth
+  if (middle >= MIN_MID) return bounded
+  // Charge the shortfall to the tree. Phrased as a deficit off `bounded` rather
+  // than as an independent `windowWidth - ... - MIN_MID` ceiling so that the bar
+  // is counted by chromeLeftOfMiddle on this path too — an inverted copy of that
+  // arithmetic is exactly the "forgot the activity bar" bug in a new place.
+  return Math.max(MIN_LEFT, bounded - (MIN_MID - middle))
 }
 
 /**

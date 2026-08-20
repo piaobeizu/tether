@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import App from './App'
 import { useStore } from './lib/store'
+import { MIN_MID } from './lib/layout'
 
 // The shell's leaf panes are stubbed. Not to make the test easier — ChatPane
 // opens a WebTransport connection on mount and ShellPane spawns a PTY view — but
@@ -246,5 +247,95 @@ describe('tether:select-tab is routed by surface name (tether#90)', () => {
     fireEvent(window, new CustomEvent('tether:select-tab', { detail: 'nonsense' }))
     expect([...container.querySelectorAll('.dt-right-tab.on')].map((b) => b.textContent)).toEqual(['Chat'])
     expect(shownInMid(container)).toEqual(['pane-canvas'])
+  })
+})
+
+// tether#129 defect 1 — the MIN_MID guarantee held on ONE of the two dividers.
+//
+// `resizeRight` routed through lib/layout's clampRightWidth, which knows the
+// window and the tree width and therefore knows what the middle column is left
+// with. `resizeLeft`, eight lines above it, clamped to MIN_LEFT/MAX_LEFT alone:
+// it read neither the window nor the right pane, so dragging the tree out to
+// MAX_LEFT walked straight through the floor the sibling handler exists to hold.
+//
+// THE WIRING HOP, not the rule. layout.test.ts owns clampLeftWidth's arithmetic;
+// what only a mount can show is that the divider the user actually drags is the
+// one calling it — App.tsx could hold a correct rule and still clamp with the
+// wrong one, or with none, and every unit test in layout.test.ts would stay
+// green. (That is this repo's standing blind spot: see the note above
+// layout.test.ts's last describe block for the same lesson learned about the
+// activity-bar addend.)
+//
+// The numbers, derived rather than read off a run — window 1280, nothing
+// persisted, so leftW = DEFAULT_LEFT = 240 and rightW = loadRightWidth(null,
+// 1280, 240) = 556 (layout.test.ts pins that pair):
+//
+//   before: the tree reaches MAX_LEFT = 480 and the middle gets
+//           1280 - (480 + 48) - 556 = 196, against a promised floor of 320.
+//   after:  the tree stops at 1280 - 48 - 556 - 320 = 356 and the middle gets
+//           exactly 320.
+//
+// 196 is measured through this test, not asserted from the constants: the
+// pre-fix run of the assertion below reported `expected 480 to be 356`.
+describe('the left divider holds the MIN_MID floor too (tether#129)', () => {
+  const realWidth = window.innerWidth
+  afterEach(() => { window.innerWidth = realWidth })
+
+  const px = (el: Element | null) => Number((el as HTMLElement).style.width.replace('px', ''))
+  const treeW  = (c: HTMLElement) => px(c.querySelector('.dt-left'))
+  const rightW = (c: HTMLElement) => px(c.querySelector('.dt-right'))
+  // What the middle column is left with. The activity bar is a fixed 48px of
+  // chrome to its left (index.css `.dt-activity`); written as a literal for the
+  // same reason layout.test.ts writes it as one — an expectation phrased in
+  // terms of the constant is immune to the constant's value.
+  const midW = (c: HTMLElement) => window.innerWidth - (treeW(c) + 48) - rightW(c)
+
+  /** Drag a divider. index 0 is the one left of the middle column, 1 the one right of it. */
+  const dragDivider = (c: HTMLElement, index: number, dx: number) => {
+    fireEvent.mouseDown(c.querySelectorAll('.col-resizer')[index], { clientX: 0 })
+    fireEvent.mouseMove(document, { clientX: dx })
+    fireEvent.mouseUp(document)
+  }
+
+  it('stops the tree short of MAX_LEFT rather than crushing the middle', () => {
+    window.innerWidth = 1280
+    const { container } = render(<App />)
+    expect(treeW(container)).toBe(240)
+    expect(rightW(container)).toBe(556)
+
+    dragDivider(container, 0, 1000) // far past MAX_LEFT (480)
+
+    expect(treeW(container)).toBe(356)
+    expect(midW(container)).toBe(MIN_MID)
+  })
+
+  // The property, over viewports rather than at one — a single-window assertion
+  // is the shape of bug this whole module exists to stop (see loadRightWidth's
+  // tether#71 table). Both directions are dragged: shrinking the tree cannot
+  // violate the floor, and asserting it anyway is what keeps the new clamp from
+  // being written as a bound on the wrong side.
+  it.each([1280, 1366, 1440, 1600, 1920])('holds the floor at %ipx, dragged either way', (w) => {
+    window.innerWidth = w
+    const { container } = render(<App />)
+    for (const dx of [1000, -1000, 400, -400]) {
+      dragDivider(container, 0, dx)
+      expect(midW(container)).toBeGreaterThanOrEqual(MIN_MID)
+    }
+    cleanup()
+  })
+
+  // The guarantee is one-directional on purpose, and this is the assertion that
+  // says so. The left divider sits between the tree and the middle, so a drag on
+  // it may shrink the middle down to its floor and then stop — it must NOT reach
+  // across the middle and take width off the right pane instead. That would be a
+  // divider moving a column it is not adjacent to, and it is also the shape
+  // clampRightWidth already rejected in the mirror case: it caps the right pane
+  // rather than shrinking the tree.
+  it('does not pay for the floor out of the right pane', () => {
+    window.innerWidth = 1280
+    const { container } = render(<App />)
+    const before = rightW(container)
+    dragDivider(container, 0, 1000)
+    expect(rightW(container)).toBe(before)
   })
 })

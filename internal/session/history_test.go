@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/piaobeizu/tether/internal/wire"
 )
@@ -147,6 +148,109 @@ func TestHistory_ToolResultCap(t *testing.T) {
 	}
 	if got := len(msgs[0].Tools[0].Result.Content); got > MaxToolResultBytes+50 {
 		t.Errorf("result content %d exceeds cap %d", got, MaxToolResultBytes)
+	}
+}
+
+// The three overflow paths in this file used to cut a byte slice at the cap and
+// hand the result to encoding/json, which re-encodes a half rune as U+FFFD. The
+// user then reads a replacement character where their text was cut — and none of
+// the three caps is a multiple of 3, so a CJK payload hits it EVERY time it
+// overruns rather than occasionally.
+//
+// Each of the three tests below asserts the absence of U+FFFD rather than the
+// length. That distinction is the whole point: TestHistory_ToolResultCap and
+// TestHistory_BufferCap above both pass on the broken code, because a
+// mid-rune cut is exactly as short as a clean one.
+//
+// The payload is 好 (U+597D, three bytes) so that the cap always lands inside a
+// rune: 16,384 mod 3 == 1 and 4,194,304 mod 3 == 1.
+
+// TestHistory_ToolResultCapNeverCutsARune — MaxToolResultBytes, RecordToolResult.
+func TestHistory_ToolResultCapNeverCutsARune(t *testing.T) {
+	dir := t.TempDir()
+	h := NewHistoryStore(dir)
+	body := strings.Repeat("好", MaxToolResultBytes) // 3x the cap
+	h.RecordToolUse("s", "t1", "Bash", nil)
+	h.RecordToolResult("s", "t1", body, false)
+	h.AccumulateAssistant("s", "x")
+	h.FinalizeAssistant("s")
+
+	msgs := h.LoadHistory("s")
+	if len(msgs) != 1 || len(msgs[0].Tools) != 1 || msgs[0].Tools[0].Result == nil {
+		t.Fatalf("expected one entry with a tool result, got %+v", msgs)
+	}
+	got := msgs[0].Tools[0].Result.Content
+	assertNoReplacementChar(t, "tool result", got)
+	// Still capped, and still a PREFIX of what was recorded — a rune-boundary cut
+	// that dropped or reordered content would satisfy the assertion above.
+	if len(got) > MaxToolResultBytes+64 {
+		t.Errorf("content is %d bytes, cap is %d — not truncated at all?", len(got), MaxToolResultBytes)
+	}
+	if !strings.HasPrefix(body, strings.TrimSuffix(got, "\n[... truncated ...]")) {
+		t.Error("the kept part is not a prefix of the recorded result")
+	}
+}
+
+// TestHistory_AssistantOverflowNeverCutsARune — MaxAssistantBufBytes, the
+// chunk[:remaining] splice in AccumulateAssistant.
+func TestHistory_AssistantOverflowNeverCutsARune(t *testing.T) {
+	dir := t.TempDir()
+	h := NewHistoryStore(dir)
+	// Two chunks of 3 MiB: the second one crosses the 4 MiB cap with
+	// remaining == 1,048,576, which is 1 mod 3.
+	chunk := strings.Repeat("好", 1<<20)
+	h.AccumulateAssistant("s", chunk)
+	h.AccumulateAssistant("s", chunk)
+	h.FinalizeAssistant("s")
+
+	msgs := h.LoadHistory("s")
+	if len(msgs) != 1 {
+		t.Fatalf("len(msgs) = %d, want 1", len(msgs))
+	}
+	assertNoReplacementChar(t, "assistant text", msgs[0].Text)
+	if !strings.Contains(msgs[0].Text, "response truncated") {
+		t.Error("text is missing its truncation marker — the cap did not bind")
+	}
+}
+
+// TestHistory_ThinkingOverflowNeverCutsARune — MaxThinkingBufBytes, the
+// delta[:remaining] splice in AccumulateThinking.
+func TestHistory_ThinkingOverflowNeverCutsARune(t *testing.T) {
+	dir := t.TempDir()
+	h := NewHistoryStore(dir)
+	chunk := strings.Repeat("好", 1<<20)
+	h.AccumulateThinking("s", chunk)
+	h.AccumulateThinking("s", chunk)
+	h.FinalizeAssistant("s")
+
+	msgs := h.LoadHistory("s")
+	if len(msgs) != 1 {
+		t.Fatalf("len(msgs) = %d, want 1", len(msgs))
+	}
+	assertNoReplacementChar(t, "thinking", msgs[0].Thinking)
+	if got := len(msgs[0].Thinking); got > MaxThinkingBufBytes {
+		t.Errorf("thinking is %d bytes, cap is %d — the cap did not bind", got, MaxThinkingBufBytes)
+	}
+}
+
+// assertNoReplacementChar fails if s carries a U+FFFD, which is what a
+// mid-rune byte cut becomes once it has been through encoding/json.
+//
+// utf8.ValidString is checked too, and it is NOT redundant: it would catch a
+// half rune that reached the caller without a JSON round trip, whereas
+// ContainsRune catches the one that already went through the file. Only the
+// second can happen on these paths today; asserting both means a future caller
+// that skips the file is covered by the same helper.
+func assertNoReplacementChar(t *testing.T, what, s string) {
+	t.Helper()
+	if !utf8.ValidString(s) {
+		t.Errorf("%s is not valid UTF-8 — a byte slice cut inside a rune", what)
+	}
+	if i := strings.IndexRune(s, utf8.RuneError); i >= 0 {
+		lo := max(0, i-24)
+		hi := min(len(s), i+24)
+		t.Errorf("%s carries U+FFFD at byte %d of %d: ...%q... — the truncation cut "+
+			"inside a rune and encoding/json replaced the fragment", what, i, len(s), s[lo:hi])
 	}
 }
 

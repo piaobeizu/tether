@@ -421,6 +421,141 @@ func TestEncodeProjectDirMapsEveryNonAlphanumeric(t *testing.T) {
 	}
 }
 
+// TestEncodeProjectDirCountsUTF16CodeUnits — cc's replace walks UTF-16 code
+// units, so a character outside the BMP yields TWO dashes there. Before
+// tether#120 this function yielded one, because `for _, r := range` walks RUNES.
+//
+// The rule was read out of the installed binary rather than inferred, the same
+// way the [a-zA-Z0-9] finding above it was. Claude Code 2.1.237 (byte-identical
+// in 2.1.233, only the minified names differ), read 2026-08-20:
+//
+//	function z$o(e){return e.replace(/[^a-zA-Z0-9]/g,"-")}
+//	function W9(e){let t=z$o(e);if(t.length<=kie)return t;
+//	               return `${t.slice(0,kie)}-${y__(e)}`}
+//	function rS(){return d$.join(Tn(),"projects")}
+//	kie=200
+//
+// There is no `u` flag on that regex, so String.prototype.replace matches each
+// half of a surrogate PAIR separately and writes a dash for each. `t.length` is
+// likewise a code-unit count, which is the second thing this fixes: the >200
+// branch below was being chosen off a shorter number than cc's.
+//
+// Every case here was cross-checked against node running that exact source.
+func TestEncodeProjectDirCountsUTF16CodeUnits(t *testing.T) {
+	for _, tc := range []struct{ path, want string }{
+		// U+1F600 is one rune, two UTF-16 code units, two dashes.
+		{"/root/\U0001F600/x", "-root----x"},
+		{"/w/\U0001F600/repo", "-w----repo"},
+		// Two of them, adjacent: four dashes, so this is not a fencepost that a
+		// single +1 somewhere would satisfy.
+		{"/a/\U0001F600\U0001F600", "-a-----"},
+		// A BMP non-ASCII character is ONE code unit and one dash — in cc AND
+		// here. This is the control that made the divergence invisible: every one
+		// of the 37 real project directories on the reference machine is in this
+		// class or plainer, so no amount of sampling there could express it.
+		{"/root/café/x", "-root-caf--x"},
+		{"/root/你好", "-root---"},
+		// The threshold's two neighbours. Without these, `r >= 0xFFFF`,
+		// `r > 0xFFFE` and `r > 0x10000` all pass the rest of this table — the
+		// dash-count cases above are all far from the boundary, so they pin the
+		// RULE and say nothing about where it switches over. Both values were
+		// checked against cc's encoder in node.
+		{"/a/￿", "-a--"},           // last BMP code point: one code unit, one dash
+		{"/a/\U00010000", "-a---"}, // first non-BMP: a surrogate pair, two dashes
+	} {
+		if got := EncodeProjectDir(tc.path); got != tc.want {
+			t.Errorf("EncodeProjectDir(%q) = %q (%d chars), want %q (%d chars)",
+				tc.path, got, len(got), tc.want, len(tc.want))
+		}
+	}
+}
+
+// TestListFindsASessionUnderANonBMPWorkdir is the consequence of the encoding
+// above reaching the only three things that read it, and the reason the
+// divergence is worth a fix rather than a footnote: with one emoji in the
+// workspace path, cc's transcript sits in a directory this daemon computes a
+// different name for, so the session is neither LISTED nor SERVED — no error, no
+// log line, exactly the failure mode the underscore bug had.
+//
+// The emoji fixture is placed at the name cc ACTUALLY writes, hard-coded. It
+// deliberately does NOT go through ccFixture.write, which derives the directory
+// from EncodeProjectDir: a fixture built by the code under test moves WITH the
+// defect and would pass either way. The ASCII workspace beside it is the positive
+// control — it keeps a broken List() from being read as this defect.
+func TestListFindsASessionUnderANonBMPWorkdir(t *testing.T) {
+	const emojiWD = "/w/\U0001F600/repo"
+	const asciiWD = "/w/plain/repo"
+	// What cc writes for emojiWD. Verified in node against the encoder read out
+	// of the binary (see TestEncodeProjectDirCountsUTF16CodeUnits).
+	const ccDirName = "-w----repo"
+
+	f := newCCFixture(t, emojiWD, asciiWD)
+	dir := filepath.Join(f.root, ccDirName)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cc-session-emoji1.jsonl"),
+		[]byte(ccUser(t, "under an emoji path")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.write(t, asciiWD, "cc-session-plain1.jsonl", ccUser(t, "under a plain path"))
+
+	s := f.store()
+	titles := map[string]string{}
+	for _, r := range s.List() {
+		titles[r.Sid] = r.Title
+	}
+	if titles["cc-session-plain1"] != "under a plain path" {
+		t.Fatalf("the ASCII control is missing, so List() is broken for a reason "+
+			"other than the encoding: %+v", titles)
+	}
+	if titles["cc-session-emoji1"] != "under an emoji path" {
+		t.Errorf("List() lost the session under %q: got %+v — cc filed it under %q",
+			emojiWD, titles, ccDirName)
+	}
+	// find / findStat share resolveProjectDir, so they miss it the same way.
+	if !s.Has("cc-session-emoji1") {
+		t.Error("Has() cannot find the session under a non-BMP workdir")
+	}
+	if _, ok := s.Messages("cc-session-emoji1"); !ok {
+		t.Error("Messages() cannot serve the session under a non-BMP workdir")
+	}
+	if _, ok := s.ModTime("cc-session-emoji1"); !ok {
+		t.Error("ModTime() cannot stat the session under a non-BMP workdir")
+	}
+}
+
+// TestResolveProjectDirLengthBranchUsesCCsOwnCount — the >200 branch is selected
+// on `len(name)`, and cc selects it on `t.length`. Those are the same number only
+// while the encoded name is ASCII, which is exactly what the fix above restores:
+// one non-BMP character used to make this side's count one SHORT, so a path cc
+// had hashed could be answered by computing a name that does not exist.
+//
+// Written as a property of the encoding rather than as a store fixture because
+// the hash cc appends is not reproducible from here — what is checkable is that
+// both sides agree on WHICH branch to take.
+func TestResolveProjectDirLengthBranchUsesCCsOwnCount(t *testing.T) {
+	// 199 characters of plain encoding, then one emoji: 199 + 2 = 201 code units
+	// for cc, but 199 + 1 = 200 for a rune count — landing on opposite sides of
+	// the boundary.
+	path := "/" + strings.Repeat("a", 197) + "/\U0001F600"
+	name := EncodeProjectDir(path)
+	if len(name) != 201 {
+		t.Fatalf("encoded name is %d chars, want 201 (cc's UTF-16 count) — "+
+			"a rune count gives 200 and takes the wrong branch", len(name))
+	}
+	if len(name) <= ccDirNameMaxLen {
+		t.Fatalf("fixture must exceed %d to exercise the hash branch", ccDirNameMaxLen)
+	}
+	// And the branch is actually taken: with no matching directory present, the
+	// hash branch answers "" rather than pointing at a computed name.
+	f := newCCFixture(t, path)
+	if got := f.store().resolveProjectDir(path); got != "" {
+		t.Errorf("resolveProjectDir = %q, want \"\" — a path cc hashes must be "+
+			"answered by looking, never by computing", got)
+	}
+}
+
 // TestResolveProjectDirFindsALongPathByPrefix — past 200 characters cc stops
 // using the plain encoding and appends a hash of the original path, which cannot
 // be reproduced from here. Without the prefix lookup such a workspace lists

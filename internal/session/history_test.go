@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/piaobeizu/tether/internal/wire"
 )
@@ -147,6 +149,183 @@ func TestHistory_ToolResultCap(t *testing.T) {
 	}
 	if got := len(msgs[0].Tools[0].Result.Content); got > MaxToolResultBytes+50 {
 		t.Errorf("result content %d exceeds cap %d", got, MaxToolResultBytes)
+	}
+}
+
+// The three overflow paths in this file used to cut a byte slice at the cap and
+// hand the result to encoding/json, which re-encodes a half rune as U+FFFD. The
+// user then reads a replacement character where their text was cut — and none of
+// the three caps is a multiple of 3, so a CJK payload hits it EVERY time it
+// overruns rather than occasionally.
+//
+// Each of the three tests below asserts the absence of U+FFFD rather than the
+// length. That distinction is the whole point: TestHistory_ToolResultCap and
+// TestHistory_BufferCap above both pass on the broken code, because a
+// mid-rune cut is exactly as short as a clean one.
+//
+// The payload is 好 (U+597D, three bytes) so that the cap always lands inside a
+// rune: 16,384 mod 3 == 1 and 4,194,304 mod 3 == 1.
+
+// TestTruncateAtRuneBoundaryKeepsAsMuchAsItCan asserts the EXACT number of bytes
+// kept, which the three end-to-end tests below deliberately cannot.
+//
+// It exists because "contains no U+FFFD" is satisfied by a truncation that keeps
+// NOTHING, and so is "is a prefix of the input" (every string has the empty
+// prefix). Review demonstrated that: a helper rewritten to `return ""` passed the
+// entire package, as did `cut := max - 1`, which silently drops one extra rune
+// whenever the cap already lands on a boundary. Absence of corruption and
+// preservation of content are two properties, and only the first one survives
+// being measured by looking for a bad byte.
+//
+// The 2-byte-rune rows are what cover the exact-boundary shape: both caps are
+// even, so a cap-aligned cut is legal there and any off-by-one shows up as a
+// deficit of 2.
+func TestTruncateAtRuneBoundaryKeepsAsMuchAsItCan(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		s    string
+		max  int
+		want int // EXACT bytes expected out
+	}{
+		{"ascii cuts exactly at the cap", strings.Repeat("a", 100), 10, 10},
+		{"two-byte runes on an even cap keep all of it", strings.Repeat("é", 100), 10, 10},
+		{"two-byte runes on an odd cap give back one", strings.Repeat("é", 100), 11, 10},
+		{"three-byte runes: 10 is 1 mod 3", strings.Repeat("好", 100), 10, 9},
+		{"three-byte runes: 11 is 2 mod 3", strings.Repeat("好", 100), 11, 9},
+		{"three-byte runes: 12 is a multiple", strings.Repeat("好", 100), 12, 12},
+		{"four-byte rune backs over three bytes", strings.Repeat("😀", 100), 7, 4},
+		{"max at len is the whole string", "好好", 6, 6},
+		{"max past len is the whole string", "好好", 99, 6},
+		{"one byte of a three-byte rune keeps nothing", "好", 1, 0},
+		{"zero keeps nothing", strings.Repeat("a", 10), 0, 0},
+		{"negative keeps nothing rather than panicking", strings.Repeat("a", 10), -5, 0},
+		{"empty input", "", 0, 0},
+	} {
+		got := truncateAtRuneBoundary(tc.s, tc.max)
+		if len(got) != tc.want {
+			t.Errorf("%s: truncateAtRuneBoundary(%d bytes, max=%d) kept %d bytes, want %d",
+				tc.name, len(tc.s), tc.max, len(got), tc.want)
+		}
+		if !strings.HasPrefix(tc.s, got) {
+			t.Errorf("%s: result is not a prefix of the input", tc.name)
+		}
+		assertNoReplacementChar(t, tc.name, got)
+	}
+}
+
+// TestHistory_ToolResultCapNeverCutsARune — MaxToolResultBytes, RecordToolResult.
+func TestHistory_ToolResultCapNeverCutsARune(t *testing.T) {
+	dir := t.TempDir()
+	h := NewHistoryStore(dir)
+	body := strings.Repeat("好", MaxToolResultBytes) // 3x the cap
+	h.RecordToolUse("s", "t1", "Bash", nil)
+	h.RecordToolResult("s", "t1", body, false)
+	h.AccumulateAssistant("s", "x")
+	h.FinalizeAssistant("s")
+
+	msgs := h.LoadHistory("s")
+	if len(msgs) != 1 || len(msgs[0].Tools) != 1 || msgs[0].Tools[0].Result == nil {
+		t.Fatalf("expected one entry with a tool result, got %+v", msgs)
+	}
+	got := msgs[0].Tools[0].Result.Content
+	assertNoReplacementChar(t, "tool result", got)
+	kept := strings.TrimSuffix(got, ccTruncated)
+	if kept == got {
+		t.Errorf("content does not end in the truncation marker — not truncated at all?")
+	}
+	// Bounded on BOTH sides. The upper bound alone is what let the pre-existing
+	// TestHistory_ToolResultCap pass on the broken code; the lower bound is what
+	// stops "keep nothing" from passing this one. The cap is 1 mod 3 and the
+	// payload is three-byte runes, so exactly one byte is given back.
+	if len(kept) != MaxToolResultBytes-1 {
+		t.Errorf("kept %d bytes, want exactly %d (the cap less the one byte a "+
+			"three-byte rune gives back)", len(kept), MaxToolResultBytes-1)
+	}
+	if !strings.HasPrefix(body, kept) {
+		t.Error("the kept part is not a prefix of the recorded result")
+	}
+}
+
+// TestHistory_AssistantOverflowNeverCutsARune — MaxAssistantBufBytes, the
+// chunk[:remaining] splice in AccumulateAssistant.
+func TestHistory_AssistantOverflowNeverCutsARune(t *testing.T) {
+	dir := t.TempDir()
+	h := NewHistoryStore(dir)
+	// Two chunks of 3 MiB: the second one crosses the 4 MiB cap with
+	// remaining == 1,048,576, which is 1 mod 3.
+	chunk := strings.Repeat("好", 1<<20)
+	h.AccumulateAssistant("s", chunk)
+	h.AccumulateAssistant("s", chunk)
+	h.FinalizeAssistant("s")
+
+	msgs := h.LoadHistory("s")
+	if len(msgs) != 1 {
+		t.Fatalf("len(msgs) = %d, want 1", len(msgs))
+	}
+	assertNoReplacementChar(t, "assistant text", msgs[0].Text)
+	marker := "\n\n[... response truncated at " + strconv.Itoa(MaxAssistantBufBytes) + " bytes ...]"
+	kept, ok := strings.CutSuffix(msgs[0].Text, marker)
+	if !ok {
+		t.Fatal("text is missing its truncation marker — the cap did not bind")
+	}
+	// Exactly the cap less one byte: 3 MiB of the first chunk, then a second cut
+	// at remaining == 1,048,576, which is 1 mod 3. Asserting the exact figure
+	// rather than an upper bound is what kills a truncation that keeps nothing.
+	if len(kept) != MaxAssistantBufBytes-1 {
+		t.Errorf("kept %d bytes, want exactly %d", len(kept), MaxAssistantBufBytes-1)
+	}
+	if !strings.HasPrefix(chunk+chunk, kept) {
+		t.Error("the kept text is not a prefix of what was streamed")
+	}
+}
+
+// TestHistory_ThinkingOverflowNeverCutsARune — MaxThinkingBufBytes, the
+// delta[:remaining] splice in AccumulateThinking.
+func TestHistory_ThinkingOverflowNeverCutsARune(t *testing.T) {
+	dir := t.TempDir()
+	h := NewHistoryStore(dir)
+	chunk := strings.Repeat("好", 1<<20)
+	h.AccumulateThinking("s", chunk)
+	h.AccumulateThinking("s", chunk)
+	h.FinalizeAssistant("s")
+
+	msgs := h.LoadHistory("s")
+	if len(msgs) != 1 {
+		t.Fatalf("len(msgs) = %d, want 1", len(msgs))
+	}
+	assertNoReplacementChar(t, "thinking", msgs[0].Thinking)
+	// This path appends no marker, so the length IS the whole assertion, and it is
+	// exact for the same reason as the two above. Note the upper bound alone used
+	// to FAIL here rather than merely pass weakly: the broken code persisted
+	// 4,194,306 bytes against a 4,194,304 cap, because the byte it dropped came
+	// back as a three-byte U+FFFD.
+	if got := len(msgs[0].Thinking); got != MaxThinkingBufBytes-1 {
+		t.Errorf("thinking is %d bytes, want exactly %d (cap %d less the one byte a "+
+			"three-byte rune gives back)", got, MaxThinkingBufBytes-1, MaxThinkingBufBytes)
+	}
+	if !strings.HasPrefix(chunk+chunk, msgs[0].Thinking) {
+		t.Error("the kept thinking is not a prefix of what was streamed")
+	}
+}
+
+// assertNoReplacementChar fails if s carries a U+FFFD, which is what a
+// mid-rune byte cut becomes once it has been through encoding/json.
+//
+// utf8.ValidString is checked too, and it is NOT redundant: it would catch a
+// half rune that reached the caller without a JSON round trip, whereas
+// ContainsRune catches the one that already went through the file. Only the
+// second can happen on these paths today; asserting both means a future caller
+// that skips the file is covered by the same helper.
+func assertNoReplacementChar(t *testing.T, what, s string) {
+	t.Helper()
+	if !utf8.ValidString(s) {
+		t.Errorf("%s is not valid UTF-8 — a byte slice cut inside a rune", what)
+	}
+	if i := strings.IndexRune(s, utf8.RuneError); i >= 0 {
+		lo := max(0, i-24)
+		hi := min(len(s), i+24)
+		t.Errorf("%s carries U+FFFD at byte %d of %d: ...%q... — the truncation cut "+
+			"inside a rune and encoding/json replaced the fragment", what, i, len(s), s[lo:hi])
 	}
 }
 

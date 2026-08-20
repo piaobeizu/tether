@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/piaobeizu/tether/internal/wire"
 )
@@ -80,6 +81,65 @@ const (
 	MaxToolsPerTurn     = 200      // cap tool calls recorded per turn
 	MaxToolResultBytes  = 16 << 10 // cap each persisted tool result (UI truncates display anyway)
 )
+
+// truncateAtRuneBoundary returns the longest prefix of s that is at most max
+// bytes and does not end inside a rune, for a valid-UTF-8 s.
+//
+// It appends no marker: the three callers in this file word theirs differently,
+// and one of them adds it to a DIFFERENT string than the one being cut.
+//
+// It would sit better in a text-utility file of its own than in the middle of
+// history persistence, and it is here because tether#120 was scoped to two files
+// and three of its four callers are in this one. ccCapBytes (ccsessions.go) is
+// the fourth and wraps it with a marker.
+//
+// # Why the boundary walk (tether#120)
+//
+// All three of the callers below used to slice at the cap. Everything they cut is
+// then handed to encoding/json, which emits U+FFFD for a fragment of a rune — so
+// the user reads a replacement character where their text was cut. The cap is not
+// even respected in exchange: the one byte dropped comes back as a THREE-byte
+// U+FFFD, so the persisted string can exceed the cap it was truncated to
+// (measured on the thinking path: 4,194,306 bytes against a 4,194,304 cap).
+//
+// How often that happens depends on the OFFSET the cut lands on, which is not the
+// same number for all three callers. RecordToolResult cuts at the cap itself, and
+// 16,384 mod 3 == 1, so a payload of three-byte runes — CJK, which is what the
+// transcript that prompted the neighbouring caps is written in — lands mid-rune on
+// EVERY overrun. The two accumulators cut at `cap - len(buffer)`, so what has to
+// be indivisible is that difference: an all-CJK buffer under a cap that is 1 mod 3
+// overruns mid-rune every time as well, but a single ASCII byte earlier in the
+// turn shifts the offset and the same payload can cut cleanly. Frequency, not
+// possibility — one in three of those is still a corrupted turn.
+//
+// The reason this went unnoticed for so long is that a mid-rune cut is exactly as
+// SHORT as a clean one, and every test on these paths asserted length. Nothing
+// about a cap's arithmetic can catch this; only looking at the bytes can.
+//
+// # Two edges worth stating
+//
+// A max at or below zero yields "" rather than panicking on a negative slice
+// bound, which is what lets the callers drop their own `> 0` guards.
+//
+// On INVALID UTF-8 the doc line at the top is not true and the walk is bounded
+// only by 0: a cut landing after a run of stray continuation bytes backs over all
+// of them, so up to max bytes can be dropped where Go's own decoder would have
+// read each stray byte as a width-1 RuneError and kept them. Accepted rather than
+// handled — every input here is model-generated text — and identical to what the
+// ccCapBytes loop this was extracted from already did.
+func truncateAtRuneBoundary(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	if max <= 0 {
+		return ""
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
 
 // HistoryMessage is one entry stored in the JSONL history file: either a
 // plain text turn (Block nil) or a completed fenced block (D-19, tether#8
@@ -230,10 +290,7 @@ func (h *HistoryStore) AccumulateAssistant(sid, chunk string) {
 		return
 	}
 	if len(buf.text)+len(chunk) > MaxAssistantBufBytes {
-		remaining := MaxAssistantBufBytes - len(buf.text)
-		if remaining > 0 {
-			buf.text += chunk[:remaining]
-		}
+		buf.text += truncateAtRuneBoundary(chunk, MaxAssistantBufBytes-len(buf.text))
 		buf.text += "\n\n[... response truncated at " +
 			strconv.Itoa(MaxAssistantBufBytes) + " bytes ...]"
 		buf.overflow = true
@@ -269,9 +326,7 @@ func (h *HistoryStore) AccumulateThinking(sid, delta string) {
 		return
 	}
 	if len(buf.thinking)+len(delta) > MaxThinkingBufBytes {
-		if remaining := MaxThinkingBufBytes - len(buf.thinking); remaining > 0 {
-			buf.thinking += delta[:remaining]
-		}
+		buf.thinking += truncateAtRuneBoundary(delta, MaxThinkingBufBytes-len(buf.thinking))
 		buf.thinkingOverflow = true
 		slog.Warn("history: thinking truncated", "sid", sid, "limit_bytes", MaxThinkingBufBytes)
 		return
@@ -301,9 +356,12 @@ func (h *HistoryStore) RecordToolResult(sid, toolUseID, content string, isError 
 	if sid == "" || toolUseID == "" {
 		return
 	}
-	if len(content) > MaxToolResultBytes {
-		content = content[:MaxToolResultBytes] + "\n[... truncated ...]"
-	}
+	// ccCapBytes rather than a local slice: it is the same cap-and-mark rule with
+	// the same marker, and it was already written to cut on a rune boundary (this
+	// path was not). Calling it also makes "both stores word a truncation the same
+	// way" — which ccTruncated's doc asserts — hold by construction instead of by
+	// two literals staying in step.
+	content = ccCapBytes(content, MaxToolResultBytes)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	buf, ok := h.pending[sid]

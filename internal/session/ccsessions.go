@@ -73,7 +73,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-	"unicode/utf8"
 )
 
 // The stores a transcript can come from. One vocabulary, shared by
@@ -403,30 +402,102 @@ func CCProjectsDir(ccConfigDir string) string {
 const ccDirNameMaxLen = 200
 
 // EncodeProjectDir maps a working directory to the directory name cc files its
-// transcripts under: every character outside [a-zA-Z0-9] becomes '-'.
+// transcripts under: every UTF-16 code unit outside [a-zA-Z0-9] becomes '-'.
 //
 // # This rule was READ OUT OF CC, not inferred from its output
 //
 // Stated because the first version of this function was inferred, and was wrong
 // in a way no amount of sampling here could have caught. cc's own encoder is
 //
-//	replace(/[^a-zA-Z0-9]/g, "-")
+//	function z$o(e){return e.replace(/[^a-zA-Z0-9]/g,"-")}
+//	function W9(e){let t=z$o(e);if(t.length<=kie)return t;
+//	               return `${t.slice(0,kie)}-${y__(e)}`}
+//	function rS(){return d$.join(Tn(),"projects")}
+//	function xN(e){return nlu()??W9(e)}
+//	function bD(e){return d$.join(rS(),xN(e))}
+//	kie=200
 //
-// (Claude Code 2.1.233, read from the installed binary on 2026-08-17.) The first
-// version mapped only '/' and '.' — which matched all 37 real project directories
-// on this machine, because not one of those paths contains a character outside
+// (Claude Code 2.1.237, read from the installed binary on 2026-08-20. The
+// SEMANTICS are the same in 2.1.233 and 2.1.222 — same character class, same
+// 200, same hash suffix — but nothing else is: every minified name differs,
+// 2.1.233 calls it `mAo`/`WE`/`qre` and inlines the pair, and 2.1.222 inlines it
+// again as `r0`. Do not read this quote as a version-stable string to grep for.)
+//
+// `xN` is quoted because W9 is NOT the whole rule in 2.1.237: `nlu` reads
+// CLAUDE_CODE_PROJECT_DIR_NAME when CLAUDE_CONFIG_DIR is set and overrides the
+// encoding entirely. That override is NEW in 2.1.237 (the string appears 6 times
+// there and 0 times in 2.1.233 and 2.1.222), and it is out of scope here: nothing
+// in this repo sets either variable, and CCProjectsDir is derived from a config
+// directory the daemon itself chose. It is written down because the first draft of
+// this comment quoted W9 alone and called it "cc's own encoder" — which is the
+// same shape of miss as the one the next paragraph apologises for, one function
+// further out.
+//
+// The first version of this function mapped only '/' and '.' — which matched all
+// 37 real project directories present on this machine when that was measured (36
+// today), because not one of those paths contains a character outside
 // [a-zA-Z0-9/.-]. A workspace at /root/my_project would have produced
-// `-root-my_project` against cc's `-root-my-project` and listed ZERO sessions:
-// no error, no log line, no failing test. Underscores in a repository path are
-// not exotic.
+// `-root-my_project` against cc's `-root-my-project` and listed ZERO sessions: no
+// error, no log line, no failing test. Underscores in a repository path are not
+// exotic.
 //
 // The lesson generalises past this function: a claim about a third party's
 // behaviour has to come from the third party, and agreement with a sample is not
 // evidence when the sample cannot express the disagreement.
 //
-// (Exactness note: cc runs this over UTF-16 code units, so a character outside
-// the BMP yields two dashes there and one here. Irrelevant for real paths, and
-// the >200 branch below covers the case where it would matter to length.)
+// # UTF-16 code units, not runes (tether#120)
+//
+// There is no `u` flag on that regex, so String.prototype.replace walks the
+// string as UTF-16 code units: a rune outside the BMP is a SURROGATE PAIR there
+// and is matched — and replaced — twice. `for _, r := range` walks runes, so this
+// function used to emit one dash where cc emits two, and `/w/😀/repo` resolved to
+// `-w---repo` against cc's `-w----repo`. Measured consequence: List() returned
+// ZERO rows for that workspace and find/findStat missed the transcript too, so
+// the session was neither listed nor served — again with no error and no log
+// line, the same shape as the underscore bug above.
+//
+// The version of this comment that shipped before tether#120 knew about the
+// divergence, called it "irrelevant for real paths", and asserted that the >200
+// branch in resolveProjectDir covered the case where it mattered. Both halves
+// were wrong. An emoji in a directory name is ordinary, and the >200 branch is
+// not reached by a 9-character name — the divergence is a dash count in the
+// MIDDLE of the name, which no prefix scan can recover, so the recovery path that
+// was cited as cover could never have fired.
+//
+// `t.length` is a code-unit count as well, which is the second thing this fixes:
+// resolveProjectDir picks its branch on len(name), and the two agree only while
+// the encoded name is ASCII — which, since every byte written below is ASCII, is
+// now unconditionally true.
+//
+// # What this function still does NOT guarantee: the INPUT
+//
+// Everything above is about the ENCODER. Given the same input string, the only
+// remaining way the two sides can disagree is a run of invalid UTF-8, where Go's
+// range yields one U+FFFD per bad byte and another runtime's lossy decode need
+// not group them the same way. Unreachable here — a workspace path comes from
+// config — and stated rather than handled, because guessing at a third party's
+// error recovery is how the first version of this function went wrong.
+//
+// But the two sides are NOT always given the same input string, and that is a
+// separate matter from the encoding:
+//
+//   - filepath.Clean below has no counterpart in cc's encoder, which is handed a
+//     string cc has already resolved. This is deliberate and it CLOSES a gap
+//     rather than opening one: a workspace registered as `/w/repo/` would
+//     otherwise encode to `-w-repo-` while cc, running with cwd `/w/repo`, wrote
+//     `-w-repo`. TestEncodeProjectDirMatchesRealSamples pins the trailing-slash
+//     case for exactly that reason. Compare the two functions on a raw
+//     un-normalised string and they will differ; that comparison is not the one
+//     that matters.
+//
+//   - cc canonicalises with realpathSync before encoding (`g4m` in 2.1.237);
+//     tether's workspace paths get filepath.Abs and nothing more
+//     (internal/workspace/state.go). So a workspace registered THROUGH A SYMLINK
+//     encodes to a name cc never wrote, and produces the same silent zero rows
+//     this whole comment is about. That is a real gap, it is NOT fixed here, and
+//     it cannot be fixed here — the normalisation belongs where the path is
+//     recorded, not in this function, and tether#120 was scoped to two files.
+//     Raised by review and written down rather than left in a PR thread.
 //
 // # Forward only. There is deliberately no decoder in this package.
 //
@@ -450,7 +521,13 @@ func EncodeProjectDir(path string) string {
 		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
 			b.WriteRune(r)
 		default:
+			// One dash per UTF-16 code unit, so a non-BMP rune — two code units
+			// for cc's regex, one iteration of this loop — gets two. See the
+			// tether#120 section above.
 			b.WriteByte('-')
+			if r > 0xFFFF {
+				b.WriteByte('-')
+			}
 		}
 	}
 	return b.String()
@@ -472,6 +549,14 @@ func EncodeProjectDir(path string) string {
 // caller deduplicates by sid, so the cost is at worst listing a neighbour's
 // sessions — never a wrong claim about which directory a session ran in, because
 // this package never makes one.
+//
+// len(name) is compared against cc's `t.length`, which is a UTF-16 code-unit
+// count, and the two are the same number only because EncodeProjectDir emits
+// nothing but ASCII — one byte per code unit. That held by accident until
+// tether#120: a rune-counting encoder made a path cc had HASHED come out at 200
+// here, so this returned a computed name for a directory that does not exist and
+// the ReadDir below never ran. Slicing at ccDirNameMaxLen bytes matches
+// `t.slice(0,200)` for the same reason.
 func (s *CCStore) resolveProjectDir(path string) string {
 	name := EncodeProjectDir(path)
 	if name == "" {
@@ -1582,22 +1667,24 @@ func ccCapRunes(s string, max int) string {
 	return s
 }
 
-// ccCapBytes truncates to at most max bytes, never mid-rune.
+// ccCapBytes truncates to at most max bytes, never mid-rune, and marks the cut.
 //
 // A byte bound here rather than a rune one because this one exists to bound the
 // RESPONSE, and bytes are what a response is measured in. Cutting back to a rune
 // boundary matters because the result goes out as JSON: a half-encoded rune would
 // be re-encoded as U+FFFD and the user would read a replacement character where
 // their error message was cut.
+//
+// The boundary walk itself lives in truncateAtRuneBoundary (history.go), which
+// tether#120 extracted so that the three caps on the native history path — which
+// were all cutting mid-rune — get the same behaviour from the same code rather
+// than from a second copy of this loop. RecordToolResult calls this function
+// whole, since its cap wants the marker too.
 func ccCapBytes(s string, max int) string {
 	if len(s) <= max {
 		return s
 	}
-	cut := max
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return s[:cut] + ccTruncated
+	return truncateAtRuneBoundary(s, max) + ccTruncated
 }
 
 // ---------------------------------------------------------------------------

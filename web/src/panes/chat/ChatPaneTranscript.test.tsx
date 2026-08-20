@@ -6,6 +6,7 @@ import ChatPane, {
   HELD_SESSION_PLACEHOLDER, HELD_SESSION_READABLE_NOTE,
   TRANSCRIPT_DOTS_EARLIER_LABEL, TRANSCRIPT_DOTS_NEWER_LABEL,
   TRANSCRIPT_EDGE_MIN_INTERVAL_MS,
+  TRANSCRIPT_JUMP_LABEL, TRANSCRIPT_JUMP_SCREENS,
   TRANSCRIPT_OVERSCROLL_TOUCH_PX,
   TRANSCRIPT_START_COMPLETE, TRANSCRIPT_START_TETHER_RECORD_ONLY,
 } from './index'
@@ -3345,6 +3346,258 @@ describe('loading a transcript by scrolling to its ends (tether#110)', () => {
 
       expect(countNewestGets()).toBe(getsBefore + 1)
       expect(screen.getByText('brand new')).toBeTruthy()
+    })
+  })
+
+  /**
+   * tether#114 — the ride back to the newest message.
+   *
+   * The second half of the owner's report: "after scrolling up a long way there should be a
+   * small button at the bottom that jumps to the latest output." It lands on the SAME rail
+   * tether#113 built for the bottom dots and reads its position from the SAME scroll handler
+   * both ends above already use, so these cases are as much about what it does not disturb
+   * as about what it does.
+   *
+   * The geometry throughout: ten 100px rows in a 300px viewport, so `scrollHeight` is 1000
+   * and the distance to the bottom is `1000 - scrollTop - 300`. One viewport is 300px, so the
+   * button's threshold sits at `scrollTop < 400` and every figure below is that arithmetic.
+   */
+  describe('jumping back to the latest message (tether#114)', () => {
+    const jump = (root: ParentNode) => root.querySelectorAll('.transcript-bottom .transcript-jump')
+
+    it('stays away until the newest message is more than a screenful below, to the pixel', async () => {
+      // renderIdle rather than renderHeld ON PURPOSE: the bottom re-read does not exist in
+      // this state (see "leaves the bottom end alone…" above), so nothing here can be
+      // explained by a request, a re-render or a merge. The button's visibility is the only
+      // moving part.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderIdle()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+      expect(box.height()).toBe(1000)
+      // Nothing before the first scroll event, whatever the position — the pane has no
+      // measurement of a viewport until something asks it to take one.
+      expect(jump(container)).toHaveLength(0)
+
+      // Top of the transcript: 700px below the fold, more than two screens.
+      await act(async () => { box.fire() })
+      expect(jump(container)).toHaveLength(1)
+
+      // The boundary, both sides, exactly. 400 leaves the newest message one pixel from
+      // entering the viewport; 399 puts it one pixel outside. `>=` in place of `>` flips the
+      // first of these and nothing else in the suite.
+      await act(async () => { box.scrollTo(400) })
+      expect(jump(container)).toHaveLength(0)
+      await act(async () => { box.scrollTo(399) })
+      expect(jump(container)).toHaveLength(1)
+
+      // …and at the bottom, where the reader already is, it is gone.
+      await act(async () => { box.scrollTo(700) })
+      expect(jump(container)).toHaveLength(0)
+
+      // The threshold is a screenful, not 400px: the same position answers differently in a
+      // taller pane. Re-modelled on the same element, which is the only way to say this
+      // without a second render — 700px below the fold is under one screen at 800px tall.
+      const tall = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 800)
+      await act(async () => { tall.scrollTo(0) })
+      expect(jump(container)).toHaveLength(0)
+      expect(TRANSCRIPT_JUMP_SCREENS).toBe(1)
+    })
+
+    it('rides the rail OUTSIDE the scroll container, and costs the scroll height nothing', async () => {
+      // tether#113's property, re-asserted for the new tenant rather than assumed to survive
+      // it. Structure, not layout — see that wi's own case above for why no test in this repo
+      // can say "no shift" and where the Chrome figures live.
+      // `earlier` is set so the top end has a cursor and renders its grid rather than
+      // tether#107's "this is the start" note — the last assertions here are about that grid,
+      // and without a cursor they would be asserting the absence of something that is absent
+      // for an unrelated reason. Nothing loads from it: the single event below arrives at the
+      // top with the latch unarmed, which is 'idle'.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500), earlier: 4096 }
+      const container = await renderIdle()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+      const chat = container.querySelector('.dt-chat') as HTMLElement
+      expect(box.height()).toBe(1000)
+
+      await act(async () => { box.fire() })
+      expect(countEarlierPages()).toBe(0)
+      const btn = container.querySelector('.transcript-jump') as HTMLElement
+      expect(btn).not.toBeNull()
+
+      // The whole of it, as one number: nothing matching that selector inside the scroller.
+      expect(chat.querySelectorAll('.transcript-jump')).toHaveLength(0)
+      // On the rail, which is where `position: absolute; bottom: 0` resolves against a
+      // zero-height box pinned to the scroller's viewport. A child of `.dt-chat` would scroll
+      // away with the content instead.
+      expect(btn.parentElement?.classList.contains('transcript-bottom')).toBe(true)
+      const rail = btn.parentElement as HTMLElement
+      expect(rail.parentElement).toBe(chat.parentElement)
+      expect(chat.compareDocumentPosition(rail) & Node.DOCUMENT_POSITION_FOLLOWING)
+        .toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+      expect(rail.nextElementSibling?.classList.contains('dt-composer')).toBe(true)
+      // …so the scroll height is what the ten rows say and not a pixel more. `fakeScrollBox`
+      // charges BOTTOM_INDICATOR_PX for a `.transcript-bottom` INSIDE `.dt-chat`, so this is
+      // the assertion that goes red if the rail is ever moved back in to host the button.
+      expect(box.height()).toBe(1000)
+
+      // A real button with a real name. Its only content is an arrow that is `aria-hidden`,
+      // so `TRANSCRIPT_JUMP_LABEL` is the entire accessible name — and `type="button"` is not
+      // decoration: the composer below is a form in every browser sense, and a default-type
+      // button that ever ends up inside one submits it.
+      expect(btn.tagName).toBe('BUTTON')
+      expect(btn.getAttribute('type')).toBe('button')
+      expect(btn.getAttribute('aria-label')).toBe(TRANSCRIPT_JUMP_LABEL)
+      expect(btn.querySelector('[aria-hidden="true"]')?.textContent).toBe('↓')
+
+      // The TOP end's grid is untouched — the same guard tether#113 wrote against fixing one
+      // end by breaking the other.
+      expect(container.querySelectorAll('.transcript-top-slots')).toHaveLength(1)
+      expect(container.querySelectorAll('.transcript-top-slots > .transcript-dots')).toHaveLength(1)
+      expect(container.querySelectorAll('.transcript-top-slots > .transcript-more')).toHaveLength(1)
+    })
+
+    it('takes the reader to the bottom in ONE step, not a smooth glide', async () => {
+      // `behavior: 'smooth'` would emit a scroll event per animation frame into a handler
+      // whose whole job is deciding what an arrival means, which is why this is an assignment.
+      // Neither half of that is observable in jsdom directly — it animates nothing and it
+      // implements no `scrollTo` — so both are pinned by their consequences: the position is
+      // final the instant the click returns, and the API that could have carried a `behavior`
+      // is never called.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderIdle()
+      const chat = container.querySelector('.dt-chat') as HTMLElement
+      const box = liveScrollBox(chat, 300)
+      const scrollToSpy = vi.fn()
+      ;(chat as unknown as { scrollTo: unknown }).scrollTo = scrollToSpy
+
+      await act(async () => { box.scrollTo(100) })
+      const btn = container.querySelector('.transcript-jump') as HTMLElement
+      expect(btn).not.toBeNull()
+
+      // Synchronously after the click, before `settle()` has flushed anything: already there.
+      await act(async () => { btn.click() })
+      expect(box.top()).toBe(1000)
+      expect(scrollToSpy).not.toHaveBeenCalled()
+      // And the button is gone without waiting for the browser to tell the pane so — which is
+      // what a transcript too short to scroll needs, since there the write moves nothing and
+      // fires nothing.
+      expect(jump(container)).toHaveLength(0)
+    })
+
+    it('asks the daemon exactly once for the press, and cannot be made to ask again', async () => {
+      // THE loop bound, and the reason it needs one: in a real browser a programmatic
+      // `scrollTop` write DOES fire a `scroll` event (CSSOM View; jsdom does not, which is
+      // what `liveScrollBox` supplies). So the press re-enters the handler at the bottom with
+      // the latch armed — the reader armed it themselves by scrolling up — and that arrival
+      // loads, exactly as arriving there by hand does. What must not happen is a SECOND one.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      pastFloor()
+      await act(async () => { box.scrollTo(100) })
+      await settle()
+      const getsBefore = countNewestGets()
+      const eventsBefore = box.events()
+      expect(jump(container)).toHaveLength(1)
+
+      pastFloor()
+      const btn = container.querySelector('.transcript-jump') as HTMLElement
+      await act(async () => { btn.click() })
+      await settle()
+
+      // The fixture's own precondition: the write really did re-enter the handler, exactly
+      // once. Without this the count below would also hold for a fixture that fired nothing,
+      // and the loop would be untested rather than bounded.
+      expect(box.events()).toBe(eventsBefore + 1)
+      expect(box.top()).toBe(1000)
+      expect(countNewestGets()).toBe(getsBefore + 1)
+
+      // Now every way the press could beget another one. Further scroll events at the bottom
+      // — momentum, a rubber-band release — find the latch spent…
+      for (let i = 0; i < 3; i++) {
+        pastFloor()
+        await act(async () => { box.fire() })
+        await settle()
+      }
+      expect(countNewestGets()).toBe(getsBefore + 1)
+
+      // …and so does pressing again, which is only reachable at all because this test reaches
+      // past the render gate: the button is not on screen after the jump, so a human cannot.
+      pastFloor()
+      await act(async () => { btn.click() })
+      await settle()
+      expect(countNewestGets()).toBe(getsBefore + 1)
+
+      // The CONTROL, so the three assertions above are known to discriminate: leaving the
+      // bottom and coming back is a new arrival, and it still loads. Without this they would
+      // all hold for a pane whose bottom end had simply died.
+      pastFloor()
+      await act(async () => { box.scrollTo(100) })
+      await settle()
+      pastFloor()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      expect(countNewestGets()).toBe(getsBefore + 2)
+    })
+
+    it('shares the rail with the loading dots — neither hides the other', async () => {
+      // The collision the rail now has to answer for, and the rule is that there is no
+      // collision. "A request is in flight" and "the newest message is a screen below you" are
+      // independent facts, and in the one state where the bottom re-read exists — a session
+      // held by a background agent — a scrolled-up reader has both true for as long as they
+      // keep reading. The geometry that lets them coexist is measured in Chrome and recorded
+      // at the render site; what a test can hold is that the pane renders both.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderHeld()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      // Arrive at the bottom with the response held open, so the in-flight window is
+      // observable rather than inferred. At the bottom the button is correctly absent.
+      pastFloor()
+      await act(async () => { box.scrollTo(100) })
+      await settle()
+      let release = () => {}
+      gates[`GET ${MESSAGES_URL}`] = new Promise<void>(r => { release = r })
+      pastFloor()
+      await act(async () => { box.scrollTo(700) })
+      await settle()
+      expect(container.querySelectorAll('.transcript-bottom .transcript-dots')).toHaveLength(1)
+      expect(jump(container)).toHaveLength(0)
+
+      // The reader goes back up while the megabyte is still on the wire — both facts true.
+      await act(async () => { box.scrollTo(100) })
+      await settle()
+      expect(container.querySelectorAll('.transcript-bottom')).toHaveLength(1)
+      expect(container.querySelectorAll('.transcript-bottom .transcript-dots')).toHaveLength(1)
+      expect(jump(container)).toHaveLength(1)
+      // On the SAME rail, as siblings — one `.transcript-bottom`, two children. A second rail
+      // would stack them and put one of them somewhere nothing measured.
+      const rail = container.querySelector('.transcript-bottom') as HTMLElement
+      expect(rail.children).toHaveLength(2)
+
+      // The request lands: the dots go, the button stays, because the reader has not moved.
+      await act(async () => { release(); await Promise.resolve() })
+      await settle()
+      expect(container.querySelectorAll('.transcript-bottom .transcript-dots')).toHaveLength(0)
+      expect(jump(container)).toHaveLength(1)
+      expect(box.top()).toBe(100)
+    })
+
+    it('forgets the reader\'s position when the session changes', async () => {
+      // The latches are retired on a session switch because they describe where the reader has
+      // been in ONE conversation. So does this. And a new transcript opens autoscrolled to the
+      // bottom, where the button has nothing to offer — with no `scroll` event to say so,
+      // because that first autoscroll writes 0 to a box already at 0.
+      pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+      const container = await renderIdle()
+      const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+      await act(async () => { box.scrollTo(100) })
+      expect(jump(container)).toHaveLength(1)
+
+      await act(async () => { useStore.setState({ sessionId: 'sid-edges-0002' }) })
+      await settle()
+      expect(jump(container)).toHaveLength(0)
     })
   })
 })

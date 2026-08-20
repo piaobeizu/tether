@@ -912,29 +912,59 @@ body {
   font-family: var(--font-mono); font-size: 11px; color: var(--ink-tertiary);
   text-align: center; max-width: 86%; line-height: 1.5;
 }
-/* tether#114 — the AI side gets a measure, and it goes on the ROW.
-   ────────────────────────────────────────────────────────────────
-   The reported defect: "the AI output is too wide, and too close in shape to what I
+/* tether#114 + tether#115 — the AI side gets a measure, and it goes on the ROW.
+   ─────────────────────────────────────────────────────────────────────────────
+   The defect #114 reported: "the AI output is too wide, and too close in shape to what I
    typed". Those are one cause. `.msg-user-bubble` has always been `max-width: 86%`;
    nothing on the AI side had a width bound at all, so it ran the full column — long
    lines AND a silhouette that stopped contrasting with the reply above it.
 
-   MEASURED, in Chrome, against this stylesheet with Geist actually loaded, at the three
-   widths the right pane really takes (lib/layout.ts: MIN_RIGHT 260, DEFAULT_RIGHT 640,
-   MAX_RIGHT 1000), on a transcript long enough to scroll (so the 6px `.scroll-thin`
-   scrollbar is taking its width, which is the state this is about). Average characters per
-   line of AI prose, before → after:
+   #114 answered that with a flat `max-width: 440px` and the owner immediately reported the
+   opposite defect — "too narrow" — with a screenshot of a ~850px pane showing a thin column
+   of text and a large dead area to its right.
 
-       pane   260px   29.2 → 29.2   (cap inert; the pane is narrower than the cap)
-       pane   390px   48.6 → 48.6   (a phone at ≤768px, where .dt-right is the viewport)
-       pane   640px   83.3 → 64.8
-       pane  1000px  145.8 → 64.8
+   # 🔴 Why 440px was wrong: it was calibrated in the wrong script
 
-   440px is chosen for 64.8, which is where the typographic measure wants to be, and it is
-   chosen over 480px (72.9 chars) for a reason that is about this pane rather than about
-   typography: at the default width a long USER bubble also reads 72.9 characters per line,
-   so a 480px cap would have made the two sides identical in line length at the single most
-   common width — reproducing half the complaint while fixing the other half.
+   #114 measured LATIN prose (Geist, ~6.8px average advance) and picked 440px for 62-65
+   characters per line, which is where the typographic measure wants to be. But this pane's
+   owner reads and writes CHINESE, and CJK is full-width: measured here, one CJK glyph
+   advances **14.00px** at `font-size: 13.5px` (the CJK glyphs are not in Geist at all — the
+   browser falls back — and 14.00 is ~1.037em rather than exactly 1em). So the same 440px
+   that holds 60.5 Latin characters holds only **29.4 Chinese ones**, under half.
+
+   ⇒ A width calibrated on Latin text is roughly twice as wide as it reads in CJK.
+     MEASURE BOTH SCRIPTS, or the number will be right for one reader and wrong for this one.
+
+   # What is here now: a percentage, with a floor
+
+   MEASURED in `chrome-headless-shell` against this stylesheet with Geist actually loaded
+   (`document.fonts.check('400 13.5px Geist') === true`; the probe DOM must sit inside
+   `#root`, because that — not `body` — is where `font-family: var(--font-sans)` lives, and
+   a probe hung off `body` silently measures the UA default), at the widths the right pane
+   really takes (lib/layout.ts: MIN_RIGHT 260, DEFAULT_RIGHT 640, MAX_RIGHT 1000) plus a
+   390px phone, on a transcript long enough that the 6px `.scroll-thin` scrollbar is taking
+   its width. `.msg-ai` width in px, and characters per line in each script:
+
+       pane  content   440px   82%      max(82%,440px)   CJK/line        Latin/line
+                                        = SHIPPED        440 → shipped   440 → shipped
+       260   222.00   222.00  182.03 ↓  222.00           13.7 → 13.7     28.2 → 28.2
+       390   352.00   352.00  288.63 ↓  352.00           22.9 → 22.9     48.9 → 48.9
+       640   602.00   440.00  493.63    493.63           29.4 → 31.7     60.5 → 70.6
+      1000   962.00   440.00  788.83    788.83           29.4 → 51.5     60.5 → 115.5
+
+   The owner asked for "a percentage of the right pane's width" and chose 82%. The FLOOR is
+   the part they did not ask for and it is not a hedge — a bare `82%` is measurably WORSE
+   than today at the two narrow widths (222.00 → 182.03 and 352.00 → 288.63), because at
+   those widths the 440px cap was already inert and the column was full-width. Giving away
+   18% of a 222px column is the same defect that was just reported, on the same axis. With
+   `max(82%, 440px)` the shipped column is **≥ today at every width**: identical below a
+   ~575px pane, wider above it.
+
+   `max()` here takes the LESS restrictive of the two bounds — that is the point. The
+   crossover is 0.82W = 440, i.e. content W = 536.6px ≈ a 575px pane; below it the bound is
+   440px, which a narrower container cannot reach, so the cap simply does not engage.
+   440px therefore survives in this file with a completely different job than #114 gave it:
+   it is no longer a target measure, it is the width below which capping stops.
 
    # It goes on `.msg-ai`, not on `.msg-ai-body` + `.msg-ai-block`
 
@@ -944,53 +974,71 @@ body {
    of alignment with each other — which two matching declarations on two of the five could,
    and which would leave the other three at full width regardless.
 
-   # Why a bare `max-width` and not `min(440px, 100%)`
+   # Why `max-width` still, now that the value is a function
 
-   Because they are the same thing here and the shorter one is harder to get wrong.
-   `.msg-ai` is a stretch-aligned flex item of `.dt-chat`, so its width is the container's,
-   clamped by this. `max-width` is an upper bound: it cannot make a box wider than its
-   container, so it degrades to "the whole column" at every width below 440px on its own.
-   Measured rather than reasoned: at pane 260 the row is 222.00px — the full content box —
-   and `.dt-chat`'s `scrollWidth === clientWidth`, i.e. nothing overflows horizontally.
+   `.msg-ai` is a stretch-aligned flex item of `.dt-chat`, so its width IS the container's,
+   clamped by this. `max-width` is an upper bound and cannot make a box wider than its
+   container — which is exactly what makes the floor safe: below a ~575px pane the bound is
+   440px, the container is smaller, and the declaration is simply inert. Measured rather
+   than reasoned: at pane 260 the row is 222.00px, the full content box, with `.dt-chat`'s
+   `scrollWidth === clientWidth` (nothing overflows horizontally) at all four widths.
+   `min()`/`clamp()` are the wrong shapes here: `min(82%, 440px)` would cap at 440px on wide
+   panes, i.e. #114 again, and `clamp()` needs a lower bound this box must not have (a
+   minimum WIDTH would force horizontal overflow on a 260px pane).
 
-   # The distinction never inverts
+   # Where the two sides invert, and how weak the width signal now is
 
-   Let W be the content width. AI = min(440, W); a long user bubble = 0.86W. The AI side is
-   wider than the user's cap only while 0.86W < min(440, W), i.e. below W = 511.6px
-   (a ~550px pane), and by at most 0.14 x 440 = 61.6px. Today it is wider at EVERY width, by
-   0.14W — 134.7px at a 1000px pane. So the gap shrinks everywhere and reverses above a
-   ~550px pane; there is no width at which this change makes the AI side wider than it is
-   now. Measured at the ends: pane 260 → AI 222.00 vs bubble 190.91 (as today, cap inert);
-   pane 1000 → AI 440.00 vs bubble 827.31.
+   Let W be the content width. AI = min(W, max(0.82W, 440)); a long user bubble = 0.86W.
 
-   # Accepted, because the owner accepted it when choosing this option
+       W ≤ 440       AI = W        wider than the bubble by 0.14W  (unchanged from #114)
+       440 < W < 511.6  AI = 440   wider than the bubble, by ≤ 61.6px (unchanged from #114)
+       511.6 ≤ W < 536.6  AI = 440 narrower
+       W ≥ 536.6     AI = 0.82W    narrower, by exactly 0.04W
 
-   Wide code now scrolls sideways instead of fitting. `.md-body pre` already carries
-   `overflow: auto` (see below) and `.msg-tool-result` already carries
-   `max-height: 280px; overflow: auto`, so what a narrower column produces is scrollbars,
-   not spill — verified at all four widths above (`.dt-chat`'s `scrollWidth === clientWidth`
-   in every one). The one thing that gets measurably worse is tether#112's documented
-   residual: a `.msg-tool-result` is capped at 280px tall, so a narrower column wraps its
-   text into more lines and leaves more of it hidden behind the nested scrollbar — and
-   wheeling inside that nested box is what tether#112 can misread as a pull at an end.
-   Measured on one fixed 40-line sample, hidden height before → after:
+   So the inversion band is the same one #114 documented and the owner accepted; this change
+   neither adds nor removes it. What it DOES change is the size of the gap above the
+   crossover: #114 left the AI side 387.31px narrower than a long bubble at a 1000px pane,
+   this leaves it **38.48px** narrower (0.04W). ⇒ 🔴 **Width is now a weak distinguisher.**
+   Four percentage points is not what a reader will notice; the distinction between the two
+   sides now rests almost entirely on the things that were always doing most of the work —
+   right-alignment, the dark `--ink-primary` bubble, the avatar and the name. That is the
+   trade the owner chose when they asked for the space to be used. If "too close in shape"
+   ever comes back, the lever to reach for is NOT this percentage — it is those three.
 
-       pane   260px   6397 → 6397px   (cap inert)
-       pane   390px   3062 → 3062px   (cap inert)
-       pane   640px   1729 → 2396px   (+38.6%)
-       pane  1000px   1062 → 2396px   (+126%)
+   # The tether#112 residual: #114 made it worse, this makes it better
 
-   Not fixed here (tether#112 explains why the correct test needs computed styles and live
-   geometry that jsdom does not have); recorded because narrowing made it likelier, which is
-   the thing a later reader would otherwise have to rediscover.
+   `.md-body pre` already carries `overflow: auto` (see below) and `.msg-tool-result` already
+   carries `max-height: 280px; overflow: auto`, so column width produces scrollbars, not
+   spill. But a `.msg-tool-result` capped at 280px tall hides more of itself the narrower its
+   column is, and wheeling inside that nested box is what tether#112 can misread as a pull at
+   an end — so #114 widening the hidden region was a real (recorded, unfixed) regression.
+
+   Re-measured for this change on one fixed 40-line sample. ⚠️ These absolute values are NOT
+   comparable with the table #114 left here — that used a different sample, so only the
+   direction and the ratio carry over. Hidden height, 440px → shipped:
+
+       pane   260px   3729 → 3729px   (cap inert both ways)
+       pane   390px   1729 → 1729px   (cap inert both ways)
+       pane   640px   1062 → 1062px   (unchanged)
+       pane  1000px   1062 →  395px   (−62.8%)
+
+   ⇒ At no width is it worse than #114, and at the widest it is substantially better. Still
+   not FIXED (tether#112 explains why the correct test needs computed styles and live
+   geometry jsdom does not have) — but #114's note that "narrowing made it likelier" no
+   longer describes the shipped state, which is why that table had to be replaced rather
+   than left to rot.
 
    # Only a human can check what this LOOKS like
 
    `index.css` is imported by main.tsx alone, no test renders it, and `css` is off in the
-   vitest config — every mutant of this line survives the suite. The numbers above are what
-   can be said without eyes; whether 440px reads as "distinct from my input" is the owner's.
+   vitest config — **every mutant of this line survives the suite** (verified for #114 by
+   hand: deleting its `max-width` left 856 passed / 0 failed). The numbers above are what can
+   be said without eyes. What cannot: whether 51.5 Chinese characters per line at a 1000px
+   pane reads well, and whether a 4-point width difference plus alignment and colour still
+   separates the two sides. Both are the owner's call, and #114 shows a plausible-looking
+   number can be wrong by 2x in the script that actually matters.
    No new token (design freeze rule 4): this adds one length, no colour and no variable. */
-.msg-ai { display: flex; flex-direction: column; gap: 8px; max-width: 440px; }
+.msg-ai { display: flex; flex-direction: column; gap: 8px; max-width: max(82%, 440px); }
 .msg-ai-header { display: flex; align-items: center; gap: 7px; }
 .msg-ai-avatar {
   width: 18px; height: 18px; border-radius: 5px; background: var(--accent);

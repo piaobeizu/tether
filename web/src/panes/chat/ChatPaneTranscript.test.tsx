@@ -49,6 +49,21 @@ const originalFetch = globalThis.fetch
 /** How tall one bubble is in the geometry model below. */
 const ROW_PX = 100
 
+/**
+ * tether#113 — what the bottom indicator costs the scroll height IF it is a flow child of
+ * the scroll container.
+ *
+ * 39, because that is what it measured in Chrome against index.css: a 19px row plus one of
+ * `.dt-chat`'s 20px flex gaps. Only its being non-zero is load-bearing here — the model
+ * below is not a layout engine and cannot check the figure. What it encodes is the part
+ * that is not a guess: a flow child of a scroll container adds to that container's scroll
+ * height, and jsdom will not tell you so because it computes no layout at all. With the
+ * indicator outside `.dt-chat` this term is always zero, so it changes no existing
+ * assertion; it exists so that putting the indicator back inside is a RED test rather than
+ * a silent regression of tether#113.
+ */
+const BOTTOM_INDICATOR_PX = 39
+
 /** tether#112 — identifiers for the two fingers the touch fixture can put on the glass: the
  *  one making the gesture, and a thumb already resting there. Distinct and arbitrary; what
  *  matters is only that the pane must follow the RIGHT one. */
@@ -68,14 +83,19 @@ const RESTING_ID = 3
  * and "jumped to the bottom" in exactly the cases where they land close together.
  *
  * At module scope since tether#108, which needs the same model to check that the arrival
- * TRACE does not move a reader who has scrolled up. Written for tether#107 and unchanged.
+ * TRACE does not move a reader who has scrolled up. Written for tether#107 and unchanged
+ * until tether#113 added the indicator term — see BOTTOM_INDICATOR_PX.
  */
 function fakeScrollBox(el: HTMLElement, clientHeight: number) {
   let top = 0
   Object.defineProperty(el, 'clientHeight', { configurable: true, get: () => clientHeight })
   Object.defineProperty(el, 'scrollHeight', {
     configurable: true,
-    get: () => el.querySelectorAll('.msg-user, .msg-ai, .msg-system').length * ROW_PX,
+    get: () => el.querySelectorAll('.msg-user, .msg-ai, .msg-system').length * ROW_PX
+      // Scoped to `el`, so this counts the indicator only while it is INSIDE the scroll
+      // container. That scoping is the assertion: since tether#113 it is a sibling, and
+      // this term is 0.
+      + el.querySelectorAll('.transcript-bottom').length * BOTTOM_INDICATOR_PX,
   })
   Object.defineProperty(el, 'scrollTop', {
     configurable: true,
@@ -1822,6 +1842,28 @@ describe('loading a transcript by scrolling to its ends (tether#110)', () => {
    *  after the mount fetches have already gone through. */
   let gates: Record<string, Promise<void>> = {}
 
+  /**
+   * tether#113 — a gate a test never got round to releasing must not outlive that test.
+   *
+   * `refreshTranscript` dedupes per sid on module-level state in lib/session.ts
+   * (`inFlightSid` / `inFlightLoad`) that is cleared only when the load SETTLES, and nothing
+   * `afterEach` can reach resets it. So an assertion that throws between installing a gate
+   * and releasing it wedges that state for the whole rest of the file: every later
+   * `refreshTranscript(SID)` gets handed the dead promise and fetches nothing. Measured while
+   * building this wi's mutation battery — one genuine detection reported as FOUR reds, three
+   * of them in tests with no connection to the mutation, which is exactly the shape that
+   * sends the next reader to the wrong file. Nine gate-setting sites in this file were
+   * exposed to it; this fixes the class rather than the two tether#113 added.
+   *
+   * `afterEach` ABANDONS the wait instead of resolving it, and the difference matters: the
+   * response that comes back is a 499 that `loadHistory` treats as a failure and swallows,
+   * so the microtask that runs after `afterEach` has already reset the store cannot write
+   * anything into it. Resolving the gate for real would let a whole transcript land in the
+   * NEXT test's store.
+   */
+  let abandonGates: () => void = () => {}
+  let gatesAbandoned: Promise<void> = Promise.resolve()
+
   function stubDaemon() {
     return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url)
@@ -1829,7 +1871,10 @@ describe('loading a transcript by scrolling to its ends (tether#110)', () => {
       if (url.includes('/providers')) return new Response(JSON.stringify({ providers: ['claude-code'] }), { status: 200 })
       if (url === SESSION_ACTIVITY_PATH) return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
       const gate = gates[`${init?.method ?? 'GET'} ${url}`]
-      if (gate) await gate
+      if (gate) {
+        const abandoned = await Promise.race([gate.then(() => false), gatesAbandoned.then(() => true)])
+        if (abandoned) return new Response(null, { status: 499 })
+      }
       const page = pages[url]
       if (page) {
         const headers = new Headers({ 'Content-Type': 'application/json' })
@@ -1885,6 +1930,7 @@ describe('loading a transcript by scrolling to its ends (tether#110)', () => {
     pages = {}
     requested = []
     gates = {}
+    gatesAbandoned = new Promise<void>(r => { abandonGates = r })
     daemonVersion = 1000
     clock = 1_760_000_000_000
     clockSpy = vi.spyOn(Date, 'now').mockImplementation(() => clock)
@@ -1900,6 +1946,10 @@ describe('loading a transcript by scrolling to its ends (tether#110)', () => {
   })
 
   afterEach(() => {
+    // FIRST, and before `cleanup()`: see gatesAbandoned. A gate this test installed and
+    // never released has to stop being a live promise, or lib/session.ts's per-sid dedupe
+    // carries it into every test after this one.
+    abandonGates()
     cleanup()
     clockSpy?.mockRestore()
     clockSpy = null
@@ -2338,21 +2388,122 @@ describe('loading a transcript by scrolling to its ends (tether#110)', () => {
     expect(bottom).toHaveLength(1)
     expect(bottom[0].getAttribute('aria-label')).toBe(TRANSCRIPT_DOTS_NEWER_LABEL)
     expect(bottom[0].querySelectorAll('.transcript-dot')).toHaveLength(3)
-    // It is the LAST thing in the scroll container — where the message will appear, which
-    // is the whole argument for its position.
-    const rows = container.querySelectorAll('.dt-chat > *')
-    expect(rows[rows.length - 1].classList.contains('transcript-bottom')).toBe(true)
 
     await act(async () => { release(); await Promise.resolve() })
     await settle()
     expect(container.querySelectorAll('.transcript-bottom')).toHaveLength(0)
   })
 
+  /**
+   * tether#113 — and what this proves is STRUCTURE, not layout. Read the name twice: it
+   * does not say "no shift", because no test in this repo can say that. jsdom computes no
+   * layout, so `scrollHeight` here is whatever `fakeScrollBox` models; the 39px this
+   * indicator really cost, and the 0px it costs now, were measured in Chrome and the
+   * figures live in index.tsx's header at the render site. What IS a fact a test can hold
+   * is the one the browser behaviour follows from: the indicator is not inside the box
+   * whose scroll height was moving. Whether the shudder is gone is the owner's eyes.
+   */
+  it('keeps the bottom indicator OUTSIDE the scroll container, which is structure and not layout', async () => {
+    pages[MESSAGES_URL] = { entries: turns('recent', 10, 500), earlier: 4096 }
+    const container = await renderHeld()
+    const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+
+    let release = () => {}
+    gates[`GET ${MESSAGES_URL}`] = new Promise<void>(r => { release = r })
+    await act(async () => { box.scrollTo(300) })
+    await settle()
+    await act(async () => { box.scrollTo(700) })
+    await settle()
+
+    const chat = container.querySelector('.dt-chat') as HTMLElement
+    const ind = container.querySelector('.transcript-bottom') as HTMLElement
+    expect(ind).not.toBeNull()
+    // The whole fix, as one number: nothing matching that selector inside the scroller.
+    expect(chat.querySelectorAll('.transcript-bottom')).toHaveLength(0)
+    // A SIBLING of the scroller — which is what makes it pinned to the scroller's viewport
+    // instead of to the end of its content. An absolutely-positioned child of `.dt-chat`
+    // would also leave the scroll height alone and would still be wrong: it scrolls with
+    // the content (measured in Chrome — see index.css), so it would hug the bottom edge
+    // only while the transcript was scrolled to the top.
+    expect(ind.parentElement).toBe(chat.parentElement)
+    // …and AFTER it, so it paints over the transcript rather than under it.
+    expect(chat.compareDocumentPosition(ind) & Node.DOCUMENT_POSITION_FOLLOWING)
+      .toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+    expect(ind.nextElementSibling?.classList.contains('dt-composer')).toBe(true)
+
+    // The TOP end's one-cell grid is untouched. The asymmetry this wi closed was that the
+    // top had a height lock and the bottom did not; closing it by taking a lock AWAY from
+    // the top would be the same bug wearing the other hat.
+    expect(container.querySelectorAll('.transcript-top-slots')).toHaveLength(1)
+    expect(container.querySelectorAll('.transcript-top-slots > .transcript-dots')).toHaveLength(1)
+    expect(container.querySelectorAll('.transcript-top-slots > .transcript-more')).toHaveLength(1)
+
+    // No `finally` around any of the above, and that is a property of the FIXTURE rather
+    // than of this test: `afterEach` abandons any gate still open (see gatesAbandoned), so
+    // a throwing assertion here cannot wedge lib/session.ts's per-sid dedupe for the tests
+    // that follow. Before that existed, one genuine red in this block reported as four.
+    await act(async () => { release(); await Promise.resolve() })
+    await settle()
+  })
+
+  /**
+   * tether#113 — the same property expressed as geometry, through a model that states the
+   * one thing jsdom will not: a flow child of a scroll container adds to its scroll height.
+   * See BOTTOM_INDICATOR_PX. This is the test that goes red if the indicator moves back
+   * inside `.dt-chat`, whatever its CSS then says — which is the honest limit of the model
+   * and the reason the structural test above exists alongside it.
+   */
+  it('leaves a reader parked at the bottom exactly where they were while the re-read runs', async () => {
+    pages[MESSAGES_URL] = { entries: turns('recent', 10, 500) }
+    const container = await renderHeld()
+    const box = liveScrollBox(container.querySelector('.dt-chat') as HTMLElement, 300)
+    expect(box.height()).toBe(1000)
+    // The model has to charge SOMETHING for an in-flow indicator or the two assertions
+    // below hold for both the fixed pane and the broken one. Pinned as non-zero rather
+    // than as 39, because 39 is a browser measurement this file cannot check and only its
+    // sign is load-bearing here.
+    expect(BOTTOM_INDICATOR_PX).toBeGreaterThan(0)
+
+    // Arrive at the bottom from further up, which is what arms the latch, and hold the
+    // response open so the in-flight window can be measured rather than inferred.
+    await act(async () => { box.scrollTo(300) })
+    await settle()
+    let release = () => {}
+    gates[`GET ${MESSAGES_URL}`] = new Promise<void>(r => { release = r })
+    await act(async () => { box.scrollTo(700) })
+    await settle()
+    expect(container.querySelectorAll('.transcript-bottom .transcript-dots')).toHaveLength(1)
+
+    // Both were 1039 and 39 before this wi: the indicator mounted, the scroll height grew
+    // underneath a reader who had not moved, and they were silently no longer at the end.
+    // 39 is under TRANSCRIPT_EDGE_PX, so nothing re-armed — the defect was never the latch,
+    // it was that the next stick-to-bottom write turned those 39px into a visible slide and
+    // the unmount clamp turned them back.
+    expect(box.height()).toBe(1000)
+    expect(box.height() - box.top() - 300).toBe(0)
+
+    // The answer differs from what is on screen, which is the precondition the shudder
+    // needed and the ordinary case for a session a background agent is writing.
+    pages[MESSAGES_URL] = { entries: [...turns('recent', 10, 500), entry('assistant', 'brand new', 9000)] }
+    await act(async () => { release(); await Promise.resolve() })
+    await settle()
+
+    expect(screen.getByText('brand new')).toBeTruthy()
+    expect(container.querySelectorAll('.transcript-bottom')).toHaveLength(0)
+    // Eleven rows, and the pane followed the new one down to exactly their height. No
+    // indicator in that number, so nothing has to come back out of it — which is the step
+    // the browser used to perform as a downward jump.
+    expect(box.height()).toBe(1100)
+    expect(box.top()).toBe(1100)
+  })
+
   it('holds one request at a time across BOTH ends', async () => {
     // One shared in-flight flag rather than one per end, and the reason is the anchor:
-    // the bottom indicator changes the scroll height, and `scrollAfterPrepend` compares a
-    // height captured before the top's request with one measured after it. If the two ends
-    // could overlap, that comparison would silently carry the other end's indicator.
+    // `scrollAfterPrepend` compares a height captured before the top's request with one
+    // measured after it, so a second fetch landing inside that window would be carried
+    // silently into the correction. Until tether#113 the example given here was the bottom
+    // INDICATOR changing the scroll height; it no longer can (it is outside the scroll
+    // container now), and what remains is the fetches themselves.
     pages[MESSAGES_URL] = { entries: turns('recent', 10, 500), earlier: 4096 }
     pages[`${MESSAGES_URL}?before=4096`] = { entries: turns('older', 5, 100), earlier: 2048 }
     const container = await renderHeld()

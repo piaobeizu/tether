@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -99,6 +100,11 @@ type Report struct {
 // today. Most of the rest of Config describes how the server runs rather than
 // what a preflight check could look at; the one field a check does want and
 // still ignores is APITokensPath, deliberately — see checkMCPAPITokens.
+//
+// The whole struct now reaches checkPortBindable rather than Port alone, and the
+// cert fields are the reason: telling "your own daemon holds this port" from
+// "somebody else does" means comparing what is served against the certificate
+// these flags select, exactly as checkCertState does (identifyPortHolder).
 func Run(cfg *server.Config, verbose bool) Report {
 	if cfg == nil {
 		cfg = &server.Config{}
@@ -108,7 +114,11 @@ func Run(cfg *server.Config, verbose bool) Report {
 		checkOpencodeBinary(verbose),
 		checkDataDir(verbose),
 		checkCertState(cfg, verbose),
-		checkPortBindable(cfg.Port, verbose),
+		checkPortBindable(cfg, verbose),
+		// Ordered as startup is: Step 3 compiles the hook binary, then injects the
+		// entry that names it, so a reader scanning down the report meets the
+		// cause above the symptom.
+		checkGoToolchain(verbose),
 		checkCCSettingsHooks(verbose),
 		checkMCPSettingsInject(cfg, verbose),
 		checkMCPAPITokens(verbose),
@@ -383,19 +393,221 @@ func lonePEMFlagHint(cfg *server.Config, src server.CertSource) string {
 	return " (note: --cert-file and --key-file only take effect together; the one you passed is being ignored)"
 }
 
-// checkPortBindable verifies that the given port can be bound on TCP.
-func checkPortBindable(port int, verbose bool) CheckResult {
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	l, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fail("port-bindable", fmt.Sprintf("port %d not bindable: %v", port, err))
+// checkPortBindable verifies that the sockets `tether server` needs on this
+// port are free — TCP *and* UDP, on every interface.
+//
+// One address was probed before tether#123, and it was neither of the two the
+// server uses: net.Listen("tcp", "127.0.0.1:<port>"). Config.addr() returns
+// ":<port>" (lifecycle.go), and that one string reaches two listeners —
+// srv.tcp.ListenAndServeTLS binds it on TCP for every interface, and
+// srv.wts.ListenAndServe hands it to the HTTP/3 server, which binds it on UDP.
+// So the old probe returned a tick for two states in which startup dies on
+// errCh, both measured:
+//
+//   - UDP held by another process. doctor said "port 8898 available"; the server
+//     died with "UDP/WT: bind: address already in use". This is the one that
+//     arrives without anybody constructing it, because QUIC/WebTransport is this
+//     daemon's primary transport and a previous tether's UDP socket can outlive
+//     its TCP one.
+//   - TCP held on any address other than 127.0.0.1 — 10.146.0.11:18899 in the
+//     measurement, and 127.0.0.2 behaves identically. A wildcard bind collides
+//     with a bind on one address; a loopback-only probe does not see it.
+//
+// What happens when a socket is taken is also where this check stopped being
+// permanently red against a live daemon. `tether doctor` on a host running its
+// own server could never exit 0: this check failed, and Report.OK is the exit
+// code (cmd/tether/main.go). Inspecting a running deployment is a normal thing
+// to do — it is what checkMCPLoopback was deliberately written to allow — so a
+// port held by *this deployment's own daemon* is a skip: nothing is broken and
+// there is no bind left to predict.
+//
+// "Its own daemon" is established and never assumed (identifyPortHolder). With
+// no such evidence the verdict stays a failure, because what the check did
+// establish — nothing can bind this port now, so `tether server` will not start
+// here — is true whoever holds it. Softening that to a skip would be the wrong
+// half of the trade for a check whose whole job is to predict a bind.
+func checkPortBindable(cfg *server.Config, verbose bool) CheckResult {
+	port := cfg.Port
+	addr := fmt.Sprintf(":%d", port)
+
+	var taken []string
+	if l, err := net.Listen("tcp", addr); err != nil {
+		taken = append(taken, "TCP (HTTPS/h2): "+err.Error())
+	} else {
+		_ = l.Close()
 	}
-	_ = l.Close()
-	r := ok("port-bindable", fmt.Sprintf("port %d available", port))
+	// net.ListenPacket and not a second net.Listen: the HTTP/3 server opens a UDP
+	// socket, and a TCP probe of the same port number answers a different
+	// question. The two protocols are allocated independently, which is exactly
+	// why one of them could be busy while the old check reported the port free.
+	if c, err := net.ListenPacket("udp", addr); err != nil {
+		taken = append(taken, "UDP (QUIC/HTTP3/WebTransport, this daemon's primary transport): "+err.Error())
+	} else {
+		_ = c.Close()
+	}
+
+	if len(taken) == 0 {
+		r := ok("port-bindable", fmt.Sprintf("port %d bindable on TCP and UDP", port))
+		if verbose {
+			r.Detail = "probed " + addr + " on both protocols, the pair Config.addr() feeds"
+		}
+		return r
+	}
+
+	holder := identifyPortHolder(cfg, port)
+	if holder.thisDeployment {
+		r := skip("port-bindable", fmt.Sprintf(
+			"port %d is held by this deployment's own daemon, so it is already running and there is no bind to preflight — %s (%s)",
+			port, strings.Join(taken, "; "), holder.evidence))
+		if verbose {
+			r.Detail = holder.detail
+		}
+		return r
+	}
+	r := fail("port-bindable", fmt.Sprintf(
+		"port %d not bindable, so `tether server` will not start here — %s. %s",
+		port, strings.Join(taken, "; "), holder.evidence))
 	if verbose {
-		r.Detail = addr
+		r.Detail = holder.detail
 	}
 	return r
+}
+
+// portHolder is what doctor could establish about whatever holds the port.
+//
+// evidence is a clause, and it is set on both paths: on the failure path the
+// difference between "somebody else's server is on your port" and "doctor could
+// not tell, and here is the flag that would let it" is the whole value of the
+// line the operator reads.
+type portHolder struct {
+	thisDeployment bool
+	evidence       string
+	detail         string
+}
+
+// certFlagsHint is what a verdict that could not compare certificates owes the
+// reader. The flags are how doctor is told which deployment it is looking at —
+// the rule tether#84 settled for checkCertState, reaching one indirection
+// further along, since the same three paths decide what a running daemon
+// presents on the port.
+const certFlagsHint = " Re-run with the same --cert-file/--key-file or --acme-domain the server has, so doctor can compare what is served against the certificate this deployment serves."
+
+// identifyPortHolder asks whether the port is held by a daemon of this
+// deployment, and answers only on evidence.
+//
+// The evidence is the certificate. A tether daemon serves TLS on this port, and
+// which certificate it serves is decided entirely by the cert flags — the
+// question server.LocateCert already answers for checkCertState — so a served
+// leaf that matches that file byte for byte is a process holding this
+// deployment's private key, which no unrelated service on the host has. It is
+// the same shape of proof as checkMCPLoopback's bearer token: compare what
+// answers against the secret this deployment records as its own, rather than
+// treating "something answered" as an identity.
+//
+// InsecureSkipVerify is not a relaxation here, it is the mechanism. This is not
+// a client deciding whether to trust a server; it is a comparison against a
+// named file, and the managed cert is self-signed, so verification would reject
+// the one certificate that settles the question.
+//
+// Only the TCP half is probed, and that covers a UDP half held by the same
+// daemon: a running server holds both or is not running at all, since Run sends
+// the HTTP/3 listener's bind error to errCh and returns. So a TCP listener
+// presenting this deployment's cert means the process that bound UDP at startup
+// is still up. The inference does not run the other way — a stale UDP socket
+// with nothing on TCP identifies nobody, which is precisely the state this check
+// exists to go red on.
+func identifyPortHolder(cfg *server.Config, port int) portHolder {
+	probeAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	served, err := servedLeafDER(cfg, probeAddr)
+	if err != nil {
+		return portHolder{
+			evidence: fmt.Sprintf("Nothing completed a TLS handshake on %s (%v), so whatever holds the port is not a running daemon of this deployment.", probeAddr, err),
+			detail:   "tls probe of " + probeAddr + " failed: " + err.Error(),
+		}
+	}
+	loc, err := server.LocateCert(cfg)
+	if err != nil || loc.Path == "" {
+		return portHolder{
+			evidence: fmt.Sprintf("Something is serving TLS on %s, but doctor could not work out which certificate this deployment serves, so it cannot tell whether that is your own daemon.%s", probeAddr, certFlagsHint),
+			detail:   fmt.Sprintf("LocateCert: path=%q err=%v", loc.Path, err),
+		}
+	}
+	// Reached for a managed deployment with no cert.pem as well as for a genuinely
+	// corrupt file, because LocateCert names the managed path without reading it.
+	// That is the state a --cert-file host run through a bare `tether doctor` is
+	// in — Step 4 mints no managed cert on the operator path — which is why this
+	// branch carries the flags hint too rather than only the one above.
+	want, err := leafCertDER(loc.Path)
+	if err != nil {
+		return portHolder{
+			evidence: fmt.Sprintf("Something is serving TLS on %s, but this deployment's %s cert at %s could not be read to compare against it (%v), so the holder could not be identified.%s", probeAddr, loc.Source, loc.Path, err, certFlagsHint),
+			detail:   fmt.Sprintf("reference cert %s unusable: %v", loc.Path, err),
+		}
+	}
+	if !bytes.Equal(want, served) {
+		return portHolder{
+			evidence: fmt.Sprintf("The certificate served on %s is not this deployment's %s cert at %s, so another server has the port.", probeAddr, loc.Source, loc.Path),
+			detail:   fmt.Sprintf("served leaf does not match %s (%s)", loc.Path, loc.Source),
+		}
+	}
+	return portHolder{
+		thisDeployment: true,
+		evidence:       fmt.Sprintf("it serves this deployment's %s certificate from %s", loc.Source, loc.Path),
+		detail:         fmt.Sprintf("tls leaf on %s matches %s (%s)", probeAddr, loc.Path, loc.Source),
+	}
+}
+
+// servedLeafDER returns the DER of the leaf certificate offered by whatever is
+// listening on addr.
+//
+// ServerName carries --acme-domain when there is one, because certmagic picks
+// the certificate by SNI and would otherwise have nothing to offer; the managed
+// and operator paths serve one certificate regardless. ALPN mirrors the TCP
+// listener's own list (server.go) so a peer that gates on it still answers.
+func servedLeafDER(cfg *server.Config, addr string) ([]byte, error) {
+	conn, err := tls.DialWithDialer(
+		&net.Dialer{Timeout: 2 * time.Second}, "tcp", addr,
+		&tls.Config{
+			// Deliberate; see identifyPortHolder. The peer is compared against a
+			// file, not trusted, and the certificate that proves the answer is
+			// self-signed.
+			InsecureSkipVerify: true,
+			ServerName:         cfg.AcmeDomain,
+			NextProtos:         []string{"h2", "http/1.1"},
+		})
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	certs := conn.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		return nil, errors.New("the handshake carried no certificate")
+	}
+	return certs[0].Raw, nil
+}
+
+// leafCertDER returns the DER of the first certificate in a PEM file.
+//
+// First and not "the one that looks like a leaf": that is what crypto/tls serves
+// as the leaf from both layouts this has to read — the managed store's single
+// certificate, and an operator's fullchain, where the chain is ordered leaf
+// first. Non-certificate blocks are stepped over so a file that keeps the key
+// beside the cert still resolves.
+func leafCertDER(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	for rest := data; len(rest) > 0; {
+		var block *pem.Block
+		if block, rest = pem.Decode(rest); block == nil {
+			break
+		}
+		if block.Type == "CERTIFICATE" {
+			return block.Bytes, nil
+		}
+	}
+	return nil, errors.New("no CERTIFICATE block")
 }
 
 // checkMCPSettingsInject verifies that ~/.claude/settings.json contains the
@@ -933,8 +1145,26 @@ func terminateMCPSession(endpoint, token, sessionID string) {
 	_ = resp.Body.Close()
 }
 
-// checkCCSettingsHooks verifies that ~/.config/claude/settings.json contains
-// the tether-managed PreToolUse hook entry.
+// checkCCSettingsHooks verifies that ~/.claude/settings.json contains the
+// tether-managed PreToolUse hook entry, and that the command that entry names
+// will actually run.
+//
+// Presence was the whole check before tether#123, which made "tether PreToolUse
+// hook is active" a claim about a JSON key rather than about a hook. The entry
+// agent.InjectPermHook writes carries the thing that matters inside it —
+// {"type":"command","command":"~/.tether/bin/tether-permission-hook"} — and a
+// constructible, non-hypothetical host has that path pointing at nothing: a
+// daemon killed with SIGKILL never runs RemovePermHook, so the entry outlives
+// it, and ~/.tether/bin is then cleaned. cc goes on firing the hook for every
+// tool call, every fire fails, and doctor printed a tick. Worse, a restart does
+// not repair it: cchook.EnsureHookBinary early-returns on the .hash file beside
+// the binary and never looks for the binary itself.
+//
+// So the command is looked up, with exec.LookPath, for the same reason
+// checkCCBinary does it: the standard that check sets out for itself is to
+// predict the spawn, and this is the only other check in the file with a spawn
+// to predict. Its sibling half — whether a Go toolchain exists to compile that
+// binary in the first place — is checkGoToolchain.
 //
 // Residual single-path assumption, deliberately left: a server started with
 // TETHER_NO_PERMISSION_HOOK=1 never injects this hook, and a daemon's
@@ -960,16 +1190,139 @@ func checkCCSettingsHooks(verbose bool) CheckResult {
 	}
 	hooks, _ := settings["hooks"].(map[string]any)
 	list, _ := hooks["PreToolUse"].([]any)
+	// Every managed entry, not the first one found: cc fires all of them, so one
+	// broken command breaks the gate however many working ones sit beside it.
+	// InjectPermHook clears stale entries before adding its own, so more than one
+	// is already a settings.json somebody else has edited.
+	var managedEntries int
+	var runnable []string
 	for _, h := range list {
-		if hm, isObj := h.(map[string]any); isObj {
-			if managed, _ := hm[agent.TetherManagedKey].(bool); managed {
-				r := ok("cc-settings-hooks", "tether PreToolUse hook is active")
-				if verbose {
-					r.Detail = path
-				}
-				return r
-			}
+		hm, isObj := h.(map[string]any)
+		if !isObj {
+			continue
+		}
+		if managed, _ := hm[agent.TetherManagedKey].(bool); !managed {
+			continue
+		}
+		managedEntries++
+		command, named := managedHookCommand(hm)
+		if !named {
+			return fail("cc-settings-hooks", "the tether-managed PreToolUse entry in ~/.claude/settings.json names no command, so cc has nothing to run for it and tool calls are not gated — re-run `tether server` to rewrite the entry")
+		}
+		bin, lookErr := exec.LookPath(command)
+		if lookErr != nil {
+			return fail("cc-settings-hooks", fmt.Sprintf(
+				"cc's tether PreToolUse hook points at %q, which will not run: %v. Every tool call in a cc session spawns it, and restarting the daemon does not repair it — cchook.EnsureHookBinary recompiles only when %s.hash is missing or stale, never when the binary alone has gone — so delete %s.hash and restart `tether server`",
+				command, lookErr, command, command))
+		}
+		runnable = append(runnable, bin)
+	}
+	if managedEntries == 0 {
+		return fail("cc-settings-hooks", "tether hook not found in settings.json — run `tether server` to inject")
+	}
+	r := ok("cc-settings-hooks", fmt.Sprintf("tether PreToolUse hook is active and the command it names is executable (%s)", strings.Join(runnable, ", ")))
+	if verbose {
+		r.Detail = path
+	}
+	return r
+}
+
+// managedHookCommand pulls the command out of a tether-managed PreToolUse entry
+// — the field agent.InjectPermHook fills with ~/.tether/bin/tether-permission-hook
+// (lifecycle.go Step 3), and the one part of the entry that has to resolve on
+// disk before cc can gate anything.
+//
+// The string is returned whole, to be looked up whole rather than split on
+// whitespace: what tether writes is a single absolute path, $HOME may contain a
+// space, and splitting would turn a working hook under "/home/my user/" into a
+// red mark. It is trimmed for the same reason mcpBearerToken trims — a trailing
+// newline from a hand-edited file is not part of the path, and would otherwise
+// fail the lookup on a host where the hook is fine.
+//
+// "type" is not gated on. command is the field that has to resolve, and a type
+// string this build has not heard of is no reason to stop reading the entry that
+// carries it.
+func managedHookCommand(entry map[string]any) (string, bool) {
+	nested, _ := entry["hooks"].([]any)
+	for _, h := range nested {
+		hm, isObj := h.(map[string]any)
+		if !isObj {
+			continue
+		}
+		if command, _ := hm["command"].(string); strings.TrimSpace(command) != "" {
+			return strings.TrimSpace(command), true
 		}
 	}
-	return fail("cc-settings-hooks", "tether hook not found in settings.json — run `tether server` to inject")
+	return "", false
+}
+
+// checkGoToolchain reports whether `go` is available to compile the permission
+// hook, which the daemon does on the way up.
+//
+// This is the startup-fatal failure nothing in doctor looked for.
+// cchook.EnsureHookBinary shells out to `go build` (embedded.go), and Step 3 of
+// lifecycle.go returns its error as "perm hook compile: ..." straight out of
+// Run — so on a host with no Go toolchain `tether server` exits rather than
+// starting without a permission gate. docs/known-limitations.md records that as
+// true of *every* install method, the release tarball included, whose pre-built
+// hook the daemon never looks for. Meanwhile this file already checks that a
+// binary it is about to spawn exists, twice (checkCCBinary, checkOpencodeBinary);
+// the one whose absence stops the daemon dead was simply not among them.
+//
+// Absent is not automatically a failure, because the compile is conditional:
+// EnsureHookBinary early-returns when the .hash file beside the binary already
+// records the hash of the embedded source. Doctor cannot compute that hash — the
+// source is unexported — so it reports the two states it can tell apart and says
+// which one it is in:
+//
+//   - no .hash file: a compile is certain on the next start. A failure.
+//   - .hash present: a compile happens only if this build's hook source differs
+//     from the one that produced it, which doctor cannot know. A skip that says
+//     so, rather than a verdict either way.
+//
+// A .hash whose binary has gone missing takes the same early-return and so is
+// not this check's business; cc-settings-hooks is the one that catches it.
+func checkGoToolchain(verbose bool) CheckResult {
+	path, lookErr := exec.LookPath("go")
+	if lookErr == nil {
+		r := ok("go-toolchain", "go found — the daemon can compile its permission hook")
+		if verbose {
+			r.Detail = path
+		}
+		return r
+	}
+	hashPath, err := hookHashPath()
+	if err != nil {
+		return fail("go-toolchain", fmt.Sprintf(
+			"go not usable (%v), and doctor cannot look for an already-compiled permission hook to say whether that matters: %v", lookErr, err))
+	}
+	if _, statErr := os.Stat(hashPath); statErr != nil {
+		return fail("go-toolchain", fmt.Sprintf(
+			"go not usable (%v) and %s does not exist, so `tether server` will try to compile its permission hook on the next start and exit with \"perm hook compile\" instead of starting — install a Go toolchain, or set TETHER_NO_PERMISSION_HOOK=1 to start without a permission gate",
+			lookErr, hashPath))
+	}
+	r := skip("go-toolchain", fmt.Sprintf(
+		"go not usable (%v), but %s exists, so a start needs the toolchain only if this build's embedded hook source has changed since that binary was compiled — doctor cannot compare the two",
+		lookErr, hashPath))
+	if verbose {
+		r.Detail = hashPath
+	}
+	return r
+}
+
+// hookHashPath is where EnsureHookBinary records the source hash of the hook it
+// compiled: binPath + ".hash", with binPath being ~/.tether/bin/tether-permission-hook
+// (lifecycle.go Step 3).
+//
+// Rebuilt here rather than taken from server, whose tetherBinDir is unexported
+// and creates the directory as a side effect — which a diagnostic must not do,
+// since a check that repairs what it is measuring cannot report on it. That
+// leaves one path literal in two packages; cc-settings-hooks needs no such copy,
+// because the path it checks is the one cc records.
+func hookHashPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".tether", "bin", "tether-permission-hook.hash"), nil
 }

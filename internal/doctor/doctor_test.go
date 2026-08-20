@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
@@ -1121,29 +1122,13 @@ func TestCheckResultJSON_SkipSerialisesAsNotAFailure(t *testing.T) {
 // readings say false, and a Run that failed the report over a skip passes that
 // version of this test (verified by mutation).
 func TestRun_SkipsDoNotFailTheReport(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	if err := os.MkdirAll(filepath.Join(home, ".tether"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	cc := filepath.Join(home, "cc")
-	if err := os.WriteFile(cc, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("TETHER_CC_PATH", cc)
-	// One settings.json satisfies both the hook check and the MCP inject check;
-	// its url points nowhere, which is what makes mcp-loopback skip.
-	writeJSON(t, filepath.Join(home, ".claude", "settings.json"), map[string]any{
-		"hooks": map[string]any{
-			"PreToolUse": []any{map[string]any{agent.TetherManagedKey: true}},
-		},
-		"mcpServers": map[string]any{
-			"tether": map[string]any{
-				agent.TetherManagedKey: true,
-				"url":                  fmt.Sprintf("http://127.0.0.1:%d/mcp", closedPort(t)),
-			},
-		},
-	})
+	// The settings.json entry's url points nowhere, which is what makes
+	// mcp-loopback skip. (This fixture used to be inline, and used to carry a
+	// PreToolUse entry with no command in it at all — the shape tether#123 turned
+	// into a failure. It now comes from plantHealthyHost, which names a hook
+	// command that resolves and pins PATH to a fake `go`, so the report this
+	// asserts on no longer depends on the machine.)
+	plantHealthyHost(t, closedPort(t))
 
 	report := Run(&server.Config{Port: closedPort(t)}, false)
 
@@ -1287,5 +1272,521 @@ func TestRun_UndeterminableHomeFailsTheReport(t *testing.T) {
 	t.Setenv("HOME", "")
 	if report := Run(&server.Config{Port: closedPort(t)}, false); report.OK {
 		t.Error("report.OK = true on a host where the server cannot start")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// tether#123. Two checks reported healthy on hosts where `tether server` does
+// not start, or where cc's permission gate does not fire. Both were constructed
+// against the shipped code before any of this was written, so each test below is
+// one that the pre-fix check passes in the wrong direction — reverting the
+// production change alone turns it red. A gate that reports green is worse than
+// no gate, so that property, and not the coverage, is the point.
+// ---------------------------------------------------------------------------
+
+// holdUDP takes the UDP socket the HTTP/3 listener wants, on every interface,
+// for the rest of the test.
+func holdUDP(t *testing.T, port int) {
+	t.Helper()
+	c, err := net.ListenPacket("udp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		t.Fatalf("hold udp :%d: %v", port, err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+}
+
+// holdTCPAt takes a TCP listener on one address, which is all it takes to stop
+// the server's ":<port>" wildcard bind — while leaving 127.0.0.1:<port>, the
+// only socket the pre-fix check looked at, free.
+//
+// 127.0.0.2 rather than this host's routable address so that the test does not
+// depend on the machine having one. Measured equivalent to 10.146.0.11 on the
+// box this was written on: in both cases 127.0.0.1:<port> binds and ":<port>"
+// does not.
+func holdTCPAt(t *testing.T, addr string, port int) {
+	t.Helper()
+	l, err := net.Listen("tcp", fmt.Sprintf("%s:%d", addr, port))
+	if err != nil {
+		t.Fatalf("hold tcp %s:%d: %v", addr, port, err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+}
+
+// managedPair writes ~/.tether/{cert.pem,key.pem} and hands back the same PEM
+// bytes, so a test can serve the very certificate this deployment records as its
+// own. writeCertPEM cannot: the managed and ACME cert checks are judged on the
+// certificate alone, so it discards the key, and serving TLS needs it.
+func managedPair(t *testing.T, home string, notAfter time.Time) (certPEM, keyPEM []byte) {
+	t.Helper()
+	certPEM, keyPEM = genCertPEM(t, notAfter)
+	dir := filepath.Join(home, ".tether")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cert.pem"), certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "key.pem"), keyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return certPEM, keyPEM
+}
+
+// listenTLS serves a certificate on :<port> — TCP on every interface, which is
+// what srv.tcp.ListenAndServeTLS binds — for the rest of the test. It stands in
+// for a running daemon in the only respect this check reads: what it presents in
+// the handshake.
+func listenTLS(t *testing.T, port int, certPEM, keyPEM []byte) {
+	t.Helper()
+	pair, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		t.Fatalf("listen tls :%d: %v", port, err)
+	}
+	srv := &http.Server{
+		Handler:   http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }),
+		TLSConfig: &tls.Config{Certificates: []tls.Certificate{pair}, NextProtos: []string{"h2", "http/1.1"}},
+	}
+	go func() { _ = srv.ServeTLS(l, "", "") }()
+	t.Cleanup(func() { _ = srv.Close() })
+}
+
+func TestCheckPortBindable_AFreePortIsOK(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	r := checkPortBindable(&server.Config{Port: closedPort(t)}, true)
+	if r.Status != StatusOK {
+		t.Fatalf("status = %s, want ok: %q", r.Status, r.Message)
+	}
+}
+
+// The headline false green, and the one that arrives on its own. Config.addr()
+// is ":<port>" and that address goes to the HTTP/3 server as well, so UDP is
+// half of what has to be free — and it is the half carrying WebTransport, this
+// daemon's primary transport, which a previous tether's socket can still hold
+// after its TCP listener has gone. Measured on the pre-fix check: "port N
+// available", exit 0, and then server.Run dying on errCh with "UDP/WT: bind:
+// address already in use".
+func TestCheckPortBindable_UDPHeldIsAFailure(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	port := closedPort(t)
+	holdUDP(t, port)
+
+	r := checkPortBindable(&server.Config{Port: port}, false)
+	if !r.Failed() {
+		t.Fatalf("status = %s with UDP :%d held: %q", r.Status, port, r.Message)
+	}
+	// Which protocol, not just that something is wrong: the operator's next move
+	// is to go and find what holds it, and TCP and UDP are searched differently.
+	if !strings.Contains(r.Message, "UDP") {
+		t.Errorf("message does not name the protocol that cannot bind: %q", r.Message)
+	}
+}
+
+// The second false green: the server binds every interface, so a listener on any
+// address stops it, and the pre-fix probe only ever looked at 127.0.0.1.
+func TestCheckPortBindable_TCPHeldOffLoopbackIsAFailure(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	port := closedPort(t)
+	holdTCPAt(t, "127.0.0.2", port)
+
+	// The fixture is only interesting if the address the old check probed is
+	// still free — otherwise this test would pass against the old code for the
+	// wrong reason and prove nothing.
+	if l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port)); err != nil {
+		t.Fatalf("fixture wrong: 127.0.0.1:%d is not free: %v", port, err)
+	} else {
+		_ = l.Close()
+	}
+
+	r := checkPortBindable(&server.Config{Port: port}, false)
+	if !r.Failed() {
+		t.Fatalf("status = %s with 127.0.0.2:%d held: %q", r.Status, port, r.Message)
+	}
+	if !strings.Contains(r.Message, "TCP") {
+		t.Errorf("message does not name the protocol that cannot bind: %q", r.Message)
+	}
+}
+
+// The other half of the same defect: this check could never let `tether doctor`
+// exit 0 against a live daemon, because the daemon holding the port made it fail
+// and Report.OK is the exit code. checkMCPLoopback treats a running daemon as
+// evidence rather than as a fault; this now does too — and only on evidence, the
+// certificate served on the port being the one this deployment records as its
+// own.
+func TestCheckPortBindable_OurOwnDaemonOnThePortIsSkipNotFail(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	port := closedPort(t)
+	certPEM, keyPEM := managedPair(t, home, time.Now().Add(30*24*time.Hour))
+	listenTLS(t, port, certPEM, keyPEM)
+
+	r := checkPortBindable(&server.Config{Port: port}, true)
+	if r.Status != StatusSkip {
+		t.Fatalf("status = %s, want skip against our own running daemon: %q", r.Status, r.Message)
+	}
+	// The status alone would also be satisfied by a check that skipped whenever
+	// anything held the port, which is the false green wearing the third state's
+	// hat. The message has to say what identified it.
+	if !strings.Contains(r.Message, "own daemon") {
+		t.Errorf("skipped without saying whose daemon it is: %q", r.Message)
+	}
+}
+
+// ...and only on evidence. Something else serving TLS on the port looks
+// identical from the outside — a completed handshake — and is not this
+// deployment. This is the test that a "somebody answered, call it ours" reading
+// of the rule fails.
+func TestCheckPortBindable_AForeignTLSListenerStillFails(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	port := closedPort(t)
+	managedPair(t, home, time.Now().Add(30*24*time.Hour)) // what this deployment serves
+	otherCert, otherKey := genCertPEM(t, time.Now().Add(30*24*time.Hour))
+	listenTLS(t, port, otherCert, otherKey)
+
+	r := checkPortBindable(&server.Config{Port: port}, false)
+	if !r.Failed() {
+		t.Fatalf("status = %s for a stranger on the port: %q", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, "not this deployment's") {
+		t.Errorf("message does not say the served certificate was compared: %q", r.Message)
+	}
+}
+
+// A held port doctor cannot attribute stays a failure. What it established —
+// nothing can bind this port, so the server will not start here — is true
+// whoever holds it, and a skip would be inventing the comfortable half of an
+// answer it does not have. The message owes the reader the flag that would
+// settle it, since a --cert-file host run through a bare `tether doctor` lands
+// here.
+func TestCheckPortBindable_HeldPortWithNoLocatableCertIsAFailure(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home) // deliberately no ~/.tether/cert.pem
+	port := closedPort(t)
+	someCert, someKey := genCertPEM(t, time.Now().Add(30*24*time.Hour))
+	listenTLS(t, port, someCert, someKey)
+
+	r := checkPortBindable(&server.Config{Port: port}, false)
+	if !r.Failed() {
+		t.Fatalf("status = %s when the holder could not be identified: %q", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, "--cert-file") {
+		t.Errorf("message does not name the flag that would settle it: %q", r.Message)
+	}
+}
+
+// plantHealthyHost builds the $HOME of a host where everything doctor can look
+// at is in order, and returns it. PATH is narrowed to a single fake `go` so the
+// result does not depend on what the machine running the tests has installed —
+// which matters more since tether#123, because a Go toolchain is now one of the
+// things doctor reports on.
+func plantHealthyHost(t *testing.T, mcpPort int) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".tether"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cc := filepath.Join(home, "cc")
+	if err := os.WriteFile(cc, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TETHER_CC_PATH", cc)
+	t.Setenv("PATH", fakeExecutableDir(t, "go"))
+	// One settings.json satisfies both the hook check and the MCP inject check.
+	// The hook entry carries a command that resolves, which is the whole subject
+	// of the cc-settings-hooks half of tether#123: before it, this fixture named
+	// no command at all and the report was green anyway.
+	writeJSON(t, filepath.Join(home, ".claude", "settings.json"), map[string]any{
+		"hooks": map[string]any{
+			"PreToolUse": []any{map[string]any{
+				agent.TetherManagedKey: true,
+				"matcher":              "*",
+				"hooks": []any{map[string]any{
+					"type":    "command",
+					"command": plantHookBinary(t, home, 0o755),
+				}},
+			}},
+		},
+		"mcpServers": map[string]any{
+			"tether": map[string]any{
+				agent.TetherManagedKey: true,
+				"url":                  fmt.Sprintf("http://127.0.0.1:%d/mcp", mcpPort),
+			},
+		},
+	})
+	return home
+}
+
+// A live daemon of this deployment must not fail the report, because Report.OK
+// is the exit code and `tether doctor` against a running server is a normal
+// thing to run. This is the end-to-end form of the skip above: the two checks
+// that see a running daemon (port-bindable, mcp-loopback) both have to decline
+// to call it a fault, and only this test would notice if one of them stopped.
+func TestRun_ALiveDaemonOnItsOwnPortDoesNotFailTheReport(t *testing.T) {
+	port := closedPort(t)
+	home := plantHealthyHost(t, closedPort(t))
+	certPEM, keyPEM := managedPair(t, home, time.Now().Add(30*24*time.Hour))
+	listenTLS(t, port, certPEM, keyPEM)
+
+	report := Run(&server.Config{Port: port}, false)
+	for _, c := range report.Checks {
+		if c.Failed() {
+			t.Errorf("%s failed against this deployment's own running daemon: %s", c.Name, c.Message)
+		}
+	}
+	if !report.OK {
+		t.Error("report.OK = false, so `tether doctor` cannot exit 0 against a live daemon")
+	}
+	// And the port really was held, or the assertions above are about a preflight
+	// on a free port and prove nothing.
+	if l, err := net.Listen("tcp", fmt.Sprintf(":%d", port)); err == nil {
+		_ = l.Close()
+		t.Fatalf("fixture wrong: :%d was bindable, so no daemon was being stood in for", port)
+	}
+}
+
+// plantHookBinary writes the file agent.InjectPermHook's command points at, with
+// the given mode, and returns its path.
+func plantHookBinary(t *testing.T, home string, mode os.FileMode) string {
+	t.Helper()
+	bin := filepath.Join(home, ".tether", "bin", "tether-permission-hook")
+	if err := os.MkdirAll(filepath.Dir(bin), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexit 0\n"), mode); err != nil {
+		t.Fatal(err)
+	}
+	return bin
+}
+
+// writeHookSettings writes a settings.json whose PreToolUse entry has exactly
+// the shape agent.InjectPermHook produces, aimed at command.
+func writeHookSettings(t *testing.T, home, command string) {
+	t.Helper()
+	writeJSON(t, filepath.Join(home, ".claude", "settings.json"), map[string]any{
+		"hooks": map[string]any{
+			"PreToolUse": []any{map[string]any{
+				agent.TetherManagedKey: true,
+				"matcher":              "*",
+				"hooks": []any{map[string]any{
+					"type":    "command",
+					"command": command,
+				}},
+			}},
+		},
+	})
+}
+
+// fakeExecutableDir returns a directory holding one executable of that name, so
+// a test can put exactly one command on PATH.
+func fakeExecutableDir(t *testing.T, name string) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// The E2 false green. A daemon killed with SIGKILL never runs RemovePermHook, so
+// its entry outlives it; ~/.tether/bin is then cleaned. cc keeps firing a hook
+// that cannot run, on every tool call, and the pre-fix check printed "tether
+// PreToolUse hook is active" because the JSON key was still there. Nor does a
+// restart repair it: EnsureHookBinary early-returns on the .hash file and never
+// looks for the binary.
+func TestCheckCCSettingsHooks_AMissingHookBinaryIsAFailure(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	gone := filepath.Join(home, ".tether", "bin", "tether-permission-hook")
+	writeHookSettings(t, home, gone)
+
+	r := checkCCSettingsHooks(false)
+	if !r.Failed() {
+		t.Fatalf("status = %s for a hook pointing at nothing: %q", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, gone) {
+		t.Errorf("message does not name the command that will not run: %q", r.Message)
+	}
+	// The remedy has to be the one that works. Restarting the daemon does not
+	// rebuild the binary, so the message that just says "re-run `tether server`"
+	// sends the reader in a circle.
+	if !strings.Contains(r.Message, gone+".hash") {
+		t.Errorf("message does not name the hash file that has to go first: %q", r.Message)
+	}
+}
+
+func TestCheckCCSettingsHooks_AUsableHookBinaryIsOK(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeHookSettings(t, home, plantHookBinary(t, home, 0o755))
+
+	if r := checkCCSettingsHooks(true); r.Status != StatusOK {
+		t.Fatalf("status = %s, want ok: %q", r.Status, r.Message)
+	}
+}
+
+// Present but not executable is the same breakage from a different cause, and
+// os.Stat cannot tell the two apart — which is why the lookup is exec.LookPath,
+// as in checkCCBinary.
+func TestCheckCCSettingsHooks_ANonExecutableHookBinaryIsAFailure(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeHookSettings(t, home, plantHookBinary(t, home, 0o600))
+
+	if r := checkCCSettingsHooks(false); !r.Failed() {
+		t.Fatalf("status = %s for a hook binary without its execute bit: %q", r.Status, r.Message)
+	}
+}
+
+// An entry that names no command is not a hook, so "tether PreToolUse hook is
+// active" is false there. This is also the shape the report fixture in this file
+// used to have, which is part of why the hole stayed invisible: the one test
+// exercising Run end to end asserted a green report over a settings.json that
+// could not gate anything.
+func TestCheckCCSettingsHooks_AManagedEntryNamingNoCommandIsAFailure(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeJSON(t, filepath.Join(home, ".claude", "settings.json"), map[string]any{
+		"hooks": map[string]any{
+			"PreToolUse": []any{map[string]any{agent.TetherManagedKey: true}},
+		},
+	})
+
+	if r := checkCCSettingsHooks(false); !r.Failed() {
+		t.Fatalf("status = %s for a managed entry with no command: %q", r.Status, r.Message)
+	}
+}
+
+// cc fires every matching entry, so one broken command breaks the gate however
+// many working ones sit beside it. Returning on the first managed entry found
+// would pass this only when map order happened to help.
+func TestCheckCCSettingsHooks_ABrokenEntryBesideAWorkingOneIsAFailure(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	good := plantHookBinary(t, home, 0o755)
+	gone := filepath.Join(home, ".tether", "bin", "tether-permission-hook-gone")
+	writeJSON(t, filepath.Join(home, ".claude", "settings.json"), map[string]any{
+		"hooks": map[string]any{
+			"PreToolUse": []any{
+				map[string]any{
+					agent.TetherManagedKey: true,
+					"hooks":                []any{map[string]any{"type": "command", "command": good}},
+				},
+				map[string]any{
+					agent.TetherManagedKey: true,
+					"hooks":                []any{map[string]any{"type": "command", "command": gone}},
+				},
+			},
+		},
+	})
+
+	r := checkCCSettingsHooks(false)
+	if !r.Failed() {
+		t.Fatalf("status = %s with one of two hooks broken: %q", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, gone) {
+		t.Errorf("message names the wrong entry: %q", r.Message)
+	}
+}
+
+// A command with a trailing newline out of a hand-edited file is the same path,
+// and failing it would be the check reddening a host whose hook is fine — the
+// mirror of the trim in mcpBearerToken.
+func TestCheckCCSettingsHooks_AWhitespacePaddedCommandStillResolves(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeHookSettings(t, home, "  "+plantHookBinary(t, home, 0o755)+"\n")
+
+	if r := checkCCSettingsHooks(false); r.Status != StatusOK {
+		t.Fatalf("status = %s, want ok: %q", r.Status, r.Message)
+	}
+}
+
+// An unrelated user hook must not be mistaken for tether's. It carries no
+// _tether_managed key, so the verdict is the unchanged "not found", not a
+// verdict about somebody else's command.
+func TestCheckCCSettingsHooks_AnUnmanagedEntryIsStillNotFound(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeJSON(t, filepath.Join(home, ".claude", "settings.json"), map[string]any{
+		"hooks": map[string]any{
+			"PreToolUse": []any{map[string]any{
+				"hooks": []any{map[string]any{"type": "command", "command": "/bin/true"}},
+			}},
+		},
+	})
+
+	r := checkCCSettingsHooks(false)
+	if !r.Failed() {
+		t.Fatalf("status = %s: %q", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, "tether hook not found") {
+		t.Errorf("reported on a hook that is not tether's: %q", r.Message)
+	}
+}
+
+func TestCheckGoToolchain_OnPATHIsOK(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PATH", fakeExecutableDir(t, "go"))
+
+	if r := checkGoToolchain(true); r.Status != StatusOK {
+		t.Fatalf("status = %s, want ok: %q", r.Status, r.Message)
+	}
+}
+
+// docs/known-limitations.md: without `go`, EnsureHookBinary's compile fails and
+// that error is returned straight out of server.Run, on every install method
+// including the release tarball. Nothing in doctor looked for it — the file
+// checks that a binary it is about to spawn exists twice over (cc, opencode),
+// and the one whose absence stops the daemon dead was not among them.
+func TestCheckGoToolchain_AbsentWithNothingCompiledIsAFailure(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PATH", "")
+
+	r := checkGoToolchain(false)
+	if !r.Failed() {
+		t.Fatalf("status = %s on a host that cannot compile the hook: %q", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, "TETHER_NO_PERMISSION_HOOK") {
+		t.Errorf("message does not offer the one way to start without a toolchain: %q", r.Message)
+	}
+}
+
+// The compile is conditional: EnsureHookBinary early-returns when the .hash file
+// beside the binary already records the embedded source's hash. Doctor cannot
+// compute that hash from here, so a verdict either way would be invented — and
+// the failure above must not be widened into every host that ships without Go.
+func TestCheckGoToolchain_AbsentButAlreadyCompiledIsSkip(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "")
+	bin := plantHookBinary(t, home, 0o755)
+	if err := os.WriteFile(bin+".hash", []byte("deadbeef"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	r := checkGoToolchain(false)
+	if r.Status != StatusSkip {
+		t.Fatalf("status = %s, want skip: %q", r.Status, r.Message)
+	}
+}
+
+// Doctor must not create ~/.tether/bin while looking at it. server.tetherBinDir
+// does (MkdirAll), which is why the path is rebuilt here rather than borrowed: a
+// check that repairs the thing it measures cannot report on it, and the next run
+// would see a directory the first one made.
+func TestCheckGoToolchain_DoesNotCreateTheHookDirectory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "")
+
+	_ = checkGoToolchain(false)
+
+	if _, err := os.Stat(filepath.Join(home, ".tether", "bin")); err == nil {
+		t.Error("the check created ~/.tether/bin")
 	}
 }

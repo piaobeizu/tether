@@ -2385,31 +2385,39 @@ describe('loading a transcript by scrolling to its ends (tether#110)', () => {
     await act(async () => { box.scrollTo(700) })
     await settle()
 
-    const chat = container.querySelector('.dt-chat') as HTMLElement
-    const ind = container.querySelector('.transcript-bottom') as HTMLElement
-    expect(ind).not.toBeNull()
-    // The whole fix, as one number: nothing matching that selector inside the scroller.
-    expect(chat.querySelectorAll('.transcript-bottom')).toHaveLength(0)
-    // A SIBLING of the scroller — which is what makes it pinned to the scroller's viewport
-    // instead of to the end of its content. An absolutely-positioned child of `.dt-chat`
-    // would also leave the scroll height alone and would still be wrong: it scrolls with
-    // the content (measured in Chrome — see index.css), so it would hug the bottom edge
-    // only while the transcript was scrolled to the top.
-    expect(ind.parentElement).toBe(chat.parentElement)
-    // …and AFTER it, so it paints over the transcript rather than under it.
-    expect(chat.compareDocumentPosition(ind) & Node.DOCUMENT_POSITION_FOLLOWING)
-      .toBe(Node.DOCUMENT_POSITION_FOLLOWING)
-    expect(ind.nextElementSibling?.classList.contains('dt-composer')).toBe(true)
+    // `finally`, which is not tidiness. `refreshTranscript` dedupes per sid on
+    // module-level state (`inFlightSid` / `inFlightLoad` in lib/session.ts) cleared only
+    // when the load SETTLES, and nothing in `afterEach` can reach it. A gate left unreleased
+    // by a throwing assertion therefore makes every later test's refresh in this file return
+    // that dead promise and fetch nothing — measured while building this: one genuine red
+    // here arrived as four, three of them in tests that had nothing to do with the mutation.
+    try {
+      const chat = container.querySelector('.dt-chat') as HTMLElement
+      const ind = container.querySelector('.transcript-bottom') as HTMLElement
+      expect(ind).not.toBeNull()
+      // The whole fix, as one number: nothing matching that selector inside the scroller.
+      expect(chat.querySelectorAll('.transcript-bottom')).toHaveLength(0)
+      // A SIBLING of the scroller — which is what makes it pinned to the scroller's viewport
+      // instead of to the end of its content. An absolutely-positioned child of `.dt-chat`
+      // would also leave the scroll height alone and would still be wrong: it scrolls with
+      // the content (measured in Chrome — see index.css), so it would hug the bottom edge
+      // only while the transcript was scrolled to the top.
+      expect(ind.parentElement).toBe(chat.parentElement)
+      // …and AFTER it, so it paints over the transcript rather than under it.
+      expect(chat.compareDocumentPosition(ind) & Node.DOCUMENT_POSITION_FOLLOWING)
+        .toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+      expect(ind.nextElementSibling?.classList.contains('dt-composer')).toBe(true)
 
-    // The TOP end's one-cell grid is untouched. The asymmetry this wi closed was that the
-    // top had a height lock and the bottom did not; closing it by taking a lock AWAY from
-    // the top would be the same bug wearing the other hat.
-    expect(container.querySelectorAll('.transcript-top-slots')).toHaveLength(1)
-    expect(container.querySelectorAll('.transcript-top-slots > .transcript-dots')).toHaveLength(1)
-    expect(container.querySelectorAll('.transcript-top-slots > .transcript-more')).toHaveLength(1)
-
-    await act(async () => { release(); await Promise.resolve() })
-    await settle()
+      // The TOP end's one-cell grid is untouched. The asymmetry this wi closed was that the
+      // top had a height lock and the bottom did not; closing it by taking a lock AWAY from
+      // the top would be the same bug wearing the other hat.
+      expect(container.querySelectorAll('.transcript-top-slots')).toHaveLength(1)
+      expect(container.querySelectorAll('.transcript-top-slots > .transcript-dots')).toHaveLength(1)
+      expect(container.querySelectorAll('.transcript-top-slots > .transcript-more')).toHaveLength(1)
+    } finally {
+      await act(async () => { release(); await Promise.resolve() })
+      await settle()
+    }
   })
 
   /**
@@ -2435,19 +2443,22 @@ describe('loading a transcript by scrolling to its ends (tether#110)', () => {
     await settle()
     expect(container.querySelectorAll('.transcript-bottom .transcript-dots')).toHaveLength(1)
 
-    // Both were 1039 and 39 before this wi: the indicator mounted, the scroll height grew
-    // underneath a reader who had not moved, and they were silently no longer at the end.
-    // 39 is under TRANSCRIPT_EDGE_PX, so nothing re-armed — the defect was never the latch,
-    // it was that the next stick-to-bottom write turned those 39px into a visible slide and
-    // the unmount clamp turned them back.
-    expect(box.height()).toBe(1000)
-    expect(box.height() - box.top() - 300).toBe(0)
-
-    // The answer differs from what is on screen, which is the precondition the shudder
-    // needed and the ordinary case for a session a background agent is writing.
-    pages[MESSAGES_URL] = { entries: [...turns('recent', 10, 500), entry('assistant', 'brand new', 9000)] }
-    await act(async () => { release(); await Promise.resolve() })
-    await settle()
+    try {
+      // Both were 1039 and 39 before this wi: the indicator mounted, the scroll height grew
+      // underneath a reader who had not moved, and they were silently no longer at the end.
+      // 39 is under TRANSCRIPT_EDGE_PX, so nothing re-armed — the defect was never the latch,
+      // it was that the next stick-to-bottom write turned those 39px into a visible slide and
+      // the unmount clamp turned them back.
+      expect(box.height()).toBe(1000)
+      expect(box.height() - box.top() - 300).toBe(0)
+    } finally {
+      // See the previous test for why an unreleased gate is not a local problem.
+      // The answer differs from what is on screen, which is the precondition the shudder
+      // needed and the ordinary case for a session a background agent is writing.
+      pages[MESSAGES_URL] = { entries: [...turns('recent', 10, 500), entry('assistant', 'brand new', 9000)] }
+      await act(async () => { release(); await Promise.resolve() })
+      await settle()
+    }
 
     expect(screen.getByText('brand new')).toBeTruthy()
     expect(container.querySelectorAll('.transcript-bottom')).toHaveLength(0)

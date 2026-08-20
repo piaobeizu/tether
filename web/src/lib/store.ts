@@ -226,6 +226,80 @@ export function hasOrd(m: { ord?: number }): boolean {
 }
 
 /**
+ * TURN_JOIN separates the fragments of one assistant turn that a PAGE BOUNDARY split
+ * (tether#116). It is `ccTurnJoin` in internal/session/ccsessions.go and the two have to
+ * stay the same string: this joins fragments that the daemon would itself have joined
+ * had they landed in one window, and the reason it is a blank line rather than a newline
+ * is stated there — a lone "\n" is a CommonMark soft break and renders as a SPACE, which
+ * runs the end of one fragment onto the start of the next.
+ */
+export const TURN_JOIN = '\n\n'
+
+/**
+ * joinTurnAcrossPages folds the last bubble of an older page into the first bubble of
+ * what is already on screen, or returns null when it must not (tether#116).
+ *
+ * # The defect
+ *
+ * The daemon starts a new assistant bubble only when the previous message it EMITTED was
+ * not an assistant one (ccMessagesFromAt), so within one window a turn that stops to call
+ * tools stays one bubble. tether#107 made each `?before=` page an independent window, and
+ * a window cannot see the record before it — so a turn spanning a page boundary comes back
+ * as one bubble per page, and `prependHistory` used to concatenate them. Measured on the
+ * transcript that prompted this: a 148 MB session whose tool results are large enough that
+ * a 1 MiB page yields ONE message, so every page the reader scrolled back added another
+ * "tether" header to a single turn (six in eighteen seconds).
+ *
+ * This is the client's job because it is the only layer that holds both pages. The rule it
+ * applies is the daemon's own, not a new one: pages are contiguous byte ranges of one
+ * append-only file (see prependHistory), so "adjacent across the seam" is the same relation
+ * as "adjacent within a window", and the daemon merges that.
+ *
+ * # Identity comes from the NEWER half, position from the OLDER half
+ *
+ * `id` is the on-screen one's, because `key={m.id}` is what React reconciles on and both
+ * `expandedBlocks` and `expandedThinking` are Sets keyed by it: re-minting it would collapse
+ * the reader's expansions and clamp the scroll, which is the exact damage this whole path
+ * exists to avoid. The older half has never been on screen, so nothing is keyed to it.
+ *
+ * `ts` and `ord` are the older one's, because a bubble carries its FIRST fragment's stamp —
+ * the rule the daemon already follows on both of its paths (ccsessions.go keeps the first
+ * fragment's Ts on a merge; history.go stamps the accumulator when it is created). `ord`
+ * matters beyond tidiness: `mergeHistory` indexes the transcript BY ord, so a merged bubble
+ * carrying the newer fragment's position would let a later refresh match the wrong slot.
+ *
+ * # It refuses rather than lose anything
+ *
+ * The result spreads the newer half, so any `thinking` or `block` on the OLDER half would be
+ * dropped. Neither can occur here — `MessagePage` only sets `HasEarlier` for the cc source
+ * (SourceTether returns the zero value), so the earlier-page header is never emitted for
+ * tether's own history, `loadEarlierTranscript` never fires for it, and the cc parser sets
+ * neither field. Refusing anyway, because "cannot happen" is a property of another file: the
+ * alternative to a refused merge is two bubbles, and the alternative to a silent drop is a
+ * missing tool card or a missing thinking block that nothing would report.
+ *
+ * A half-populated `ord` is refused for the same reason and a sharper one: with only the
+ * newer half carrying a position there is no correct value to give the result, and
+ * inventing one puts a wrong key into `mergeHistory`'s index.
+ */
+export function joinTurnAcrossPages(older: Message, newer: Message): Message | null {
+  if (older.role !== 'assistant' || newer.role !== 'assistant') return null
+  if (older.thinking || older.block) return null
+  if (hasOrd(older) !== hasOrd(newer)) return null
+  const tools = [...(older.tools ?? []), ...(newer.tools ?? [])]
+  const joined: Message = {
+    ...newer,
+    ts: older.ts,
+    text: older.text && newer.text ? older.text + TURN_JOIN + newer.text : older.text || newer.text,
+  }
+  // Assigned rather than spread so the absent case stays absent: `ord: undefined` is a
+  // present key, and `historyEntryToMessage` is deliberate about the difference.
+  if (hasOrd(older)) joined.ord = older.ord
+  if (tools.length > 0) joined.tools = tools
+  return joined
+}
+
+/**
  * A daemon session-lifecycle notice (tether#50) — e.g. "the previous
  * conversation's context could not be restored".
  *
@@ -918,14 +992,33 @@ export const useStore = create<AppState>((set, get) => ({
    * an overlap should not happen; if one does — a rewritten transcript, a cursor spent
    * twice — a duplicate React key is a broken list, which is worse than a missing
    * bubble, and this is the cheapest place to make it impossible.
+   *
+   * It ALSO joins the seam (tether#116). Concatenating the two pages was wrong whenever a
+   * turn spanned the boundary: the daemon merges consecutive assistant records into one
+   * bubble, but it does that per WINDOW, and since tether#107 each page is its own window.
+   * See joinTurnAcrossPages for why the client is the layer that can fix it, what the
+   * merged bubble takes from which half, and the four shapes it refuses. The dedupe runs
+   * FIRST — the seam is between what survived it and the transcript, not between the raw
+   * page and the transcript, or a page whose tail is already on screen would be joined to
+   * the bubble it duplicates.
    */
   prependHistory: (msgs) => set((s) => {
     // `s` and not `{}` — see setTranscriptBounds for the measurement.
     if (msgs.length === 0) return s
     const have = new Set(s.messages.map(messageKey))
     const older = msgs.filter((m) => !have.has(messageKey(m)))
-    if (older.length === 0) return { transcriptPagesBack: s.transcriptPagesBack + 1 }
-    return { messages: [...older, ...s.messages], transcriptPagesBack: s.transcriptPagesBack + 1 }
+    const pagesBack = s.transcriptPagesBack + 1
+    if (older.length === 0) return { transcriptPagesBack: pagesBack }
+    const seam = s.messages.length > 0
+      ? joinTurnAcrossPages(older[older.length - 1], s.messages[0])
+      : null
+    if (seam) {
+      return {
+        messages: [...older.slice(0, -1), seam, ...s.messages.slice(1)],
+        transcriptPagesBack: pagesBack,
+      }
+    }
+    return { messages: [...older, ...s.messages], transcriptPagesBack: pagesBack }
   }),
   /**
    * mergeHistory folds a freshly-fetched NEWEST page into a transcript that already

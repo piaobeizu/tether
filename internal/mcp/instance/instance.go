@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -77,6 +78,11 @@ type MCPInstance struct {
 
 	skipInject bool
 	started    bool
+	// spent is set by rollback: everything New() opened for this instance has
+	// been released, so it can never serve anything again. started stays false
+	// on that path, which is why it is not enough on its own to stop a second
+	// Start from walking straight through and reporting success.
+	spent bool
 	// lastActive is updated on Start() and on each authorized loopback request.
 	lastActive time.Time
 	// extraServers records the stdio servers passed to Start().
@@ -174,6 +180,10 @@ func (i *MCPInstance) Start(ctx context.Context, extraServers map[string]mcphost
 	if i.started {
 		return nil
 	}
+	if i.spent {
+		return fmt.Errorf("mcp/instance %s: a previous Start failed and released this "+
+			"instance's port and context; construct a new one", i.TaskSlug)
+	}
 
 	i.extraServers = extraServers
 	i.lastActive = time.Now()
@@ -184,12 +194,13 @@ func (i *MCPInstance) Start(ctx context.Context, extraServers map[string]mcphost
 		// that triggered Start; the passed ctx (often r.Context()) would kill
 		// them when the HTTP handler returns.
 		if err := i.mgr.Start(i.baseCtx, cfg); err != nil {
+			i.rollback()
 			return fmt.Errorf("mcp/instance %s: start extra servers: %w", i.TaskSlug, err)
 		}
 	}
 
 	if err := i.loopback.Start(); err != nil {
-		i.mgr.StopAll()
+		i.rollback()
 		return fmt.Errorf("mcp/instance %s: loopback listen: %w", i.TaskSlug, err)
 	}
 
@@ -209,6 +220,33 @@ func (i *MCPInstance) Start(ctx context.Context, extraServers map[string]mcphost
 		"task_slug", i.TaskSlug,
 		"port", i.Port)
 	return nil
+}
+
+// rollback gives back everything New() and a failed Start took, and marks the
+// instance spent. Caller must hold i.mu.
+//
+// Stop cannot be asked to do this afterwards: it returns early while i.started
+// is false, and i.started is false on every path out of a failed Start. So
+// either Start releases these or nobody does, and the three things nobody would
+// release are the loopback port and descriptor that New() opened, whichever
+// child servers mgr.Start had already spawned before it reached the one that
+// failed (it walks a map and returns on the first error, so which those are is
+// not fixed from run to run) along with their supervisor goroutines and their
+// entries in the tool registry, and the instance-scoped context that exists
+// precisely so those children outlive the request. One typo in a command in
+// <wsRoot>/.tether/task-config.json is enough, and every retry adds another set.
+//
+// Wake already rolls back the same mgr.Start call for the same reason; this is
+// that rollback for the start path, extended to the loopback and the context,
+// which only the start path owns.
+func (i *MCPInstance) rollback() {
+	i.mgr.StopAll()
+	if err := i.loopback.Close(); err != nil {
+		slog.Warn("mcp/instance: loopback close during start rollback",
+			"task_slug", i.TaskSlug, "port", i.Port, "err", err)
+	}
+	i.baseCancel()
+	i.spent = true
 }
 
 // Stop drains active sessions (within the context deadline), kills child
@@ -463,6 +501,18 @@ func (l *loopback) Start() error {
 
 func (l *loopback) Stop(ctx context.Context) error {
 	return l.srv.Shutdown(ctx)
+}
+
+// Close releases the listener directly, which Stop cannot do before Start has
+// run: newLoopback binds the port, but http.Server.Shutdown only closes
+// listeners Serve was called on, so until then Shutdown has nothing to close
+// and the port stays bound. Idempotent — closing twice reports net.ErrClosed,
+// which is the state the caller wanted.
+func (l *loopback) Close() error {
+	if err := l.ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		return err
+	}
+	return nil
 }
 
 // generateToken returns a cryptographically random 32-byte hex string.

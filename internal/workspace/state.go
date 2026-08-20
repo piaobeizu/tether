@@ -152,9 +152,82 @@ func (r *Registry) Path(id string) (string, bool) {
 	return w.Path, true
 }
 
-// Add registers a new workspace (deduplicated by path).
-func (r *Registry) Add(name, path string) (Workspace, error) {
+// canonicalPath is the ONE rule for turning a user-supplied workspace path into
+// the string this package stores, compares and hands out: made absolute, then
+// symlink-resolved.
+//
+// # Why the resolution happens HERE and not at the comparison sites
+//
+// The stored path is not private to this package. It is handed to
+// session.WorkspaceLookup (which makes it an agent subprocess's cwd), to
+// server/mux.go's ccWorkdirs (which makes it a transcript directory NAME), and
+// to this package's own tree listing. Resolving at each of those sites means the
+// rule exists three times, in three packages, and the next consumer added is the
+// next one to forget — which is how this got found: the MCP builtin resolves
+// (internal/mcp/builtin/workspace.go), and nothing else did, so one half of the
+// daemon disagreed with the other half about which directory a workspace is.
+// Recording the resolved form makes the stored value mean exactly one thing, and
+// the two silent failures below stop being reachable from any consumer at all,
+// including the two that live in packages this change does not touch.
+//
+// # The failure policy is cc's, and it is quoted rather than chosen
+//
+// cc canonicalises a cwd before encoding it, and on failure keeps the
+// un-resolved absolute path (Claude Code 2.1.237, read from the installed
+// binary on 2026-08-20):
+//
+//	function g4m(e){let t=LH.resolve(e??"."),r;
+//	                try{r=aGi.realpathSync(t)}catch{r=t}return zu(r)}
+//	function W1e(e,t){let r=g4m(e);if(t===void 0)return xN(r);...}
+//
+// `zu` is the identity function on this platform, `xN` is the encoder
+// session.EncodeProjectDir reproduces, and W1e is what the transcript
+// list/resume/delete paths call — so the ordering is resolve-then-encode, and
+// the fallback on a throw is the absolute path.
+//
+// So this returns the absolute path when EvalSymlinks fails instead of an error,
+// and that is not a convenience fallback: it is the same branch cc takes, which
+// keeps the two sides agreeing in the failure case too — the entire reason this
+// function exists. It also preserves the pre-existing contract that a path need
+// not exist yet to be registered (filepath.Abs never required it), so a POST
+// that succeeds today does not start failing because a directory is on a volume
+// that is not mounted right now. A registry is a bookmark list; a bookmark to a
+// directory that is temporarily absent is worth keeping.
+//
+// The returned error is filepath.Abs's alone (it fails only when the process has
+// no working directory), kept so Add's signature still reports the one condition
+// under which no path can be produced at all.
+func canonicalPath(path string) (string, error) {
 	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return abs, nil
+	}
+	return resolved, nil
+}
+
+// Add registers a new workspace (deduplicated by path).
+//
+// The path is canonicalised (see canonicalPath) before it is compared or stored,
+// which fixed two failures that looked unrelated and were the same bug:
+//
+//   - A workspace registered THROUGH A SYMLINK listed zero cc sessions. cc
+//     resolves a cwd before encoding it into a transcript directory name, so an
+//     un-resolved path encodes to a name cc never wrote and CCStore.List /
+//     find / findStat all miss — no error, no log line.
+//   - The @-mention file tree for such a workspace returned exactly `["."]`.
+//     filepath.WalkDir lstats its root, so a symlink root is not a directory to
+//     it and lands in the file branch, appending Rel(root, root).
+//
+// Dedup stays correct across the change because load canonicalises the entries
+// it reads, so both sides of this comparison are canonical: a registry written
+// before this change does not grow a second entry for a directory it already
+// has. That is the whole reason the normalisation is in load as well as here.
+func (r *Registry) Add(name, path string) (Workspace, error) {
+	abs, err := canonicalPath(path)
 	if err != nil {
 		return Workspace{}, err
 	}
@@ -190,12 +263,54 @@ func (r *Registry) Remove(id string) error {
 	return r.saveLocked()
 }
 
+// load reads the registry file, then canonicalises every path it read IN MEMORY.
+//
+// # Why existing entries are canonicalised at all
+//
+// An entry written before canonicalPath existed holds whatever filepath.Abs
+// produced, so a workspace someone registered through a symlink is carrying both
+// silent failures described on Add right now. Canonicalising only on Add would
+// fix that workspace the next time the user re-added it and not before — and
+// worse, it would leave Add comparing a canonical candidate against a stored
+// un-canonical path, so re-adding is exactly when the directory would acquire a
+// SECOND registry entry. Doing it here is what makes both sides of Add's dedup
+// canonical, which is what keeps that from happening.
+//
+// # Why the file is not rewritten
+//
+// This is a read path, and NewRegistry's doc above argues at length that this
+// function must not write over a file whose contents it did not fully
+// understand. Rewriting here would also change the on-disk meaning of every
+// entry during startup, before the operator has done anything. Instead the
+// in-memory form is canonical, every consumer sees canonical paths, and the file
+// converges the next time a user-initiated Add or Remove calls saveLocked. Until
+// then the file is a faithful record of what the user last did, which is the
+// property that makes it recoverable by hand.
+//
+// # Why a failure to resolve is not a failure to load
+//
+// canonicalPath already falls back to the absolute path (see its doc), so an
+// entry whose directory is currently missing or on an unmounted volume keeps the
+// value it had and stays in the list. A registry must not become unloadable —
+// which server/lifecycle.go turns into "this daemon has no workspace registry" —
+// because one bookmark points somewhere temporarily unreachable.
 func (r *Registry) load() error {
 	data, err := os.ReadFile(r.path)
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(data, &r.workspaces)
+	if err := json.Unmarshal(data, &r.workspaces); err != nil {
+		return err
+	}
+	for i := range r.workspaces {
+		if r.workspaces[i].Path == "" {
+			continue
+		}
+		if c, cerr := canonicalPath(r.workspaces[i].Path); cerr == nil {
+			r.workspaces[i].Path = c
+		}
+	}
+	return nil
 }
 
 func (r *Registry) saveLocked() error {

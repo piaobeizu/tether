@@ -92,9 +92,34 @@ var errStopWalk = errors.New("stop walk")
 // files (truncated=true). root is the trusted workspace root, so no per-path
 // SafeJoin is needed; WalkDir does not follow symlinks, which bounds the walk.
 // Unreadable entries are skipped rather than aborting the whole listing.
+//
+// # The ROOT is resolved first, and that is a separate matter from the walk
+//
+// "WalkDir does not follow symlinks, which bounds the walk" is true of every
+// entry INSIDE the tree and was the whole of what the previous version of this
+// comment reasoned about. It missed the root itself, and the miss was total:
+// WalkDir lstats the path it is given, so a root that IS a symlink is not a
+// directory to it, falls into the file branch, and the function returns exactly
+// one entry — Rel(root, root), i.e. `["."]` — with a nil error and no log line.
+// The user sees an empty @-mention picker. Its non-recursive sibling listFiles
+// never had the bug because os.ReadDir follows the symlink it is handed, which is
+// why only one of the two was broken.
+//
+// Resolving here is deliberately redundant with the registry, which now stores
+// canonical paths (workspace.canonicalPath), and the redundancy is the point: the
+// assumption that just cost two silent failures was "the caller passes something
+// already resolved". This function is the one place in this file that consumes a
+// workspace root WITHOUT going through builtin.SafeJoin — handleFiles and
+// ReadFileContent both resolve via builtin.New — so it is the one place that has
+// to answer for its own root. A failure to resolve keeps the given root, matching
+// canonicalPath and this function's existing habit of degrading rather than
+// aborting.
 func listFilesRecursive(root string, limit int) (files []string, truncated bool, err error) {
 	if limit <= 0 {
 		limit = 5000
+	}
+	if resolved, rerr := canonicalPath(root); rerr == nil {
+		root = resolved
 	}
 	files = []string{}
 	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {

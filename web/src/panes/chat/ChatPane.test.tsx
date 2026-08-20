@@ -931,8 +931,10 @@ describe('transcriptEdgeAction (tether#110)', () => {
 
   it('does NOTHING while a request is already in flight, at EITHER end', () => {
     // One shared flag, so this is also the mutual exclusion: the two ends cannot both have
-    // a request out, which is what stops one end's indicator from changing the scroll
-    // height the other end's anchor arithmetic was measured against.
+    // a request out. Since tether#113 that is no longer about the indicators — neither can
+    // change the scroll height any more — but about the fetches: `scrollAfterPrepend`
+    // compares a height captured before a request with one measured after it, and a second
+    // request landing inside that window would invalidate the comparison.
     expect(transcriptEdgeAction({ ...at, inFlight: true })).toBe('idle')
   })
 
@@ -945,9 +947,13 @@ describe('transcriptEdgeAction (tether#110)', () => {
   })
 
   it('has a threshold and a floor a caller can rely on', () => {
-    // Pinned by value, because both numbers are load-bearing elsewhere and silently:
-    // the bottom indicator must be SHORTER than the threshold or its own appearance
-    // re-arms the latch it just consumed (index.css states the ~13px it costs), and the
+    // Pinned by value, because both numbers are load-bearing elsewhere and silently.
+    // The threshold used to be a ceiling on the bottom indicator's height too — a taller
+    // one would have re-armed the latch its own appearance had just consumed — and the
+    // margin was 9px rather than the 35px the arithmetic in this file claimed, because the
+    // 20px row gap `.dt-chat` adds per flow child was left out of it. tether#113 moved that
+    // indicator out of the scroll container, which retires the ceiling rather than widening
+    // it. What is left: this is how far from an end counts as having arrived there, and the
     // floor has to stay well above one frame to be worth anything.
     expect(TRANSCRIPT_EDGE_PX).toBe(48)
     expect(TRANSCRIPT_EDGE_MIN_INTERVAL_MS).toBe(500)

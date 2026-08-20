@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# check-artifacts-uncommitted.sh — assert generated frontend artifacts are not in git.
+# check-artifacts-uncommitted.sh — assert build artifacts are not in git.
+#
+# Scope note: this started as a frontend-only gate (tether#81) and now also covers
+# pnpm's install tree, the compiled build-hook and release/ (tether#86). The shared
+# invariant is not "frontend" — it is "a file produced by a build, which no one
+# decided to track, and which therefore has no mechanism keeping it current".
 #
 # Why this exists (tether#81): web/dist is `vite build` output that gets compiled
 # into the binary by web/embed.go. It used to be committed, so there were two
@@ -19,19 +24,35 @@ cd "$(dirname "$0")/.."
 # path that must be reported as ignored (so a deleted .gitignore entry is caught
 # even before anyone re-adds the files).
 #
-# The `:(glob)` prefix is load-bearing. git's two glob dialects disagree about `/`:
-# in .gitignore a `*` never crosses a slash, but in a plain pathspec it does. Without
-# `:(glob)` this list would be strictly broader than the .gitignore rule it is
-# supposed to enforce, and would fail on vendored files inside the (committed)
-# web/node_modules — e.g. tldts ships its own dist/cjs/tsconfig.tsbuildinfo. That is
-# not a hypothetical; it turned CI red the first time this ran.
+# The `:(glob)` prefix is load-bearing, and its job outlived the situation that
+# first exposed it. git's two glob dialects disagree about `/`: in .gitignore a `*`
+# never crosses a slash, but in a plain pathspec it does. Without `:(glob)` this
+# entry would be strictly broader than the .gitignore rule it enforces. It first
+# showed up as a CI failure on vendored files inside web/node_modules, which used
+# to be committed — tldts ships its own dist/cjs/tsconfig.tsbuildinfo. That tree is
+# no longer in the index (tether#86), so `git ls-files` no longer surfaces those
+# files; keep the prefix anyway, because `git ls-files` still lists anything
+# force-added, and the broad form would blame /web/*.tsbuildinfo for a nested file
+# that the web/node_modules entry below is the correct rule for.
 #
 # web/test-results is the vitest junit/json report pair (tether#105). It is in
 # the same class — generated per run, describing that run — and it is written by
 # `pnpm test`, which runs far more often than `pnpm build`, so it is the entry
 # most likely to be swept up by a careless `git add -A`.
-INDEX_FORBIDDEN=(web/dist ':(glob)web/*.tsbuildinfo' web/test-results)
-MUST_BE_IGNORED=(web/dist/index.html web/tsconfig.app.tsbuildinfo web/test-results/junit.xml)
+#
+# The last three are tether#86. They are not "generated frontend output" like the
+# rest, but they are the same invariant — an artifact nobody decided to track —
+# and this is the only gate in the repo that enforces it:
+#   web/node_modules  pnpm's install tree, committed by accident on 2026-05-09.
+#                     While tracked, one `pnpm install --frozen-lockfile` left
+#                     7264 dirty entries, so every build's `git describe --dirty`
+#                     version stamp was untrustworthy.
+#   build-hook        a compiled copy of ./cmd/build-hook. Both callers build the
+#                     wrapper to their own temp path, so the committed binary had
+#                     no reader — the kind of file that goes stale invisibly.
+#   release           scripts/release.sh's tarball output.
+INDEX_FORBIDDEN=(web/dist ':(glob)web/*.tsbuildinfo' web/test-results web/node_modules build-hook release)
+MUST_BE_IGNORED=(web/dist/index.html web/tsconfig.app.tsbuildinfo web/test-results/junit.xml web/node_modules/.modules.yaml build-hook release/tether-linux-amd64.tar.gz)
 
 fail=0
 all_tracked=""
@@ -66,10 +87,11 @@ done
 
 if [[ "$fail" -ne 0 ]]; then
 	echo >&2
-	echo "Generated frontend output must stay out of git. Build it with 'make build';" >&2
-	echo "if you need to inspect what a binary carries, use" >&2
-	echo "scripts/spa-bundle.sh print <binary>." >&2
+	echo "Build output must stay out of git. Produce it with 'make build' (which runs" >&2
+	echo "pnpm install itself, so web/node_modules needs no committed copy); if you" >&2
+	echo "need to inspect what a binary carries, use scripts/spa-bundle.sh print" >&2
+	echo "<binary>." >&2
 	exit 1
 fi
 
-echo "OK: no generated frontend artifacts tracked; ignore rules in effect"
+echo "OK: no build artifacts tracked; ignore rules in effect"

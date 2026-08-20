@@ -726,41 +726,80 @@ body {
    this row cost its own 19px box PLUS one row gap — a 39px `scrollHeight` delta, measured
    in Chrome against this file — which the stick-to-bottom write then turned into a 39px
    slide up and the unmount clamp into a 39px drop back down. index.tsx carries the full
-   sequence. Out of flow there is no delta, so there is nothing to compensate.
+   sequence, including the CONDITION on it, which belongs here too because it is easy to
+   read this paragraph as unconditional: the up-then-down needs the re-read to come back
+   with different text. When it comes back identical — the common case, and the one this
+   indicator was built for — nothing moves at all; measured against the pre-fix stylesheet,
+   total motion 0.00px, and the dots were not even visible, mounting 7.69px BELOW the
+   viewport's bottom edge for a reader standing at the end. Out of flow there is no delta,
+   so there is nothing to compensate, and the indicator is now visible whenever it exists.
 
    `height: 0` and NOT `position: absolute`, which would need a positioned ancestor this
    pane does not have. `.dt-chat`'s own parent is an inline-styled flex column in App.tsx
    (shared with the skill and shell tabs), and `.dt-chat` itself is the wrong answer twice
    over: a scroll container's padding box does contain its absolute descendants, but they
    scroll WITH its content, so the pill would hug the viewport's bottom edge only while the
-   transcript was scrolled to the top (measured: 6px above it at `scrollTop = 0`, 1781px
-   above it at the bottom of the same transcript). A rail sibling is pinned to the viewport
-   because it is not in the scrolled coordinate space at all.
+   transcript was scrolled to the top (measured: 6px above it at `scrollTop = 0`, and
+   `maxScrollTop` + 6 — 1781px on the transcript measured — at the bottom of the same one).
+   A rail sibling is pinned to the viewport because it is not in the scrolled coordinate
+   space at all.
+
+   `height: 0` is, today, INERT: `height: auto` measures 0.00px too, because the rail's only
+   child is absolutely positioned. It is kept because it is what caps the flex automatic
+   minimum size at 0 the day someone adds an in-flow child, which is exactly the edit that
+   would otherwise reintroduce this wi.
 
    The rail costs the pane's flex column exactly nothing — measured: mounting it moves
    neither `.dt-chat`'s bottom edge nor the composer's top edge, and changes neither
-   `scrollHeight` nor `clientHeight`. The one assumption it does make, stated because it is
-   the way this breaks: that column has no `gap`. Give it one and this rail acquires a
-   height it does not want, the same way the 20px gap inside `.dt-chat` tripled the delta
-   this wi came to remove.
+   `scrollHeight` nor `clientHeight`. The one assumption it does make: that column has no
+   `gap`. Verified — `getComputedStyle` on the App.tsx wrapper reports `row-gap: normal`,
+   and that wrapper is the only production mount of ChatPane. What an added `gap` would do
+   is NOT what this comment first guessed: the rail still measures 0.00px, and instead each
+   gap comes out of `.dt-chat`'s `flex: 1`, so its `clientHeight` drops 20px while a request
+   is in flight and returns on unmount. That is a viewport resize rather than a scroll-height
+   delta, and it would evade the guard in ChatPaneTranscript.test.tsx entirely, because
+   `fakeScrollBox` fakes `clientHeight` as a constant. There is no test for it; the check is
+   this sentence.
 
-   `pointer-events: none`, which is new information rather than defensive: in flow this
-   element sat BELOW the transcript and could not be over anything. Pinned to the viewport
-   it floats 7px into the last line (measured: a 15px pill 4px above the boundary against
-   `.dt-chat`'s 12px bottom padding), so without this it would be able to swallow a tap or a
-   wheel aimed at the message underneath. The dots keep `role="status"` and their label, so
-   nothing is taken away from a screen reader.
+   `pointer-events: none` — and the reason is larger than a swallowed tap. In flow this
+   element sat BELOW the transcript and could not be over anything; pinned to the viewport it
+   is over the last row's box. Measured: with the guard, `elementFromPoint` at the pill's
+   centre returns `.dt-chat`; without it, it returns `.transcript-dot` and a `wheel`
+   dispatched there NEVER REACHES `.dt-chat`'s listener, because the pill is no longer in the
+   scroller's subtree. Deleting this line would therefore put a 45x11px dead patch in
+   tether#112's gesture path, at the bottom edge of the transcript — which is precisely where
+   that gesture is made. No test in this repo can see it (no stylesheet reaches jsdom); this
+   is the record.
 
-   `left: 50%` + `translateX(-50%)` rather than leaning on the rail's `justify-content` to
-   place an absolute child (the flexbox static-position rules, which Safari has a history
-   of getting wrong) or on `width: fit-content`. All three centre correctly in Chrome
-   (measured); this one is the idiom with the fewest ways to be unsupported. */
-.transcript-bottom { position: relative; height: 0; pointer-events: none; }
+   `bottom: 0` with the pill's vertical padding trimmed to 2px, so it is 11px tall and its
+   TOP edge lands 1.00px below `.dt-chat`'s content box (12px bottom padding) — measured
+   zero occlusion of the last line, and measured flush with the scroller's bottom edge so it
+   does not cover the composer's top border either. The first draft used `bottom: 4px` on the
+   full 15px pill, which review measured as 6.84px of overlap with the last row's box — 57%
+   of a `.msg-user-time` line box — and rendering confirmed it slicing glyphs on any last
+   line long enough to reach the centre.
+
+   `z-index: 1` because `.md-code-copy` inside the transcript carries `z-index: 1`, and at
+   `auto` the rail would lose to it. Equal z-index plus later DOM order puts the rail on top.
+   Still under `.slash-pop`'s 10, which is the right way round.
+
+   `left: 50%` + `translateX(-50%)` for the centring. The alternative of letting the rail's
+   `justify-content` place an absolute child would mean giving the rail `display: flex` back
+   (it has none now) and relying on the flexbox static-position rules, which Safari has a
+   history of getting wrong; `width: fit-content` + `margin: auto` is the third option. All
+   three centre to 0.00px in Chrome (measured); this one has the fewest ways to be
+   unsupported. Accepted cost, since it is visible: a 45px pill in a 640px column lands at
+   x = 297.5, so the 1px hairline is antialiased across two device pixels at DPR 1. `auto`
+   margins and `fit-content` land on the same half pixel, and the product is used mostly at
+   DPR >= 2. */
+.transcript-bottom { position: relative; height: 0; pointer-events: none; z-index: 1; }
 .transcript-bottom > .transcript-dots {
-  position: absolute; bottom: 4px; left: 50%; transform: translateX(-50%);
+  position: absolute; bottom: 0; left: 50%; transform: translateX(-50%);
   /* A pill, because it is now over text rather than under it. Existing tokens only
      (design freeze rule 4) — the same surface, hairline and radius the rest of the file
-     uses for something that floats. */
+     uses for something that floats. The padding override is what keeps it clear of the
+     last line; see above. */
+  padding: 2px 10px;
   background: var(--bg-surface);
   border: 1px solid var(--line-soft);
   border-radius: var(--r-pill);
@@ -773,14 +812,18 @@ body {
    `::before` carrying no animation and hangs the animation on an EMPTY `::after` — so it
    has never moved, whatever its call site's comment says.
 
-   Height: 13px measured (5px dot + 4px/4px padding), 15px in the bottom end's pill once
-   its border is counted. It used to be under a ceiling — "shorter than
-   TRANSCRIPT_EDGE_PX", because at the bottom end these dots grew the scroll height under
-   a reader standing at the edge and an indicator past that threshold would have re-armed
-   the latch its own request had just consumed. tether#113 took that end out of flow, so
-   the delta is 0 and this height constrains nothing. Recorded rather than deleted because
-   the ceiling was real while it lasted and its margin turned out to be 9px, not 35: the
-   figure the old comment reasoned from left out `.dt-chat`'s 20px row gap. */
+   Height: 13px measured (5px dot + 4px/4px padding); the bottom end's pill overrides the
+   padding down to 2px and adds a border, so it is 11px. This used to be under a ceiling —
+   "shorter than TRANSCRIPT_EDGE_PX", because at the bottom end these dots grew the scroll
+   height under a reader standing at the edge and an indicator past that threshold would
+   have re-armed the latch its own request had just consumed. tether#113 took that end out
+   of flow, so the delta is 0 and this height constrains nothing.
+
+   Recorded rather than deleted because the ceiling was real while it lasted and its margin
+   turned out to be 9px, not 35. Where the missing 26px went, since "the row gap was left
+   out" is only three quarters of it: 13px was the DOTS' height and correct as such, but the
+   flow child that mounted was the `.transcript-bottom` ROW — 13 plus its own `4px 0 2px`
+   padding, so 19 — and then one 20px row gap on top. 19 + 20 = 39, measured. */
 .transcript-dots {
   display: inline-flex; align-items: center; gap: 4px;
   padding: 4px 10px;

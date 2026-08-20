@@ -275,12 +275,19 @@ export type EdgeAction = 'idle' | 'arm' | 'load'
  * `inFlight` covers BOTH ends and the button too, so at most one transcript request
  * exists at a time. Until tether#113 the reason given here was that this keeps one end's
  * indicator from changing the scroll height the other end's anchor arithmetic was measured
- * against; neither indicator can do that any more (the top shares one grid cell, the bottom
- * is out of the scroll container entirely), so the reason is now the plainer one: two
- * concurrent fetches would both prepend or merge into the same window, and
- * `scrollAfterPrepend` compares a height captured before a request with one measured after
- * it — a comparison a second request landing inside that window would invalidate whatever
- * the indicators do.
+ * against. That is now too weak to be the reason, but NOT because no indicator can move a
+ * height — a first draft of this comment claimed that and review measured it false. The
+ * bottom one cannot (it is outside the scroll container since tether#113). The top one
+ * still can: its grid cell and the `.transcript-top-note` that replaces it are different
+ * heights, measured 27.00px vs 22.50px, a −4px `scrollHeight` delta. What makes that
+ * harmless is not its size but WHEN it lands — only on the commit where `transcriptEarlier`
+ * goes non-null → null, which is a prepend commit, and `scrollAfterPrepend` reads the
+ * post-commit height (see the render site for the full argument).
+ *
+ * So the reason for the shared flag is the plainer one: two concurrent fetches would both
+ * prepend or merge into the same window, and `scrollAfterPrepend` compares a height
+ * captured before a request with one measured after it — a comparison a second request
+ * landing inside that window would invalidate whatever the indicators do.
  *
  * Neither is folded in here, because a `'load'` this function returned for an end with
  * nothing to fetch would be a bug that only the caller could see.
@@ -334,11 +341,13 @@ export function transcriptEdgeAction(o: {
 // One thing that does NOT need room here, checked because it looks as though it might: the
 // bottom dots. They used to add scroll height while a request was in flight, which took
 // `bottomDistance` well past this slack — 39px of it, not the ~13px the comment here first
-// claimed, because `.dt-chat`'s 20px row gap was left out of that figure. It could not
-// matter even then, since the height only existed while `requestInFlightRef` was set and
-// that is the state in which every path already refuses. Since tether#113 it cannot matter
-// for a second and simpler reason: that indicator is no longer inside the scroll container,
-// so it adds nothing to any distance measured here.
+// claimed. That figure was the DOTS' height and right about the dots; the flow child that
+// mounted was the `.transcript-bottom` row (19px with its own padding), and then one of
+// `.dt-chat`'s 20px row gaps on top. It could not matter even then, since the height only
+// existed while `requestInFlightRef` was set and that is the state in which every path
+// already refuses. Since tether#113 it cannot matter for a second and simpler reason: that
+// indicator is no longer inside the scroll container, so it adds nothing to any distance
+// measured here.
 export const TRANSCRIPT_OVERSCROLL_SLACK_PX = 2
 
 // The smallest touch pull that counts as a pull, in CSS pixels of finger travel.
@@ -2429,9 +2438,23 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
           Measured in Chrome against this stylesheet rather than estimated, because the
           old figure was wrong and wrong in the direction that matters: `.dt-chat` is a
           flex column with `gap: 20px`, so mounting one more flow child costs its own box
-          (19px) PLUS one row gap — a `scrollHeight` delta of 39px, and a 39px jump up
-          then down. tether#112's 500ms floor lets one flick start two or three requests,
-          which is two or three of those. That is the jitter that was reported.
+          (19px — the 13px dots plus the row's own `4px 0 2px`) PLUS one row gap. That is a
+          `scrollHeight` delta of 39px and a 39px jump up then down; the `~13px` the old
+          comment reasoned from was the DOTS' height, correct as such and not the height of
+          the thing that mounted. tether#112's 500ms floor lets one flick start two or three
+          requests, which is two or three of those.
+
+          Step 2 is a CONDITION, not a certainty, and the bound on this whole account rests
+          on it: `grown` only moves if the re-read returns different text. For a session a
+          background agent is writing that is nearly every time, and it is the state this
+          end is gated on — but a re-read that returns the same bytes moves nothing at all
+          (measured: 0.00px, and the dots were not even visible, mounting 7.69px below the
+          viewport's bottom edge). So this is the explanation for a shudder on reads that
+          brought something back; it is not a proof that no other mechanism contributes. The
+          other candidates this wi did NOT rule out are the cost of tether#112's floor itself
+          — two or three whole-transcript merges and re-renders per flick — and the
+          platform's own overscroll bounce, which tether#112 deliberately kept by choosing
+          `overscroll-behavior-y: contain` over `none`.
 
           Both ends of that sequence are properties of being IN FLOW. Out of flow there
           is no delta to compensate, so nothing has to be: steps 1 and 3 do not happen,
@@ -2449,22 +2472,39 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
           between `.dt-chat` and the composer — see index.css for what that rail is and why
           it is not a wrapper element.
 
-          # What this costs, since it is now over content rather than under it
+          # What this costs, and the tether#110 claim it gives up
 
-          A pill floating 7px into the last line of the transcript for the length of one
-          request. `pointer-events: none` (index.css) so it cannot swallow a tap or a
-          wheel aimed at the message beneath it — in flow it never could, and that is a
-          guarantee this shape has to restate rather than inherit.
+          tether#110 put this element "immediately after the last bubble, because that is
+          where a new one will appear". That rationale is not being ignored, it is being
+          answered: it was aspirational. Measured on the pre-fix build, a reader standing at
+          the end never saw these dots at all unless the re-read changed the text, because
+          they mounted 7.69px BELOW the viewport's bottom edge. An indicator whose position
+          argues about where content will land, and which is off-screen at the moment it
+          matters, is answering the wrong question. What it actually reports is "a request is
+          in flight", which is a property of the pane rather than of a place in the content —
+          so the pane's bottom edge is where it belongs, and it is now visible whenever it
+          exists.
+
+          The cost of that, stated because it is the same trade in reverse: a reader who
+          scrolls up during the request (up to a megabyte on the wire — see refreshNewest)
+          sees the pill over mid-transcript content instead of at the end. It is 11px tall
+          and clears the last line by 1px at rest (index.css has the arithmetic), and it
+          carries `pointer-events: none` — which in this shape is not politeness. The pill is
+          no longer in the scroller's subtree, so without that line a `wheel` over it would
+          not reach `.dt-chat`'s listener at all and tether#112's gesture would go dead in a
+          patch at the bottom edge, which is exactly where that gesture is made.
 
           # Two constraints this shape RETIRES
 
           "These dots must stay shorter than TRANSCRIPT_EDGE_PX" was never about the dots.
           It was a consequence of being in flow, and with a 39px real delta against a 48px
           threshold its margin was 9px rather than the 35px the old arithmetic implied —
-          nine pixels between here and an unbounded re-read loop, since a delta past the
-          threshold would re-arm the latch that the request had just consumed and the
-          clamp on unmount fires the `scroll` event that would spend it again. Out of flow
-          the delta is 0 and the indicator's height is nobody's business.
+          nine pixels between here and a SELF-SUSTAINING re-read, since a delta past the
+          threshold would re-arm the latch that the request had just consumed and the clamp
+          on unmount fires the `scroll` event that would spend it again. Not unbounded: the
+          500ms floor caps it at two a second, which on the megabyte reads this end makes is
+          bad enough. Out of flow the delta is 0 and the indicator's height is nobody's
+          business.
 
           And `requestInFlightRef`'s job of keeping these dots from appearing or vanishing
           between the top end's anchor capture and its prepend commit is now moot for this
@@ -2479,7 +2519,19 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
           element is not a descendant of the scroll container. ChatPaneTranscript.test.tsx
           asserts exactly that and says so in as many words. The 39px figures above come
           from Chrome, not from the suite, and whether the shudder is gone is the owner's
-          eyes. */}
+          eyes.
+
+          One exposure this shape adds and no test can cover, named so it is at least
+          written down: before tether#113 the indicator's position lived only in the JSX
+          here, and JSX is testable. Now three declarations in index.css decide whether the
+          fix works at all, and index.css is imported solely by main.tsx, which no test
+          renders (`css` is off in the vitest config), so every CSS mutant survives the
+          suite. Measured consequences of deleting each, in Chrome: without
+          `position: relative` the pill escapes the pane entirely and lands 4px above the
+          WINDOW's bottom edge, centred on the viewport; without `pointer-events: none` a
+          wheel over the pill stops reaching the scroller; without `bottom: 0` and the
+          padding override it slices the last line. Those three are what a human has to
+          look at. */}
       {loadingNewer && (
         <div className="transcript-bottom">
           <TranscriptDots label={TRANSCRIPT_DOTS_NEWER_LABEL} />

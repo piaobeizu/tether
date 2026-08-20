@@ -931,10 +931,13 @@ describe('transcriptEdgeAction (tether#110)', () => {
 
   it('does NOTHING while a request is already in flight, at EITHER end', () => {
     // One shared flag, so this is also the mutual exclusion: the two ends cannot both have
-    // a request out. Since tether#113 that is no longer about the indicators — neither can
-    // change the scroll height any more — but about the fetches: `scrollAfterPrepend`
-    // compares a height captured before a request with one measured after it, and a second
-    // request landing inside that window would invalidate the comparison.
+    // a request out. Since tether#113 that is about the FETCHES rather than the indicators:
+    // `scrollAfterPrepend` compares a height captured before a request with one measured
+    // after it, and a second request landing inside that window would invalidate the
+    // comparison. Not "no indicator can move a height" — the top one still can (measured:
+    // its grid cell 27.00px vs the `.transcript-top-note` that replaces it 22.50px), and
+    // what makes that harmless is that the swap only ever lands on a prepend commit, which
+    // `scrollAfterPrepend` reads after the fact.
     expect(transcriptEdgeAction({ ...at, inFlight: true })).toBe('idle')
   })
 
@@ -950,11 +953,12 @@ describe('transcriptEdgeAction (tether#110)', () => {
     // Pinned by value, because both numbers are load-bearing elsewhere and silently.
     // The threshold used to be a ceiling on the bottom indicator's height too — a taller
     // one would have re-armed the latch its own appearance had just consumed — and the
-    // margin was 9px rather than the 35px the arithmetic in this file claimed, because the
-    // 20px row gap `.dt-chat` adds per flow child was left out of it. tether#113 moved that
-    // indicator out of the scroll container, which retires the ceiling rather than widening
-    // it. What is left: this is how far from an end counts as having arrived there, and the
-    // floor has to stay well above one frame to be worth anything.
+    // margin was 9px rather than the 35px the arithmetic in this file claimed. The old
+    // figure named the DOTS (13px, correct); what mounted was the row around them (19px)
+    // plus one of `.dt-chat`'s 20px row gaps, so 39. tether#113 moved that indicator out of
+    // the scroll container, which retires the ceiling rather than widening it. What is left:
+    // this is how far from an end counts as having arrived there, and the floor has to stay
+    // well above one frame to be worth anything.
     expect(TRANSCRIPT_EDGE_PX).toBe(48)
     expect(TRANSCRIPT_EDGE_MIN_INTERVAL_MS).toBe(500)
   })

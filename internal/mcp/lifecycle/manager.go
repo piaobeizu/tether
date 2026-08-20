@@ -63,6 +63,10 @@ func WithIdleWatchdog(threshold, tick time.Duration) Option {
 type LifecycleManager struct {
 	mu        sync.RWMutex
 	instances map[string]*instance.MCPInstance // keyed by TaskID
+	// gates serializes the start/stop transitions of one task against each
+	// other, keyed by TaskID. Refcounted so the map tracks tasks in transition
+	// rather than every task the daemon has ever started.
+	gates map[string]*taskGate
 
 	cfg          Config
 	watchdogStop chan struct{}
@@ -70,11 +74,51 @@ type LifecycleManager struct {
 	stopOnce     sync.Once
 }
 
+// taskGate serializes the transitions of a single task. waiters is guarded by
+// LifecycleManager.mu, not by the gate's own mutex.
+type taskGate struct {
+	mu      sync.Mutex
+	waiters int
+}
+
+// lockTask takes the gate for taskID and returns the function that releases it.
+//
+// This has to be a separate lock from m.mu, held for as long as it takes to
+// build and start an instance. m.mu also guards Get and Active, and starting an
+// instance spawns a child process per configured MCP server and completes a
+// handshake with each — a manager-wide lock held across that would stall every
+// other task's reads behind one task's slow or broken server. Per task it costs
+// nothing that matters: two starts for the same task are a double click, and
+// queueing the second one behind the first is what makes it a restart instead of
+// a second live instance.
+func (m *LifecycleManager) lockTask(taskID string) func() {
+	m.mu.Lock()
+	g := m.gates[taskID]
+	if g == nil {
+		g = &taskGate{}
+		m.gates[taskID] = g
+	}
+	g.waiters++
+	m.mu.Unlock()
+
+	g.mu.Lock()
+	return func() {
+		g.mu.Unlock()
+		m.mu.Lock()
+		g.waiters--
+		if g.waiters == 0 {
+			delete(m.gates, taskID)
+		}
+		m.mu.Unlock()
+	}
+}
+
 // New creates a LifecycleManager. With no options the idle watchdog is off
 // (backward-compatible); pass WithIdleWatchdog to enable it.
 func New(opts ...Option) *LifecycleManager {
 	m := &LifecycleManager{
 		instances: make(map[string]*instance.MCPInstance),
+		gates:     make(map[string]*taskGate),
 	}
 	for _, o := range opts {
 		o(&m.cfg)
@@ -123,6 +167,16 @@ func (m *LifecycleManager) sweepIdle(now time.Time) {
 // If an instance for TaskID already exists and is running, it is stopped first
 // before the new one is started (handles resume-with-new-config).
 // Returns the started instance so callers can read Port and Token.
+//
+// Concurrent calls for one TaskID are serialized here, and here is the only
+// place they can be: the HTTP handler behind POST /tasks/{id}/mcp/start adds no
+// serialization of its own, and two of those requests in flight at once is a
+// double click or an SPA retry. Without it each caller built and started its own
+// instance and only the last to reach the map was tracked, leaving the rest
+// running — loopback bound, bearer token valid, mcpServers entry written, child
+// servers alive — with no reference left anywhere to stop them by, so not even
+// StopAll could reach them. Serialized, the second caller finds the first
+// caller's instance and takes the restart path that already existed for it.
 func (m *LifecycleManager) StartTask(ctx context.Context, cfg TaskConfig) (*instance.MCPInstance, error) {
 	if cfg.TaskID == "" {
 		return nil, fmt.Errorf("lifecycle: TaskID is required")
@@ -133,6 +187,9 @@ func (m *LifecycleManager) StartTask(ctx context.Context, cfg TaskConfig) (*inst
 	if cfg.PermManager == nil {
 		return nil, fmt.Errorf("lifecycle: PermManager is required")
 	}
+
+	release := m.lockTask(cfg.TaskID)
+	defer release()
 
 	// Load per-task MCP servers from <WsRoot>/.tether/task-config.json.
 	// A missing file yields no servers; a malformed file aborts start.
@@ -154,6 +211,9 @@ func (m *LifecycleManager) StartTask(ctx context.Context, cfg TaskConfig) (*inst
 	}
 
 	// Stop any existing instance for this task first (idempotent restart).
+	// Reading this and publishing the replacement below are separated by the
+	// whole of instance construction and start; the task gate is what makes the
+	// pair atomic against another start for the same task.
 	m.mu.Lock()
 	existing, exists := m.instances[cfg.TaskID]
 	if exists {
@@ -192,7 +252,14 @@ func (m *LifecycleManager) StartTask(ctx context.Context, cfg TaskConfig) (*inst
 
 // StopTask shuts down the running MCPInstance for taskID.
 // Returns an error if no instance is found or shutdown fails.
+//
+// Takes the same per-task gate as StartTask, so a stop that arrives while a
+// start for that task is in flight waits for it and then stops what it started,
+// instead of reporting "no instance" and letting the start publish one behind it.
 func (m *LifecycleManager) StopTask(ctx context.Context, taskID string) error {
+	release := m.lockTask(taskID)
+	defer release()
+
 	m.mu.Lock()
 	inst, ok := m.instances[taskID]
 	if ok {
@@ -227,6 +294,14 @@ func (m *LifecycleManager) Active() []*instance.MCPInstance {
 
 // StopAll stops the idle watchdog (if running) and shuts down all instances.
 // Intended for daemon shutdown. Best-effort: per-instance errors are ignored.
+//
+// It snapshots the task ids and then stops them one at a time, so a StartTask
+// that publishes an instance for a task not in the snapshot outlives this call.
+// That is a start racing shutdown rather than two starts racing each other and
+// is not what the task gate addresses: the gate serializes per task, and the
+// task in question is by definition not one StopAll saw. Closing it means
+// refusing starts once shutdown has begun, which is a change to what this type
+// promises callers and is left to whoever wants that promise.
 func (m *LifecycleManager) StopAll(ctx context.Context) {
 	if m.watchdogStop != nil {
 		m.stopOnce.Do(func() { close(m.watchdogStop) })

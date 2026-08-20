@@ -209,13 +209,15 @@ func (r *Registry) handleRunShell(ctx context.Context, req *mcp.CallToolRequest)
 		case errors.As(runErr, &exitErr):
 			exitCode = exitErr.ExitCode()
 		case errors.Is(runErr, exec.ErrWaitDelay):
-			// Reachable only where setKillScope sets Cmd.WaitDelay
-			// (proc_windows.go); on !windows the field stays zero and os/exec
-			// never produces this. It means Wait stopped reading the pipes
+			// Both platforms' setKillScope set Cmd.WaitDelay, so this is
+			// reachable everywhere. It means Wait stopped reading the pipes
 			// because something the command left behind was still holding
 			// them — and os/exec returns it "instead of nil", i.e. the command
 			// itself exited successfully. Reporting it as a tool error would
 			// turn a command that worked into a failure with no output at all.
+			// What differs per platform is which survivors can get here: on
+			// !windows only one that left the process group, since the rest are
+			// killed with it; on windows any child at all.
 			cutShort = true
 		default:
 			return errResult(fmt.Sprintf("workspace_run_shell: %v", runErr)), nil

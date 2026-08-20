@@ -48,10 +48,22 @@ func NewSupervisor(cfg ServerConfig, reg ToolRegistry, logger HistoryLogger, ini
 
 // Run blocks until the server is permanently stopped (ctx cancelled or retries exhausted).
 // It uses initialConn as the first connection, then calls connectFn up to maxRetries times on crash.
+//
+// The loop counts crashes rather than iterations, and gives up at the top of the
+// iteration that follows the last restart rather than at the bottom of the one
+// that made it. Counting iterations put the reconnect after the loop condition
+// had already been evaluated for the last time, so the maxRetries'th replacement
+// was spawned, had its tools registered, and was then closed and deregistered
+// without Run ever waiting on it — a child process, an MCP handshake and a
+// tools/list paid for after a full backoff and thrown away; a window in which the
+// registry observer advertised tools that immediately vanished, so a tools/list
+// landing in it was answered with tools that could not be called; and, for a
+// server whose third start would have held, a kill it never earned. maxRetries
+// restarts were maxRetries-1 usable ones.
 func (s *Supervisor) Run(ctx context.Context) {
 	conn := s.initialConn
 
-	for attempt := 1; attempt <= maxRetries; attempt++ {
+	for crashes := 0; ; {
 		// Block until connection closes (crash or clean shutdown).
 		waitErr := conn.Wait()
 
@@ -65,20 +77,31 @@ func (s *Supervisor) Run(ctx context.Context) {
 		}
 
 		// Crash.
-		slog.Warn("mcp/supervisor: server crashed", "server", s.cfg.Name, "attempt", attempt, "err", waitErr)
+		crashes++
+		slog.Warn("mcp/supervisor: server crashed", "server", s.cfg.Name, "attempt", crashes, "err", waitErr)
 		s.deregister()
 		_ = conn.Close()
+
+		// Every restart this loop spends is one the connection above got to run,
+		// so the budget is spent only once a restart has crashed in its turn.
+		if crashes > maxRetries {
+			_ = s.logger.Append("mcp_server_crashed", map[string]any{
+				"server":        s.cfg.Name,
+				"attempt_count": maxRetries,
+			})
+			return
+		}
 
 		// Always backoff before reconnect (even after failed connectFn — fixes I2).
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(RetryDelays[attempt-1]):
+		case <-time.After(RetryDelays[crashes-1]):
 		}
 
 		newConn, newTools, err := s.connectFn()
 		if err != nil {
-			slog.Error("mcp/supervisor: reconnect failed", "server", s.cfg.Name, "attempt", attempt, "err", err)
+			slog.Error("mcp/supervisor: reconnect failed", "server", s.cfg.Name, "attempt", crashes, "err", err)
 			// deadConn sentinel: Wait() returns immediately → next iteration consumes another attempt with backoff.
 			conn = &deadConn{err: err}
 			continue
@@ -98,14 +121,6 @@ func (s *Supervisor) Run(ctx context.Context) {
 			}
 		}
 	}
-
-	// All retries exhausted — clean up.
-	_ = conn.Close()
-	s.deregister()
-	_ = s.logger.Append("mcp_server_crashed", map[string]any{
-		"server":        s.cfg.Name,
-		"attempt_count": maxRetries,
-	})
 }
 
 // deadConn is a sentinel ServerConn whose Wait() returns immediately.

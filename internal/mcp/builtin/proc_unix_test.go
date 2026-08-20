@@ -141,8 +141,13 @@ func TestRunShell_TimeoutKillsBackgroundGrandchild(t *testing.T) {
 // misses that process makes the caller wait for it: measured at 60.0s against
 // this command's `sleep 60`, versus 1.0s when the group kill takes it out.
 //
-// This is what os/exec's Cmd.WaitDelay covers, and why proc_windows.go sets it
-// and this file does not.
+// The process group is what buys it *here*, where the background process stays
+// in the group. It is not the whole answer: a descendant that leaves the group
+// survives the kill and holds the same pipe, which is why setKillScope also sets
+// Cmd.WaitDelay on this platform. That case is out of this test's reach by
+// construction — see TestRunShell_TimeoutReturnsWhileEscapedDescendantHoldsPipe,
+// which is the one that fails if the WaitDelay goes away, while this one passes
+// either way.
 func TestRunShell_TimeoutReturnsWhileGrandchildHoldsPipe(t *testing.T) {
 	_, elapsed := runShellPidProbe(t, "")
 

@@ -746,9 +746,10 @@ body {
 
    `pointer-events: none`, which is new information rather than defensive: in flow this
    element sat BELOW the transcript and could not be over anything. Pinned to the viewport
-   it floats about 11px into the last line, so without this it would be able to swallow a
-   tap or a wheel aimed at the message underneath. The dots keep `role="status"` and their
-   label, so nothing is taken away from a screen reader.
+   it floats 7px into the last line (measured: a 15px pill 4px above the boundary against
+   `.dt-chat`'s 12px bottom padding), so without this it would be able to swallow a tap or a
+   wheel aimed at the message underneath. The dots keep `role="status"` and their label, so
+   nothing is taken away from a screen reader.
 
    `left: 50%` + `translateX(-50%)` rather than leaning on the rail's `justify-content` to
    place an absolute child (the flexbox static-position rules, which Safari has a history

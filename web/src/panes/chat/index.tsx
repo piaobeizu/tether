@@ -2451,7 +2451,7 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
 
           # What this costs, since it is now over content rather than under it
 
-          A pill floating ~11px into the last line of the transcript for the length of one
+          A pill floating 7px into the last line of the transcript for the length of one
           request. `pointer-events: none` (index.css) so it cannot swallow a tap or a
           wheel aimed at the message beneath it — in flow it never could, and that is a
           guarantee this shape has to restate rather than inherit.

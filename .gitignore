@@ -4,6 +4,20 @@
 /bin/
 /dist/
 
+# scripts/release.sh's `mkdir -p dist release` output — the per-platform tarballs.
+# Same class as /dist/ (tether#86). Nothing was ever committed here; this entry is
+# what keeps it that way, since the published artifacts come from
+# .github/workflows/release.yml and not from whatever a local run left behind.
+/release/
+
+# A compiled copy of ./cmd/build-hook, committed once on 2026-05-09 (3,001,974
+# bytes) and referenced by nothing since (tether#86). Both callers —
+# scripts/release.sh and .github/workflows/release.yml — build the wrapper to a
+# temp path of their own, because it has to run on the host while the hook it
+# produces is cross-compiled. The source stays; only the binary is ignored, so
+# that `go build -o build-hook ./cmd/build-hook` cannot silently dirty the tree.
+/build-hook
+
 # Generated frontend bundle — `vite build` output, embedded into the binary by
 # web/embed.go's `//go:embed all:dist`. Deliberately NOT committed (tether#81):
 # a committed copy has no way to stay in sync with web/src, and any build that
@@ -37,6 +51,26 @@
 # a tracked copy would be one more thing that is stale on every checkout, and
 # the point of these files is that they describe *this* run.
 /web/test-results/
+
+# pnpm's install tree. It was committed by accident, not by decision (tether#86):
+# two commits on 2026-05-09 added it, and in the first — titled "React 19+Vite 7
+# SPA skeleton" — 2796 of the 2833 files were node_modules. None of the three
+# reasons to vendor an install tree holds here, each checked rather than assumed:
+# there is no offline build path anywhere in the repo (every `offline` hit is docs
+# about PWA offline support, deferred to v0.5+); there is no patched dependency
+# (no pnpm patch/resolutions/overrides keys, no patches/); and CI never read the
+# committed copy — both workflows run `pnpm install --frozen-lockfile` from the
+# network, so the tracked tree was work for CI to reconcile, not work it saved.
+#
+# What it cost while tracked, measured at dbdfb24 on 2026-08-20: one
+# `pnpm install --frozen-lockfile` leaves 7264 dirty entries (7113 untracked, 137
+# deleted, 14 modified) and nothing outside node_modules. So `git describe
+# --tags --always --dirty` read `v0.5.0-110-gdbdfb24-dirty` after any build, which
+# is the string scripts/build.sh compiles into the binary as its version.
+#
+# Keep scripts/check-artifacts-uncommitted.sh in sync with this block; CI runs it,
+# so deleting this entry turns CI red rather than quietly re-arming the bug.
+/web/node_modules/
 
 # Spike output (per .plans Step 7) — runtime files only.
 # Curated artifacts (the dated spike-report and verification-report from

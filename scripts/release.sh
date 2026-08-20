@@ -12,11 +12,11 @@ echo "Building tether ${VERSION}"
 # name a platform that nothing ever compiles for (tether#85).
 source "$(dirname "$0")/platforms.sh"
 
-# Build web assets first. CI=true because the committed web/node_modules does not
-# match pnpm-lock.yaml, so --frozen-lockfile purges it and pnpm refuses to do that
-# without a TTY (ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY). Same reason as in
-# scripts/build.sh.
-(cd web && CI=true pnpm install --frozen-lockfile && pnpm build)
+# Build web assets first. This carried `CI=true` from tether#81 until tether#86,
+# for the committed web/node_modules that no longer exists; see the block above
+# this same line in scripts/build.sh for what was measured before dropping it —
+# including why the behaviour it guarded against was never fixed by repo state.
+(cd web && pnpm install --frozen-lockfile && pnpm build)
 
 # Stamp before any go build so every cross-compiled artifact carries the build id.
 bash scripts/spa-bundle.sh stamp

@@ -2389,8 +2389,8 @@ func (e *Entry) deliverTurn(ch chan wire.Envelope, env wire.Envelope) {
 // being wrong is one they stop reading. A dropped permission request IS a real and
 // worse defect than the one tether#124 fixes — it hangs a tool call with no way
 // for anyone to find out — but repairing it means a pending-requests endpoint and
-// a frontend that asks for it, which is neither this file nor this change. Filed
-// as its own wi rather than papered over with a notice that would mislead.
+// a frontend that asks for it, which is neither this file nor this change. It is
+// tether#132, filed rather than papered over with a notice that would mislead.
 //
 // It is deliberately NOT counted into Entry.lost either. That counter is what the
 // notice reports, and letting an unrepairable drop raise it would make the very

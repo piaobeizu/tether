@@ -3,7 +3,7 @@
 // workspace root (matching fetchFile's `path` param). Directory rows must
 // keep expanding/collapsing rather than selecting.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { act, cleanup, render, screen, fireEvent, waitFor } from '@testing-library/react'
 import WorkspaceTree from './WorkspaceTree'
 import { useStore } from '../../lib/store'
 
@@ -14,6 +14,51 @@ function mockFiles(entries: Entry[]) {
     ok: true,
     json: async () => entries,
   })))
+}
+
+/**
+ * A file-listing stub that answers the workspace ROOT immediately and holds every
+ * other directory open until it is released by hand.
+ *
+ * mockFiles above cannot express the window this exists to test: it resolves in a
+ * microtask, so "the user clicked while the fetch was in flight" has nowhere to
+ * happen. Holding the promise is what makes that window arbitrarily wide, which
+ * is the only way to test the race rather than to try to win it.
+ */
+function deferredFiles(root: Entry[]) {
+  // The raw resolvers, so `release` and `fail` each build their own Response
+  // shape. An earlier version stored a pre-wrapped ok-resolver and had `fail`
+  // push a bad status through it, which resolved as `ok: true` carrying the
+  // status object as the listing — a stub that fails in a way the daemon never
+  // could is not a test of the error path.
+  const pending = new Map<string, (res: unknown) => void>()
+  const calls: string[] = []
+  vi.stubGlobal('fetch', vi.fn((url: string) => {
+    calls.push(url)
+    const dir = new URL(url, 'http://localhost').searchParams.get('dir') ?? ''
+    if (dir === '') return Promise.resolve({ ok: true, json: async () => root })
+    return new Promise((resolve) => { pending.set(dir, resolve) })
+  }))
+  const take = (dir: string) => {
+    const resolve = pending.get(dir)
+    if (!resolve) throw new Error(`no in-flight listing for "${dir}"`)
+    pending.delete(dir)
+    return resolve
+  }
+  return {
+    /** How many listings have been requested, per directory. */
+    countFor: (dir: string) => calls.filter((u) => u.endsWith(`dir=${dir}`)).length,
+    /** Land `dir`'s listing and let React flush the resulting state write. */
+    release: async (dir: string, entries: Entry[]) => {
+      const resolve = take(dir)
+      await act(async () => { resolve({ ok: true, json: async () => entries }) })
+    },
+    /** Fail `dir`'s listing the way fileTreeCache surfaces a bad status. */
+    fail: async (dir: string) => {
+      const resolve = take(dir)
+      await act(async () => { resolve({ ok: false, status: 500 }) })
+    },
+  }
 }
 
 afterEach(() => {
@@ -155,5 +200,77 @@ describe('WorkspaceTree hidden entries', () => {
 
     await waitFor(() => screen.getByText('src'))
     expect(screen.queryByTestId('tree-hidden-row')).toBeNull()
+  })
+})
+
+// tether#129 defect 2 — a directory folded shut while its listing was still in
+// flight sprang back open on its own.
+//
+// `expand` wrote `expanded: true` optimistically, then BOTH of its async
+// callbacks wrote `expanded: true` again unconditionally. A collapse landing in
+// between set it false, and the arriving listing overwrote that with an intent
+// the user had already withdrawn — the callback re-asserting a decision instead
+// of reporting the one fact it actually learned.
+//
+// Two assertions per case, and the second is what makes the first mean anything.
+// "Still collapsed" is also what a listing that never arrived would look like, so
+// each case ALSO proves the write landed: one more click reveals the children
+// with no second request. That doubles as the guard against the obvious wrong
+// fix, which is to stop writing `entries` along with `loading` and quietly turn
+// every interrupted expand into a refetch.
+describe('WorkspaceTree collapse during load (tether#129)', () => {
+  const root: Entry[] = [{ name: 'src', isDir: true, dirty: false }]
+  const children: Entry[] = [{ name: 'deep.txt', isDir: false, dirty: false }]
+
+  it('stays collapsed when the listing lands after the fold', async () => {
+    const files = deferredFiles(root)
+    render(<WorkspaceTree workspaceId="ws-1" />)
+    await waitFor(() => screen.getByText('src'))
+
+    fireEvent.click(screen.getByText('src'))            // expand — listing now in flight
+    expect(screen.getByText('loading…')).toBeTruthy()
+    fireEvent.click(screen.getByText('src'))            // fold it back before the listing lands
+    expect(screen.queryByText('loading…')).toBeNull()
+
+    await files.release('src', children)
+
+    expect(screen.queryByText('deep.txt')).toBeNull()   // it must not have re-opened itself
+    expect(files.countFor('src')).toBe(1)
+
+    // ...and the listing really did arrive: one click shows it, no second fetch.
+    fireEvent.click(screen.getByText('src'))
+    expect(screen.getByText('deep.txt')).toBeTruthy()
+    expect(files.countFor('src')).toBe(1)
+  })
+
+  // The error callback had the identical unconditional write. It is a separate
+  // clause in a separate `.catch`, so it needs its own case — a fix applied to
+  // the success path alone leaves the failure path popping directories open, and
+  // that is the path a user on a flaky daemon actually sees.
+  it('stays collapsed when the listing FAILS after the fold', async () => {
+    const files = deferredFiles(root)
+    render(<WorkspaceTree workspaceId="ws-1" />)
+    await waitFor(() => screen.getByText('src'))
+
+    fireEvent.click(screen.getByText('src'))
+    fireEvent.click(screen.getByText('src'))
+
+    await files.fail('src')
+
+    expect(screen.queryByText('HTTP 500')).toBeNull()
+    expect(screen.queryByText('deep.txt')).toBeNull()
+  })
+
+  // The other half of the contract, so the fix cannot be "never expand from a
+  // callback". Left alone, an expand that is never interrupted must still open.
+  it('still opens when nothing interrupts the expand', async () => {
+    const files = deferredFiles(root)
+    render(<WorkspaceTree workspaceId="ws-1" />)
+    await waitFor(() => screen.getByText('src'))
+
+    fireEvent.click(screen.getByText('src'))
+    await files.release('src', children)
+
+    expect(screen.getByText('deep.txt')).toBeTruthy()
   })
 })

@@ -864,9 +864,12 @@ body {
 /* tether#110 — three dots, at either end, while a request is genuinely in flight.
 
    Three ELEMENTS, not a '···' string: opacity cannot be animated per character. That is
-   also why this is not built on `.thinking-dots` below, which puts the glyphs in a
-   `::before` carrying no animation and hangs the animation on an EMPTY `::after` — so it
-   has never moved, whatever its call site's comment says.
+   also why this is not built on `.thinking-dots` below, which until tether#129 put the
+   glyphs in a `::before` carrying no animation and hung the animation on an EMPTY
+   `::after` — so it had never moved, whatever its call site's comment said. tether#129
+   moved the animation onto the glyphs, which is as far as one box can go: those dots now
+   pulse as a GROUP while these three travel. The per-character limit above is why copying
+   them still would not do.
 
    Height: 13px measured (5px dot + 4px/4px padding); the bottom end's pill overrides the
    padding down to 2px and adds a border, so it is 11px. This used to be under a ceiling —
@@ -1286,7 +1289,29 @@ body {
 /* ── Streaming cursor keyframe (used by .msg-ai-body.streaming .md-body::after) ─── */
 @keyframes tether-blink { 0%,100% { opacity: 1 } 50% { opacity: 0 } }
 
-/* ── Thinking dots (waiting for first token, NOT a cursor) ───── */
+/* ── Thinking dots (waiting for first token, NOT a cursor) ─────
+
+   tether#129 — the animation is on the pseudo-element that carries the INK.
+
+   It used to be split across both: `::before` held the glyphs and no animation,
+   and an `::after` with `content: ''` held the animation. Nothing was broken
+   about the animation itself — `content: ''` is an empty STRING and not `none`,
+   so that box really was generated and the keyframes really did run on it. It
+   just had no text, no background and no border, so animating its opacity moved
+   nothing that paints. What the user saw was the static `::before`: three dots
+   that never moved, under a call site advertising that they did. The `::after`
+   existed only to hold the animation and is gone with it.
+
+   A whole-group pulse rather than a per-dot wave, and that is a ceiling rather
+   than a preference: the glyphs are one three-character string in one box, and
+   opacity cannot be animated per character. A travelling wave needs one box per
+   dot — which is why `.transcript-dots` above is built from three real elements
+   instead of copying this, and getting three boxes HERE would mean changing the
+   markup at the call site (panes/chat renders a childless <span>). Different
+   change, different file.
+
+   `thinking-bounce` animates opacity and nothing else; the name predates this
+   and is left alone rather than renamed inside a bug fix. */
 @keyframes thinking-bounce {
   0%,60%,100% { opacity: .3 }
   30%          { opacity: 1 }
@@ -1296,8 +1321,7 @@ body {
   font-size: 16px; letter-spacing: 2px;
   color: var(--ink-quat);
 }
-.thinking-dots::before { content: '···'; }
-.thinking-dots::after { content: ''; animation: thinking-bounce 1.4s infinite; }
+.thinking-dots::before { content: '···'; animation: thinking-bounce 1.4s infinite; }
 
 /* ── Extended thinking (tether#34): live stream → collapsed summary ─── */
 .msg-thinking { padding-left: 25px; margin-bottom: 4px; }

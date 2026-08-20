@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"runtime"
@@ -1541,5 +1542,332 @@ func TestFanOut_ForwardsInitlessResultCarryingText(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("an init-less result WITH text was swallowed; the guard is too broad")
+	}
+}
+
+// ─── tether#124: a dropped envelope must leave a mark ────────────────────────
+
+// gapNoticeText pulls the text out of an envelope if it is the gap notice, so
+// the tests below assert on the SHAPE web/src/lib/store.ts consumes (a
+// KindMessage whose payload object has type "notice" and a non-empty text)
+// rather than on an internal constant. The second return distinguishes "this is
+// not a notice" from "a notice with no words", which is a notice the frontend
+// silently discards.
+func gapNoticeTextOf(env wire.Envelope) (string, bool) {
+	if env.Kind != wire.KindMessage {
+		return "", false
+	}
+	obj, ok := env.Payload.(map[string]any)
+	if !ok {
+		return "", false
+	}
+	if t, _ := obj["type"].(string); t != "notice" {
+		return "", false
+	}
+	text, _ := obj["text"].(string)
+	return text, true
+}
+
+// lossySubscriber gives a test a subscriber whose channel is already FULL, and
+// returns the channel plus a drain function.
+//
+// The capacity is 2 and not 32: what is under test is the behaviour at the
+// boundary, and the real 32 in serveChat is not a number this package knows or
+// should depend on (see the subCh declaration in internal/server/wt_chat.go for
+// why that number is what it is and why nobody has measured it).
+func lossySubscriber(t *testing.T, reg *Registry, e *Entry) (chan wire.Envelope, func(n int)) {
+	t.Helper()
+	ch := make(chan wire.Envelope, 2)
+	e.Subscribe(ch)
+	return ch, func(n int) {
+		t.Helper()
+		for i := 0; i < n; i++ {
+			select {
+			case <-ch:
+			default:
+				t.Fatalf("drain: channel empty after %d of %d", i, n)
+			}
+		}
+	}
+}
+
+// TestBroadcast_MarksTheGapLeftByADroppedEnvelope — the whole of tether#124's
+// claim, in one sequence.
+//
+// A subscriber whose channel fills loses envelopes (Registry.broadcast drops
+// rather than blocking, deliberately — a session's fanOut must not be held up by
+// one slow browser). Until this change the ONLY record of that was a server-side
+// slog.Warn, so the tab rendered an answer with a hole in it and said nothing:
+// see the subCh declaration in internal/server/wt_chat.go for the mechanism that
+// makes a stalled browser lose exactly this way.
+//
+// The repair the notice asks for is real and is the only one available. The text
+// is on disk before it is ever broadcast (emitSegments writes HistoryStore first),
+// and ChatPane's mount effect refetches GET /messages for the restored sid — so a
+// reload shows the full answer. A RECONNECT does not: session_ready re-confirms
+// the same sid, which is a no-op for the `[sessionId]` effect that owns the
+// refetch. That asymmetry is why the notice says "reload".
+func TestBroadcast_MarksTheGapLeftByADroppedEnvelope(t *testing.T) {
+	reg := &Registry{}
+	e := &Entry{subs: make(map[chan wire.Envelope]struct{})}
+	ch, drain := lossySubscriber(t, reg, e)
+
+	reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "one"})
+	reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "two"})
+	// Full now: these two are the ones the user never sees.
+	reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "lost-a"})
+	reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "lost-b"})
+
+	// The browser catches up and the loop starts draining again.
+	drain(2)
+	reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "three"})
+
+	var env wire.Envelope
+	select {
+	case env = <-ch:
+	default:
+		t.Fatal("nothing queued after the subscriber caught up")
+	}
+	text, ok := gapNoticeTextOf(env)
+	if !ok {
+		t.Fatalf("first envelope after the gap = %q/%#v; want the gap notice, so the tab is told its view is incomplete", env.Kind, env.Payload)
+	}
+	if text == "" {
+		t.Fatal("gap notice carries no text; store.ts drops a notice with an empty text, so this reaches nobody")
+	}
+
+	// And the notice is IN BAND, not instead of the traffic: the envelope that
+	// did fit still arrives, immediately after the marker.
+	select {
+	case env = <-ch:
+		if s, _ := env.Payload.(string); s != "three" {
+			t.Fatalf("envelope after the notice = %#v, want \"three\"", env.Payload)
+		}
+	default:
+		t.Fatal("the gap notice replaced the envelope it was supposed to precede")
+	}
+}
+
+// TestBroadcast_OneNoticePerGapNotPerLostEnvelope — the notice describes a GAP,
+// so two lost envelopes in a row are one notice and not two.
+//
+// This is load-bearing rather than tidiness. store.ts collapses a repeat of the
+// session banner already showing, so a notice per lost envelope would mostly be
+// swallowed there — mostly, because tether#80 made that dedupe compare against
+// the last SESSION-class notice, so any other line arriving in between un-gates
+// the next identical one. Bounding the emission here rather than relying on the
+// frontend's collapse keeps that out of the picture entirely.
+func TestBroadcast_OneNoticePerGapNotPerLostEnvelope(t *testing.T) {
+	reg := &Registry{}
+	e := &Entry{subs: make(map[chan wire.Envelope]struct{})}
+	ch, drain := lossySubscriber(t, reg, e)
+
+	reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "one"})
+	reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "two"})
+	for i := 0; i < 5; i++ {
+		reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "lost"})
+	}
+	drain(2)
+
+	// Room for exactly the notice and one payload, so a second notice would have
+	// to displace the payload and would be caught either way.
+	reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "three"})
+
+	notices, payloads := 0, 0
+	for {
+		select {
+		case env := <-ch:
+			if _, ok := gapNoticeTextOf(env); ok {
+				notices++
+			} else {
+				payloads++
+			}
+			continue
+		default:
+		}
+		break
+	}
+	if notices != 1 {
+		t.Fatalf("notices after a run of %d lost envelopes = %d, want exactly 1", 5, notices)
+	}
+	if payloads != 1 {
+		t.Fatalf("payloads delivered = %d, want 1 (the notice must not displace traffic)", payloads)
+	}
+
+	// Having reported the gap, it goes QUIET: a subscriber that is keeping up gets
+	// traffic and nothing else.
+	//
+	// This is the half a mutation battery had to find, and the reason it is worth
+	// naming: the "one notice per gap" count above passes whether the counter is
+	// cleared when it is reported or never cleared at all, because that sequence
+	// ends immediately after the report. A counter that only ever grows would
+	// prefix EVERY later envelope with a notice, for the whole life of the
+	// connection, and every other assertion in this file would still be green.
+	for i := 0; i < 3; i++ {
+		reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: fmt.Sprintf("calm-%d", i)})
+		select {
+		case env := <-ch:
+			if _, ok := gapNoticeTextOf(env); ok {
+				t.Fatalf("envelope %d after the gap was reported is another notice; the counter is never cleared, so the tab is told forever", i)
+			}
+		default:
+			t.Fatalf("nothing queued for envelope %d", i)
+		}
+	}
+
+	// A second gap is a second notice: the counter reports and RE-ARMS. Without
+	// this the tab is told once and then goes quiet for the rest of a long
+	// session, however many more times it stalls.
+	//
+	// Three sends into a channel of two: the third is the one that is lost. Two
+	// would FIT, and a version of this that sent only two would assert nothing —
+	// it would be asking about a gap that never happened.
+	reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "four"})
+	reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "four-b"})
+	reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "lost again"})
+	drain(2)
+	reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "five"})
+	select {
+	case env := <-ch:
+		if _, ok := gapNoticeTextOf(env); !ok {
+			t.Fatalf("first envelope after the SECOND gap = %q/%#v; the notice does not re-arm", env.Kind, env.Payload)
+		}
+	default:
+		t.Fatal("nothing queued after the second gap")
+	}
+}
+
+// TestBroadcast_NoticeGoesOnlyToTheSubscriberThatLost — the notice must be
+// per-connection, and this is the assertion that makes that a property rather
+// than an accident of there usually being one subscriber.
+//
+// A session can have several (the same human on a phone and a laptop, both
+// attached to one sid). A tab that received everything must not be told its view
+// has a hole in it: this file's own neighbours argue that a notice a user has
+// caught lying is one they stop reading, and a false one here would spend exactly
+// that credit.
+func TestBroadcast_NoticeGoesOnlyToTheSubscriberThatLost(t *testing.T) {
+	reg := &Registry{}
+	e := &Entry{subs: make(map[chan wire.Envelope]struct{})}
+	slow, drainSlow := lossySubscriber(t, reg, e)
+	fast := make(chan wire.Envelope, 64)
+	e.Subscribe(fast)
+
+	for i := 0; i < 6; i++ {
+		reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: fmt.Sprintf("tok-%d", i)})
+	}
+	drainSlow(2)
+	reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "tok-6"})
+
+	select {
+	case env := <-slow:
+		if _, ok := gapNoticeTextOf(env); !ok {
+			t.Fatalf("the subscriber that LOST envelopes was told nothing; got %q/%#v", env.Kind, env.Payload)
+		}
+	default:
+		t.Fatal("nothing queued for the slow subscriber")
+	}
+
+	for {
+		select {
+		case env := <-fast:
+			if _, ok := gapNoticeTextOf(env); ok {
+				t.Fatal("a subscriber that received every envelope was told its view is incomplete")
+			}
+			continue
+		default:
+		}
+		break
+	}
+}
+
+// captureWarnings redirects slog to a buffer for the duration of one test and
+// returns a reader for what was logged.
+//
+// A test that asserts on log output is a poor second choice and is used here
+// because it is the only choice: the whole of the BroadcastAll fix is that a drop
+// which used to leave NO trace anywhere now leaves one, and "no trace anywhere"
+// is by definition not observable through any other surface. The alternative —
+// asserting the drop through Entry.lost — would assert the opposite of what
+// deliverOutOfBand is supposed to do.
+func captureWarnings(t *testing.T) *strings.Builder {
+	t.Helper()
+	var buf strings.Builder
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+// TestBroadcastAll_RecordsItsDropsButPromisesNothing — BroadcastAll is a SECOND
+// drop site on the same channels, and it needs the opposite treatment to the
+// first one.
+//
+// Two assertions, and they pull in opposite directions on purpose:
+//
+//   - It must leave a RECORD. Registry.broadcast at least warned; BroadcastAll's
+//     loop over e.subs was a bare `select { case ch <- env: default: }` with no
+//     log at all, so a daemon-wide envelope vanished from a stalled tab without
+//     leaving a trace anywhere.
+//   - It must NOT emit the gap notice, and must not raise the counter that does.
+//     The notice tells the reader to reload, and for these three producers a
+//     reload does not get the content back — for a KindPermission request it is
+//     actively destructive, since loadHistory clears pendingPermissions and
+//     nothing refills it. See deliverOutOfBand.
+func TestBroadcastAll_RecordsItsDropsButPromisesNothing(t *testing.T) {
+	logs := captureWarnings(t)
+	e := &Entry{subs: make(map[chan wire.Envelope]struct{}), regKey: "sid-all"}
+	reg := &Registry{sessions: map[string]*Entry{"sid-all": e}}
+	ch, drain := lossySubscriber(t, reg, e)
+
+	for i := 0; i < 4; i++ {
+		reg.BroadcastAll(wire.Envelope{Kind: wire.KindPermission, Payload: "wide"})
+	}
+	if got := logs.String(); !strings.Contains(got, "envelope dropped") {
+		t.Fatalf("BroadcastAll dropped two envelopes and logged nothing; captured warnings were %q", got)
+	}
+	if got := logs.String(); !strings.Contains(got, "repairable_by_reload=false") {
+		t.Fatalf("the log does not say the drop is unrecoverable, which is the one fact an operator needs here; got %q", got)
+	}
+
+	// Nothing it dropped may be announced, now or later: the counter the notice
+	// reports must still be zero, so the next TURN envelope makes no claim about
+	// a permission request a reload cannot bring back.
+	drain(2)
+	reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "a real turn envelope"})
+	select {
+	case env := <-ch:
+		if _, ok := gapNoticeTextOf(env); ok {
+			t.Fatal("a BroadcastAll drop produced a notice telling the reader to reload; a reload cannot recover any of BroadcastAll's payloads")
+		}
+	default:
+		t.Fatal("nothing queued after the subscriber caught up")
+	}
+}
+
+// TestUnsubscribe_ForgetsTheDropAccounting — Subscribe and Unsubscribe must keep
+// the accounting map in step with the audience map, or a long-lived daemon leaks
+// one counter per chat connection that ever existed.
+//
+// Asserted on the map because there is nothing observable to assert on: a
+// forgotten counter is invisible until the process runs out of memory. This is
+// also the only test that would catch the accounting being keyed to an Entry that
+// Attachment.Subscribe has already swapped away from.
+func TestUnsubscribe_ForgetsTheDropAccounting(t *testing.T) {
+	e := &Entry{subs: make(map[chan wire.Envelope]struct{})}
+	ch := make(chan wire.Envelope, 1)
+	e.Subscribe(ch)
+	e.subsMu.RLock()
+	tracked := len(e.lost)
+	e.subsMu.RUnlock()
+	if tracked != 1 {
+		t.Fatalf("counters after Subscribe = %d, want 1 (a subscriber with no counter can never be told about a gap)", tracked)
+	}
+	e.Unsubscribe(ch)
+	e.subsMu.RLock()
+	tracked = len(e.lost)
+	e.subsMu.RUnlock()
+	if tracked != 0 {
+		t.Fatalf("counters after Unsubscribe = %d, want 0 (one leaked per connection for the daemon's lifetime)", tracked)
 	}
 }

@@ -318,9 +318,30 @@ type spawnReservation struct {
 // so callers can Subscribe BEFORE the agent has emitted its system/init,
 // avoiding the first-event drop race in serveChat (see Subscribe docs).
 type Entry struct {
-	sess          agent.Session
-	subs          map[chan wire.Envelope]struct{}
-	subsMu        sync.RWMutex
+	sess agent.Session
+	subs map[chan wire.Envelope]struct{}
+	// lost counts, per subscriber channel, the envelopes deliver could not fit
+	// into it and had to drop — reset each time the subscriber is TOLD about them
+	// (see deliver and gapNotice). Every channel in subs has an entry here and
+	// nothing else does; Subscribe and Unsubscribe maintain both together, and
+	// TestUnsubscribe_ForgetsTheDropAccounting is what holds them together, since
+	// a counter left behind is invisible until the daemon runs out of memory.
+	//
+	// The map is read under subsMu like subs, but the VALUES are atomics so that
+	// deliver can account for a drop while holding only the read lock. broadcast is
+	// on the hot path of every token increment (cc runs with
+	// --include-partial-messages), and taking the write lock there would serialise
+	// that against every ownership read on the entry.
+	//
+	// A second map rather than making subs a map to a struct value, which is the
+	// tidier shape: this package's tests build Entry literals by hand with a
+	// `subs: make(...)` field, so changing that type is a change to files outside
+	// the one this lives in. The cost is the invariant above having to be
+	// maintained by hand in two methods instead of by construction; it is stated
+	// here and pinned by a test rather than left to be noticed.
+	lost   map[chan wire.Envelope]*atomic.Int64
+	subsMu sync.RWMutex
+
 	ownerClientID string
 	fenceParser   *FenceParser // D-19 fenced-block extraction (tether#8 T6); one per session
 	// regKey is the key this entry is registered under in Registry.sessions —
@@ -501,16 +522,32 @@ func (e *Entry) clearTurns() { e.turnsInFlight.Store(0) }
 // session's fanOut. Safe to call before the session's real sid is known —
 // this is the path that closes the first-event drop window between
 // "agent emitted its init event" and "serveChat called Subscribe by sid".
+//
+// Idempotent for a channel already subscribed to THIS entry, and the drop
+// counter is deliberately part of that: Attachment.Subscribe re-registers the
+// same channel across a fallback swap and can leave it on two entries at once, so
+// re-subscribing must not silently forgive a gap the subscriber has not been told
+// about yet.
 func (e *Entry) Subscribe(ch chan wire.Envelope) {
 	e.subsMu.Lock()
 	e.subs[ch] = struct{}{}
+	// Lazily, because Entry is built as a literal in several places (including
+	// this package's tests) that name subs and nothing else.
+	if e.lost == nil {
+		e.lost = make(map[chan wire.Envelope]*atomic.Int64, 1)
+	}
+	if _, ok := e.lost[ch]; !ok {
+		e.lost[ch] = new(atomic.Int64)
+	}
 	e.subsMu.Unlock()
 }
 
-// Unsubscribe removes ch from the subscriber set.
+// Unsubscribe removes ch from the subscriber set, and with it the drop
+// accounting — see Entry.lost for why the two must move together.
 func (e *Entry) Unsubscribe(ch chan wire.Envelope) {
 	e.subsMu.Lock()
 	delete(e.subs, ch)
+	delete(e.lost, ch)
 	e.subsMu.Unlock()
 }
 
@@ -1437,11 +1474,17 @@ func (r *Registry) BroadcastAll(env wire.Envelope) {
 	r.mu.RUnlock()
 	for _, e := range entries {
 		e.subsMu.RLock()
+		// This is the SECOND drop site on the very same channels Registry.broadcast
+		// uses, and until tether#124 it did not even log — a bare
+		// `select { case ch <- env: default: }` — so a daemon-wide envelope
+		// vanished from a stalled tab without leaving a trace anywhere.
+		//
+		// deliverOutOfBand and NOT deliverTurn, which is the whole reason the two
+		// are separate methods: nothing here is recoverable from history, so this
+		// path records a drop and says nothing to the reader. Its doc comment is
+		// where that is argued, including what a dropped permission request costs.
 		for ch := range e.subs {
-			select {
-			case ch <- env:
-			default:
-			}
+			e.deliverOutOfBand(ch, env)
 		}
 		e.subsMu.RUnlock()
 	}
@@ -2171,15 +2214,193 @@ func (r *Registry) broadcast(e *Entry, env wire.Envelope) {
 	e.subsMu.RLock()
 	slog.Debug("fanOut: broadcasting", "wire_kind", env.Kind, "nsub", len(e.subs))
 	for ch := range e.subs {
-		select {
-		case ch <- env:
-		default:
-			slog.Warn("fanOut: slow subscriber, envelope dropped", "kind", env.Kind)
-		}
+		e.deliverTurn(ch, env)
 	}
 	e.subsMu.RUnlock()
 
 	r.deliverObservers(e, env)
+}
+
+// gapNoticeText is what a chat client is told after deliver has had to drop
+// envelopes destined for it.
+//
+// # Why there is anything to say at all
+//
+// A dropped envelope is NOT lost text. Registry.fanOut's emitSegments writes
+// every segment to HistoryStore (AccumulateAssistant / AppendBlock) BEFORE
+// calling broadcast, so what a full channel costs is this tab's live rendering
+// and nothing else: the answer is on disk, complete. Until tether#124 the only
+// record was a server-side slog.Warn, so the browser painted an answer with a
+// hole in it and said nothing — a view that had silently diverged from a
+// transcript that was intact.
+//
+// # Why it says RELOAD and not "reconnecting…"
+//
+// Reload is the repair that exists. web/src/panes/chat/index.tsx's mount effect
+// restores tether_last_sid and its `[sessionId]` effect refetches GET /messages,
+// which replaces the message list with the daemon's copy — the complete one. A
+// RECONNECT does not do this, and that was verified rather than assumed: the
+// reconnect lands on the same sid (cc --resume keeps its id), session_ready calls
+// setSessionId with a value that has not changed, and the effect that owns the
+// refetch is keyed on exactly that value. So nothing refetches. Every other
+// refetch path in that pane (watchTranscript, REFRESH_TRANSCRIPT_EVENT,
+// refreshNewest) is gated on readingHeldSession, which a live chat is not.
+//
+// That asymmetry is also why tether#124 did NOT put a deadline on
+// OpenUniStreamSync, which was the candidate remedy this wi was opened to pursue.
+// Its premise was "a wedged browser is disconnected and its reconnect repairs the
+// transcript from history"; the reconnect does not repair anything today, so a
+// deadline would trade a rendering gap for a rendering gap plus a dropped
+// connection, and would need a slow-link measurement to pick besides. See the
+// subCh declaration in internal/server/wt_chat.go.
+//
+// # The shape
+//
+// A KindMessage carrying {type: notice, text: …} because that is the one shape
+// web/src/lib/store.ts already renders as a durable line that a history refetch
+// cannot eat (tether#57 keeps notices in a slice loadHistory does not own), so
+// this needs no frontend change to reach the user's eyes. It is a stretch of that
+// payload's meaning — store.ts files it under kind 'session', and this is a
+// delivery fact rather than a session-lifecycle one — and the honest home for it
+// is a wire kind of its own, which internal/wire is where to add and is outside
+// this change.
+//
+// The text is CONSTANT, deliberately, and the count goes to the log instead:
+// store.ts collapses a repeat of the session-class notice already showing, so a
+// constant line is bounded on screen for a tab that stalls repeatedly, while one
+// carrying "3 envelopes" and then "7 envelopes" would stack. What an operator
+// needs (how many, how often) and what the reader needs ("part of this is
+// missing, here is how to see it") are different facts and go to different places.
+const gapNoticeText = "Part of this answer did not reach this tab. Reload the page to see the full transcript."
+
+// gapNotice is the envelope gapNoticeText is delivered in. Built fresh per call
+// rather than kept as a package var: the payload is a map, and a shared one would
+// be handed to every subscriber and to serveChat, which writes Envelope.SessionID
+// on the way out.
+func gapNotice() wire.Envelope {
+	return wire.Envelope{Kind: wire.KindMessage, Payload: map[string]any{
+		"type": "notice",
+		"text": gapNoticeText,
+	}}
+}
+
+// trySend offers env to ch without blocking, reporting whether it fitted. The
+// non-blocking send is the point: broadcast runs on the session's own fanOut
+// goroutine, so waiting for one slow browser would stop the session.
+func trySend(ch chan wire.Envelope, env wire.Envelope) bool {
+	select {
+	case ch <- env:
+		return true
+	default:
+		return false
+	}
+}
+
+// deliverTurn hands one subscriber an envelope from the SESSION's event stream
+// (Registry.broadcast, i.e. fanOut), telling that subscriber first about any such
+// envelopes it has already lost.
+//
+// The caller holds subsMu for reading — which is all the synchronisation the
+// counter needs, being an atomic; see Entry.lost.
+//
+// # Why the notice is on this path and not on the other one
+//
+// It promises that a reload shows the whole answer, and on this path that promise
+// is backed: emitSegments writes every segment to HistoryStore before it
+// broadcasts. deliverOutOfBand carries envelopes with no such backing and says
+// nothing — see its doc, which is where the difference is argued.
+//
+// # The gap notice rides IN BAND, and that is the whole design
+//
+// It is enqueued on the subscriber's own channel, immediately ahead of the next
+// envelope that fits. So it lands in the stream at the position of the gap, it
+// reaches the browser through the drain loop that is already there
+// (internal/server/wt_chat.go's serveChat forwards whatever comes out of subCh),
+// and no new plumbing crosses the package boundary — which matters because the
+// consumer holds a bare `chan wire.Envelope` and has nowhere to hang a callback.
+//
+// "At the position of the gap" is approximate on the wire and exactly nothing
+// depends on it being better: sendEnvelope opens a new unidirectional stream per
+// envelope, so send order is not delivery order (see its doc), and the frontend
+// keeps notices in a separate list ordered by its own timestamp anyway.
+//
+// The trigger is the DAMAGE, not a proxy for it. A notice is sent if and only if
+// this subscriber actually lost an envelope, so it cannot fire on a healthy
+// connection: no threshold to tune, and no measurement needed to justify one. The
+// price is that it can only be sent once the channel has room again — i.e. once
+// the browser has caught up, which is exactly when it is able to act on it. A
+// browser that never catches up gets nothing, and is told by the connection dying.
+//
+// A run of drops is ONE notice: the counter is reported and cleared, so what the
+// reader is told is "there is a gap here", not one line per lost token increment.
+func (e *Entry) deliverTurn(ch chan wire.Envelope, env wire.Envelope) {
+	// The nil checks here and below are reachable only for an Entry whose subs map
+	// was populated without going through Subscribe, which nothing does today.
+	// Kept because the alternative is a nil dereference inside fanOut — a panic
+	// that takes the session down — as the penalty for a bookkeeping miss, and the
+	// accounting is not worth a crash.
+	lost := e.lost[ch]
+	if lost != nil {
+		// Subtract what was reported rather than storing 0: a drop racing in from
+		// another producer is still owed a notice of its own. A notice that does
+		// not fit stays owed, and the next call that finds room sends it.
+		if n := lost.Load(); n > 0 && trySend(ch, gapNotice()) {
+			lost.Add(-n)
+		}
+	}
+	if trySend(ch, env) {
+		return
+	}
+	// Dropped. The count is per subscriber and per gap, which is what makes this
+	// log usable as a measurement: "one connection lost 400 increments" and "400
+	// connections lost one each" used to print identically.
+	n := int64(1)
+	if lost != nil {
+		n = lost.Add(1)
+	}
+	slog.Warn("slow subscriber, envelope dropped", "site", "fanOut", "kind", env.Kind,
+		"lost_this_gap", n, "repairable_by_reload", true)
+}
+
+// deliverOutOfBand hands one subscriber a DAEMON-WIDE envelope (BroadcastAll),
+// recording a drop without announcing it.
+//
+// Until tether#124 this path did not even log: the loop in BroadcastAll was a
+// bare `select { case ch <- env: default: }`, so an envelope that vanished from a
+// stalled tab left no trace anywhere at all — strictly worse than the fanOut path
+// it sits beside.
+//
+// # Why it does NOT get the gap notice, which is a finding and not an omission
+//
+// The notice tells the reader to reload. That is only worth saying where reloading
+// gets the content back, and for these three producers it does not:
+//
+//   - A KindPermission request (mux.go) is the worst case. The frontend's
+//     pendingPermissions list is populated from THIS envelope and nothing else —
+//     there is no endpoint to ask for outstanding requests — and loadHistory
+//     CLEARS that list, so a reload does not recover the prompt, it destroys what
+//     was left of it. Meanwhile the tool call the request belongs to is still
+//     waiting.
+//   - wt_shell.go's lock_held and lock_taken are transient affordances for the
+//     shell pane, with no history behind them either.
+//
+// So a notice here would be a promise this code cannot keep, and its neighbours
+// in this package already argue what that costs: a notice a reader has caught
+// being wrong is one they stop reading. A dropped permission request IS a real and
+// worse defect than the one tether#124 fixes — it hangs a tool call with no way
+// for anyone to find out — but repairing it means a pending-requests endpoint and
+// a frontend that asks for it, which is neither this file nor this change. Filed
+// as its own wi rather than papered over with a notice that would mislead.
+//
+// It is deliberately NOT counted into Entry.lost either. That counter is what the
+// notice reports, and letting an unrepairable drop raise it would make the very
+// next turn envelope claim a repair for something a reload cannot fix.
+func (e *Entry) deliverOutOfBand(ch chan wire.Envelope, env wire.Envelope) {
+	if trySend(ch, env) {
+		return
+	}
+	slog.Warn("slow subscriber, envelope dropped", "site", "BroadcastAll", "kind", env.Kind,
+		"repairable_by_reload", false)
 }
 
 // deliverObservers sends env to the read-only observers of the sid e is

@@ -3,6 +3,7 @@ import {
   useStore, mergeTranscript, parseErrorPayload, rememberedWorkspaceId, WORKSPACE_ID_KEY,
   appendAgentErrorNotice, nextNoticeTs, AGENT_ERROR_NOTICE_LIMIT,
   hasOrd, historyEntryToMessage,
+  joinTurnAcrossPages, TURN_JOIN,
   type Message, type Notice, type HistoryEntry,
 } from './store'
 import type { Envelope } from './wire.gen'
@@ -2134,6 +2135,180 @@ describe('prependHistory (tether#107)', () => {
     useStore.getState().prependHistory([])
     expect(useStore.getState().messages.map(m => m.id)).toEqual(kept)
     expect(useStore.getState().transcriptPagesBack).toBe(0)
+  })
+})
+
+// tether#116 — one turn, one bubble, even when a page boundary lands inside it.
+//
+// The reported defect: scrolling back through a 148 MB session produced a new "tether"
+// header per page (six in eighteen seconds, the daemon's log showing count=1 for each
+// 1 MiB page) because the daemon merges consecutive assistant records per WINDOW and
+// tether#107 made every page its own window. The seam is the client's to close; these
+// pin both halves of that — what it joins, and the four shapes it must refuse instead.
+describe('joining a turn split by a page boundary (tether#116)', () => {
+  afterEach(() => {
+    reset()
+    useStore.setState({ transcriptEarlier: null, transcriptOtherRecord: null, transcriptPagesBack: 0 })
+  })
+
+  const ai = (text: string, ts: number, extra: Partial<Message> = {}): Message =>
+    ({ id: crypto.randomUUID(), role: 'assistant', text, ts, ...extra })
+  const user = (text: string, ts: number): Message =>
+    ({ id: crypto.randomUUID(), role: 'user', text, ts })
+  const tool = (id: string) => ({ id, name: 'Bash', input: {} })
+
+  it('joins the seam into one bubble when both sides of it are assistant', () => {
+    useStore.setState({ messages: [ai('second half', 600)] })
+    useStore.getState().prependHistory([user('go', 100), ai('first half', 200)])
+
+    const after = useStore.getState().messages
+    expect(after.map(m => m.role)).toEqual(['user', 'assistant'])
+    expect(after[1].text).toBe(`first half${TURN_JOIN}second half`)
+  })
+
+  it('separates the two fragments with a BLANK line, not a newline', () => {
+    // A lone "\n" is a CommonMark soft break and renders as a SPACE, so it would run the
+    // end of one fragment onto the start of the next — which is why this asserts the
+    // string rather than "contains both texts". Same constant as the daemon's ccTurnJoin.
+    expect(TURN_JOIN).toBe('\n\n')
+    const joined = joinTurnAcrossPages(ai('查清楚:', 100), ai('先看进度:', 200))
+    expect(joined?.text).toBe('查清楚:\n\n先看进度:')
+  })
+
+  it('keeps the ON-SCREEN id, so the reader\'s expansions and scroll survive', () => {
+    // THE property, and the reason identity comes from the newer half: expandedBlocks and
+    // expandedThinking are Sets keyed by message id, and `key={m.id}` is React's handle on
+    // the row. A join that minted a fresh id would remount the bubble the reader is looking
+    // at — the damage tether#106 removed from the reload path.
+    useStore.setState({ messages: [{ id: 'on-screen', role: 'assistant', text: 'second', ts: 600 }] })
+    useStore.getState().prependHistory([ai('first', 200)])
+
+    const after = useStore.getState().messages
+    expect(after).toHaveLength(1)
+    expect(after[0].id).toBe('on-screen')
+  })
+
+  it('takes the OLDER half\'s ts and ord, because a bubble carries its first fragment\'s', () => {
+    // Not cosmetic: mergeHistory indexes the transcript BY ord, so a merged bubble carrying
+    // the newer fragment's position would let a later refresh match the wrong slot.
+    useStore.setState({ messages: [ai('second', 600, { ord: 900 })] })
+    useStore.getState().prependHistory([ai('first', 200, { ord: 300 })])
+
+    const after = useStore.getState().messages
+    expect(after).toHaveLength(1)
+    expect(after[0].ts).toBe(200)
+    expect(after[0].ord).toBe(300)
+  })
+
+  it('concatenates the tool calls, older page first', () => {
+    useStore.setState({ messages: [ai('second', 600, { tools: [tool('c'), tool('d')] })] })
+    useStore.getState().prependHistory([ai('first', 200, { tools: [tool('a'), tool('b')] })])
+
+    expect(useStore.getState().messages[0].tools?.map(t => t.id)).toEqual(['a', 'b', 'c', 'd'])
+  })
+
+  it('leaves the seam alone when the on-screen side of it is a user message', () => {
+    useStore.setState({ messages: [user('next question', 600)] })
+    useStore.getState().prependHistory([ai('an answer', 200)])
+    expect(useStore.getState().messages.map(m => m.text)).toEqual(['an answer', 'next question'])
+  })
+
+  it('leaves the seam alone when the older side of it is a user message', () => {
+    useStore.setState({ messages: [ai('an answer', 600)] })
+    useStore.getState().prependHistory([user('a question', 200)])
+    expect(useStore.getState().messages.map(m => m.text)).toEqual(['a question', 'an answer'])
+  })
+
+  it('refuses when the older half carries thinking, rather than dropping it', () => {
+    // Cannot occur today — MessagePage only sets HasEarlier for the cc source, and the cc
+    // parser sets neither field — but "cannot happen" is a property of another file, and
+    // the cost of being wrong is a silently missing thinking block.
+    expect(joinTurnAcrossPages(ai('first', 200, { thinking: 'reasoning' }), ai('second', 600))).toBeNull()
+  })
+
+  it('refuses when the older half carries a fenced block, rather than dropping it', () => {
+    const block = { blockId: 'b1', lang: 'md', body: 'card' } as unknown as Message['block']
+    expect(joinTurnAcrossPages(ai('first', 200, { block }), ai('second', 600))).toBeNull()
+  })
+
+  it('refuses when only one half carries an ord', () => {
+    // There is no correct ord to give the result, and inventing one puts a wrong key into
+    // mergeHistory's index. Both directions, because only one of them is the obvious one.
+    expect(joinTurnAcrossPages(ai('first', 200), ai('second', 600, { ord: 900 }))).toBeNull()
+    expect(joinTurnAcrossPages(ai('first', 200, { ord: 300 }), ai('second', 600))).toBeNull()
+  })
+
+  it('joins when NEITHER half carries an ord, and leaves the key absent', () => {
+    const joined = joinTurnAcrossPages(ai('first', 200), ai('second', 600))
+    expect(joined).not.toBeNull()
+    // `ord: undefined` is a present key; historyEntryToMessage is deliberate about the
+    // difference and hasOrd is what reads it.
+    expect('ord' in (joined as Message)).toBe(false)
+    expect(hasOrd(joined as Message)).toBe(false)
+  })
+
+  it('shrinks the transcript by exactly one bubble and mints no duplicate id', () => {
+    useStore.setState({ messages: [ai('second', 600), user('later', 700)] })
+    useStore.getState().prependHistory([user('go', 100), ai('first', 200)])
+
+    const after = useStore.getState().messages
+    expect(after).toHaveLength(3) // 2 on screen + 2 prepended - 1 joined
+    expect(new Set(after.map(m => m.id)).size).toBe(after.length)
+    expect(after.map(m => m.text)).toEqual(['go', `first${TURN_JOIN}second`, 'later'])
+  })
+
+  it('still counts the page the reader went back', () => {
+    useStore.setState({ messages: [ai('second', 600)] })
+    useStore.getState().prependHistory([ai('first', 200)])
+    expect(useStore.getState().transcriptPagesBack).toBe(1)
+  })
+
+  it('dedupes BEFORE joining, so a page whose tail is on screen is not joined to its own duplicate', () => {
+    // Order matters: seaming the raw page would fold the on-screen bubble into a copy of
+    // itself, doubling its text.
+    useStore.setState({ messages: [{ id: 'held', role: 'assistant', text: 'same turn', ts: 600 }] })
+    useStore.getState().prependHistory([user('go', 100), ai('same turn', 600)])
+
+    const after = useStore.getState().messages
+    expect(after.map(m => m.text)).toEqual(['go', 'same turn'])
+    expect(after[1].id).toBe('held')
+  })
+
+  it('does not touch the live turn while joining', () => {
+    useStore.setState({ messages: [{ id: 'live', role: 'assistant', text: 'mid-turn', ts: 900 }] })
+    useStore.setState({ streaming: true, streamingMsgId: 'live', curTurnId: 'live', answerStartTs: 800 })
+    useStore.getState().prependHistory([ai('earlier fragment', 200)])
+
+    const s = useStore.getState()
+    expect(s.streaming).toBe(true)
+    expect(s.streamingMsgId).toBe('live')
+    expect(s.curTurnId).toBe('live')
+    expect(s.messages[0].id).toBe('live')
+  })
+
+  it('collapses SIX pages of one turn into one bubble — the reported symptom', () => {
+    // The shape the owner saw: one "继续", then a turn long enough that six consecutive
+    // 1 MiB pages each held a single fragment of it.
+    useStore.setState({ messages: [ai('fragment 6', 600)] })
+    for (const [text, ts] of [['fragment 5', 500], ['fragment 4', 400], ['fragment 3', 300],
+                              ['fragment 2', 200], ['fragment 1', 100]] as const) {
+      useStore.getState().prependHistory([ai(text, ts)])
+    }
+
+    const after = useStore.getState().messages
+    expect(after).toHaveLength(1)
+    expect(after[0].role).toBe('assistant')
+    expect(after[0].ts).toBe(100)
+    expect(after[0].text).toBe(
+      ['fragment 1', 'fragment 2', 'fragment 3', 'fragment 4', 'fragment 5', 'fragment 6'].join(TURN_JOIN),
+    )
+    expect(useStore.getState().transcriptPagesBack).toBe(5)
+  })
+
+  it('simply prepends when the transcript is empty, with nothing to seam against', () => {
+    useStore.setState({ messages: [] })
+    useStore.getState().prependHistory([ai('only', 200)])
+    expect(useStore.getState().messages.map(m => m.text)).toEqual(['only'])
   })
 })
 

@@ -418,6 +418,54 @@ export function transcriptOverscrolled(o: {
   return o.distance <= TRANSCRIPT_OVERSCROLL_SLACK_PX
 }
 
+// tether#114 — how far up counts as "a long way up", i.e. far enough to offer a ride back.
+//
+// In VIEWPORTS, not pixels, and that is the whole of the choice. The owner asked for the
+// button "after scrolling up a long way", and a long way is a distance relative to what the
+// reader can see: one screenful on a phone is not one screenful on a dragged-wide desktop
+// pane, and a pixel constant would mean two different things on the two devices this
+// product is actually used on.
+//
+// ONE viewport, so the predicate below reads exactly as "everything the reader was looking
+// at has left the screen, and the newest message is at least a full screen further down".
+// That is a fact about what is visible rather than a taste about what is far.
+//
+// Deliberately NOT the inverse of the 120px `nearBottom` (which decides whether a new
+// message should pull the view down) nor of TRANSCRIPT_EDGE_PX (48px, "the reader has
+// arrived at this end"). Inverting either would put the button on screen 121px or 49px up,
+// which is one flick of a wheel and not "a long way". Measured against the pane this ships
+// in: `.dt-chat` is 300px tall in the test fixture and typically 600-900px in the product,
+// so one viewport is 600-900px — five to seven wheel notches.
+export const TRANSCRIPT_JUMP_SCREENS = 1
+
+/**
+ * transcriptJumpVisible — should the "jump to latest" button be on screen?
+ *
+ * tether#114. Pure and extracted for the same reason as its neighbours above: the thing
+ * that calls it needs a mounted pane and a real scrollable element, so the decision is the
+ * only part a unit test in this repo can reach directly — and this decision is the whole of
+ * the feature's visible behaviour, so it is the part that most needs to be reachable.
+ *
+ * `distance` is the same quantity `transcriptEdgeAction` is given for the bottom end
+ * (`scrollHeight - scrollTop - clientHeight`), taken from the same read of the same element
+ * in the same handler, so the two answers can never describe different scroll positions.
+ *
+ * The `viewport > 0` guard is not defensive padding. `clientHeight` is 0 for a pane that has
+ * not been laid out — a hidden tab, a `display: none` ancestor, jsdom before a fixture
+ * installs a geometry — and with a zero viewport `distance > 0` would be satisfied by every
+ * scroll position except the exact bottom, so the button would be "shown" in a pane that has
+ * no viewport to show it in. Returning false there says the honest thing: nothing is known
+ * about what the reader can see, so nothing is offered.
+ */
+export function transcriptJumpVisible(o: { distance: number; viewport: number }): boolean {
+  if (o.viewport <= 0) return false
+  return o.distance > o.viewport * TRANSCRIPT_JUMP_SCREENS
+}
+
+// The button's accessible name. Exported so the render tests pin it by identity rather than
+// by literal, the same reason TRANSCRIPT_DOTS_NEWER_LABEL is.
+export const TRANSCRIPT_JUMP_LABEL = 'jump to the latest message'
+
 // tether#107 — the two things the top of a transcript can say when there is nothing
 // earlier to fetch, which before this change were the same thing: nothing.
 //
@@ -999,6 +1047,24 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   const topFiredAtRef = useRef(0)
   const bottomArmedRef = useRef(false)
   const bottomFiredAtRef = useRef(0)
+  // tether#114 — is the reader far enough up to be offered a ride back to the newest
+  // message? See transcriptJumpVisible for the threshold and why it is in viewports.
+  //
+  // A state AND a ref holding the same boolean, which is not duplication: the state is what
+  // renders, and the ref is what the scroll handler compares against so it can call
+  // `setShowJump` only on a CROSSING rather than on every scroll event. The handler runs on
+  // every frame of a scroll; an unconditional `setShowJump(next)` would re-render the whole
+  // transcript ~60 times a second for a value that changes twice a session. (React bails out
+  // of a set to an identical value, but only AFTER re-entering the component to compare —
+  // which for this pane means re-running the transcript projection, and that is the cost
+  // being avoided.)
+  const [showJump, setShowJump] = useState(false)
+  const showJumpRef = useRef(false)
+  const setJumpVisible = (next: boolean) => {
+    if (next === showJumpRef.current) return
+    showJumpRef.current = next
+    setShowJump(next)
+  }
   // tether#112 — the touch gesture currently on the glass: WHICH finger, where it started, and
   // whether it has already been answered. Null between gestures — cleared on touchend and
   // touchcancel as well as replaced on touchstart, so that sentence is true rather than merely
@@ -1602,6 +1668,55 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
   }
 
   /**
+   * tether#114 — the ride back to the newest message.
+   *
+   * # An INSTANT write, not `behavior: 'smooth'`
+   *
+   * A smooth scroll is an animation, and per CSSOM View the browser fires a `scroll` event
+   * for every frame of it — a hundred-odd events into a handler whose three bounds
+   * (tether#110's arm latch, the shared in-flight ref, tether#112's 500ms floor) were sized
+   * for a reader's own scrolling. The first frames of the animation are still far from the
+   * bottom and would RE-ARM the latch (distance > TRANSCRIPT_EDGE_PX ⇒ 'arm'), the last
+   * frames arrive at distance ≈ 0 with it armed, and the floor is the only thing left
+   * holding the difference. One write fires one event, at one position, which is the same
+   * shape as the pane's own `scrollTop = scrollHeight` autoscroll that tether#110 already
+   * bounded. There is nothing to make safe because there is no animation.
+   *
+   * # This DOES re-read the newest page, and that is the design rather than a leak
+   *
+   * jsdom fires no event for a programmatic `scrollTop` write and a real browser does (both
+   * measured — tether#110/#112, and `liveScrollBox` in the test file models the browser).
+   * So in Chrome this write lands in tether#110's bottom trigger zone with the latch armed
+   * (the reader is a full viewport up, which is far past TRANSCRIPT_EDGE_PX, so some earlier
+   * event armed it) and the arrival fires one re-read of the newest page.
+   *
+   * That is exactly what scrolling down by hand does, and making the button do something
+   * else would be the surprise. It cannot repeat, and the argument is tether#110's own,
+   * unchanged: the load clears the latch, and the ONLY thing that sets it again is a `scroll`
+   * event observed at distance > TRANSCRIPT_EDGE_PX. A `scroll` event fires only when
+   * `scrollTop` CHANGES — growing `scrollHeight` underneath a parked reader fires nothing —
+   * and every write in the sequence that follows (this one, then the autoscroll effect's
+   * `scrollTop = scrollHeight` when the re-read appends) puts the position AT the bottom.
+   * So the latch stays spent until the reader themselves scrolls away. Bounded at one
+   * request per press, and the press is a human.
+   *
+   * # Why it also hides the button here rather than waiting for the event
+   *
+   * The write it just did will fire a `scroll` in a browser, and the handler would set the
+   * same false a frame later — so this line is redundant THERE. It is not redundant in
+   * jsdom, which fires nothing, and it is not redundant for a pane whose scroll position
+   * cannot move at all (a transcript shorter than the viewport, where `scrollTop` is already
+   * clamped): in both, the button would otherwise stay on screen offering a ride to where
+   * the reader already is.
+   */
+  const jumpToLatest = () => {
+    const el = chatRef.current
+    if (!el) return
+    el.scrollTop = el.scrollHeight
+    setJumpVisible(false)
+  }
+
+  /**
    * tether#110 — both ends, one scroll event.
    *
    * Kept in a ref-to-latest rather than re-bound on every render, the same construction
@@ -1646,8 +1761,10 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
       loadEarlier()
     }
 
+    const bottomDistance = el.scrollHeight - el.scrollTop - el.clientHeight
+
     const bottom = transcriptEdgeAction({
-      distance: el.scrollHeight - el.scrollTop - el.clientHeight,
+      distance: bottomDistance,
       armed: bottomArmedRef.current,
       available: readingHeldSession && !!sessionId,
       // Re-read, not the snapshot above: `loadEarlier` sets the ref synchronously, so an
@@ -1661,6 +1778,17 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
       bottomFiredAtRef.current = now
       refreshNewest()
     }
+
+    // tether#114 — the jump button's visibility, decided from the SAME read of the same
+    // element as the bottom end above, in the SAME listener. Not a second scroll listener:
+    // there is exactly one on this element and this is it, so the button's idea of where the
+    // reader is and the loader's idea of it cannot disagree.
+    //
+    // Ordering is deliberate but not load-bearing, and saying which it is matters: this runs
+    // after the two edge decisions, so a `load` that has already started is reflected in
+    // nothing here — `transcriptJumpVisible` reads only geometry. Moving this line above them
+    // would produce the same answer.
+    setJumpVisible(transcriptJumpVisible({ distance: bottomDistance, viewport: el.clientHeight }))
   }
   const onTranscriptScrollRef = useRef(onTranscriptScroll)
   onTranscriptScrollRef.current = onTranscriptScroll
@@ -1869,6 +1997,13 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
     topFiredAtRef.current = 0
     bottomArmedRef.current = false
     bottomFiredAtRef.current = 0
+    // tether#114 — and the jump button with them, for the same reason and one more. The
+    // latches describe where the reader has been in ONE conversation; so does this. The
+    // extra reason is that a new session's transcript opens autoscrolled to the bottom, so
+    // "you are a screen up from the newest message" is false the instant the switch lands —
+    // and nothing would fire a `scroll` event to say so, because the new transcript's first
+    // autoscroll is a write to a box whose scrollTop is already 0.
+    setJumpVisible(false)
   }, [sessionId])
 
   // tether#52 — first-connect ordering (see shouldDeferFirstConnect above).
@@ -2532,9 +2667,51 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
           wheel over the pill stops reaching the scroller; without `bottom: 0` and the
           padding override it slices the last line. Those three are what a human has to
           look at. */}
-      {loadingNewer && (
+      {/* tether#114 — the rail now carries TWO things, and the rule for the collision is
+          that there is no collision: they coexist, always.
+
+          "A request is in flight" and "the newest message is a screen or more below you"
+          are independent facts, and in the one state where the bottom re-read exists at all
+          — a session held by a background agent, polled every three seconds — they are both
+          true for as long as a scrolled-up reader keeps reading. Letting either hide the
+          other would delete a signal at exactly the moment it is most likely to be wanted:
+          hide the dots and the reader loses the only indication that the megabyte re-read
+          they are waiting on is happening; hide the button and the ride back disappears for
+          three seconds out of every three seconds.
+
+          They do not overlap, and that is geometry rather than hope. The dots are a 45px
+          pill centred on the rail; the button is a 26px square in the right gutter. Measured
+          in Chrome at the narrowest the right pane can be dragged (MIN_RIGHT = 260px, rail
+          228px wide): pill right edge 136.50px, button left edge 186.00px — 49.50px of
+          clear space. The gap only grows with the pane.
+
+          The rail itself is unchanged and still tether#113's: OUTSIDE `.dt-chat`,
+          `height: 0`, so neither child can move `scrollHeight` and mounting one cannot
+          shudder the pane. `pointer-events: none` on the rail is still load-bearing (a wheel
+          over the pill has to reach the scroller or tether#112's gesture dies in that patch)
+          — the button re-enables pointer events for ITSELF only, in index.css.
+
+          The cost of that, stated because nothing here can test it: while the button is on
+          screen there is a 26x26px patch of the bottom-right corner where a `wheel` reaches
+          the button instead of `.dt-chat`. It cannot touch tether#112's BOTTOM gesture,
+          because the button exists only when the reader is at least a viewport from the
+          bottom and that gesture only acts within 2px of it. It can shadow the TOP-end pull
+          for a reader who is simultaneously at the top and wheeling in that corner. 26px of
+          a 228-968px column, in one corner, for one of the two ends. */}
+      {(loadingNewer || showJump) && (
         <div className="transcript-bottom">
-          <TranscriptDots label={TRANSCRIPT_DOTS_NEWER_LABEL} />
+          {loadingNewer && <TranscriptDots label={TRANSCRIPT_DOTS_NEWER_LABEL} />}
+          {showJump && (
+            <button
+              type="button"
+              className="transcript-jump"
+              onClick={jumpToLatest}
+              aria-label={TRANSCRIPT_JUMP_LABEL}
+              title={TRANSCRIPT_JUMP_LABEL}
+            >
+              <span aria-hidden="true">↓</span>
+            </button>
+          )}
         </div>
       )}
 

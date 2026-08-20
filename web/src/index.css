@@ -805,6 +805,59 @@ body {
   border-radius: var(--r-pill);
 }
 
+/* tether#114 — the second tenant of the same rail: one press back to the newest message.
+
+   `pointer-events: auto` is the whole reason this rule cannot be folded into the one
+   above. The RAIL's `pointer-events: none` is load-bearing and stays exactly as it is —
+   tether#113 measured that without it `elementFromPoint` at the pill returns
+   `.transcript-dot` instead of `.dt-chat`, so a `wheel` there never reaches the scroller's
+   listener and tether#112's gesture goes dead in the patch where that gesture is made. A
+   button has to receive clicks, so it takes pointer events back for ITSELF, and pays the
+   same price over its own 26x26px: see the render site in panes/chat/index.tsx for why
+   that patch cannot touch the bottom-end gesture and what it does shadow.
+
+   RIGHT rather than centred, which is what keeps the two tenants apart: the dots are a
+   centred pill, this is in the gutter, and `right: 16px` is `.dt-chat`'s own horizontal
+   padding, so the button sits in the transcript's right margin rather than over its text.
+   Measured in Chrome at MIN_RIGHT (260px pane, 228px rail — the narrowest this can get):
+   pill right edge 136.50px, button left edge 186.00px, 49.50px clear between them. The
+   scroll-thin scrollbar takes the last 6px of the pane, so the button clears that by 10px
+   too.
+
+   `bottom: 0` — the rail's own baseline, the same one the pill uses, which puts the
+   button's bottom edge on the seam between the transcript and the composer. It floats over
+   the last ~14px of transcript content, which is what a floating jump control is for and
+   is the opposite of the pill's requirement (the pill had to avoid slicing the last line
+   because it is text over text).
+
+   No animation, and that is a decision rather than an omission: a fade or a slide would
+   need a `prefers-reduced-motion` alternative that is a STATIC alternative and not just
+   `animation: none` (this file already carries three of those). A control that is simply
+   present or absent needs neither, and the reduced-motion query below is deliberately left
+   with nothing to say about it.
+
+   Existing tokens only (design freeze rule 4): the same `--bg-surface` / `--line-soft` /
+   `--r-pill` the pill on this rail already uses, `--ink-secondary` for the glyph and
+   `--sh-2` for the lift that separates it from the text underneath. No new colour, no new
+   variable. */
+.transcript-bottom > .transcript-jump {
+  position: absolute; bottom: 0; right: 16px;
+  pointer-events: auto;
+  width: 26px; height: 26px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--bg-surface);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-pill);
+  box-shadow: var(--sh-2);
+  color: var(--ink-secondary);
+  font-size: 13px; line-height: 1;
+  cursor: pointer;
+}
+.transcript-bottom > .transcript-jump:hover {
+  color: var(--ink-primary);
+  border-color: var(--line);
+}
+
 /* tether#110 — three dots, at either end, while a request is genuinely in flight.
 
    Three ELEMENTS, not a '···' string: opacity cannot be animated per character. That is
@@ -856,7 +909,75 @@ body {
   font-family: var(--font-mono); font-size: 11px; color: var(--ink-tertiary);
   text-align: center; max-width: 86%; line-height: 1.5;
 }
-.msg-ai { display: flex; flex-direction: column; gap: 8px; }
+/* tether#114 — the AI side gets a measure, and it goes on the ROW.
+   ────────────────────────────────────────────────────────────────
+   The reported defect: "the AI output is too wide, and too close in shape to what I
+   typed". Those are one cause. `.msg-user-bubble` has always been `max-width: 86%`;
+   nothing on the AI side had a width bound at all, so it ran the full column — long
+   lines AND a silhouette that stopped contrasting with the reply above it.
+
+   MEASURED, in Chrome, against this stylesheet with Geist actually loaded, at the three
+   widths the right pane really takes (lib/layout.ts: MIN_RIGHT 260, DEFAULT_RIGHT 640,
+   MAX_RIGHT 1000). Average characters per line of AI prose, before → after:
+
+       pane   260px   29.2 → 29.2   (cap inert; the pane is narrower than the cap)
+       pane   390px   48.6 → 48.6   (a phone at ≤768px, where .dt-right is the viewport)
+       pane   640px   83.3 → 64.8
+       pane  1000px  145.8 → 64.8
+
+   440px is chosen for 64.8, which is where the typographic measure wants to be, and it is
+   chosen over 480px (72.9 chars) for a reason that is about this pane rather than about
+   typography: at the default width a long USER bubble also reads 72.9 characters per line,
+   so a 480px cap would have made the two sides identical in line length at the single most
+   common width — reproducing half the complaint while fixing the other half.
+
+   # It goes on `.msg-ai`, not on `.msg-ai-body` + `.msg-ai-block`
+
+   The owner's choice was "the whole message narrows, code blocks and tool results
+   included". `.msg-ai` is the row that holds all five children (header, thinking, tools,
+   fenced block, answer body), so one declaration binds them all and they cannot drift out
+   of alignment with each other — which two matching declarations on two of the five could,
+   and which would leave the other three at full width regardless.
+
+   # Why a bare `max-width` and not `min(440px, 100%)`
+
+   Because they are the same thing here and the shorter one is harder to get wrong.
+   `.msg-ai` is a stretch-aligned flex item of `.dt-chat`, so its width is the container's,
+   clamped by this. `max-width` is an upper bound: it cannot make a box wider than its
+   container, so it degrades to "the whole column" at every width below 440px on its own.
+   Measured rather than reasoned: at pane 260 the row is 222.00px — the full content box —
+   and `.dt-chat`'s `scrollWidth === clientWidth`, i.e. nothing overflows horizontally.
+
+   # The distinction never inverts
+
+   Let W be the content width. AI = min(440, W); a long user bubble = 0.86W. The AI side is
+   wider than the user's cap only while 0.86W < min(440, W), i.e. below W = 511.6px
+   (a ~550px pane), and by at most 0.14 x 440 = 61.6px. Today it is wider at EVERY width, by
+   0.14W — 135.5px at a 1000px pane. So the gap shrinks everywhere and reverses above a
+   ~550px pane; there is no width at which this change makes the AI side wider than it is
+   now. Measured at the ends: pane 260 → AI 222.00 vs bubble 190.91 (as today, cap inert);
+   pane 1000 → AI 440.00 vs bubble 827.31.
+
+   # Accepted, because the owner accepted it when choosing this option
+
+   Wide code now scrolls sideways instead of fitting. `.md-body pre` already carries
+   `overflow: auto` (see below) and `.msg-tool-result` already carries
+   `max-height: 280px; overflow: auto`, so what a narrower column produces is scrollbars,
+   not spill — verified at all four widths above (`.dt-chat` never overflows horizontally).
+   The one thing that gets measurably worse is tether#112's documented residual: a tool
+   result 280px tall wraps more in a narrower column, so there is more of it to wheel
+   through. At a 640px pane the same result went from 1062px of hidden height to 1442px
+   (measured), i.e. ~36% more scrolling inside the nested box that can be misread as a pull
+   at an end. Not fixed here (tether#112 explains why it needs computed styles and live
+   geometry); recorded because narrowing made it likelier.
+
+   # Only a human can check what this LOOKS like
+
+   `index.css` is imported by main.tsx alone, no test renders it, and `css` is off in the
+   vitest config — every mutant of this line survives the suite. The numbers above are what
+   can be said without eyes; whether 440px reads as "distinct from my input" is the owner's.
+   No new token (design freeze rule 4): this adds one length, no colour and no variable. */
+.msg-ai { display: flex; flex-direction: column; gap: 8px; max-width: 440px; }
 .msg-ai-header { display: flex; align-items: center; gap: 7px; }
 .msg-ai-avatar {
   width: 18px; height: 18px; border-radius: 5px; background: var(--accent);

@@ -194,7 +194,7 @@ func (m *LifecycleManager) sweepIdle(now time.Time) {
 // Returns the started instance so callers can read Port and Token.
 //
 // Concurrent calls for one TaskID are serialized here, and here is the only
-// place they can be: the HTTP handler behind POST /tasks/{id}/mcp/start adds no
+// place they can be: the handler behind POST /api/v1/tasks/{id}/mcp adds no
 // serialization of its own, and two of those requests in flight at once is a
 // double click or an SPA retry. Without it each caller built and started its own
 // instance and only the last to reach the map was tracked, leaving the rest

@@ -45,7 +45,7 @@ func portIsFree(port int) bool {
 
 // TestStartTaskConcurrentSameTaskKeepsOneAlive pins the invariant the type
 // documents for itself — "at most one instance per task is running at any time"
-// — against the trigger that reaches it: two POST /tasks/{id}/mcp/start in
+// — against the trigger that reaches it: two POST /api/v1/tasks/{id}/mcp in
 // flight at once (a double click, an SPA retry). The handler adds no
 // serialization of its own, so whatever holds this line has to be here.
 //

@@ -2679,17 +2679,21 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
           they are waiting on is happening; hide the button and the ride back disappears for
           three seconds out of every three seconds.
 
-          They do not overlap, and that is geometry rather than hope. The dots are a 45px
-          pill centred on the rail; the button is a 26px square in the right gutter. Measured
-          in Chrome at the narrowest the right pane can be dragged (MIN_RIGHT = 260px, rail
-          228px wide): pill right edge 136.50px, button left edge 186.00px — 49.50px of
-          clear space. The gap only grows with the pane.
+          They do not overlap, and that is geometry rather than hope. The dots are a 45x11px
+          pill centred on the rail; the button is a 26x26px box in the right gutter. Measured
+          in Chrome at the narrowest the right pane can be dragged (MIN_RIGHT = 260px): the
+          pill runs x=107.50..152.50, the button x=218.00..244.00 — 65.50px of clear space,
+          and the gap only grows with the pane (130.50 at 390px, 435.50 at 1000px).
 
           The rail itself is unchanged and still tether#113's: OUTSIDE `.dt-chat`,
-          `height: 0`, so neither child can move `scrollHeight` and mounting one cannot
-          shudder the pane. `pointer-events: none` on the rail is still load-bearing (a wheel
-          over the pill has to reach the scroller or tether#112's gesture dies in that patch)
-          — the button re-enables pointer events for ITSELF only, in index.css.
+          `height: 0` (measured 0.00px with both tenants mounted), so neither child can move
+          `scrollHeight` and mounting one cannot shudder the pane. `pointer-events: none` on
+          the rail is still load-bearing (a wheel over the pill has to reach the scroller or
+          tether#112's gesture dies in that patch) — the button re-enables pointer events for
+          ITSELF only, in index.css. Both halves measured with `elementFromPoint`, with the
+          pair mounted together: at the pill's centre it returns an element INSIDE `.dt-chat`
+          (the transcript's own text, or `.dt-chat` itself where the pill is below the last
+          line); at the button's centre it returns the button's own glyph.
 
           The cost of that, stated because nothing here can test it: while the button is on
           screen there is a 26x26px patch of the bottom-right corner where a `wheel` reaches

@@ -819,16 +819,19 @@ body {
    RIGHT rather than centred, which is what keeps the two tenants apart: the dots are a
    centred pill, this is in the gutter, and `right: 16px` is `.dt-chat`'s own horizontal
    padding, so the button sits in the transcript's right margin rather than over its text.
-   Measured in Chrome at MIN_RIGHT (260px pane, 228px rail — the narrowest this can get):
-   pill right edge 136.50px, button left edge 186.00px, 49.50px clear between them. The
-   scroll-thin scrollbar takes the last 6px of the pane, so the button clears that by 10px
-   too.
+   The rail spans the whole pane (it is a child of `.dt-right-body`, which has no padding),
+   so measured in Chrome at MIN_RIGHT — a 260px pane, the narrowest this can get — the pill
+   runs x=107.50..152.50 and the button x=218.00..244.00: 65.50px of clear space, growing
+   with the pane (130.50 at 390px, 255.50 at 640px, 435.50 at 1000px). The `.scroll-thin`
+   scrollbar takes the last 6px, so the button clears that by 10px too.
 
    `bottom: 0` — the rail's own baseline, the same one the pill uses, which puts the
-   button's bottom edge on the seam between the transcript and the composer. It floats over
-   the last ~14px of transcript content, which is what a floating jump control is for and
-   is the opposite of the pill's requirement (the pill had to avoid slicing the last line
-   because it is text over text).
+   button's bottom edge exactly on `.dt-chat`'s bottom border and the composer's top edge
+   (measured: both deltas 0.00px). The 26px box therefore reaches 26px up into the
+   scroller's padding box, i.e. it floats over the last 14px of transcript CONTENT
+   (`.dt-chat` has 12px of bottom padding). That overlap is what a floating jump control is
+   for, and it is the opposite of the pill's requirement — the pill is text over text and
+   had to be kept clear of the last line.
 
    No animation, and that is a decision rather than an omission: a fade or a slide would
    need a `prefers-reduced-motion` alternative that is a STATIC alternative and not just
@@ -918,7 +921,9 @@ body {
 
    MEASURED, in Chrome, against this stylesheet with Geist actually loaded, at the three
    widths the right pane really takes (lib/layout.ts: MIN_RIGHT 260, DEFAULT_RIGHT 640,
-   MAX_RIGHT 1000). Average characters per line of AI prose, before → after:
+   MAX_RIGHT 1000), on a transcript long enough to scroll (so the 6px `.scroll-thin`
+   scrollbar is taking its width, which is the state this is about). Average characters per
+   line of AI prose, before → after:
 
        pane   260px   29.2 → 29.2   (cap inert; the pane is narrower than the cap)
        pane   390px   48.6 → 48.6   (a phone at ≤768px, where .dt-right is the viewport)
@@ -953,7 +958,7 @@ body {
    Let W be the content width. AI = min(440, W); a long user bubble = 0.86W. The AI side is
    wider than the user's cap only while 0.86W < min(440, W), i.e. below W = 511.6px
    (a ~550px pane), and by at most 0.14 x 440 = 61.6px. Today it is wider at EVERY width, by
-   0.14W — 135.5px at a 1000px pane. So the gap shrinks everywhere and reverses above a
+   0.14W — 134.7px at a 1000px pane. So the gap shrinks everywhere and reverses above a
    ~550px pane; there is no width at which this change makes the AI side wider than it is
    now. Measured at the ends: pane 260 → AI 222.00 vs bubble 190.91 (as today, cap inert);
    pane 1000 → AI 440.00 vs bubble 827.31.
@@ -963,13 +968,21 @@ body {
    Wide code now scrolls sideways instead of fitting. `.md-body pre` already carries
    `overflow: auto` (see below) and `.msg-tool-result` already carries
    `max-height: 280px; overflow: auto`, so what a narrower column produces is scrollbars,
-   not spill — verified at all four widths above (`.dt-chat` never overflows horizontally).
-   The one thing that gets measurably worse is tether#112's documented residual: a tool
-   result 280px tall wraps more in a narrower column, so there is more of it to wheel
-   through. At a 640px pane the same result went from 1062px of hidden height to 1442px
-   (measured), i.e. ~36% more scrolling inside the nested box that can be misread as a pull
-   at an end. Not fixed here (tether#112 explains why it needs computed styles and live
-   geometry); recorded because narrowing made it likelier.
+   not spill — verified at all four widths above (`.dt-chat`'s `scrollWidth === clientWidth`
+   in every one). The one thing that gets measurably worse is tether#112's documented
+   residual: a `.msg-tool-result` is capped at 280px tall, so a narrower column wraps its
+   text into more lines and leaves more of it hidden behind the nested scrollbar — and
+   wheeling inside that nested box is what tether#112 can misread as a pull at an end.
+   Measured on one fixed 40-line sample, hidden height before → after:
+
+       pane   260px   6397 → 6397px   (cap inert)
+       pane   390px   3062 → 3062px   (cap inert)
+       pane   640px   1729 → 2396px   (+38.6%)
+       pane  1000px   1062 → 2396px   (+126%)
+
+   Not fixed here (tether#112 explains why the correct test needs computed styles and live
+   geometry that jsdom does not have); recorded because narrowing made it likelier, which is
+   the thing a later reader would otherwise have to rediscover.
 
    # Only a human can check what this LOOKS like
 

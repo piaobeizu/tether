@@ -45,7 +45,7 @@ import {
   resetSessionActivityForTests,
   type SessionActivityMap,
 } from '../../lib/sessionActivity'
-import { resetArmedBinding, type SessionSummary } from '../../lib/wiSession'
+import { resetArmedBinding, WI_BOUND_EVENT, type SessionSummary } from '../../lib/wiSession'
 
 const WI_ID = 'wi_JAsOyS4F'
 const SLUG = 'tether#91'
@@ -102,6 +102,17 @@ function mockWorkDaemon(
 
 const putCalls = (fn: { mock: { calls: Call[] } }) =>
   fn.mock.calls.filter(([, init]) => init?.method === 'PUT')
+
+/** How many times the session list has been ASKED FOR (tether#111).
+ *
+ * This is the timing-free half of the fix below. resumeWi re-asks only when
+ * `sessionsLoaded` is false, and it does so SYNCHRONOUSLY inside the click handler,
+ * before its first await — so "the click added no call here" is a direct observation
+ * that the settled branch was taken, and it holds however slow the environment is.
+ * The count, not a boolean: the pane asks once on mount and again on WI_BOUND_EVENT,
+ * so the assertion has to be against the number already made. */
+const sessionsCalls = (fn: { mock: { calls: Call[] } }) =>
+  fn.mock.calls.filter(([url]) => url === '/api/v1/sessions')
 
 let injected: string[] = []
 let offInject: (() => void) | null = null
@@ -192,16 +203,92 @@ describe('WorkDetail resumes from the daemon-side binding (tether#91)', () => {
     }
   })
 
-  it('falls back to the resume prompt when no session is bound', async () => {
-    mockWorkDaemon('running', () => [{ sid: 'sid-other', workItem: 'tether#90', updatedAt: 300 }])
+  // tether#111 — the test that used to stand here was a constructive flake, and the two
+  // below are what it was trying to be.
+  //
+  // It gated on `await waitFor(() => expect(queryByText('Sessions')).toBeNull())`, with a
+  // comment saying it was waiting for the list to settle "or 'no binding' would just be
+  // 'the fetch had not answered yet'". That gate cannot tell those two apart: `Sessions`
+  // renders only when `sessions.length > 0` (WorkDetail.tsx:209) and `sessions` starts as
+  // `[]` and is reset to `[]` at the top of the effect (:60, :74), so the absence it waited
+  // for is equally true BEFORE the answer arrives. It therefore passed on the first attempt
+  // and proved nothing — and since the sessions effect is keyed on the SLUG, which only
+  // exists once the item fetch has resolved, it usually passed while `sessionsLoaded` was
+  // still false. The click then took resumeWi's `await fetchSessions()` branch (:144-146),
+  // which dispatches one microtask after the click, and the SYNCHRONOUS assertion below it
+  // read `[]`. Seen once on tether#110's branch, where ~13s of real sleeps changed how the
+  // suite's promise chains interleaved; that wi later replaced the sleeps with a Date.now
+  // spy, which is why the flake stopped reproducing without ever being fixed.
+  //
+  // The general judgement, worth more than this fix: an `expect(queryByText(X)).toBeNull()`
+  // gate is almost never a proof of "it has answered", because it holds just as well before.
+  // Read a gate's assertion aloud in both the before and the after state; if it is true in
+  // both, it is not a gate.
+  it('asks the daemon when the list has not answered yet, and still injects', async () => {
+    // resumeWi's awaiting branch (WorkDetail.tsx:144-146), exercised deliberately. Its own
+    // comment says why it exists: the binding used to be a synchronous localStorage read, so
+    // a click a few milliseconds after the pane appeared could not miss it, and a fetch can.
+    //
+    // The window is HELD OPEN rather than raced for. Written first as "click as early as
+    // possible and hope", which measured 1 session call instead of the 2 it asserted: on this
+    // machine the list settles before `findByText` even resolves, so the click landed on the
+    // settled branch and the test proved nothing about the other one. That is the same coin
+    // flip the original flake was — it needed the whole suite's scheduling pressure to land
+    // inside this window — so the fix is to make the window explicit and put the click in it
+    // by construction, not by luck.
+    const inner = mockWorkDaemon('running', () => [
+      { sid: 'sid-other', workItem: 'tether#90', updatedAt: 300 },
+    ])
+    let release: () => void = () => {}
+    const held = new Promise<void>((r) => { release = r })
+    const outer = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === '/api/v1/sessions') await held
+      return inner(url, init)
+    })
+    vi.stubGlobal('fetch', outer)
+
     render(<WorkDetail id={WI_ID} />)
-    // Wait for the session list to have settled, or "no binding" would just be
-    // "the fetch had not answered yet".
-    await screen.findByText('→ Open in chat')
+    fireEvent.click(await screen.findByText('→ Open in chat'))
+
+    // SYNCHRONOUS, and the point of the test: the click is parked on its own re-ask, so
+    // nothing has been injected yet. This is precisely the state the old test asserted its
+    // way through — it read this empty array and called it a failure.
+    expect(injected).toEqual([])
+
+    release()
+    await waitFor(() => expect(injected).toEqual([`/pf-work ${SLUG} --resume`]))
+    expect(useStore.getState().sessionId).toBeNull()
+    // Two asks: the pane's own on mount, and resumeWi's. This is what distinguishes this
+    // test from the next one — without it, a resumeWi that had stopped awaiting would pass
+    // both, since the two would then differ only in how they wait.
+    expect(sessionsCalls(outer).length).toBeGreaterThan(1)
+  })
+
+  it('injects the resume prompt when the SETTLED list holds no binding', async () => {
+    let rows: SessionSummary[] = [{ sid: 'sid-mine', workItem: SLUG, updatedAt: 300 }]
+    const fetchMock = mockWorkDaemon('running', () => rows)
+    render(<WorkDetail id={WI_ID} />)
+
+    // Phase 1 — a binding that DOES match, so the answer's arrival is observable.
+    // `Sessions` APPEARING is only reachable after the fetch settled, which is exactly what
+    // its absence could not establish.
+    await screen.findByText('Sessions')
+
+    // Phase 2 — the daemon now reports nothing bound to this wi, and the refetch is driven
+    // by the event a Start click emits (untested until now). `Sessions` DISAPPEARING is
+    // reachable only from a settled response that produced an empty list, so past this line
+    // the component is in the state this test is about: answered, and nothing bound.
+    rows = [{ sid: 'sid-other', workItem: 'tether#90', updatedAt: 300 }]
+    fireEvent(window, new Event(WI_BOUND_EVENT))
     await waitFor(() => expect(screen.queryByText('Sessions')).toBeNull())
 
+    const asked = sessionsCalls(fetchMock).length
     fireEvent.click(screen.getByText('→ Open in chat'))
 
+    // Timing-free proof that the settled branch was taken: resumeWi re-asks synchronously,
+    // before its first await, so an unchanged count means it did not. Asserted BEFORE the
+    // injection, because it is what makes the synchronous assertion sound rather than lucky.
+    expect(sessionsCalls(fetchMock)).toHaveLength(asked)
     expect(injected).toEqual([`/pf-work ${SLUG} --resume`])
     expect(useStore.getState().sessionId).toBeNull()
   })

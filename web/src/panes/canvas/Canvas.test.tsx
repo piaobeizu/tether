@@ -1,5 +1,5 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import Canvas from './index'
 import { useStore } from '../../lib/store'
 import { fetchFile, fetchWorkspaces } from '../../lib/aihub'
@@ -99,6 +99,12 @@ beforeAll(warmUpMarkdown, LAZY_TEST_TIMEOUT_MS)
 afterEach(() => {
   cleanup()
   useStore.getState().select(null)
+  // tether#129 — `activeWorkspace` is on the same zustand singleton as the
+  // selection, so a test that publishes one must not leak it into the next file
+  // or the next test (WorkspacePane.test.tsx resets it for the same reason).
+  // Reset here rather than in the one describe that writes it, so a later test
+  // added below cannot inherit a workspace it never set.
+  useStore.setState({ activeWorkspace: null })
   vi.clearAllMocks()
 })
 
@@ -245,6 +251,75 @@ describe('Canvas — home when nothing is selected (tether#33)', () => {
     // would catch a regression where the .catch erroneously set workspace state.
     await new Promise((r) => setTimeout(r, 0))
     expect(container.querySelector('.canvas-home-ws')).toBeNull()
+  })
+
+  // tether#129 defect 3 — the home called `ws[0]` "the workspace" and never read
+  // store.activeWorkspace, which is the one the rest of the app is pointed at:
+  // the left tree lists it and chatUrl.ts pins a new session's cwd to it. With
+  // more than one workspace registered and the active one not first in the
+  // daemon's listing, the home labelled the wrong name and the wrong path — and
+  // put `· +N more` beside them, which reads as "and here are the others".
+  //
+  // Registration order is not selection order and nothing makes it so, so `ws[0]`
+  // was only ever right by luck; asserting the SECOND entry is what distinguishes
+  // a fix from a test that agrees with the bug.
+  describe('names the workspace the app is actually pointed at (tether#129)', () => {
+    const two = [
+      { id: 'w1', name: 'tether', path: '/root/code/tether' },
+      { id: 'w2', name: 'aihub', path: '/root/code/aihub' },
+    ]
+    const wsLine = (c: HTMLElement) => c.querySelector('.canvas-home-ws')?.textContent ?? ''
+    const wsPath = (c: HTMLElement) => c.querySelector('.canvas-home-path')?.textContent ?? ''
+
+    it('shows the active workspace, not the first one registered', async () => {
+      mockFetchWorkspaces.mockResolvedValue(two)
+      useStore.setState({ activeWorkspace: { id: 'w2', path: '/root/code/aihub' } })
+      const { container } = render(<Canvas />)
+      await screen.findByText('/root/code/aihub')
+
+      expect(wsLine(container)).toContain('aihub')
+      expect(wsPath(container)).toBe('/root/code/aihub')
+      // The name of the pane's own fallback must not still be on screen. Without
+      // this, a home that rendered BOTH lines would satisfy everything above.
+      expect(wsLine(container)).not.toContain('tether')
+      // The count is a count of what is registered and is unaffected.
+      expect(wsLine(container)).toContain('+1 more')
+    })
+
+    it('follows the selection when it moves', async () => {
+      mockFetchWorkspaces.mockResolvedValue(two)
+      const { container } = render(<Canvas />)
+      await screen.findByText('/root/code/tether') // nothing selected yet: the fallback
+
+      act(() => { useStore.setState({ activeWorkspace: { id: 'w2', path: '/root/code/aihub' } }) })
+      expect(wsPath(container)).toBe('/root/code/aihub')
+
+      act(() => { useStore.setState({ activeWorkspace: { id: 'w1', path: '/root/code/tether' } }) })
+      expect(wsPath(container)).toBe('/root/code/tether')
+    })
+
+    // The fallback, asserted so it stays a deliberate one rather than becoming a
+    // blank line. `activeWorkspace` is null until WorkspacePane's fetch settles
+    // (store.workspacesLoaded is the gate ChatPane waits on), so this is what the
+    // home shows for the first frames of every cold load.
+    it('falls back to the first registered workspace when nothing is selected', async () => {
+      mockFetchWorkspaces.mockResolvedValue(two)
+      const { container } = render(<Canvas />)
+      await screen.findByText('/root/code/tether')
+      expect(wsPath(container)).toBe('/root/code/tether')
+    })
+
+    // A selection the daemon's listing does not contain — a workspace removed in
+    // another tab, or a remembered id from a previous run (activeWorkspace is
+    // persisted, see store's rememberWorkspace). The home has no name for it, so
+    // it falls back rather than rendering an empty label.
+    it('falls back when the active workspace is not in the listing', async () => {
+      mockFetchWorkspaces.mockResolvedValue(two)
+      useStore.setState({ activeWorkspace: { id: 'w-gone', path: '/gone' } })
+      const { container } = render(<Canvas />)
+      await screen.findByText('/root/code/tether')
+      expect(wsPath(container)).toBe('/root/code/tether')
+    })
   })
 
   it('quick actions dispatch the expected window events', () => {

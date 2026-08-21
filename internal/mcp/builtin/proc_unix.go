@@ -33,12 +33,6 @@ const procWaitDelay = 5 * time.Second
 // triggers in an AI coding workspace are anything that daemonizes itself without
 // redirecting inherited descriptors: dev servers, language servers, a tmux or
 // screen server.
-//
-// One knock-on this build cannot fix from here: proc_windows.go's own comments
-// say WaitDelay is something "this build needs and the !windows build does not",
-// and set the field as the sole compensation for having no killable process
-// group. The first half stopped being true with the line below; the file is
-// outside the change that added it.
 func setKillScope(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = procWaitDelay

@@ -55,6 +55,32 @@ func handleCertHash(certs *certHolder, pick func(CertBundle) [32]byte) http.Hand
 	}
 }
 
+// permissionEnvelope is the envelope one permission request is announced in.
+//
+// ONE builder, used by both deliveries of it: the live fan-out when the request
+// arrives, and the backfill a chat client is given when it attaches (tether#132).
+// Two hand-written copies would be free to drift in the payload keys, and the
+// consumer that would notice — the frontend's dedupe on `id` — is precisely the
+// one that CANNOT notice, since a shape that differs anywhere else still has the
+// same id. It would surface as a second permission card for a request the user
+// has already answered.
+//
+// The payload keys are camelCase because they are read by web/src/lib/store.ts's
+// PermissionRequest, not by anything generated from internal/wire — this envelope
+// carries a hand-rolled map rather than a wire type, which is why the shape lives
+// here at all.
+func permissionEnvelope(req *permission.Request) wire.Envelope {
+	return wire.Envelope{
+		Kind:      wire.KindPermission,
+		SessionID: wire.SessionID(req.SessionID),
+		Payload: map[string]any{
+			"id":       req.ID,
+			"toolName": req.ToolName,
+			"input":    req.Args,
+		},
+	}
+}
+
 // buildMux constructs the shared route table used by both the TCP and UDP
 // listeners. Routes per §10.B.4:
 //
@@ -100,15 +126,42 @@ func buildMux(cfg *Config, certs *certHolder, wts *webtransport.Server, reg *ses
 
 	// s5: permission API (canonical + alias).
 	broadcastFn := func(req *permission.Request) {
-		reg.BroadcastAll(wire.Envelope{
-			Kind:      wire.KindPermission,
-			SessionID: wire.SessionID(req.SessionID),
-			Payload: map[string]any{
-				"id":       req.ID,
-				"toolName": req.ToolName,
-				"input":    req.Args,
-			},
-		})
+		reg.BroadcastAll(permissionEnvelope(req))
+	}
+	// tether#132 — the SECOND delivery of the same envelopes: what a chat client
+	// that has just attached is owed. A permission request reaches the browser as
+	// one BroadcastAll envelope, which a stalled tab drops (see
+	// Entry.deliverOutOfBand) — after which the prompt exists nowhere the user can
+	// reach it while the tool call waits. Registry.PendingBackfill closes that for
+	// every client that attaches afterwards, which is a second device, a second
+	// tab, or a channel migration — but NOT a reload of the only open tab, which
+	// kills the agent. Entry.backfill carries that measurement; do not restate it
+	// here, and do not read this line as a claim that a reload repairs anything.
+	//
+	// This wiring is the one hop in the change that NO test covers: deleting these
+	// nine lines leaves the whole Go suite green (checked, not assumed), because
+	// nothing that can construct a buildMux can also drive a WebTransport client.
+	// It was verified by hand instead — a live daemon, a real /wt/chat client, a
+	// permission request left outstanding, and the reconnecting client receiving
+	// the same request id. Anyone changing it owes that check again.
+	//
+	// Set here, one statement from the live fan-out above and through the SAME
+	// builder, because the frontend deduplicates a re-sent request on `id`: a
+	// second copy of this envelope shape, drifting from the first, would show up
+	// as a duplicate card rather than as an error anybody notices.
+	//
+	// Guarded on pm because buildMux is called with a nil Manager by tests that
+	// exercise unrelated routes; a nil pm there means no permission API is
+	// reachable either, so there is nothing to back-fill.
+	if pm != nil {
+		reg.PendingBackfill = func() []wire.Envelope {
+			reqs := pm.Pending()
+			envs := make([]wire.Envelope, 0, len(reqs))
+			for _, req := range reqs {
+				envs = append(envs, permissionEnvelope(req))
+			}
+			return envs
+		}
 	}
 	permission.RegisterAPI(mux, pm, broadcastFn)
 

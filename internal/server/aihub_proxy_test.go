@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -847,4 +848,248 @@ func TestWorkPaging_BoundedAndDefaulted(t *testing.T) {
 			}
 		})
 	}
+}
+
+// 20. GET /work/recent?status= is filtered against the status vocabulary this
+// file already maintains, de-duplicated, and therefore bounded.
+//
+// Until tether#146 the raw strings.Split of the query value went straight to
+// aihub.Client.ListWorkItems, which joins it back into the upstream query
+// string — so one request could make the daemon build an arbitrarily long
+// upstream URL out of arbitrary status names. This is the sibling of the page
+// size bound in TestWorkPaging_BoundedAndDefaulted: same endpoint, same "a
+// caller-supplied value reaches aihub unchecked" shape, except the unbounded
+// dimension here is set cardinality rather than a count.
+func TestWorkRecentStatus_WhitelistedAndBounded(t *testing.T) {
+	// The vocabulary the proxy is willing to forward: recentStatuses ∪
+	// graphStatuses as declared in aihub_proxy.go, which is also exactly the
+	// set aihub's own schema allows (0002_work_items.sql CHECK constraint), so
+	// the filter rejects only values that were already meaningless upstream.
+	//
+	// Spelled out here rather than derived from the production values, because
+	// it is the contract under test. Be exact about how much of a tripwire
+	// that is, since it is less than it looks: *narrowing* either production
+	// set fails below (whole_vocabulary), and widening recentStatuses fails
+	// below (defaultCSV), but widening graphStatuses with some status not
+	// named anywhere in this test would pass — the invariants are all upper
+	// bounds on a set the table only ever populates from `known`. The
+	// vocabulary_is_closed row covers the plausible candidates; beyond those,
+	// keeping this list in step with the two production sets is a manual job.
+	known := []string{"queued", "running", "blocked", "paused", "wrapped", "cancelled", "failed"}
+	isKnown := map[string]bool{}
+	for _, s := range known {
+		isKnown[s] = true
+	}
+	// recentStatuses, in declaration order: what an absent/unusable ?status=
+	// falls back to.
+	const defaultCSV = "wrapped,cancelled,failed"
+
+	var gotStatus string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotStatus = r.URL.Query().Get("status")
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/v1/work_items" {
+			_, _ = w.Write([]byte(`{"items":[],"next_cursor":null}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	mux := newTestMux(aihub.New(srv.URL, "k"))
+
+	// askRaw issues GET /work/recent with an already-encoded query string and
+	// returns the status CSV that reached upstream.
+	askRaw := func(t *testing.T, label, rawQuery string) string {
+		t.Helper()
+		// Sentinel for the same reason as TestWorkPaging_BoundedAndDefaulted:
+		// the stub only writes gotStatus when it is actually reached, so
+		// without it a request answered without calling upstream would be
+		// asserted against the *previous* request's value.
+		gotStatus = "<upstream not called>"
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/work/recent?"+rawQuery, nil))
+		// Unusable values keep this endpoint's pre-existing silent fallback
+		// (?status= empty already fell back to the default) instead of
+		// becoming a 400 — the same disposition PR #218 chose for page sizes
+		// it could not use.
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: response = %d, want 200; body=%s", label, rec.Code, rec.Body.String())
+		}
+		return gotStatus
+	}
+
+	// ask issues GET /work/recent with the given raw ?status= value (nil =
+	// param absent) and returns the status CSV that reached upstream.
+	ask := func(t *testing.T, status *string) string {
+		t.Helper()
+		q := url.Values{}
+		q.Set("project", "x")
+		if status != nil {
+			q.Set("status", *status)
+		}
+		return askRaw(t, "status="+derefOrAbsent(status), q.Encode())
+	}
+
+	// checkBounded asserts the invariants that must hold for every input in
+	// this test, whatever the expected value is: what reaches aihub is always
+	// a de-duplicated subset of the vocabulary, which is what actually bounds
+	// the upstream URL. Only the first offender of each kind is reported — the
+	// pathological cases carry 10k+ elements and one message per element would
+	// bury the rest of the run.
+	checkBounded := func(t *testing.T, got string) {
+		t.Helper()
+		seen := map[string]bool{}
+		unknownCount, unknownFirst := 0, ""
+		dupCount, dupFirst := 0, ""
+		for _, s := range strings.Split(got, ",") {
+			if !isKnown[s] {
+				if unknownCount == 0 {
+					unknownFirst = s
+				}
+				unknownCount++
+			}
+			if seen[s] {
+				if dupCount == 0 {
+					dupFirst = s
+				}
+				dupCount++
+			}
+			seen[s] = true
+		}
+		if unknownCount > 0 {
+			t.Errorf("upstream status %q has %d out-of-vocabulary element(s), first %q",
+				elide(got), unknownCount, elide(unknownFirst))
+		}
+		if dupCount > 0 {
+			t.Errorf("upstream status %q has %d repeated element(s), first %q",
+				elide(got), dupCount, elide(dupFirst))
+		}
+		if n := len(strings.Split(got, ",")); n > len(known) {
+			t.Errorf("upstream status has %d elements, want at most %d", n, len(known))
+		}
+		if len(got) > len(strings.Join(known, ",")) {
+			t.Errorf("upstream status is %d bytes, want at most %d", len(got), len(strings.Join(known, ",")))
+		}
+	}
+
+	// Pathological inputs, built here so the table below stays readable.
+	manyDupes := strings.Repeat("wrapped,", 10000) + "wrapped"
+	manyUnknown := make([]string, 10000)
+	for i := range manyUnknown {
+		manyUnknown[i] = "bogus" + strconv.Itoa(i)
+	}
+	manyMixed := make([]string, 0, 20000)
+	for i := 0; i < 10000; i++ {
+		// Cycling through known in order means the surviving set comes out in
+		// exactly the vocabulary's own order.
+		manyMixed = append(manyMixed, known[i%len(known)], "junk"+strconv.Itoa(i))
+	}
+
+	for _, tc := range []struct {
+		name string
+		in   *string
+		want string
+	}{
+		// Absent → the endpoint's own default vocabulary, unchanged behavior.
+		{name: "absent", in: nil, want: defaultCSV},
+		{name: "empty", in: ptr(""), want: defaultCSV},
+
+		// A legal subset is forwarded verbatim, in the caller's order. The
+		// filter must not narrow what callers are already allowed to ask for
+		// — including statuses outside the /recent default (that is the whole
+		// point of the override).
+		{name: "one_legal", in: ptr("wrapped"), want: "wrapped"},
+		{name: "legal_subset_keeps_order", in: ptr("failed,running"), want: "failed,running"},
+		{name: "whole_vocabulary", in: ptr(strings.Join(known, ",")), want: strings.Join(known, ",")},
+
+		// Unknown values are dropped and the request continues; if nothing
+		// usable is left, it falls back to the default like an empty param.
+		{name: "unknown_only", in: ptr("bogus"), want: defaultCSV},
+		{name: "unknown_dropped_legal_kept", in: ptr("wrapped,bogus,failed"), want: "wrapped,failed"},
+		{name: "unknown_smuggling_extra_param", in: ptr("wrapped,limit=999999"), want: "wrapped"},
+		{name: "unknown_path_traversal_shape", in: ptr("../../v1/api_keys"), want: defaultCSV},
+
+		// Status-shaped names that exist elsewhere in the tree but are not
+		// work-item statuses: "in_progress" is a step status
+		// (0005_step_state.sql), "done"/"current"/"pending" are step-graph
+		// node states (wire.WorkStepNode), "archived" is a memory state
+		// (0006_events_memories.sql). None may be forwarded — and if a future
+		// edit adds one of them to graphStatuses, this row is what notices.
+		{name: "vocabulary_is_closed", in: ptr("in_progress,done,current,pending,archived"), want: defaultCSV},
+
+		// Not normalized, deliberately: PR #218 already treats " 7" as junk
+		// that falls back rather than a 7 to be trimmed, so neither case nor
+		// surrounding whitespace is fixed up here.
+		{name: "wrong_case_is_unknown", in: ptr("WRAPPED"), want: defaultCSV},
+		{name: "padded_is_unknown", in: ptr("wrapped, failed"), want: "wrapped"},
+
+		// Empty elements are dropped rather than forwarded as empty statuses.
+		{name: "empty_element", in: ptr("wrapped,,failed"), want: "wrapped,failed"},
+		{name: "only_empty_elements", in: ptr(",,,"), want: defaultCSV},
+		{name: "leading_trailing_commas", in: ptr(",wrapped,"), want: "wrapped"},
+
+		// Duplicates collapse — without this the whitelist alone would not
+		// bound cardinality, since a legal value may be repeated forever.
+		{name: "adjacent_duplicate", in: ptr("wrapped,wrapped"), want: "wrapped"},
+		{name: "non_adjacent_duplicate", in: ptr("wrapped,failed,wrapped"), want: "wrapped,failed"},
+
+		// The cardinality bound itself: 10k elements in, at most one per
+		// vocabulary entry out.
+		{name: "10k_duplicates", in: ptr(manyDupes), want: "wrapped"},
+		{name: "10k_unknown", in: ptr(strings.Join(manyUnknown, ",")), want: defaultCSV},
+		{name: "20k_mixed", in: ptr(strings.Join(manyMixed, ",")), want: strings.Join(known, ",")},
+
+		// One enormous element, rather than many: a 1 MiB status name must not
+		// reach the upstream URL either.
+		{name: "one_1mib_element", in: ptr(strings.Repeat("a", 1<<20)), want: defaultCSV},
+		{name: "1mib_element_beside_legal", in: ptr("wrapped," + strings.Repeat("a", 1<<20)), want: "wrapped"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ask(t, tc.in)
+			if got != tc.want {
+				t.Errorf("upstream status = %q, want %q", elide(got), tc.want)
+			}
+
+			checkBounded(t, got)
+		})
+	}
+
+	// Repeating the whole param is bounded either way round: url.Values.Get
+	// answers with the first value, so order decides which one is honoured,
+	// but neither order gets an unknown status or an unbounded set upstream.
+	// This goes through askRaw rather than ask because url.Values.Set cannot
+	// express a repeated key, and through checkBounded so it is gated on the
+	// same invariants as every table row above.
+	t.Run("repeated_param", func(t *testing.T) {
+		for _, tc := range []struct{ name, query, want string }{
+			{name: "legal_first", query: "status=wrapped&status=" + strings.Repeat("bogus,", 5000) + "bogus", want: "wrapped"},
+			{name: "junk_first", query: "status=" + strings.Repeat("bogus,", 5000) + "bogus&status=wrapped", want: defaultCSV},
+		} {
+			got := askRaw(t, tc.name, "project=x&"+tc.query)
+			if got != tc.want {
+				t.Errorf("%s: upstream status = %q, want %q", tc.name, elide(got), tc.want)
+			}
+			checkBounded(t, got)
+		}
+	})
+}
+
+func ptr(s string) *string { return &s }
+
+func derefOrAbsent(s *string) string {
+	if s == nil {
+		return "<absent>"
+	}
+	return elide(*s)
+}
+
+// elide keeps failure messages readable when the input or the forwarded value
+// is one of the pathological multi-kilobyte cases.
+func elide(s string) string {
+	const max = 120
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "...(" + strconv.Itoa(len(s)) + " bytes)"
 }

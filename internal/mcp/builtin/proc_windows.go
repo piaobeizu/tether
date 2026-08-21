@@ -8,8 +8,14 @@ import (
 )
 
 // procWaitDelay bounds how long cmd.Wait() may keep the caller waiting after
-// the process we started has exited. See setKillScope for why this build needs
-// it and the !windows build does not.
+// the process we started has exited.
+//
+// Both builds set this bound, to the same value, against the same mechanism: a
+// process that outlived killOnTimeout still holds the write end of the command's
+// output pipe, and os/exec reads that pipe until EOF. What differs is the gap
+// each build is compensating for — this file has no killable process group at
+// all (see setKillScope below), while proc_unix.go has one that a descendant can
+// leave of its own accord (see setKillScope there).
 const procWaitDelay = 5 * time.Second
 
 // setKillScope cannot widen the kill scope on this platform, so all it does is
@@ -34,13 +40,18 @@ const procWaitDelay = 5 * time.Second
 // the <-done in handleRunShell would block for as long as that grandchild
 // lives, and the tool would never return the timeout it already decided on.
 //
-// The delay also applies when the command exits normally, which is a real
-// behaviour difference from the !windows build: a command that leaves a
-// background process holding the pipe returns after procWaitDelay rather than
+// The delay also applies when the command exits normally: a command that leaves
+// a background process holding the pipe returns after procWaitDelay rather than
 // blocking, and Wait then reports exec.ErrWaitDelay in place of the nil it
 // would otherwise have returned. handleRunShell has to special-case that error
 // or a command that succeeded is reported as a failure carrying no output —
 // see the switch on runErr in workspace.go.
+//
+// That path is not this build's alone; both builds can return ErrWaitDelay for a
+// command that worked. What is specific to this build is how easily it is
+// reached: on !windows only a descendant that left the process group can hold
+// the pipe, because killOnTimeout takes the rest of the group with it, whereas
+// here every descendant qualifies because there is no group to take.
 func setKillScope(cmd *exec.Cmd) {
 	cmd.WaitDelay = procWaitDelay
 }
@@ -55,9 +66,11 @@ func setKillScope(cmd *exec.Cmd) {
 //     workspace's files, ports and CPU, and tether has no handle on them
 //     afterwards.
 //   - The timeout error itself is no worse here — handleRunShell discards the
-//     captured output on a timeout regardless of platform. What this build
-//     loses is on the path where the command *succeeds* and a survivor holds
-//     the pipes; see setKillScope.
+//     captured output on a timeout regardless of platform. Where this build is
+//     worse off is the path on which the command *succeeds* and something it
+//     left behind holds the pipes: both builds bound that with Cmd.WaitDelay,
+//     but on !windows the only candidates are descendants that left the process
+//     group, and here every descendant is one. See setKillScope.
 //
 // Worth knowing when judging how much the above costs: workspace_run_shell runs
 // `sh -c`, and Windows ships no sh. The tool does anything at all only on a host

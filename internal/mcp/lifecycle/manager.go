@@ -6,6 +6,7 @@ package lifecycle
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -14,6 +15,18 @@ import (
 	"github.com/piaobeizu/tether/internal/mcp/instance"
 	"github.com/piaobeizu/tether/internal/permission"
 )
+
+// ErrShuttingDown is returned by StartTask once StopAll has begun. The manager
+// is terminal from that point on: StopAll's whole job is to leave nothing
+// running, and there is no way to honour that and also start something new.
+//
+// It is a state of the manager, not a fault in the request, and a caller
+// surfacing it to a client should say so — 503, not 500. The handler behind
+// POST /api/v1/tasks/{id}/mcp maps every StartTask error to 500 today
+// (handleTaskMCPStart in internal/server/task_mcp.go, which this change does not
+// touch); the sentinel is exported so that mapping can be corrected there
+// without reaching in here to match on a string.
+var ErrShuttingDown = errors.New("lifecycle: manager is shutting down")
 
 // TaskConfig carries the parameters needed to start a per-task MCPInstance.
 type TaskConfig struct {
@@ -67,6 +80,11 @@ type LifecycleManager struct {
 	// other, keyed by TaskID. Refcounted so the map tracks tasks in transition
 	// rather than every task the daemon has ever started.
 	gates map[string]*taskGate
+	// closing is set by StopAll and never cleared: the manager is terminal once
+	// shutdown has begun. Guarded by mu, and read inside the same critical
+	// section that publishes into instances — that pairing is what closes the
+	// window StopAll's snapshot leaves open.
+	closing bool
 
 	cfg          Config
 	watchdogStop chan struct{}
@@ -111,6 +129,13 @@ func (m *LifecycleManager) lockTask(taskID string) func() {
 		}
 		m.mu.Unlock()
 	}
+}
+
+// shuttingDown reports whether StopAll has begun.
+func (m *LifecycleManager) shuttingDown() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.closing
 }
 
 // New creates a LifecycleManager. With no options the idle watchdog is off
@@ -169,7 +194,7 @@ func (m *LifecycleManager) sweepIdle(now time.Time) {
 // Returns the started instance so callers can read Port and Token.
 //
 // Concurrent calls for one TaskID are serialized here, and here is the only
-// place they can be: the HTTP handler behind POST /tasks/{id}/mcp/start adds no
+// place they can be: the handler behind POST /api/v1/tasks/{id}/mcp adds no
 // serialization of its own, and two of those requests in flight at once is a
 // double click or an SPA retry. Without it each caller built and started its own
 // instance and only the last to reach the map was tracked, leaving the rest
@@ -177,6 +202,10 @@ func (m *LifecycleManager) sweepIdle(now time.Time) {
 // servers alive — with no reference left anywhere to stop them by, so not even
 // StopAll could reach them. Serialized, the second caller finds the first
 // caller's instance and takes the restart path that already existed for it.
+//
+// Once StopAll has begun this returns ErrShuttingDown and starts nothing. The
+// bound on when it will try at all is what makes StopAll's promise hold; see
+// StopAll for what the alternative was and why it was not taken.
 func (m *LifecycleManager) StartTask(ctx context.Context, cfg TaskConfig) (*instance.MCPInstance, error) {
 	if cfg.TaskID == "" {
 		return nil, fmt.Errorf("lifecycle: TaskID is required")
@@ -190,6 +219,19 @@ func (m *LifecycleManager) StartTask(ctx context.Context, cfg TaskConfig) (*inst
 
 	release := m.lockTask(cfg.TaskID)
 	defer release()
+
+	// Nothing built below can outlive a shutdown that has already begun, so once
+	// it has, do not build it. The check after the start is the one that holds
+	// the invariant; this one keeps the side effects from happening at all on the
+	// ordinary path, and they reach outside this package: instance.New binds a
+	// loopback port before Start is even called, Start spawns a child process per
+	// configured server, and unless SkipInject is set it writes an mcpServers
+	// entry into the agent settings file that only Stop takes back out. A daemon
+	// that exits partway through undoing that leaves the entry pointing at a port
+	// nothing is listening on.
+	if m.shuttingDown() {
+		return nil, ErrShuttingDown
+	}
 
 	// Load per-task MCP servers from <WsRoot>/.tether/task-config.json.
 	// A missing file yields no servers; a malformed file aborts start.
@@ -243,7 +285,20 @@ func (m *LifecycleManager) StartTask(ctx context.Context, cfg TaskConfig) (*inst
 		return nil, fmt.Errorf("lifecycle: start instance for %s: %w", cfg.TaskSlug, err)
 	}
 
+	// Publishing and the closing check share one critical section, and StopAll
+	// sets closing and takes its snapshot in another, which is what leaves no
+	// third ordering: either this instance is in the map before the snapshot and
+	// StopAll stops it, or closing is already true here and it never goes in. The
+	// map is the only reference anyone keeps, so an instance published after the
+	// snapshot would be one nothing could ever stop.
 	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		stopCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		_ = inst.Stop(stopCtx)
+		return nil, ErrShuttingDown
+	}
 	m.instances[cfg.TaskID] = inst
 	m.mu.Unlock()
 
@@ -295,13 +350,24 @@ func (m *LifecycleManager) Active() []*instance.MCPInstance {
 // StopAll stops the idle watchdog (if running) and shuts down all instances.
 // Intended for daemon shutdown. Best-effort: per-instance errors are ignored.
 //
-// It snapshots the task ids and then stops them one at a time, so a StartTask
-// that publishes an instance for a task not in the snapshot outlives this call.
-// That is a start racing shutdown rather than two starts racing each other and
-// is not what the task gate addresses: the gate serializes per task, and the
-// task in question is by definition not one StopAll saw. Closing it means
-// refusing starts once shutdown has begun, which is a change to what this type
-// promises callers and is left to whoever wants that promise.
+// This is terminal: the manager is marked closing here and every StartTask from
+// then on returns ErrShuttingDown, starting nothing. That narrows what the type
+// promised callers — StartTask used to make an attempt whenever it was called —
+// and it is what makes "shuts down all instances" true instead of nearly true.
+// The ids below are a snapshot, so without the flag a start that published an
+// instance for a task the snapshot does not contain would walk out of here still
+// running: loopback bound, child servers up, instance-scoped context alive, and
+// nothing left holding a reference to stop it by. The per-task gate does not
+// reach that case — it serializes two transitions of one task, and this task is
+// by definition not one the snapshot saw.
+//
+// The alternative was to keep the old promise and loop here until a pass finds
+// no new instances. Rejected on two counts. It has no bound (a client that keeps
+// starting tasks keeps the daemon from ever exiting) and giving it one only
+// moves the leak to the far side of the bound. And it does nothing for a start
+// that arrives after this function has returned, which is the same defect with
+// the concurrency taken out: the daemon is on its way out either way, so an
+// instance published then is exactly as unreachable.
 func (m *LifecycleManager) StopAll(ctx context.Context) {
 	if m.watchdogStop != nil {
 		m.stopOnce.Do(func() { close(m.watchdogStop) })
@@ -309,6 +375,7 @@ func (m *LifecycleManager) StopAll(ctx context.Context) {
 	}
 
 	m.mu.Lock()
+	m.closing = true
 	ids := make([]string, 0, len(m.instances))
 	for id := range m.instances {
 		ids = append(ids, id)

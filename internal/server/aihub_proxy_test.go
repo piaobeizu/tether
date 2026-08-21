@@ -724,3 +724,127 @@ func TestWorkSteps_DegradedNoScenario(t *testing.T) {
 		t.Errorf("Nodes missing x/current, got %+v", got.Nodes)
 	}
 }
+
+// 15. Every caller-supplied page size in the aihub proxy is bounded before it
+// reaches aihub (tether#143). Before the fix each entry point checked only
+// `n > 0` and then forwarded the value verbatim, so one browser request could
+// make the daemon ask the upstream for an unbounded page.
+//
+// The three rows below are the complete set of query params in
+// aihub_proxy.go that flow into a count. Before this change that file had
+// eight r.URL.Query().Get() call sites: these three plus five that carry no
+// count (project on /queue, /recent and /graph; the status filter on
+// /recent; the opaque cursor on /events). The three collapsed into the
+// shared pageSize helper, so the file now greps as six — pageSize's own read
+// plus those five. /graph's page size is the hardcoded defaultGraphLimit,
+// not a caller value, and /steps uses stepsEventsLimit the same way.
+//
+// Each row asserts the same three-part contract, so a fourth paging param
+// added without a cap has to be added here too.
+func TestWorkPaging_BoundedAndDefaulted(t *testing.T) {
+	// The count the proxy actually asked the upstream for, as seen on the
+	// wire. Written by the stub handler and read after mux.ServeHTTP returns,
+	// same as the other forwarding tests in this file.
+	var gotCount string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Whichever of the two upstream page-size params is present on this
+		// request is the count under test (aihub.Client spells it "max" for
+		// the ready queue and "limit" for the other two).
+		gotCount = ""
+		for _, p := range []string{"max", "limit"} {
+			if v := r.URL.Query().Get(p); v != "" {
+				gotCount = v
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/work_items/ready":
+			_, _ = w.Write([]byte(`{"items":[],"running":[],"stalled":[],"paused":[],"needs_human_session":[],"unclassified":[]}`))
+		case "/v1/work_items":
+			_, _ = w.Write([]byte(`{"items":[],"next_cursor":null}`))
+		case "/v1/events":
+			_, _ = w.Write([]byte(`{"events":[],"next_cursor":null}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	mux := newTestMux(aihub.New(srv.URL, "k"))
+
+	// base already ends in the separator the paging param gets appended to,
+	// so the "param absent" case is just base on its own.
+	for _, ep := range []struct {
+		name  string
+		base  string
+		param string
+		def   int
+		upper int
+	}{
+		{name: "queue_max", base: "/api/v1/work/queue?project=x&", param: "max", def: 10, upper: 100},
+		{name: "recent_limit", base: "/api/v1/work/recent?project=x&", param: "limit", def: 20, upper: 200},
+		{name: "events_limit", base: "/api/v1/work/items/wi_1/events?", param: "limit", def: 50, upper: 500},
+	} {
+		t.Run(ep.name, func(t *testing.T) {
+			ask := func(t *testing.T, url string) string {
+				t.Helper()
+				// Sentinel, not "": the stub only overwrites gotCount when it
+				// is actually reached, so without this a request the proxy
+				// answers without calling upstream would silently be asserted
+				// against the *previous* request's count.
+				gotCount = "<upstream not called>"
+				rec := httptest.NewRecorder()
+				mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, url, nil))
+				if rec.Code != http.StatusOK {
+					t.Fatalf("GET %s: status = %d, want 200; body=%s", url, rec.Code, rec.Body.String())
+				}
+				return gotCount
+			}
+			with := func(v string) string { return ep.base + ep.param + "=" + v }
+
+			// Absent → the endpoint's default page size reaches aihub.
+			if got := ask(t, ep.base); got != strconv.Itoa(ep.def) {
+				t.Errorf("no %s: upstream count = %q, want default %d", ep.param, got, ep.def)
+			}
+
+			// Under the cap, and exactly at it → forwarded verbatim. The cap
+			// must not shrink page sizes callers are allowed to ask for, and
+			// must be inclusive (off-by-one guard).
+			for _, ok := range []int{1, ep.upper - 1, ep.upper} {
+				if got := ask(t, with(strconv.Itoa(ok))); got != strconv.Itoa(ok) {
+					t.Errorf("%s=%d: upstream count = %q, want %d passed through", ep.param, ok, got, ok)
+				}
+			}
+
+			// Over the cap → clamped down to the cap. This is the tether#143
+			// regression: the value used to reach aihub unchanged.
+			for _, over := range []int{ep.upper + 1, 10 * ep.upper, 1000000} {
+				if got := ask(t, with(strconv.Itoa(over))); got != strconv.Itoa(ep.upper) {
+					t.Errorf("%s=%d: upstream count = %q, want clamp to %d", ep.param, over, got, ep.upper)
+				}
+			}
+
+			// Zero, negative, unparseable and out-of-int-range values keep the
+			// pre-existing silent fallback to the default. Adding the cap must
+			// not turn any of these into a 400 — ask() already fails the test
+			// if the response is not 200. "%207" is " 7", which strconv
+			// rejects; the last entry overflows int, which strconv reports as
+			// a range error rather than a value the clamp could act on.
+			for _, junk := range []string{"", "0", "-1", "-9999", "abc", "12.5", "1e6", "%207", "99999999999999999999999999"} {
+				if got := ask(t, with(junk)); got != strconv.Itoa(ep.def) {
+					t.Errorf("%s=%q: upstream count = %q, want default %d", ep.param, junk, got, ep.def)
+				}
+			}
+
+			// Repeating the param is bounded either way round: url.Values.Get
+			// answers with the first value, so order decides which one is
+			// honoured, but neither order gets past the cap.
+			if got := ask(t, with("99999")+"&"+ep.param+"=1"); got != strconv.Itoa(ep.upper) {
+				t.Errorf("%s=99999&%s=1: upstream count = %q, want clamp to %d", ep.param, ep.param, got, ep.upper)
+			}
+			if got := ask(t, with("1")+"&"+ep.param+"=99999"); got != "1" {
+				t.Errorf("%s=1&%s=99999: upstream count = %q, want the first value, 1", ep.param, ep.param, got)
+			}
+		})
+	}
+}

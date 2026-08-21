@@ -245,6 +245,26 @@ func buildMux(cfg *Config, certs *certHolder, wts *webtransport.Server, reg *ses
 		workspace.RegisterAPI(mux, cfg.WsRegistry)
 	}
 	if cfg.SkillRegistry != nil {
+		// The skill overlay WRITES into a workspace directory (symlink in, symlink
+		// out), so it needs this daemon's own answer to "which directories are
+		// workspaces" instead of trusting a path off the request body — which is what
+		// it did until tether#142. The workspace registry is that answer, and this is
+		// the one place both registries are in scope, so it is where they are joined.
+		//
+		// Assigned through a guarded local rather than passed straight in. A nil
+		// *workspace.Registry stored in the skill.WorkspaceIndex interface would be a
+		// NON-nil interface holding a nil pointer — the identical trap lifecycle.go
+		// documents for session.Registry.Workspaces, and there it cost a nil-receiver
+		// call instead of the "no registry, refuse" branch. Leaving the index unbound
+		// is what makes a failed workspace registry REFUSE overlay writes (503) rather
+		// than panic on one. BindWorkspaces detects the typed nil as well, so this
+		// guard is the belt to its braces; both are cheap and the failure is a panic
+		// in the daemon's HTTP path.
+		var wsIndex skill.WorkspaceIndex
+		if cfg.WsRegistry != nil {
+			wsIndex = cfg.WsRegistry
+		}
+		cfg.SkillRegistry.BindWorkspaces(wsIndex)
 		skill.RegisterAPI(mux, cfg.SkillRegistry)
 	}
 

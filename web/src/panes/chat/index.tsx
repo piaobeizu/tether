@@ -756,13 +756,17 @@ export const TRANSCRIPT_DOTS_NEWER_LABEL = 'checking for new messages'
  * it never renders on a timer. Its whole population is "a request exists and will settle".
  *
  * THREE ELEMENTS rather than a '···' string in a pseudo-element, and the reason is
- * concrete rather than stylistic: opacity cannot be animated per-character, so the dots
- * have to be separate boxes to travel. `.thinking-dots` a few hundred lines down in
- * index.css is the cautionary case — it puts the glyphs in a `::before` with no animation
- * and hangs the animation on an EMPTY `::after`, i.e. it animates a box with nothing in
- * it, so the "animated dots" its call site advertises have never moved. Not this wi's to
- * fix (tether#34's indicator, its own call site, its own tests), but it is the reason this
- * one is not built by copying it.
+ * concrete rather than stylistic: opacity cannot be animated per-character, so dots that
+ * TRAVEL have to be separate boxes. The travel is `.transcript-dot:nth-child(2)/(3)`'s
+ * staggered animation-delay in index.css, and three delays need three elements.
+ *
+ * Which is also why this is not `.thinking-dots` under another name. That rule was broken
+ * when this component was written, and tether#129 fixed it — the animation sits on the
+ * `::before` carrying the glyphs now, and the empty `::after` it used to hang on is gone
+ * — but copying it STILL would not do: one box holding one three-character string can
+ * only pulse as a GROUP, which is what it now does. The per-character limit above is the
+ * durable half of this paragraph. The rest of it used to quote that rule's broken state
+ * verbatim, and went false the moment the rule was repaired (tether#130).
  *
  * `role="status"` + an aria-label rather than the bare glyphs: three decorative dots say
  * nothing to a reader who cannot see them, and this is the one moment where what is
@@ -1484,6 +1488,28 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
     wtRef.current = wt
 
     wt.connect().then(async () => {
+      // tether#130 — is this chain still THE connection? `wtRef.current` was set to
+      // this `wt` immediately above, and a replacement always nulls it and then
+      // repoints it (top of this function), so a superseded chain can always tell.
+      // Nothing already here answers that question: `unmountedRef` asks whether the
+      // PANE is gone and is false again after StrictMode's mount→cleanup→mount, and
+      // `firstConnectedRef` gates only the mount path — doConnect sets it itself, so
+      // a retry click or a reconnect timer landing inside the two HTTP round trips
+      // connect() awaits (wt.ts) re-enters here with it already true.
+      //
+      // ABOVE setConnected/setConnState rather than anywhere further down, because
+      // those two are the point of no return: past them the app has been told it is
+      // live on a transport this function already discarded, and the rest of this
+      // body then hands the composer a writer pointing at it. Before tether#128 that
+      // writer reached a session the daemon kept open while TetherWT.readStream
+      // dropped every envelope from it — a prompt sent into a hole, silently. Since
+      // #128 openBidiStream() rejects with 'not connected' instead, which is visible
+      // but no less wrong: see the `.catch` below.
+      //
+      // Same shape as tether#127's identity check in the history-load effect above:
+      // an async callback asking whether what it closed over is still what the app
+      // means. Whoever resolves last used to win; now whoever is current does.
+      if (wtRef.current !== wt) return
       // tether#63 — the attempt budget is NOT refunded here. See
       // shouldRefundAttemptBudget: a handshake is not evidence that the
       // connection is usable, and refunding on one is what made the bounded
@@ -1502,6 +1528,19 @@ export default function ChatPane({ onMenuClick: _onMenuClick }: Props) {
       controlRef.current = control
       void control.start()
     }).catch((err: unknown) => {
+      // tether#130 — the same question, and it has to be asked on this arm too. Since
+      // tether#128 a superseded chain reaches here BY WAY OF the `.then` above:
+      // connect() still RESOLVES (wt.ts returns early once close() has landed), and it
+      // is `await wt.openBidiStream()` that rejects with 'not connected'. So the two
+      // guards divide the work — that one stops the false "connected", this one stops
+      // the false failure — and neither covers for the other.
+      //
+      // Unguarded, every line below fires on behalf of a connection nobody is waiting
+      // for: setConnError puts its message on the pane, and scheduleReconnect arms a
+      // timer whose doConnect tears down the replacement that is working fine. Above
+      // the console.error and not merely above the reconnect, because the log is where
+      // a reader goes to find out why the REAL connection failed.
+      if (wtRef.current !== wt) return
       const msg = err instanceof Error ? err.message : String(err)
       console.error('[tether] chat connect failed:', msg)
       setConnError(msg)

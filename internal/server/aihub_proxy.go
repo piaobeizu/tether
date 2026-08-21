@@ -21,6 +21,30 @@ const (
 	defaultRecentLimit = 20
 )
 
+// Upper bounds on those same caller-supplied page sizes. A default is not a
+// limit: until tether#143 each entry point checked only that the parsed
+// value was positive and then handed it to aihub.Client, which puts it
+// straight into the upstream query string — so a single browser request
+// could make the daemon ask aihub for an unbounded page. Every cap here is
+// ten times the matching default: enough headroom that no legitimate view
+// hits it, small enough that one request can't turn into a full-table scan
+// upstream.
+//
+// Values above the cap are clamped down to it rather than rejected with a
+// 400, matching how the same parsing already treats zero, negative and
+// unparseable values (silent fall back to the default). These are read-only
+// view endpoints for tether's own SPA, and the SPA sends no page size at all
+// today (web/src/lib/aihub.ts asks for project and cursor only), so nothing
+// in tree reaches these caps: a caller that asks for too much should still
+// get a rendered — merely bounded — page, and clamping keeps the change to a
+// ceiling rather than a new error status for some out-of-tree caller that
+// already passes a large limit.
+const (
+	maxQueueMax    = 10 * defaultQueueMax
+	maxEventsLimit = 10 * defaultEventsLimit
+	maxRecentLimit = 10 * defaultRecentLimit
+)
+
 // stepsEventsLimit bounds the event page fetched to compute step-completion
 // status for the /steps endpoint (Task 5): generous enough to cover a whole
 // scenario run's step_completed events without paging.
@@ -38,6 +62,31 @@ var graphStatuses = []string{"queued", "running", "blocked", "paused", "wrapped"
 // defaultGraphLimit is a generous cap on the number of work items fetched
 // for the graph view.
 const defaultGraphLimit = 200
+
+// pageSize resolves one caller-supplied page size from the request query:
+// def when the param is absent, empty, non-numeric, out of int range or
+// non-positive, otherwise the requested value clamped to upper. It is the
+// single place the proxy turns a query string into a count, so every paging
+// entry point gets the same bounds and the same out-of-range behavior
+// (tether#143); route it through here rather than calling strconv.Atoi at a
+// new call site.
+//
+// The fallback stays deliberately silent — see the cap block above for why
+// none of these inputs is answered with a 400.
+func pageSize(r *http.Request, param string, def, upper int) int {
+	v := r.URL.Query().Get(param)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return def
+	}
+	if n > upper {
+		return upper
+	}
+	return n
+}
 
 // RegisterWorkAPI wires the curated, read-only /api/v1/work/* endpoints
 // that proxy the polyforge aihub backend for the tether workbench MVP
@@ -107,12 +156,7 @@ func RegisterWorkAPI(mux *http.ServeMux, client *aihub.Client, workspaceRoot str
 			return
 		}
 
-		max := defaultQueueMax
-		if v := r.URL.Query().Get("max"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				max = n
-			}
-		}
+		max := pageSize(r, "max", defaultQueueMax, maxQueueMax)
 
 		rq, err := client.ReadyQueue(r.Context(), project, max)
 		if err != nil {
@@ -141,12 +185,7 @@ func RegisterWorkAPI(mux *http.ServeMux, client *aihub.Client, workspaceRoot str
 		if v := r.URL.Query().Get("status"); v != "" {
 			statuses = strings.Split(v, ",")
 		}
-		limit := defaultRecentLimit
-		if v := r.URL.Query().Get("limit"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				limit = n
-			}
-		}
+		limit := pageSize(r, "limit", defaultRecentLimit, maxRecentLimit)
 
 		list, err := client.ListWorkItems(r.Context(), project, statuses, limit)
 		if err != nil {
@@ -299,12 +338,7 @@ func handleWorkItemDetail(w http.ResponseWriter, r *http.Request, client *aihub.
 
 // handleWorkItemEvents serves GET /api/v1/work/items/{id}/events.
 func handleWorkItemEvents(w http.ResponseWriter, r *http.Request, client *aihub.Client, id string) {
-	limit := defaultEventsLimit
-	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			limit = n
-		}
-	}
+	limit := pageSize(r, "limit", defaultEventsLimit, maxEventsLimit)
 	cursor := r.URL.Query().Get("cursor")
 
 	resp, err := client.Events(r.Context(), id, limit, cursor)

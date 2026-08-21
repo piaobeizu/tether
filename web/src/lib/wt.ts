@@ -32,6 +32,28 @@ export class TetherWT {
 
   async connect(): Promise<void> {
     const [certHash, ticket] = await Promise.all([fetchCertHash(), fetchWtTicket()])
+    // close() can only close what is already in this.wt, and nothing writes that
+    // field until the constructor below — so a close() landing in those two HTTP
+    // round trips closed nothing, and this method went on to open a session no
+    // caller had a handle to (tether#128). `closed` only made it QUIET: readStream
+    // drops its envelopes and fireClose returns early, so the transport stayed up
+    // and so did the daemon-side attach behind it. Two real triggers: StrictMode
+    // runs an effect, its cleanup, then the effect again, so every dev load put a
+    // close() in this window; and ChatPane closes the outgoing TetherWT on retry
+    // and reconnect without knowing whether it ever finished connecting.
+    //
+    // Returning HERE, above the constructor, rather than tearing down afterwards:
+    // there is then nothing built to remember to tear down. From the constructor
+    // on, this.wt is set before every await, so a close() in the `ready` window
+    // below already reaches the real session and needs no second check.
+    //
+    // Per the notice above this is a behavioural change with no unit coverage and
+    // no live run behind it, which is why it is one guard and no teardown. What a
+    // live run would confirm: the caller's `.then` still runs on this early
+    // return and openBidiStream() throws 'not connected' — the error path a
+    // connect that never connected has always taken — so a superseded attempt now
+    // reports a failure where it used to report a bogus success.
+    if (this.closed) return
     const wtOpts: WebTransportOptions = certHash
       ? { serverCertificateHashes: [{ algorithm: 'sha-256', value: hexToBuffer(certHash) }] }
       : {}

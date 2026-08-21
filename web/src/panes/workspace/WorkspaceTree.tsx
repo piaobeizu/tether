@@ -92,15 +92,43 @@ export default function WorkspaceTree({ workspaceId }: WorkspaceTreeProps) {
     })
   }
 
+  // tether#144 — which branch to take is read from the render the user clicked,
+  // because that is the row they acted on; the node written BACK has to come
+  // from `prev`. Whatever touched nodes[dir] between that render and this update
+  // is in `prev` and not in the closure — most often the listing from the
+  // previous expand landing in this same batch — so spreading the closure's
+  // `node` shipped it straight back out again, `entries` included, and the fold
+  // silently un-listed the directory. Last write wins, and this was it.
+  //
+  // An absent key is NOT that case and must not be rebuilt from either side: it
+  // means the [workspaceId] effect reset `nodes` after the click, so writing
+  // here would plant a directory belonging to the workspace we just left. Drop
+  // the write instead — the row renders collapsed and the next click re-fetches.
+  // (This is also what keeps the written value a whole NodeState: `{ ...prev[dir]
+  // }` on a missing key would be `{ expanded }` alone, typed as if it were not.)
+  const setExpanded = (dir: string, expanded: boolean) => {
+    setNodes(prev => (prev[dir] ? { ...prev, [dir]: { ...prev[dir], expanded } } : prev))
+  }
+
+  // Both writes below had that defect; only the fold has a regression test.
+  // Reaching the cache-hit branch needs `entries` set already, and today that
+  // rules out a concurrent writer for `dir` — not because expand() cannot be
+  // re-entered with entries in `prev` (it can: fold a directory mid-listing,
+  // then click again in the same batch as that listing landing), but because
+  // fileTreeCache dedupes in-flight loads per directory and caches successes for
+  // the life of the workspace, and its `invalidate` has no caller outside its
+  // own unit test. Wire `invalidate` to a file watcher and a refetch CAN be in
+  // flight while entries are on screen — that is when this branch starts racing
+  // too, and it is cheaper to be correct now than to remember then.
   const toggle = (dir: string) => {
     const node = nodes[dir]
     if (node?.expanded) {
-      setNodes(prev => ({ ...prev, [dir]: { ...node, expanded: false } }))
+      setExpanded(dir, false)
       return
     }
     // Already cached client-side from a prior expand — no re-fetch, just show it.
     if (node?.entries) {
-      setNodes(prev => ({ ...prev, [dir]: { ...node, expanded: true } }))
+      setExpanded(dir, true)
       return
     }
     expand(dir)

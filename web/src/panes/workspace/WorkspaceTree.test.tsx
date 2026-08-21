@@ -33,6 +33,11 @@ function deferredFiles(root: Entry[]) {
   // could is not a test of the error path.
   const pending = new Map<string, (res: unknown) => void>()
   const calls: string[] = []
+  // Directories whose landed listing has been read back out of the response
+  // body. releaseDuring asserts on this rather than assuming its own wait was
+  // long enough — a listing that never got as far as fileTreeCache would leave
+  // the very race it is trying to set up unset, silently.
+  const bodiesRead = new Set<string>()
   vi.stubGlobal('fetch', vi.fn((url: string) => {
     calls.push(url)
     const dir = new URL(url, 'http://localhost').searchParams.get('dir') ?? ''
@@ -45,13 +50,54 @@ function deferredFiles(root: Entry[]) {
     pending.delete(dir)
     return resolve
   }
+  const respond = (dir: string, entries: Entry[]) => ({
+    ok: true,
+    json: async () => { bodiesRead.add(dir); return entries },
+  })
   return {
     /** How many listings have been requested, per directory. */
     countFor: (dir: string) => calls.filter((u) => u.endsWith(`dir=${dir}`)).length,
     /** Land `dir`'s listing and let React flush the resulting state write. */
     release: async (dir: string, entries: Entry[]) => {
       const resolve = take(dir)
-      await act(async () => { resolve({ ok: true, json: async () => entries }) })
+      await act(async () => { resolve(respond(dir, entries)) })
+    },
+    /**
+     * Land `dir`'s listing and run `interleave` inside the SAME React batch —
+     * after the listing's state write has been queued, but before React has
+     * re-rendered — so whatever `interleave` clicks is still holding the
+     * pre-listing render's closures.
+     *
+     * `release` above cannot express that: it awaits its own act scope, so the
+     * commit has always happened by the time it returns and every handler is
+     * fresh. Yielding to a TIMER is what opens the gap. It drains the microtask
+     * queue to empty — so fileTreeCache's fetch -> json -> load -> component-
+     * .then chain runs to completion, however many hops it grows — while React
+     * does not flush an act scope from a timer either: updates go on the act
+     * queue and are drained when the scope exits.
+     *
+     * An earlier version ticked `await Promise.resolve()` a fixed number of
+     * times instead, and that count was load-bearing in the worst way: at three
+     * ticks or fewer `interleave` ran BEFORE the state write was queued, which
+     * is merely the fold-then-listing order this component already survives, so
+     * the case passed with the defect present and nothing said so. A drain with
+     * no number in it cannot drift into that. `bodiesRead` then holds: once the
+     * body has been read inside a microtask, every continuation behind it has
+     * run too, because macrotasks wait for the microtask queue to empty.
+     */
+    releaseDuring: async (dir: string, entries: Entry[], interleave: () => void) => {
+      const resolve = take(dir)
+      bodiesRead.delete(dir)
+      await act(async () => {
+        resolve(respond(dir, entries))
+        // Twice: one yield proves the promise chain drained, a second would also
+        // absorb a hop that itself goes through a timer, should one ever appear
+        // between the fetch and the state write.
+        await new Promise(r => setTimeout(r, 0))
+        await new Promise(r => setTimeout(r, 0))
+        if (!bodiesRead.has(dir)) throw new Error(`listing for "${dir}" never reached fileTreeCache`)
+        interleave()
+      })
     },
     /** Fail `dir`'s listing the way fileTreeCache surfaces a bad status. */
     fail: async (dir: string) => {
@@ -272,5 +318,51 @@ describe('WorkspaceTree collapse during load (tether#129)', () => {
     await files.release('src', children)
 
     expect(screen.getByText('deep.txt')).toBeTruthy()
+  })
+})
+
+// tether#144 — `toggle` read the node it was about to write from the RENDER-TIME
+// closure (`{ ...node, expanded: false }`) while taking `prev` from the
+// functional update, so the write was only correct as long as nothing had
+// touched `nodes[dir]` since that render. The arriving listing is exactly such a
+// something: land it in the same batch as the fold and the fold shipped the
+// pre-listing node back to React, taking `entries` with it.
+//
+// This is a DIFFERENT ordering from tether#129 above, which is why that suite
+// stayed green through this defect. There the fold landed first and the listing
+// second, so the listing's own write repaired anything the fold got wrong. Here
+// the listing is already in `prev` when the fold is applied, and last write
+// wins — so a fold built from a stale snapshot is the final state.
+describe('WorkspaceTree fold racing the arriving listing (tether#144)', () => {
+  const root: Entry[] = [{ name: 'src', isDir: true, dirty: false }]
+  const children: Entry[] = [{ name: 'deep.txt', isDir: false, dirty: false }]
+
+  it('keeps the listing when the fold lands in the same batch as it', async () => {
+    const files = deferredFiles(root)
+    render(<WorkspaceTree workspaceId="ws-1" />)
+    await waitFor(() => screen.getByText('src'))
+
+    fireEvent.click(screen.getByText('src'))            // expand — listing in flight
+    expect(screen.getByText('loading…')).toBeTruthy()
+
+    await files.releaseDuring('src', children, () => {
+      // The window, asserted rather than assumed: the listing's write is queued
+      // but nothing has re-rendered, so the children are not on screen and this
+      // row's onClick is still the one built before the listing existed.
+      expect(screen.queryByText('deep.txt')).toBeNull()
+      expect(screen.getByText('loading…')).toBeTruthy()
+      fireEvent.click(screen.getByText('src'))         // fold, from that stale render
+    })
+
+    // The fold is honoured — the user asked for it last and it stands...
+    expect(screen.queryByText('deep.txt')).toBeNull()
+    // ...but it did not take the listing down with it. One click brings the
+    // children back synchronously, off the node's own `entries`, with no second
+    // request. Before the fix the fold wrote `entries: null` back over them and
+    // this click fell through to a fresh expand(), which paints nothing until
+    // its promise settles — so `getByText` here is what goes red.
+    fireEvent.click(screen.getByText('src'))
+    expect(screen.getByText('deep.txt')).toBeTruthy()
+    expect(files.countFor('src')).toBe(1)
   })
 })

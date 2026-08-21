@@ -27,9 +27,12 @@ let inFlightLoad: Promise<void> | null = null
  *   - `!r.ok` THROWS rather than falling back to `[]`, so "this session has no messages"
  *     (200 []) stays distinguishable from "we could not ask" (5xx / offline). Collapsing
  *     the two forces a `msgs.length > 0` guard downstream, which silently keeps the
- *     PREVIOUS session's transcript — and `loadHistory` is also what clears
- *     pendingPermissions and the turn cursor, so that residue is interactive, not merely
- *     stale text.
+ *     PREVIOUS session's transcript — and `loadHistory` is also what retires the turn
+ *     cursor and the pending permission cards, so that residue is interactive, not
+ *     merely stale text. (Since tether#132 it keeps the pending requests raised in the
+ *     session it is INSTALLING and drops only the rest, which leaves this argument
+ *     as it was: the case here is one where loadHistory never runs, and in the switch
+ *     it describes the residue carries the sid being left, so it still goes.)
  *   - The sid is re-checked after the await, so a load for a session the user has
  *     already left cannot land on the one they are now looking at.
  *   - A second call for the SAME sid joins the first instead of racing it. That was not

@@ -130,8 +130,15 @@ describe('openSession (tether#61)', () => {
   it('CLEARS the transcript when the target session is genuinely empty', async () => {
     mockMessages([]) // 200 with no messages — a real, empty session
     useStore.setState({
+      sessionId: 'sid-a',
       messages: [msg('a1', 'A-only prompt', 1)],
-      pendingPermissions: [{ id: 'p1', toolName: 'Bash', input: {} }],
+      // Tagged with the session being LEFT, which is what makes this a test of the
+      // rule and not of a fixture's omission. Since tether#132 the reducer drops a
+      // request because its sid is not the arriving one; an UNTAGGED request — what
+      // this fixture used to hold — is dropped for a weaker reason, that it matches
+      // no session at all, and THAT outcome survives deleting the sid discriminator
+      // entirely. store.test.ts pins the untagged case deliberately and on its own.
+      pendingPermissions: [{ id: 'p1', toolName: 'Bash', input: {}, sessionId: 'sid-a' }],
     })
 
     openSession('sid-empty')
@@ -352,6 +359,36 @@ describe('refreshTranscript (tether#106)', () => {
     const fetchMock = mockVersionedMessages([], 100)
     await refreshTranscript('')
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('KEEPS a permission request raised in the session it is reloading (tether#132)', async () => {
+    // The counterpart of openSession's "genuinely empty" test above, and the half no
+    // switch can pin. Every caller of THIS function is a refetch of the session
+    // already on screen — the click on the already-open row, the held-session
+    // watcher's three-second reload, "Check again" — and none of them is a switch,
+    // yet loadHistory used to discard the whole permission queue. So a live card
+    // could be dismissed by a misclick with nothing anywhere able to raise it again:
+    // `pendingPermissions` is filled from one broadcast envelope and nothing else,
+    // and before tether#132 there was no backfill to re-send it.
+    //
+    // Asserted HERE rather than only on the reducer (store.test.ts covers that)
+    // because this is the hop that supplies the reducer's discriminator: the sid
+    // re-check above is what makes `s.sessionId` the session being installed, so a
+    // load that landed without it would drop the card while every store-level test
+    // stayed green.
+    mockVersionedMessages([{ role: 'user', text: 'newly appended', ts: 9 }], 100)
+    useStore.setState({
+      sessionId: 'sid-a',
+      messages: [],
+      pendingPermissions: [{ id: 'p1', toolName: 'Bash', input: {}, sessionId: 'sid-a' }],
+    })
+
+    await refreshTranscript('sid-a')
+
+    // The transcript IS replaced — this is still the server-truth load, and asserting
+    // it here keeps the test from passing by way of loadHistory not having run.
+    expect(useStore.getState().messages.map(m => m.text)).toEqual(['newly appended'])
+    expect(useStore.getState().pendingPermissions.map(p => p.id)).toEqual(['p1'])
   })
 
   it('joins a load already in flight for the same session instead of racing it', async () => {

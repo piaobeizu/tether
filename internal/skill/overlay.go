@@ -1,7 +1,9 @@
 // Package skill implements the D-20 cc plugin overlay (symlink farm).
 // Skills live in ~/.tether/skills/<id>/ (the canonical source).
 // Enabling a skill for a workspace creates a symlink:
-//   <registered workspace dir>/.claude/plugins/<id> → ~/.tether/skills/<id>/
+//
+//	<registered workspace dir>/.claude/plugins/<id> → ~/.tether/skills/<id>/
+//
 // cc reads plugin manifests via the filesystem; symlinks mean updates to the
 // skill source are seen by cc without an explicit copy (D-20 contract).
 package skill
@@ -30,9 +32,9 @@ var (
 	// request against, so no overlay write can be authorised at all.
 	//
 	// Kept distinct from ErrUnknownWorkspace deliberately: "I cannot check" and
-	// "that is not one of yours" send an operator looking in different places, and
-	// collapsing them is the exact confusion tether#63 split apart for the chat
-	// handshake.
+	// "that is not one of yours" send an operator looking in different places.
+	// tether#52 split those two errors apart for the chat handshake and tether#63
+	// gave each its own wire code (workspace/state.go:50-51).
 	ErrNoWorkspaceIndex = errors.New("skill: this daemon has no workspace registry")
 
 	// ErrUnknownWorkspace — the id is not in the workspace registry, so there is no
@@ -183,8 +185,19 @@ func isNilIndex(ws WorkspaceIndex) bool {
 // daemon stored for it, or refuses.
 //
 // The returned path is a string the DAEMON wrote (workspace.Registry
-// canonicalises on Add and on load), never one the client sent. So the overlay
-// can only be written inside a directory that is IN THE WORKSPACE REGISTRY.
+// canonicalises the workspace ROOT on Add and on load), never one the client
+// sent. So the path the overlay is resolved against is chosen by the registry
+// rather than by the caller.
+//
+// That is a claim about the PATH, not about the directory it lands in, and the
+// difference is load-bearing. Nothing here — or anywhere in this package — calls
+// Lstat or EvalSymlinks on the path components BELOW the workspace root, so a
+// symlink at the overlay's own directory (or at its parent) redirects the write
+// outside the workspace; os.MkdirAll and os.Symlink follow it, and Disable's
+// os.Remove follows it back out again. Even the root's guarantee is best-effort:
+// workspace.canonicalPath falls back to the unresolved absolute path when
+// EvalSymlinks fails. Resolving that is a containment strategy in its own right
+// and is tracked in tether#147; do not read this function as providing it.
 //
 // # What this does and does not guarantee — stated precisely
 //

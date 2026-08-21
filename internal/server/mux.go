@@ -251,20 +251,22 @@ func buildMux(cfg *Config, certs *certHolder, wts *webtransport.Server, reg *ses
 		// it did until tether#142. The workspace registry is that answer, and this is
 		// the one place both registries are in scope, so it is where they are joined.
 		//
-		// Assigned through a guarded local rather than passed straight in. A nil
-		// *workspace.Registry stored in the skill.WorkspaceIndex interface would be a
-		// NON-nil interface holding a nil pointer — the identical trap lifecycle.go
-		// documents for session.Registry.Workspaces, and there it cost a nil-receiver
-		// call instead of the "no registry, refuse" branch. Leaving the index unbound
-		// is what makes a failed workspace registry REFUSE overlay writes (503) rather
-		// than panic on one. BindWorkspaces detects the typed nil as well, so this
-		// guard is the belt to its braces; both are cheap and the failure is a panic
-		// in the daemon's HTTP path.
-		var wsIndex skill.WorkspaceIndex
-		if cfg.WsRegistry != nil {
-			wsIndex = cfg.WsRegistry
-		}
-		cfg.SkillRegistry.BindWorkspaces(wsIndex)
+		// Passed straight in, including when it is nil. A nil *workspace.Registry
+		// stored in the skill.WorkspaceIndex interface is a NON-nil interface holding
+		// a nil pointer — the trap lifecycle.go documents for
+		// session.Registry.Workspaces — so it cannot be checked for here with `!=
+		// nil` anyway. BindWorkspaces detects that shape and stores nothing, and
+		// workspaceDir refuses when nothing is stored, which is what makes a failed
+		// workspace registry answer 503 instead of panicking.
+		//
+		// An earlier draft guarded this with a local `var wsIndex skill.WorkspaceIndex`
+		// assigned only when cfg.WsRegistry was non-nil. Review showed it was dead:
+		// removing it left the suite green, and removing it AND BindWorkspaces' own
+		// check still left the suite green, because workspaceDir catches the case
+		// regardless. Three checks for one condition, two of them unreachable, is not
+		// depth — it is three places for the next reader to keep in sync. The two that
+		// remain each have a test.
+		cfg.SkillRegistry.BindWorkspaces(cfg.WsRegistry)
 		skill.RegisterAPI(mux, cfg.SkillRegistry)
 	}
 

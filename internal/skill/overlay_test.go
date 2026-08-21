@@ -8,9 +8,10 @@ package skill
 // silently forgot what it had loaded.
 //
 // Every test below was written against the pristine tree first and observed to
-// FAIL there — with the exception of the two marked "regression guard", which
+// FAIL there — with the exception of the four marked "regression guard", which
 // pin behaviour that was already correct and must survive the fix. That
-// distinction is the point of naming them.
+// distinction is the point of naming them. (Counted, not estimated: an earlier
+// version of this sentence said "two" and there were four.)
 
 import (
 	"errors"
@@ -229,22 +230,75 @@ func TestOverlayWrites_RefuseWithNoIndexBound(t *testing.T) {
 //
 // The trap lifecycle.go documents: a nil pointer stored in an interface makes the
 // interface non-nil, so `ws == nil` is false and the next call is a nil-receiver
-// call. For fakeIndex (a map type) and for any *T index, that must degrade to
-// ErrNoWorkspaceIndex rather than a panic in the daemon's HTTP path.
+// call. For fakeIndex (a map type) and for any *T index, BindWorkspaces must
+// store NOTHING rather than store the typed nil.
+//
+// # Why this asserts the stored field and not Enable's error
+//
+// It used to call Enable and check for ErrNoWorkspaceIndex, and review proved
+// that was not a gate: workspaceDir performs the SAME nil check before it uses
+// the index, so deleting BindWorkspaces' check left this green — the error came
+// from the second guard, not the one under test. Only removing both turned it
+// red. An assertion that holds whether or not the code under test is present is
+// not an assertion about that code.
+//
+// So this reads r.ws directly. That is BindWorkspaces' whole observable effect,
+// it is reachable because this test is in-package, and it fails for exactly one
+// reason: BindWorkspaces stored something it was supposed to reject.
 func TestBindWorkspaces_TreatsATypedNilAsUnbound(t *testing.T) {
-	sk, _ := installedSkill(t, "aaaa000000000007")
-
 	for name, idx := range map[string]WorkspaceIndex{
 		"nil map type": fakeIndex(nil),
 		"nil pointer":  (*nilPtrIndex)(nil),
 	} {
 		t.Run(name, func(t *testing.T) {
-			r := newTestRegistry(t, nil, sk)
+			r := &Registry{path: filepath.Join(t.TempDir(), "skills.json")}
 			r.BindWorkspaces(idx)
-			if err := r.Enable(sk.ID, "ws1"); !errors.Is(err, ErrNoWorkspaceIndex) {
-				t.Fatalf("Enable with a typed-nil index: error = %v, want ErrNoWorkspaceIndex", err)
+
+			r.mu.RLock()
+			stored := r.ws
+			r.mu.RUnlock()
+			if stored != nil {
+				t.Fatalf("BindWorkspaces(%s) stored %#v; want nil, because a non-nil "+
+					"interface wrapping a nil pointer is what hands a nil-receiver call to Path", name, stored)
 			}
 		})
+	}
+}
+
+// TestBindWorkspaces_StoresAUsableIndex — the companion that keeps the test above
+// from being satisfied by a BindWorkspaces that stores nothing at all.
+func TestBindWorkspaces_StoresAUsableIndex(t *testing.T) {
+	dir := t.TempDir()
+	r := &Registry{path: filepath.Join(t.TempDir(), "skills.json")}
+	r.BindWorkspaces(fakeIndex{"ws1": dir})
+
+	r.mu.RLock()
+	stored := r.ws
+	r.mu.RUnlock()
+	if stored == nil {
+		t.Fatal("BindWorkspaces(non-nil index) stored nil")
+	}
+	if got, ok := stored.Path("ws1"); !ok || got != dir {
+		t.Fatalf("stored index resolves ws1 to (%q, %v), want (%q, true)", got, ok, dir)
+	}
+}
+
+// TestOverlayWrites_DoNotPanicOnATypedNilIndex keeps the end-to-end half of the
+// old test: even if a typed nil reaches the field somehow, the write path refuses
+// instead of dereferencing it. This one is deliberately about workspaceDir's
+// guard, which is why it sets r.ws directly and bypasses BindWorkspaces.
+func TestOverlayWrites_DoNotPanicOnATypedNilIndex(t *testing.T) {
+	sk, _ := installedSkill(t, "aaaa000000000007")
+	r := newTestRegistry(t, nil, sk)
+	r.ws = (*nilPtrIndex)(nil) // what BindWorkspaces exists to prevent
+
+	for name, call := range map[string]func() error{
+		"enable":  func() error { return r.Enable(sk.ID, "ws1") },
+		"disable": func() error { return r.Disable(sk.ID, "ws1") },
+	} {
+		if err := call(); !errors.Is(err, ErrNoWorkspaceIndex) {
+			t.Errorf("%s with a typed-nil index: error = %v, want ErrNoWorkspaceIndex", name, err)
+		}
 	}
 }
 

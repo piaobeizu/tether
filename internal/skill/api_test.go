@@ -184,6 +184,35 @@ func TestOverlayEndpoints_StatusCodes(t *testing.T) {
 	}
 }
 
+// TestOverlayEndpoints_RefuseAnOversizedBody pins the http.MaxBytesReader in
+// overlayWrite, which review found had no gate at all — deleting it left the
+// whole suite green.
+//
+// The payload is a workspace id; 4 KiB is already far more than one needs. The
+// body below is a VALID request except for a megabyte of padding in a field the
+// handler ignores, so the only thing that can refuse it is the size limit: remove
+// the limit and the decoder skips the padding, reads a registered workspaceId and
+// answers 204.
+func TestOverlayEndpoints_RefuseAnOversizedBody(t *testing.T) {
+	for _, action := range []string{"enable", "disable"} {
+		t.Run(action, func(t *testing.T) {
+			h, sk, wsDir := serveSkills(t, true)
+
+			body := `{"workspaceId":"ws1","pad":"` + strings.Repeat("A", 1<<20) + `"}`
+			rec := post(t, h, "/api/v1/skills/"+sk.ID+"/"+action, body)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("POST %s with a %d-byte body -> %d, want 400; body %q",
+					action, len(body), rec.Code, strings.TrimSpace(rec.Body.String()))
+			}
+			// And it was refused rather than partially applied.
+			if _, err := os.Lstat(filepath.Join(wsDir, ".claude", "plugins", sk.ID)); err == nil {
+				t.Fatalf("%s acted on an over-limit body: the overlay link exists", action)
+			}
+		})
+	}
+}
+
 // TestOverlayEndpoints_UnavailableWithoutAWorkspaceIndex.
 //
 // 503 rather than 500: the daemon is not broken, it is unable — its workspace

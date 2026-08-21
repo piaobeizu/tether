@@ -45,13 +45,36 @@ import {
 // human can read" is the whole point of this wi. A fix that produced a perfect
 // notice the pane never rendered would pass every other test in the repo.
 //
-// Mounting ChatPane is possible without a WebTransport stack for one specific
-// reason: with no remembered sid and `workspacesLoaded` false, the first connect
-// is DEFERRED (shouldDeferFirstConnect) behind a store subscription and a 2s
-// fallback timer, neither of which fires here. That is the harness's own
-// precondition, so it is asserted below rather than assumed — if a future change
-// makes the pane connect on mount, these tests must fail loudly instead of
-// quietly exercising a different path.
+// Mounting ChatPane needs no WebTransport stack, and this file gets there three
+// different ways — so which one is in play is a property of the BLOCK you are
+// reading, not of the file. All three fall out of two inputs read at mount,
+// `tether_last_sid` in localStorage and `workspacesLoaded` on the store
+// (shouldDeferFirstConnect), plus whether anything has put a WebTransport
+// constructor on globalThis:
+//
+//   neither input set ⇒ the first connect is DEFERRED behind a store subscription
+//     and a 2s fallback timer, and a test that leaves both alone never attempts a
+//     connection at all.
+//   either input set ⇒ the mount connects for real and the connect REJECTS, jsdom
+//     having no WebTransport; what the pane makes of the rejection is tether#104's
+//     "Reaching connState === 'failed' honestly" note below.
+//   either input set, plus a fake constructor ⇒ the connect SUCCEEDS. Only
+//     tether#106 does that, and only where it installs FakeWebTransport.
+//
+// The tests immediately below are the first kind. That is THIS block's
+// precondition rather than a fact about the file, so its beforeEach asserts it —
+// if a future change makes this pane connect on mount, these tests must fail
+// loudly instead of quietly exercising a different path.
+//
+// Counted at 4536b9c: 102 tests in 6 top-level describes (two more nested inside
+// tether#110's) — 35 never attempt a connection, 64 connect and fail, 3 connect
+// and stay connected. The deferred path is therefore about a third of the file,
+// not the whole of it. Recount rather than trust that split: classify a test by
+// the two inputs and `globalThis.WebTransport`, each of which every block fixes in
+// its beforeEach or in a named helper (renderIdle / renderHeld /
+// heldWithAPageLoaded / renderRefusedWithSid). The "one specific reason" sentence
+// that stood here until tether#136 was true at 69c0e32, where this file was 119
+// lines and one describe, and went false the moment tether#104 added a second.
 
 const originalFetch = globalThis.fetch
 
@@ -278,7 +301,8 @@ describe('ChatPane renders notices (tether#80, wi N5)', () => {
     // settled is exactly the state that defers the first connect.
     expect(localStorage.getItem('tether_last_sid')).toBeNull()
     expect(useStore.getState().workspacesLoaded).toBe(false)
-    // And nothing in this file may reach a WebTransport constructor.
+    // And nothing in this block may reach a WebTransport constructor. (In the
+    // file: tether#106 installs one on purpose, and deletes it again.)
     expect((globalThis as { WebTransport?: unknown }).WebTransport).toBeUndefined()
   })
 
@@ -647,9 +671,10 @@ describe('a held transcript keeps up, and a live one is still left alone (tether
   /**
    * The minimum WebTransport that lets doConnect reach connState 'connected'.
    *
-   * jsdom has none, which is why every other test in this file exercises the FAILED
-   * path — and why "clicking the current row while connected does nothing" could not
-   * be asserted before. `closed` never settles, so onClose never fires and the pane
+   * jsdom has none, which is why every other test in THIS block exercises the FAILED
+   * path — the beforeEach sets both `tether_last_sid` and `workspacesLoaded`, so every
+   * mount here connects for real — and why "clicking the current row while connected
+   * does nothing" could not be asserted before. `closed` never settles, so onClose never fires and the pane
    * stays connected for the length of the test; the incoming stream never yields, so
    * no envelope arrives to move the store underneath the assertions.
    */

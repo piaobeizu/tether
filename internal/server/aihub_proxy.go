@@ -63,6 +63,25 @@ var graphStatuses = []string{"queued", "running", "blocked", "paused", "wrapped"
 // for the graph view.
 const defaultGraphLimit = 200
 
+// knownStatuses is the vocabulary of work-item statuses this proxy is willing
+// to name in an upstream request: the union of the two filters declared above.
+// graphStatuses happens to already contain every recentStatuses value today,
+// but taking the union keeps that from being load-bearing.
+//
+// It is derived rather than written out because both source sets are already
+// maintained in this file: whoever teaches the graph view about a new aihub
+// status extends this vocabulary in the same edit, whereas a third hand-typed
+// copy here would be a second place to forget (tether#146).
+var knownStatuses = func() map[string]bool {
+	m := make(map[string]bool, len(recentStatuses)+len(graphStatuses))
+	for _, group := range [][]string{recentStatuses, graphStatuses} {
+		for _, s := range group {
+			m[s] = true
+		}
+	}
+	return m
+}()
+
 // pageSize resolves one caller-supplied page size from the request query:
 // def when the param is absent, empty, non-numeric, out of int range or
 // non-positive, otherwise the requested value clamped to upper. It is the
@@ -86,6 +105,65 @@ func pageSize(r *http.Request, param string, def, upper int) int {
 		return upper
 	}
 	return n
+}
+
+// statusFilter resolves the ?status= work-item status filter for
+// /work/recent: def when the param is absent or leaves nothing usable,
+// otherwise the caller's values in the caller's order, keeping only names in
+// knownStatuses and dropping repeats.
+//
+// It is pageSize's counterpart for the one caller-supplied value on these
+// routes that is a set rather than a count. Until tether#146 the raw
+// strings.Split of the query value went to aihub.Client.ListWorkItems
+// unchecked, and that client joins the slice straight back into the upstream
+// query string — so a single request could make the daemon ask aihub for
+// arbitrary status names, in unbounded quantity.
+//
+// Filtering alone would not bound the quantity, because a legal status may be
+// repeated forever; the de-duplication is what caps the forwarded set at
+// len(knownStatuses) entries, and with it the length of the upstream URL.
+// SplitSeq rather than Split so an oversized query value is not first
+// materialised as an equally oversized slice.
+//
+// Unusable input is answered silently rather than with a 400, which is this
+// parameter's own pre-existing behavior (an empty ?status= already fell back
+// to def) and the disposition pageSize settled on for counts it cannot use
+// (tether#143). Values are matched exactly for the same reason — pageSize
+// treats " 7" as junk to fall back on rather than a 7 to trim, so " failed"
+// and "FAILED" are not normalised into statuses here.
+//
+// Be precise about what that costs, because it is not the same trade pageSize
+// makes: clamping a count still answers the question the caller asked, only
+// less of it, whereas falling back to def answers a different question. A
+// caller who asks for ?status=Running is shown terminal items and cannot tell
+// that from "the default filter is what I asked for". Two alternatives were
+// considered and rejected. Returning an empty slice is the worst option
+// available: aihub.Client.ListWorkItems omits the status param entirely for
+// an empty slice, which widens the query to every status. Short-circuiting to
+// an empty page would preserve pre-tether#146 behavior exactly (aihub answers
+// an unknown status with no rows), but it would answer without consulting
+// upstream and would make ?status=bogus differ from ?status=, a distinction
+// this endpoint has never drawn. Nothing in tree sends ?status= at all
+// (web/src/lib/aihub.ts asks for project and cursor only), so this only
+// decides what an out-of-tree caller sees.
+func statusFilter(r *http.Request, def []string) []string {
+	v := r.URL.Query().Get("status")
+	if v == "" {
+		return def
+	}
+	out := make([]string, 0, len(knownStatuses))
+	seen := make(map[string]bool, len(knownStatuses))
+	for s := range strings.SplitSeq(v, ",") {
+		if !knownStatuses[s] || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	if len(out) == 0 {
+		return def
+	}
+	return out
 }
 
 // RegisterWorkAPI wires the curated, read-only /api/v1/work/* endpoints
@@ -181,10 +259,7 @@ func RegisterWorkAPI(mux *http.ServeMux, client *aihub.Client, workspaceRoot str
 			return
 		}
 
-		statuses := recentStatuses
-		if v := r.URL.Query().Get("status"); v != "" {
-			statuses = strings.Split(v, ",")
-		}
+		statuses := statusFilter(r, recentStatuses)
 		limit := pageSize(r, "limit", defaultRecentLimit, maxRecentLimit)
 
 		list, err := client.ListWorkItems(r.Context(), project, statuses, limit)

@@ -1,6 +1,6 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, fmtTokens, summarizeToolInput, summarizeToolResult, truncateResult, shouldSendOnEnter, growHeight, parseAtQuery, fuzzyRankFiles, shouldDeferFirstConnect, shouldReconnectAfterClose, shouldRefundAttemptBudget, transcriptTextLength, transcriptEdgeAction, TRANSCRIPT_EDGE_MIN_INTERVAL_MS, TRANSCRIPT_EDGE_PX, transcriptOverscrolled, TRANSCRIPT_OVERSCROLL_SLACK_PX, TRANSCRIPT_OVERSCROLL_TOUCH_PX, transcriptJumpVisible, TRANSCRIPT_JUMP_SCREENS, TRANSCRIPT_JUMP_LABEL, FATAL_CODE_MESSAGES, heldActivityLine, trailingArrivals, HELD_ACTIVITY_WORKING, HELD_ACTIVITY_IDLE, HELD_ACTIVITY_UNKNOWN, HELD_ACTIVITY_GONE } from './index'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import ChatPane, { AnswerBody, AnswerMeta, ThinkingBlock, ToolCallList, fmtThinkMs, fmtTokens, summarizeToolInput, summarizeToolResult, truncateResult, shouldSendOnEnter, growHeight, parseAtQuery, fuzzyRankFiles, shouldDeferFirstConnect, shouldReconnectAfterClose, shouldRefundAttemptBudget, transcriptTextLength, transcriptEdgeAction, TRANSCRIPT_EDGE_MIN_INTERVAL_MS, TRANSCRIPT_EDGE_PX, transcriptOverscrolled, TRANSCRIPT_OVERSCROLL_SLACK_PX, TRANSCRIPT_OVERSCROLL_TOUCH_PX, transcriptJumpVisible, TRANSCRIPT_JUMP_SCREENS, TRANSCRIPT_JUMP_LABEL, FATAL_CODE_MESSAGES, heldActivityLine, trailingArrivals, HELD_ACTIVITY_WORKING, HELD_ACTIVITY_IDLE, HELD_ACTIVITY_UNKNOWN, HELD_ACTIVITY_GONE } from './index'
 import { SESSION_ACTIVITY_HELD, SESSION_ACTIVITY_IDLE, SESSION_ACTIVITY_WORKING } from '../../lib/sessionActivity'
 import { PermissionQueue, postDecide } from '../../fenced-blocks/PermissionBlock'
 import {
@@ -9,10 +9,95 @@ import {
   ErrCodeSpawnFailed, ErrCodeConnectionClosed, ErrCodeSessionUnconfirmed, ErrCodeAgent,
   ErrCodePromptUndelivered,
 } from '../../lib/wire.gen'
+import { useStore } from '../../lib/store'
 import type { ToolCall, PermissionRequest } from '../../lib/store'
 
 // tether#34 — ThinkingBlock is exported and prop-controlled so it tests directly,
 // without mounting ChatPane (which opens a WebTransport connection on mount).
+//
+// That is still how everything down to the tether#114 block works, and it is still
+// the right default. The ONE exception is the tether#130 block at the bottom of this
+// file, which mounts the pane on purpose: what it pins is doConnect's own promise
+// chain, and there is no seam that reaches that without the component around it. It
+// pays for the mount with the module mock below rather than by weakening the rule —
+// no WebTransport is constructed there either.
+
+/**
+ * tether#130 — a stand-in for TetherWT whose connect() settles WHEN THE TEST SAYS SO.
+ *
+ * The bug this replaces the real class for lives entirely inside the window
+ * `wt.connect()` is awaiting in: two HTTP round trips to the local daemon (wt.ts's
+ * `Promise.all([fetchCertHash(), fetchWtTicket()])`). A test that tried to re-enter
+ * doConnect "while those are in flight" would be racing the harness; holding the
+ * handshake open by hand makes the ordering a property of the fixture instead. Same
+ * device, and the same reasoning, as lib/control.test.ts's `gate` (tether#128).
+ *
+ * Deliberately NOT modelling tether#128's post-close behaviour: `close()` here only
+ * counts, so `openBidiStream()` on a discarded transport still succeeds. That is the
+ * pre-#128 world, and it is the harsher one to defend against — it is where a
+ * superseded chain reached all the way to a live writer on a transport nobody owned.
+ * A guard that holds here holds in both.
+ */
+const wtFixture = vi.hoisted(() => {
+  /** A promise plus its two settlers, so a chain can be parked and then released. */
+  function gate() {
+    let open!: () => void
+    let fail!: (err: Error) => void
+    const promise = new Promise<void>((resolve, reject) => {
+      open = () => { resolve() }
+      fail = reject
+    })
+    return { promise, open, fail }
+  }
+
+  const instances: FakeWT[] = []
+
+  class FakeWT {
+    private readonly handshakeGate = gate()
+    /** How many times the pane asked THIS transport for a bidi stream. */
+    streamRequests = 0
+    /** How many times anybody closed it. */
+    closes = 0
+
+    constructor(readonly opts: unknown) { instances.push(this) }
+
+    connect(): Promise<void> { return this.handshakeGate.promise }
+
+    async openBidiStream(): Promise<unknown> {
+      this.streamRequests++
+      return {
+        writable: { getWriter: () => ({ write: () => Promise.resolve(), releaseLock: () => {} }) },
+        // Never yields an envelope; what the pane reads is not what these cases are about.
+        readable: { getReader: () => ({ read: () => new Promise<never>(() => {}) }) },
+      }
+    }
+
+    close(): void { this.closes++ }
+
+    /** The handshake completes. */
+    handshake(): void { this.handshakeGate.open() }
+    /**
+     * The handshake fails, i.e. the chain lands in doConnect's `.catch`.
+     *
+     * Rejecting connect() is the shortest way in. In production since tether#128 a
+     * superseded chain gets there one hop later — connect() resolves (wt.ts returns
+     * early once close() has landed) and `await wt.openBidiStream()` throws 'not
+     * connected' inside the async `.then`, which is the same `.catch`. This fixture
+     * takes the short way so the two arms can be exercised one at a time.
+     */
+    refuse(err: Error): void { this.handshakeGate.fail(err) }
+  }
+
+  return { instances, FakeWT }
+})
+
+vi.mock('../../lib/wt', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../lib/wt')>()
+  // Only the class ChatPane constructs is replaced. `createWT` — which ControlClient
+  // uses, and which fails harmlessly under jsdom because there is no WebTransport
+  // constructor — stays real, so this mock cannot change what the control lane does.
+  return { ...real, TetherWT: wtFixture.FakeWT as unknown as typeof real.TetherWT }
+})
 
 // vitest globals are off (matches Canvas.test.tsx), so register cleanup explicitly.
 afterEach(() => cleanup())
@@ -1126,5 +1211,183 @@ describe('transcriptJumpVisible (tether#114)', () => {
     // the entire accessible name — there is no visible text to fall back on. Pinned here so
     // the render tests can assert by identity rather than repeating a literal.
     expect(TRANSCRIPT_JUMP_LABEL).toBe('jump to the latest message')
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// tether#130 — a superseded connect chain must not speak for the connection that
+// replaced it.
+//
+// doConnect builds a TetherWT, publishes it to `wtRef.current`, and then hangs an
+// async `.then` and a `.catch` off `wt.connect()`. Neither of them asked whether that
+// `wt` was still the pane's transport by the time they ran, and re-entering doConnect
+// inside the handshake window is ordinary: a second retry click, a reconnect timer
+// firing at that moment, and — in dev — every single load, because <StrictMode> runs
+// the mount effect, its cleanup, and the mount effect again.
+//
+// `unmountedRef` is not this guard and cannot be: it answers "is the pane gone?", and
+// after StrictMode's mount→cleanup→mount it is false again, so the superseded chain
+// sails through `shouldReconnectAfterClose({ unmounted: false, fatal: false })`.
+// `firstConnectedRef` is not it either — it gates the MOUNT path only, and doConnect
+// sets it true itself.
+//
+// BOTH arms are covered here, and the reason is that they fail differently rather
+// than that symmetry is tidy. The `.then` arm writes global state (setConnected →
+// store `connection.state: 'live'`) before it ever touches the transport, so it lies
+// about being connected and then takes a writer; the `.catch` arm reports an error and
+// arms the reconnect ladder, whose timer then tears down the healthy connection. One
+// test would leave the other half green with nothing behind it.
+//
+// The mount is what makes these tests worth anything: the guard is one line inside a
+// promise chain that no exported function reaches, so extracting a predicate would
+// pin the `!==` and not the wiring — the repo's standing lesson, and the reason
+// tether#80's block exists in ChatPaneTranscript.test.tsx.
+const originalFetch = globalThis.fetch
+
+/** Both mount fetches (GET /api/v1/providers and GET /messages), modelled on the
+ *  transcript suite's stub. No WebTransport is involved: TetherWT is mocked. The
+ *  provider id is arbitrary — nothing downstream of chatURL reads it here, and
+ *  chatURL's output goes into the mocked transport's opts, which nothing asserts. */
+function stubChatFetch() {
+  return vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url)
+    const body = url.includes('/providers') ? { providers: ['cc'] } : []
+    return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  })
+}
+
+describe('a superseded connect chain never speaks for the one that replaced it (tether#130)', () => {
+  let consoleErrors: string[]
+  let consoleSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    localStorage.clear()
+    wtFixture.instances.length = 0
+    globalThis.fetch = stubChatFetch() as unknown as typeof fetch
+    useStore.setState({
+      messages: [], notices: [], pendingPermissions: [], fatal: null,
+      streaming: false, streamingMsgId: null, curTurnId: null,
+      sessionId: null, activeWorkspace: null,
+      // The harness's precondition for connecting AT ALL: with no remembered sid,
+      // `workspacesLoaded: false` would defer the first connect behind a store
+      // subscription and a 2s timer, and neither fires here — which is exactly how
+      // every other mounting test in this repo avoids a connection. These need the
+      // opposite, so the predicate is asserted rather than assumed.
+      workspacesLoaded: true,
+      connected: false,
+      connection: { state: 'connecting', latency: 0, attempt: 0 },
+    })
+    expect(localStorage.getItem('tether_last_sid')).toBeNull()
+    expect(shouldDeferFirstConnect({ hasLastSid: false, workspacesLoaded: true })).toBe(false)
+    // And nothing here may reach a real WebTransport, mock or no mock.
+    expect((globalThis as { WebTransport?: unknown }).WebTransport).toBeUndefined()
+
+    consoleErrors = []
+    consoleSpy = vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+      consoleErrors.push(args.map(String).join(' '))
+    })
+  })
+
+  afterEach(() => {
+    cleanup()
+    consoleSpy.mockRestore()
+    globalThis.fetch = originalFetch
+    useStore.setState({
+      messages: [], notices: [], sessionId: null, fatal: null, workspacesLoaded: false,
+      connected: false, connection: { state: 'connecting', latency: 0, attempt: 0 },
+    })
+    localStorage.clear()
+  })
+
+  /** Lets microtasks AND the timer queue drain, since the `.then` body awaits. */
+  const settle = () => act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)) })
+
+  const placeholderOf = (container: HTMLElement) =>
+    (container.querySelector('.composer-input') as HTMLTextAreaElement).placeholder
+
+  const connectFailures = () => consoleErrors.filter((l) => l.includes('chat connect failed'))
+
+  /**
+   * Mounts the pane and supersedes its first connect with a second one, leaving BOTH
+   * parked in their handshake. Every precondition the assertions rest on is checked
+   * here, so a harness that stopped reaching this state would fail loudly instead of
+   * turning the cases below into vacuous truths.
+   */
+  async function mountAndSupersede() {
+    const { container } = render(<ChatPane />)
+    expect(wtFixture.instances).toHaveLength(1)         // the pane connected on mount…
+    expect(placeholderOf(container)).toBe('connecting…') // …and is still shaking hands
+
+    // The re-entry, through the path the app really uses: the error banner, the
+    // catch-up modal and the WT pill all dispatch this event, and it lands on
+    // manualRetry → doConnect.
+    await act(async () => { window.dispatchEvent(new Event('tether:retry-connection')) })
+
+    expect(wtFixture.instances).toHaveLength(2)
+    const [superseded, live] = wtFixture.instances
+    // doConnect discarded the first transport on the way past — which is what makes
+    // `wtRef.current !== wt` answerable from inside the first chain.
+    expect(superseded.closes).toBe(1)
+    expect(live.closes).toBe(0)
+    // Neither chain has run yet, so nothing has been claimed.
+    expect(useStore.getState().connected).toBe(false)
+    expect(useStore.getState().connection.state).toBe('connecting')
+    return { container, superseded, live }
+  }
+
+  it('a superseded handshake that SUCCEEDS claims neither the app state nor a writer', async () => {
+    const { container, superseded, live } = await mountAndSupersede()
+
+    await act(async () => { superseded.handshake() })
+    await settle()
+
+    // The two global writes, which are the reason the guard cannot sit any lower in
+    // the `.then` body: reaching them at all means the app has already been told it
+    // is live on a transport doConnect threw away.
+    expect(useStore.getState().connected).toBe(false)
+    expect(useStore.getState().connection.state).toBe('connecting')
+    // The pane's own state, one line further down, and the one the user sees.
+    expect(placeholderOf(container)).toBe('connecting…')
+    // And it never got as far as asking the discarded transport for a stream — the
+    // step whose writer used to become the one every prompt was sent through.
+    expect(superseded.streamRequests).toBe(0)
+
+    // Positive control, and not optional: without it every assertion above also
+    // passes on a pane that never connects at all. The chain that IS current does
+    // all of the things the superseded one was just stopped from doing.
+    await act(async () => { live.handshake() })
+    await settle()
+    expect(useStore.getState().connected).toBe(true)
+    expect(useStore.getState().connection.state).toBe('live')
+    expect(live.streamRequests).toBe(1)
+    expect(placeholderOf(container)).toBe('message tether…')
+  })
+
+  it('a superseded handshake that FAILS reports nothing and arms no reconnect', async () => {
+    const { container, superseded, live } = await mountAndSupersede()
+
+    await act(async () => { superseded.refuse(new Error('not connected')) })
+    await settle()
+
+    // Nothing was said about it. Asserted on the log line rather than only on the
+    // ladder because the log is the FIRST statement in the `.catch` — a guard placed
+    // after it would keep the reconnect assertions below green while still filling
+    // the console a reader consults about the real connection with a failure that
+    // belongs to a transport nobody is waiting for.
+    expect(connectFailures()).toEqual([])
+    // And no ladder was started: this is the write that would put the pane into
+    // 'reconnecting' and arm a timer whose doConnect tears down the live transport.
+    expect(useStore.getState().connection.state).toBe('connecting')
+    expect(container.querySelectorAll('.reconnect-banner')).toHaveLength(0)
+    expect(placeholderOf(container)).toBe('connecting…')
+    expect(live.closes).toBe(0)
+
+    // Positive control: the CURRENT chain's failure is still reported in full, so
+    // these cases cannot pass by silencing the `.catch` outright.
+    await act(async () => { live.refuse(new Error('boom')) })
+    await settle()
+    expect(connectFailures()).toHaveLength(1)
+    expect(useStore.getState().connection.state).toBe('reconnecting')
+    expect(container.querySelectorAll('.reconnect-banner')).toHaveLength(1)
   })
 })

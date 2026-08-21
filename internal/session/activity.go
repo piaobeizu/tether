@@ -350,6 +350,44 @@ func activityRank(state string) int {
 // "tether is holding this, nothing running" for a few milliseconds is a far
 // cheaper wrong answer than reporting a live one as finished.
 //
+// # The other direction is reachable too, and it is NOT the same shape (tether#140)
+//
+// `false` for a sid whose turn IS running can happen. The entry window is narrow,
+// but unlike the corpse above the wrong answer then stands for the WHOLE of that
+// turn, and it is a claim rather than a shrug.
+//
+// It takes a provider that produces two end-of-turn signals for one delivery —
+// opencodeSession's run goroutine emits an EventError for a scan failure and then
+// its terminal EventResult — plus a prompt accepted between them. fanOut counted
+// the original delivery down on the error, so the result's endTurn counts the NEW
+// turn down instead, and this map reports that turn as idle until its own result
+// arrives (where endTurn's floor absorbs it). The floor guard keeps the counter
+// out of negative territory; it cannot keep a stale signal from consuming a turn
+// that has one.
+//
+// What BOUNDS the window is worth naming, because the obvious reading of it is
+// wrong in the dangerous direction. The gap between those two emits is not the
+// exposure: opencodeSession.SendPrompt CAS-gates on `busy`, and `defer
+// s.busy.Store(false)` is the run goroutine's FIRST defer, so it fires LAST —
+// after the terminal EventResult. A prompt arriving anywhere inside the run,
+// including across the cmd.Wait() that follows the scan-failure kill, is REFUSED
+// with its own EventError, which counts the speculative delivery straight back
+// down. Nothing is running and this map is right.
+//
+// The reachable window is the next one along, and it is small: `busy` clears once
+// the terminal result is IN the provider's 64-deep buffer, not once fanOut has
+// applied it. A prompt accepted between those two instants is the one whose turn
+// the stale result consumes. Microseconds to enter; the rest of that turn to live
+// with.
+//
+// Named rather than repaired here, and named for a reason beyond tidiness: the
+// counter belongs to registry.go, not to this reader. Today this map has exactly
+// one production consumer, States above; the second would be a reaper that treats
+// `false` as "safe to kill" (tether#139), and it has to know this answer has a
+// false-NEGATIVE shape at all — something no amount of polling can reveal,
+// because every reading inside the affected turn agrees. It is also, in a test
+// fixture, exactly what the tether#140 flake was.
+//
 // # Why the registry and not the entries themselves
 //
 // One RLock for the whole answer, and the copy is made inside it. Handing out

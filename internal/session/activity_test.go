@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/piaobeizu/tether/internal/agent"
+	"github.com/piaobeizu/tether/internal/wire"
 )
 
 // statusRecord is a live-registry record carrying an explicit status, which is
@@ -993,31 +994,198 @@ func TestEntryTurnFlag_AnErrorEndsTheTurnToo(t *testing.T) {
 // child for, and then its terminal EventResult. Two count-downs for one delivery.
 // The floor guard is what stops that leaving the counter negative, which would make
 // a LATER real turn read as idle.
+//
+// # Why the fixture paces the stream, and why the gate is an envelope (tether#140)
+//
+// This test was a flake. It failed once — at 9968aed, under `-race ./...`, on a
+// machine three agents were finishing work on — and then went green 24
+// consecutive times: single-test, whole package, whole repo, both sides of the PR
+// it was suspected of, and with all 12 cores saturated. So rerunning it could
+// not settle anything, and the interleaving was STAGED instead. Staged, the
+// original failure line reproduces 8 runs out of 8, with and without -race.
+//
+// The defect was in this test, and its own assertion message named a cause that
+// cannot happen. At the moment of the staged failure the count reads 0, not -1,
+// with both prompts delivered — endTurn's CAS loop returns on `n <= 0` and has no
+// path to a negative value. The only other way to read 0 one statement after a
+// successful Add(1) is that a decrement ran in between, and the pending
+// EventResult is the only candidate: the old gate was `waitForTurnCount(e, 0)`,
+// which the ERROR's decrement ALONE already satisfies (1→0), so the result's was
+// still queued when the test walked on to deliver the next prompt. A few
+// microseconds of scheduling delay in the wrong place then loses the race.
+//
+// On the question the wi left open — which SHARED resource the loaded machine
+// supplied — the answer is none. No port, directory or global state is involved:
+// the window is unconditional in this test's own structure, and load only has to
+// stretch it. That is not the same as saying load was irrelevant (an
+// oversubscribed machine takes a thread off-core between two adjacent statements,
+// which is exactly the stretch needed); it is saying twelve saturated cores
+// happened not to hit it in twelve attempts, and that no second component is
+// required to explain the failure. It is also the only test in this file that
+// ever had two end-of-turn signals outstanding at once — every other one has at
+// most one unaccounted-for when it next asserts — which is why only this one
+// flaked.
+//
+// The gate is now the result's own broadcast envelope, and the count CANNOT serve
+// as one: the floor guard makes the second signal a no-op, so `count == 0` is
+// true both before and after it, and an assertion that holds in both states is
+// not a gate. pacedSession then makes the bad interleaving certain rather than
+// rare. To see the original flake, REPLACE the gate with the old
+// `waitForTurnCount(t, e, 0, ...)` — red 8/8, at the LiveTurns assertion, with
+// the message this test used to carry. Merely deleting the gate is red too but
+// for a duller reason: the count is still 1 because nothing has been applied yet.
 func TestEntryTurnFlag_ErrorThenResultDoesNotUnderflow(t *testing.T) {
-	fs := &fakeSession{sid: "sid-err-then-result", events: make(chan agent.Event, 8)}
-	reg := NewRegistry(&fakeProvider{sess: fs})
-	e, err := reg.GetOrSpawnEntry(context.Background(), "sid-err-then-result", "fake")
+	const sid = "sid-err-then-result"
+	fs := newPacedSession(sid)
+	reg := NewRegistry(&pacedProvider{sess: fs})
+	e, err := reg.GetOrSpawnEntry(context.Background(), sid, "fake")
 	if err != nil {
 		t.Fatalf("GetOrSpawnEntry: %v", err)
 	}
 	fs.announceInit()
-	waitForRegistered(t, reg, "sid-err-then-result")
+	waitForRegistered(t, reg, sid)
+
+	// Subscribed before the prompt, so the turn's own envelopes cannot be missed.
+	sub := make(chan wire.Envelope, 64)
+	e.Subscribe(sub)
 
 	if err := e.sendPrompt(context.Background(), "go"); err != nil {
 		t.Fatalf("sendPrompt: %v", err)
 	}
 	fs.events <- agent.Event{Kind: agent.EventError, Err: errors.New("run: stdout scan: boom")}
 	fs.events <- agent.Event{Kind: agent.EventResult, Text: "stop"}
-	waitForTurnCount(t, e, 0, "one delivery, two end-of-turn signals")
+
+	// Both signals applied — see awaitResultEnvelope for why this and not the count.
+	awaitResultEnvelope(t, sub)
+
+	// A literal 0, and this is the assertion the floor guard answers to: with
+	// endTurn as a plain Add(-1) it reads -1 (verified). It does NOT distinguish
+	// which of the two signals did the counting — neuter fanOut's EventError arm
+	// and this still passes; TestEntryTurnFlag_AnErrorEndsTheTurnToo is what
+	// covers that.
+	if got := e.turnsInFlight.Load(); got != 0 {
+		t.Fatalf("after one delivery and two end-of-turn signals the outstanding-turn count is %d, want 0", got)
+	}
 
 	// The next real turn must still register. Without the floor guard the counter
 	// would be at -1 here and this delivery would read as "nothing running".
 	if err := e.sendPrompt(context.Background(), "again"); err != nil {
 		t.Fatalf("sendPrompt: %v", err)
 	}
-	if got := reg.LiveTurns()["sid-err-then-result"]; !got {
-		t.Fatal("a later real turn reported nothing in flight — the counter went negative on the doubled end-of-turn and never came back")
+	if got := reg.LiveTurns()[sid]; !got {
+		t.Fatal("a later real turn reported nothing in flight — the counter did not come back from the doubled end-of-turn")
 	}
+}
+
+// awaitResultEnvelope waits for the turn-ending envelope on a subscribed channel.
+// Bounded.
+//
+// It is the happens-after the counter cannot provide. fanOut is ONE goroutine
+// consuming the agent's event channel in order, and its EventResult branch calls
+// endTurn strictly before it broadcasts KindResult — so this envelope arriving
+// proves that result's decrement has been applied, and with it every earlier
+// event's. Polling the count instead can only observe the state the FIRST of two
+// end-of-turn signals already produces.
+//
+// The exclusion, because this helper is package-level and its name does not carry
+// it: fanOut has a SECOND KindResult site, the end-of-stream `if sawInit` block,
+// and that one broadcasts WITHOUT an endTurn. A caller whose fixture closes the
+// agent's event channel can therefore be released by an envelope that decremented
+// nothing — a green from the wrong envelope. Callers must keep the stream open,
+// as the test below does.
+//
+// A generous deadline on purpose: with the gate in place the test's outcome does
+// not depend on how long fanOut takes, only on waiting for it, and a blown
+// deadline should be reported as "fanOut never got there" rather than as the
+// stale-signal bug it is not.
+func awaitResultEnvelope(t *testing.T, sub <-chan wire.Envelope) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case env := <-sub:
+			if env.Kind == wire.KindResult {
+				return
+			}
+		case <-deadline:
+			t.Fatal("the turn's KindResult envelope never arrived, so the test cannot tell whether fanOut has applied the result's end-of-turn")
+		}
+	}
+}
+
+// pacedSession is fakeSession with two deliberately widened windows. It exists so
+// that the gate in TestEntryTurnFlag_ErrorThenResultDoesNotUnderflow is
+// DEMONSTRABLY load-bearing rather than asserted to be.
+//
+// The interleaving that flake needs is: a stale end-of-turn signal applied inside
+// the next delivery's `Add(1)` … "is a turn in flight?" window. On a plain fake
+// that window is microseconds wide, which is how the defect survived 24
+// consecutive green reproductions. Two knobs make the loss certain:
+//
+//   - pacedEventDelay holds each event before fanOut can RECEIVE it — fanOut
+//     being behind on the stream. The stale result therefore arrives after the
+//     count has already been observed at zero.
+//   - pacedSendDelay parks inside Entry.sendPrompt, between its Add(1) and the
+//     caller's next statement. That is exactly the stretch the loaded machine
+//     descheduled.
+//
+// Timed, which is the weaker of this package's two staging idioms —
+// fakeSession.aliveHold blocks on a channel and its doc says why that is
+// airtight. Sound here because the timing is load-bearing for the FAILING
+// direction only: with the gate in place the test waits on a real happens-after
+// and its outcome does not depend on these delays at all. A machine that stalls
+// past the margins costs the mutation detection, never a green run's honesty.
+type pacedSession struct {
+	*fakeSession
+	out chan agent.Event
+}
+
+const (
+	// The stale result reaches fanOut one pacedEventDelay after the error does,
+	// i.e. a quarter of the way into the window pacedSendDelay opens. Both
+	// margins are orders of magnitude above the scheduling delay the flake needed,
+	// and the whole test still costs well under half a second.
+	pacedEventDelay = 20 * time.Millisecond
+	pacedSendDelay  = 80 * time.Millisecond
+)
+
+func newPacedSession(sid string) *pacedSession {
+	s := &pacedSession{
+		fakeSession: &fakeSession{sid: sid, events: make(chan agent.Event, 8)},
+		out:         make(chan agent.Event, 8),
+	}
+	// In order, one delay each, and `out` closes when the inner channel does — so
+	// a test that ends the stream still reaches fanOut's teardown.
+	go func() {
+		defer close(s.out)
+		for ev := range s.fakeSession.events {
+			time.Sleep(pacedEventDelay)
+			s.out <- ev
+		}
+	}()
+	return s
+}
+
+func (s *pacedSession) Events() <-chan agent.Event { return s.out }
+
+func (s *pacedSession) SendPrompt(ctx context.Context, text string) error {
+	time.Sleep(pacedSendDelay)
+	return s.fakeSession.SendPrompt(ctx, text)
+}
+
+// pacedProvider hands the registry a pacedSession.
+//
+// fakeProvider cannot: its field is typed *fakeSession, so handing it the wrapper
+// does not compile, and the shape that DOES compile —
+// `&fakeProvider{sess: fs.fakeSession}` — quietly delivers the inner fake and
+// none of the pacing above happens: a fixture that looks staged and is not.
+// Widening that field to agent.Session instead would break the callers that reach
+// through it for the fake's own helpers (attach_test.go's fp.sess.announceInit).
+type pacedProvider struct{ sess agent.Session }
+
+func (p *pacedProvider) Name() string { return "fake" }
+func (p *pacedProvider) Spawn(_ context.Context, _ agent.SpawnConfig) (agent.Session, error) {
+	return p.sess, nil
 }
 
 // TestActivity_DoesNotOverrideACCRecordThatSaysBusy.

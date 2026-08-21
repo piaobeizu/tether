@@ -2946,3 +2946,125 @@ describe('store pendingPermissions across a history refetch (tether#132)', () =>
     expect(useStore.getState().pendingPermissions).toHaveLength(0)
   })
 })
+
+// ============================================================================
+// tether#137 — a request the daemon has taken back must stop being offered.
+//
+// The failure this closes is NOT a missing prompt. tether#134 measured that the
+// request survives its agent in every respect that matters: the gate process is a
+// grandchild and is never in the kill scope, the Manager and its timeout are
+// daemon-side, and the backfill re-delivers the request to whatever attaches
+// next. What does not survive is the CONSUMER of the decision — the gate's exit
+// code, read by the agent that spawned it. So the card was present, clickable,
+// and answering it reached the gate and then nothing. This branch is how the
+// daemon un-says it.
+// ============================================================================
+
+const withdrawEnv = (...ids: string[]): Envelope =>
+  ({ kind: 'message', payload: { type: 'permissions_withdrawn', ids } } as unknown as Envelope)
+
+describe('withdrawn permission requests stop being answerable (tether#137)', () => {
+  afterEach(() => {
+    reset()
+    useStore.setState({ sessionId: null })
+  })
+
+  it('drops the withdrawn request and says so once', () => {
+    useStore.getState().setSessionId('sid-A')
+    useStore.getState().handleEnvelope(permEnvFor('sid-A', 'req-dead'))
+    expect(useStore.getState().pendingPermissions.map((p) => p.id)).toEqual(['req-dead'])
+
+    useStore.getState().handleEnvelope(withdrawEnv('req-dead'))
+
+    const s = useStore.getState()
+    expect(s.pendingPermissions).toHaveLength(0)
+    // Not silent. Removing a card the reader was looking at without a word is the
+    // failure tether#124 wrote up in the other direction, and the wording has to
+    // survive the same test: it says the agent has ended, which is measured, and
+    // promises nothing about a reconnect restoring anything.
+    expect(s.notices).toHaveLength(1)
+    expect(s.notices[0].kind).toBe('permission_withdrawn')
+    expect(s.notices[0].text).toContain('can no longer be answered')
+  })
+
+  it('leaves a request that was not withdrawn alone', () => {
+    useStore.getState().setSessionId('sid-A')
+    useStore.getState().handleEnvelope(permEnvFor('sid-A', 'req-dead'))
+    useStore.getState().handleEnvelope(permEnvFor('sid-A', 'req-live'))
+
+    useStore.getState().handleEnvelope(withdrawEnv('req-dead'))
+
+    // The other direction of the core assertion, at this layer: a withdrawal is
+    // per-request, so the surviving card is still on the queue and still
+    // answerable. An implementation that cleared the queue would pass the first
+    // case and fail this one.
+    expect(useStore.getState().pendingPermissions.map((p) => p.id)).toEqual(['req-live'])
+  })
+
+  // The withdrawal is announced with BroadcastAll, so every connected client sees
+  // it whether or not it holds the card — a tab attached to another session, or
+  // the freshly reloaded tab whose backfill already excluded the request. Saying
+  // "a tool request can no longer be answered" to a reader who never saw one is
+  // noise at best and a puzzle at worst.
+  //
+  // NOT a pre-fix gate, and labelled so rather than left to be discovered: on the
+  // unmodified store this branch does not exist, so "nothing happened" is trivially
+  // true and this case passes. What it gates is the `removed.length === 0` guard
+  // INSIDE the new branch — checked by removing that line, which turns this red and
+  // leaves every other case in the block green. The block's pre-fix gates are the
+  // two cases above and the batch case below.
+  it('says nothing to a client that never had the card', () => {
+    useStore.getState().setSessionId('sid-A')
+    useStore.getState().handleEnvelope(permEnvFor('sid-A', 'req-mine'))
+
+    useStore.getState().handleEnvelope(withdrawEnv('req-someone-elses'))
+
+    const s = useStore.getState()
+    expect(s.pendingPermissions.map((p) => p.id)).toEqual(['req-mine'])
+    expect(s.notices).toHaveLength(0)
+  })
+
+  // A parallel-tool batch (tether#40) is withdrawn as one envelope, and one line
+  // is what a reader needs — but the count is information, so it is reported.
+  it('reports a whole batch on one line', () => {
+    useStore.getState().setSessionId('sid-A')
+    for (const id of ['r1', 'r2', 'r3']) {
+      useStore.getState().handleEnvelope(permEnvFor('sid-A', id))
+    }
+
+    useStore.getState().handleEnvelope(withdrawEnv('r1', 'r2', 'r3'))
+
+    const s = useStore.getState()
+    expect(s.pendingPermissions).toHaveLength(0)
+    expect(s.notices).toHaveLength(1)
+    expect(s.notices[0].text).toContain('3 tool requests')
+  })
+
+  // An envelope with no ids is inert rather than a no-op that still speaks. Also
+  // not a pre-fix gate, for the same reason as the case above — and it gates the
+  // same guard from the other side: without `removed.length === 0` an ids-less
+  // payload produces a "0 tool requests" line out of nowhere.
+  it('ignores an empty withdrawal', () => {
+    useStore.getState().setSessionId('sid-A')
+    useStore.getState().handleEnvelope(permEnvFor('sid-A', 'req-mine'))
+
+    useStore.getState().handleEnvelope(withdrawEnv())
+
+    expect(useStore.getState().pendingPermissions).toHaveLength(1)
+    expect(useStore.getState().notices).toHaveLength(0)
+  })
+
+  // The `stopped` gate (tether#42) sits between the session-lifecycle branches and
+  // the turn-content ones, and this is lifecycle: a user who pressed Stop and then
+  // lost the agent still has a dead card on screen, and it still has to go.
+  it('applies after a manual stop', () => {
+    useStore.getState().setSessionId('sid-A')
+    useStore.getState().handleEnvelope(permEnvFor('sid-A', 'req-dead'))
+    useStore.getState().stopTurn()
+    expect(useStore.getState().stopped).toBe(true)
+
+    useStore.getState().handleEnvelope(withdrawEnv('req-dead'))
+
+    expect(useStore.getState().pendingPermissions).toHaveLength(0)
+  })
+})

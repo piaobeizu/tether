@@ -2093,3 +2093,195 @@ func TestBackfill_IsInertWithoutAWiredSource(t *testing.T) {
 		t.Fatalf("an empty backfill queued %d envelopes, want 0", got)
 	}
 }
+
+// ============================================================================
+// tether#137 — a session whose agent is gone stops offering its pending
+// permission requests. Registry.WithdrawPending is the seam; teardown is the
+// only caller, and WHEN it is called is the whole safety argument.
+// ============================================================================
+
+// withdrawSpy records the sids teardown reported, under a mutex because the call
+// happens on the session's own fanOut goroutine.
+type withdrawSpy struct {
+	mu   sync.Mutex
+	sids []string
+}
+
+func (w *withdrawSpy) hook() func(string) {
+	return func(sid string) {
+		w.mu.Lock()
+		w.sids = append(w.sids, sid)
+		w.mu.Unlock()
+	}
+}
+
+func (w *withdrawSpy) seen() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.sids...)
+}
+
+// waitForWithdrawn polls until the spy has been called n times, bounded.
+func waitForWithdrawn(t *testing.T, w *withdrawSpy, n int) {
+	t.Helper()
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(w.seen()) >= n {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("WithdrawPending was called %v, want %d call(s)", w.seen(), n)
+}
+
+// TestTeardown_WithdrawsThePendingRequestsOfTheEndedSession — the affirmative
+// direction of tether#137's core assertion, taken at the seam teardown owns.
+//
+// Driven by CLOSING Events(), which is the one signal that means the agent is
+// really gone, and it is closed by hand rather than by racing a disconnect: the
+// point is not how fast the reap is (tether#134 §2.4 measured that at anywhere
+// between 0.03s and ~43s) but that the withdrawal hangs off the reap and not off
+// the disconnect.
+func TestTeardown_WithdrawsThePendingRequestsOfTheEndedSession(t *testing.T) {
+	fs := &fakeSession{sid: "sid-withdraw", events: make(chan agent.Event, 8)}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+	spy := &withdrawSpy{}
+	reg.WithdrawPending = spy.hook()
+
+	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	fs.events <- agent.Event{Kind: agent.EventInit, SessionID: "sid-withdraw"}
+	waitForRegistered(t, reg, "sid-withdraw")
+
+	// A live session's requests are still worth answering, so nothing may have been
+	// withdrawn yet. Without this the test would also pass on an implementation
+	// that withdrew at spawn time.
+	if got := spy.seen(); len(got) != 0 {
+		t.Fatalf("WithdrawPending was called %v while the session was LIVE", got)
+	}
+
+	close(fs.events)
+	waitForEvicted(t, reg, "sid-withdraw")
+	waitForWithdrawn(t, spy, 1)
+
+	if got := spy.seen(); len(got) != 1 || got[0] != "sid-withdraw" {
+		t.Fatalf("WithdrawPending calls = %v, want exactly [sid-withdraw]", got)
+	}
+}
+
+// TestTeardown_DoesNotWithdrawFromASessionWhoseAgentIsStillAlive — the other
+// direction, and the one the spec singles out as this change's own failure mode
+// (§5-F, "misfire mode").
+//
+// tether#134 §2.4 measured an accidental grace period of 0 to ~43 seconds: a
+// reconnect that lands inside it ADOPTS the live Entry (§2.3 connection 3 — no
+// new pid, `SessionID resolved` logged before the prompt) and the turn keeps
+// running. A withdrawal driven from the client going away instead of from the
+// reap would take away a prompt that was still answerable in exactly that
+// window, and the user would watch a card vanish for a tool call that is still
+// waiting for it.
+//
+// So this drives the whole disconnect-and-adopt sequence on one live entry —
+// subscriber leaves, subscriber count reaches zero, a new subscriber attaches to
+// the SAME entry — and asserts nothing was withdrawn at any point. The positive
+// control at the end is what stops that from being vacuous: the identical hook
+// does fire once the agent's Events() really closes.
+func TestTeardown_DoesNotWithdrawFromASessionWhoseAgentIsStillAlive(t *testing.T) {
+	fs := &fakeSession{sid: "sid-adopted", events: make(chan agent.Event, 8)}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+	spy := &withdrawSpy{}
+	reg.WithdrawPending = spy.hook()
+
+	e, err := reg.GetOrSpawnEntry(context.Background(), "", "fake")
+	if err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	fs.events <- agent.Event{Kind: agent.EventInit, SessionID: "sid-adopted"}
+	waitForRegistered(t, reg, "sid-adopted")
+
+	// The connection that raised the request.
+	first := make(chan wire.Envelope, 32)
+	e.Subscribe(first)
+
+	// It goes away — a reload, or a phone that lost signal. This is the moment a
+	// naive implementation would call "the session ended".
+	e.Unsubscribe(first)
+	e.subsMu.RLock()
+	subs := len(e.subs)
+	e.subsMu.RUnlock()
+	if subs != 0 {
+		t.Fatalf("fixture: %d subscribers left, want 0 — the disconnect is not staged", subs)
+	}
+	if got := spy.seen(); len(got) != 0 {
+		t.Fatalf("WithdrawPending was called %v when the last CLIENT left; the agent "+
+			"is still alive and its requests are still answerable", got)
+	}
+
+	// The reconnect lands inside the window and adopts the live entry: same *Entry,
+	// no respawn. Asserted, because "adoption happened" is the premise of the whole
+	// case.
+	if got := entryFor(reg, "sid-adopted"); got != e {
+		t.Fatalf("fixture: the sid no longer resolves to the live entry (%p vs %p)", got, e)
+	}
+	second := make(chan wire.Envelope, 32)
+	e.Subscribe(second)
+	if got := spy.seen(); len(got) != 0 {
+		t.Fatalf("WithdrawPending was called %v after the reconnect adopted a LIVE agent", got)
+	}
+
+	// The turn that survived can still be answered, which is what "still
+	// answerable" means in practice.
+	fs.events <- agent.Event{Kind: agent.EventText, Text: "still answering"}
+	waitForEnvelope(t, second)
+
+	// Positive control. Every assertion above also holds for a hook that is wired
+	// to nothing, so prove the same hook does fire on the signal that means the
+	// agent is really gone.
+	close(fs.events)
+	waitForEvicted(t, reg, "sid-adopted")
+	waitForWithdrawn(t, spy, 1)
+	if got := spy.seen(); len(got) != 1 || got[0] != "sid-adopted" {
+		t.Fatalf("WithdrawPending calls after the agent died = %v, want [sid-adopted]", got)
+	}
+}
+
+// TestTeardown_WithdrawIsInertWithoutAWiredHook — every daemon before tether#137
+// and every fixture in this file that does not set the field. Cheap, and it is
+// what would catch a teardown that dereferenced the hook unconditionally.
+func TestTeardown_WithdrawIsInertWithoutAWiredHook(t *testing.T) {
+	fs := &fakeSession{sid: "sid-unwired", events: make(chan agent.Event, 8)}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+
+	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	fs.events <- agent.Event{Kind: agent.EventInit, SessionID: "sid-unwired"}
+	waitForRegistered(t, reg, "sid-unwired")
+
+	close(fs.events)
+	waitForEvicted(t, reg, "sid-unwired")
+}
+
+// entryFor is a test-only lookup of the entry registered under sid, so a case can
+// assert that a reconnect ADOPTED a live entry rather than that some entry exists.
+// A plain function and not a method, like regLen above: the production type's
+// method set is not the place for a fixture's convenience.
+func entryFor(reg *Registry, sid string) *Entry {
+	reg.mu.RLock()
+	defer reg.mu.RUnlock()
+	return reg.sessions[sid]
+}
+
+// waitForEnvelope polls until ch holds at least one envelope, bounded.
+func waitForEnvelope(t *testing.T, ch chan wire.Envelope) {
+	t.Helper()
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(ch) > 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("the adopting subscriber received nothing from the still-live session")
+}

@@ -165,6 +165,32 @@ type Registry struct {
 	// above: buildMux sets it before the listener accepts anything, so no session
 	// exists to read it concurrently.
 	PendingBackfill func() []wire.Envelope
+	// WithdrawPending is PendingBackfill's opposite number (tether#137): it is
+	// told the sid of a session that has just ENDED, so that the permission
+	// requests which belonged to it stop being offered as answerable.
+	//
+	// Called from teardown and nowhere else, which is what makes it safe. A
+	// permission request outlives its agent by design — the gate is a grandchild
+	// and survives, the Manager and its timeout are daemon-side, and the backfill
+	// re-delivers the request to whatever attaches next (tether#134 §2.5, §2.6).
+	// What does NOT outlive the agent is the only consumer of the decision: the
+	// gate's exit code, read by the agent that spawned it. So after the agent is
+	// reaped the prompt is present, answerable and inert, and this is where the
+	// daemon stops pretending otherwise. teardown is the one place that knows a
+	// session ended, runs exactly once for it, and — crucially — runs only after
+	// Events() has closed, i.e. strictly after the agent is really gone; a
+	// withdrawal driven from the disconnect instead would fire inside the 0–43s
+	// window tether#134 §2.4 measured, in which a reconnect adopts a LIVE agent
+	// and the prompt is still worth answering.
+	//
+	// nil = withdraw nothing, which is every daemon before tether#137 and every
+	// test that does not set it. Wired in internal/server/mux.go alongside
+	// PendingBackfill, because the withdrawal has to reach permission.Manager
+	// (which this package deliberately does not import) and then be announced as
+	// an envelope built next to the other permission envelope builders.
+	//
+	// Written once at startup, like PendingBackfill above.
+	WithdrawPending func(sid string)
 }
 
 // hadConversation reports whether ANY store this daemon can see holds a
@@ -1566,6 +1592,19 @@ func (r *Registry) teardown(e *Entry) {
 	// reconnect, and it must not queue behind a Wait on a child that is slow to
 	// die. The reap has no such urgency — nothing observes it but the OS.
 	r.evict(e)
+
+	// tether#137 — and for the same reason as the eviction above, BEFORE the Wait:
+	// a request nobody can usefully answer any more should stop being offered as
+	// soon as the session is off the map, not once a child that is slow to die has
+	// been harvested. The evidence that the agent is gone is already in hand at
+	// this point and does not improve after Close: reaching here means Events()
+	// closed and drained, which teardown's own os/exec argument above spells out as
+	// the LATER and stronger of the two available signals. See
+	// Registry.WithdrawPending for what is withdrawn and why teardown is the only
+	// place it can be done without taking away a prompt that was still answerable.
+	if r.WithdrawPending != nil && sid != "" {
+		r.WithdrawPending(sid)
+	}
 
 	// A non-nil error here is the normal case, not an alarm: the overwhelmingly
 	// common teardown is a client disconnect, which cancels the Spawn ctx, which

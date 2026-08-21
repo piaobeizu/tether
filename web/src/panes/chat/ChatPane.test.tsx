@@ -1391,3 +1391,123 @@ describe('a superseded connect chain never speaks for the one that replaced it (
     expect(container.querySelectorAll('.reconnect-banner')).toHaveLength(1)
   })
 })
+
+// ============================================================================
+// tether#137 — the end-to-end shape of "stop offering a dead session's requests".
+//
+// The two blocks above test the queue component in isolation and the reducer is
+// tested in lib/store.test.ts; neither of those answers the question the wi
+// actually asks, which is whether the BUTTON is still there. index.tsx renders
+// PermissionQueue from `pendingPermissions` and wires its onDecide to
+// postDecide + resolvePermission, and that wiring is the thing that turns a
+// store entry into something a user can click. So this mounts the pane.
+//
+// It pins BOTH directions on purpose. A change that emptied the queue on any
+// withdrawal would satisfy "the dead one is gone" and quietly take the live one
+// with it, which is the regression the spec's §2.7 boundary is about one layer
+// down.
+// ============================================================================
+
+describe('a withdrawn permission request is no longer clickable (tether#137)', () => {
+  beforeEach(() => {
+    localStorage.clear()
+    wtFixture.instances.length = 0
+    globalThis.fetch = stubChatFetch() as unknown as typeof fetch
+    useStore.setState({
+      messages: [], notices: [], pendingPermissions: [], fatal: null,
+      streaming: false, streamingMsgId: null, curTurnId: null,
+      sessionId: null, activeWorkspace: null,
+      // Deliberately the OPPOSITE of the tether#130 block: with no remembered sid
+      // and workspaces not loaded, shouldDeferFirstConnect parks the first connect
+      // behind a store subscription and a 2s timer that never fires here, so the
+      // pane mounts without opening a transport. Asserted below, because a pane
+      // that connected would put this suite's fixtures in the same room as a
+      // reconnect ladder.
+      workspacesLoaded: false,
+      connected: false,
+      connection: { state: 'connecting', latency: 0, attempt: 0 },
+    })
+    expect(shouldDeferFirstConnect({ hasLastSid: false, workspacesLoaded: false })).toBe(true)
+  })
+
+  afterEach(() => {
+    cleanup()
+    globalThis.fetch = originalFetch
+    useStore.setState({
+      messages: [], notices: [], pendingPermissions: [], sessionId: null,
+      workspacesLoaded: false, connected: false,
+      connection: { state: 'connecting', latency: 0, attempt: 0 },
+    })
+    localStorage.clear()
+  })
+
+  const permEnv = (id: string): unknown =>
+    ({ kind: 'permission', sessionId: 'sid-A', payload: { id, toolName: 'Bash', input: { command: 'go test' } } })
+
+  const withdrawEnv = (...ids: string[]): unknown =>
+    ({ kind: 'message', payload: { type: 'permissions_withdrawn', ids } })
+
+  /** Mounts the pane with two live cards on screen, and proves they are clickable
+   *  before anything is withdrawn — otherwise "the button is gone" is a claim
+   *  about a button that was never rendered. */
+  async function mountWithTwoCards() {
+    const { container } = render(<ChatPane />)
+    expect(wtFixture.instances).toHaveLength(0) // no transport, as arranged above
+
+    await act(async () => {
+      useStore.getState().setSessionId('sid-A')
+      useStore.getState().handleEnvelope(permEnv('req-dead') as never)
+      useStore.getState().handleEnvelope(permEnv('req-live') as never)
+    })
+
+    expect(container.querySelectorAll('.perm-block')).toHaveLength(2)
+    expect(container.querySelectorAll('.perm-btn-allow')).toHaveLength(3) // 2 cards + Approve all
+    return container
+  }
+
+  it('the dead session\'s card loses its Allow button; the live one keeps it', async () => {
+    const container = await mountWithTwoCards()
+
+    await act(async () => {
+      useStore.getState().handleEnvelope(withdrawEnv('req-dead') as never)
+    })
+
+    // One card left, and it is the one that was not withdrawn. A single card drops
+    // the bulk toolbar (PermissionQueue only shows it above one), hence 1 Allow.
+    expect(container.querySelectorAll('.perm-block')).toHaveLength(1)
+    expect(container.querySelectorAll('.perm-btn-allow')).toHaveLength(1)
+    expect(useStore.getState().pendingPermissions.map((p) => p.id)).toEqual(['req-live'])
+
+    // And the surviving button really is live, not merely present: clicking it
+    // still POSTs a decision. This is what makes "the live one keeps it" a claim
+    // about the wiring rather than about the DOM.
+    const fetchSpy = globalThis.fetch as unknown as ReturnType<typeof vi.fn>
+    const before = fetchSpy.mock.calls.length
+    fireEvent.click(container.querySelector('.perm-btn-allow') as HTMLElement)
+    const posted = fetchSpy.mock.calls.slice(before).map((c) => String(c[0]))
+    expect(posted.some((u) => u.includes('/permission/req-live/decide'))).toBe(true)
+  })
+
+  it('the removal is explained rather than silent', async () => {
+    const container = await mountWithTwoCards()
+
+    await act(async () => {
+      useStore.getState().handleEnvelope(withdrawEnv('req-dead') as never)
+    })
+
+    // Reaching the reader's eyes, not just the store: mergeTranscript projects the
+    // notice into the transcript, and this asserts the sentence is rendered.
+    expect(container.textContent).toContain('can no longer be answered')
+  })
+
+  it('withdrawing every card removes the queue entirely', async () => {
+    const container = await mountWithTwoCards()
+
+    await act(async () => {
+      useStore.getState().handleEnvelope(withdrawEnv('req-dead', 'req-live') as never)
+    })
+
+    expect(container.querySelectorAll('.perm-queue')).toHaveLength(0)
+    expect(container.querySelectorAll('.perm-btn-allow')).toHaveLength(0)
+  })
+})

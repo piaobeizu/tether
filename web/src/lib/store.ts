@@ -333,8 +333,14 @@ export interface Notice {
    *  unrelated test files (session.test.ts, WorkspacePane.test.tsx, …) to be
    *  rewritten for a type-hygiene change, and none of those cases care which
    *  class they hold. An absent kind means exactly "no class-specific rule
-   *  applies", which is the correct reading for a bare fixture. */
-  kind?: 'agent_error' | 'prompt_undelivered' | 'session'
+   *  applies", which is the correct reading for a bare fixture.
+   *
+   *  'permission_withdrawn' (tether#137) has the prompt_undelivered policy and
+   *  for the same reason: each line stands for a distinct tool request the user
+   *  can no longer answer, so collapsing two of them would under-report a loss.
+   *  It is NOT a 'session' line, because the tether#50 collapse compares against
+   *  the last banner and these are not banners. */
+  kind?: 'agent_error' | 'prompt_undelivered' | 'session' | 'permission_withdrawn'
   /** How many arrivals this one line stands for (tether#80) — see
    *  appendAgentErrorNotice for why the count is information rather than
    *  decoration. Absent on a line that has not repeated; mergeTranscript only
@@ -1481,6 +1487,54 @@ export const useStore = create<AppState>((set, get) => ({
                 }
               })
             }
+            break
+          }
+          if (pObj['type'] === 'permissions_withdrawn') {
+            // tether#137 — the daemon has taken these requests back, because the
+            // agent whose gate subprocess was the only reader of the decision has
+            // been reaped (internal/session/registry.go teardown ->
+            // Registry.WithdrawPending). Until this branch existed the card stayed
+            // on screen and stayed clickable: the POST succeeded, the gate really
+            // did receive `allow:true` and exit 0, and nothing whatsoever acted on
+            // it (tether#134 §2.5). An answerable prompt for a tool call that
+            // cannot exist is worse than no prompt — see the "a notice a user has
+            // caught lying" argument in internal/server/wt_chat.go.
+            //
+            // Matched on id alone. The envelope carries no sid on purpose (see
+            // permissionsWithdrawnEnvelope in internal/server/mux.go: serveChat
+            // would overwrite it with the RECEIVING connection's sid), and it does
+            // not need one — ids are unique daemon-wide, and BroadcastAll sends
+            // this to every client because the backfill means a card for one
+            // session can be on screen in a tab attached to another.
+            const raw = pObj['ids']
+            const ids = Array.isArray(raw) ? raw.filter((v): v is string => typeof v === 'string') : []
+            set((s) => {
+              const removed = s.pendingPermissions.filter((p) => ids.includes(p.id))
+              // Nothing to say to a client that never had the card. This is the
+              // ordinary case for the reload that motivated the whole change: the
+              // withdrawal happens in teardown, which for a graceful close is
+              // typically over long before the new page has finished connecting,
+              // so the backfill the fresh tab receives simply no longer contains
+              // the request and there is no card to explain. Announcing a removal
+              // to a reader who never saw the thing removed is noise, and it is
+              // also how a daemon-wide broadcast would put a line in every
+              // unrelated tab.
+              if (removed.length === 0) return {}
+              // Removed, not greyed out. The card is rendered by
+              // fenced-blocks/PermissionBlock from a PermissionRequest, and a
+              // disabled state there would be a second, weaker answer to "is this
+              // answerable" living next to the queue's membership — the same
+              // duplicate-rule argument permission.Manager.Pending makes for not
+              // re-testing expiry. So the queue is the single answer, and the
+              // notice is what stops the removal from being silent.
+              const text = removed.length === 1
+                ? 'A tool request can no longer be answered — the agent that asked for it has ended.'
+                : `${removed.length} tool requests can no longer be answered — the agent that asked for them has ended.`
+              return {
+                pendingPermissions: s.pendingPermissions.filter((p) => !ids.includes(p.id)),
+                notices: [...s.notices, { id: crypto.randomUUID(), text, ts: Date.now(), kind: 'permission_withdrawn' as const }],
+              }
+            })
             break
           }
           // After a manual stop (tether#42), cc may still flush a few buffered

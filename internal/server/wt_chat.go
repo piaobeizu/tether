@@ -336,42 +336,65 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 	// attachment (not the Entry) additionally re-registers subCh if a failed
 	// resume swaps the Entry underneath us.
 	//
-	// KNOWN, NOT FIXED — found by tether#119 and left to tether#124, because
-	// every candidate remedy is outside this file. The 32 is a drop threshold,
-	// not a queue depth: Registry.broadcast's producer is
-	// `select { case ch <- env: default: slog.Warn("slow subscriber, envelope
-	// dropped") }`, so a full channel loses envelopes rather than blocking.
-	// Filling it is ordinary, not adversarial — cc runs with
+	// The 32 is a DROP THRESHOLD, not a queue depth, and it still is after
+	// tether#124 — what that wi changed is that the drop is no longer silent.
+	//
+	// # The mechanism (tether#119, unchanged)
+	//
+	// Registry.broadcast does not block on a full subscriber channel; it must not,
+	// or one slow browser would stall the whole session's fanOut. Filling this
+	// channel is ordinary rather than adversarial: cc runs with
 	// --include-partial-messages, so KindMessage envelopes are token-level
 	// increments, and sendEnvelope opens a fresh unidirectional stream per
-	// envelope. A browser that stalls for a moment (a long transcript
-	// re-rendering, a throttled background tab, a slow mobile link) exhausts its
-	// peer's uni-stream credit, OpenUniStreamSync blocks, this function's loop
-	// below stops draining, and the increments after the 32nd are dropped. The
-	// user sees an answer with a hole in it; the only record is one server-side
-	// slog.Warn.
+	// envelope. A browser that stalls for a moment (a long transcript re-rendering,
+	// a throttled background tab, a slow mobile link) exhausts its peer's
+	// uni-stream credit, OpenUniStreamSync blocks, this function's loop below stops
+	// draining, and the increments after the 32nd are dropped.
 	//
-	// What IS true and narrows the fix, verified rather than assumed:
-	// Registry.emitSegments writes every segment to HistoryStore
-	// (AccumulateAssistant / AppendBlock) BEFORE calling broadcast, so a dropped
-	// envelope loses the LIVE rendering only — the full answer is on disk and a
-	// history refetch repairs it. This is not data loss, it is a view that has
-	// silently diverged from a transcript that is intact.
+	// # What is lost is the RENDERING, not the text
 	//
-	// Three remedies were weighed and none belongs in this change:
-	//   - Raise the 32. Moves the threshold without removing it, and there is no
-	//     measurement of how deep is deep enough, so the number would be as
-	//     arbitrary as the one it replaced.
+	// Verified rather than assumed, and still true at the time of writing:
+	// Registry.fanOut's emitSegments writes every segment to HistoryStore
+	// (AccumulateAssistant / AppendBlock) BEFORE calling broadcast. So a dropped
+	// envelope costs this tab's live view and nothing else — the full answer is on
+	// disk. This is not data loss, it is a view that has diverged from a transcript
+	// that is intact.
+	//
+	// # What tether#124 did
+	//
+	// Made the divergence VISIBLE, at the one place that knows it happened:
+	// Registry's Entry.deliver counts what it drops per subscriber and, as soon as
+	// this channel has room again, puts a notice in front of the next envelope
+	// telling the reader part of the answer did not reach the tab and a reload will
+	// show all of it. The trigger is the damage itself, so it needs no threshold
+	// and cannot fire on a healthy connection. See gapNoticeText for the whole
+	// argument, including why the notice says "reload".
+	//
+	// # What it did NOT do, and why — read this before raising the 32
+	//
+	// The candidate that wi was opened to pursue was a deadline on
+	// OpenUniStreamSync, so that a wedged browser is disconnected and its reconnect
+	// repairs the transcript from history. Its premise is FALSE as the frontend
+	// stands: the reconnect lands on the same sid (cc --resume keeps its id),
+	// session_ready calls setSessionId with an unchanged value, and the
+	// `[sessionId]` effect in web/src/panes/chat/index.tsx that owns the refetch is
+	// keyed on exactly that value — so nothing refetches. Every other refetch path
+	// in that pane is gated on readingHeldSession, which a live chat is not. A
+	// deadline today would therefore trade a rendering gap for a rendering gap plus
+	// a dropped connection, and it would still need a slow-link measurement to
+	// pick, with too short a value meaning spurious reconnects mid-answer on mobile
+	// — this product's primary case. It becomes worth doing only after the frontend
+	// refetches on reconnect, and it is that change, not the number, that is the
+	// prerequisite.
+	//
+	// The other two, weighed and still declined:
+	//   - Raise the 32. Moves the threshold without removing it, and there is
+	//     still no measurement of how deep is deep enough, so the number would be
+	//     as arbitrary as the one it replaced.
 	//   - Drain subCh into an unbounded local queue. Would stop the drop, and
 	//     trades a bounded per-connection rendering gap for unbounded daemon
-	//     memory growth under exactly the condition that triggers it.
-	//   - Give OpenUniStreamSync a deadline so a wedged browser is disconnected
-	//     and its reconnect repairs the transcript from history. This is the
-	//     promising one — it reuses machinery that already exists and the
-	//     paragraph above is why it works — but picking the deadline needs a
-	//     measurement against a real slow link, and too short a value means
-	//     spurious reconnects mid-answer on mobile, which is this product's
-	//     primary case.
+	//     memory growth under exactly the condition that triggers it. The owner's
+	//     daemon runs all day; that trade is worse.
 	subCh := make(chan wire.Envelope, 32)
 	att.Subscribe(subCh)
 	defer att.Unsubscribe(subCh)
@@ -656,9 +679,12 @@ func errorEnvelope(err error) wire.Envelope {
 //
 // OpenUniStreamSync BLOCKS when the peer has no stream credit left, and this is
 // called from serveChat's own loop, so a stalled browser stalls that loop and
-// costs the connection every envelope that arrives while it is stopped. See the
-// subCh declaration in serveChat for the whole mechanism, why it is a rendering
-// gap rather than lost text, and why it is tether#124 and not this change.
+// costs the connection every envelope that arrives while it is stopped. That is
+// still true; what changed in tether#124 is that those envelopes no longer go
+// missing in silence — the subscriber channel's producer marks the gap and the
+// reader is told (Registry's Entry.deliver and gapNoticeText). See the subCh
+// declaration in serveChat for the whole mechanism, and for why giving this call
+// a deadline is blocked on a frontend change rather than on a number.
 func sendEnvelope(wtsess *webtransport.Session, env wire.Envelope) {
 	stream, err := wtsess.OpenUniStreamSync(wtsess.Context())
 	if err != nil {

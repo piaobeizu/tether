@@ -102,15 +102,17 @@ type Config struct {
 
 	// PermGate is the ONE answer to "how is a cc subprocess this daemon spawns
 	// wired to the PreToolUse permission gate", decided by setupPermGate during
-	// startup step 3 and consumed by every cc spawn path.
+	// startup step 3.
 	//
-	// It exists as a field rather than a local because there is more than one
-	// spawn path — the chat path (session.Registry) and the shell path
-	// (buildPTYEnv) — and a gate decision made twice is a gate decision that can
-	// disagree with itself. The interesting case is not the happy one: a sentinel
-	// injected on one path and forgotten on the other fails OPEN precisely in the
-	// branch it was added to close (tether#117 A4b; the shell path is wired in
-	// tether#149).
+	// NO CONSUMER YET. Both spawn paths — the chat path in session.Registry and
+	// the shell path in buildPTYEnv — still read Registry.PermEndpoint, which
+	// Run() fills from PermGate.Endpoint below. tether#149 owns those two files
+	// and switches them to PermGate.Env(), which is what finally puts the
+	// TETHER_DAEMON_MANAGED mark on a real subprocess. This field exists now so
+	// that change has one value to consume instead of two decisions to
+	// re-derive: a mark applied on one path and forgotten on the other fails
+	// OPEN precisely in the branch it was added to close, and no test inside
+	// either package's own scope can see that.
 	//
 	// Zero value (unmanaged, no endpoint) is the correct state for
 	// TETHER_NO_PERMISSION_HOOK=1: it injects nothing, which leaves the hook's
@@ -246,8 +248,12 @@ func Run(cfg *Config) error {
 		return err
 	}
 	cfg.PermGate = gate
-	// The chat spawn path still reads this single string; tether#149 replaces
-	// both spawn paths with cfg.PermGate.Env() so the shell path is covered too.
+	// This one string is what BOTH spawn paths read today — chat via
+	// Registry.PermEndpoint directly, shell via buildPTYEnv(reg.PermEndpoint) on
+	// this same Registry. So making it unconditional is the whole of the A4b fix
+	// that is live in production: neither path can now be left without an
+	// endpoint because a settings-file write failed. tether#149 moves both onto
+	// cfg.PermGate.Env(), which additionally applies the mark.
 	cfg.Registry.PermEndpoint = gate.Endpoint
 
 	// Step 3b: MCP host + loopback (v0.3.1).
@@ -556,8 +562,12 @@ func Run(cfg *Config) error {
 // sessionAuthFor adapts the auth middleware's cookie verifier into the predicate
 // oauth.Handlers uses to gate the consent POST (tether#117 A1).
 // ClientIDFromRequest returns "" for a cookie that is missing, malformed,
-// expired, or carries the wrong subject, so this is exactly the verification the
-// middleware performs — the second lock on the token mint, not a looser one.
+// expired, or carrying the wrong subject — so this is at least as strict as the
+// middleware, which is the direction that matters for a second lock on a token
+// mint. Not identical: the middleware accepts a valid token whose jti is empty
+// and this refuses it. Nothing issues such a token (VerifyHandler generates a
+// random clientID when the client omits one), and if anything ever did, the
+// consent page is the last place that should be the first to trust it.
 //
 // A named function rather than a closure written inline at the call site, so the
 // wiring is a thing a test can hold: TestOAuthMintChain_* drives the real mux

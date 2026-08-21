@@ -26,15 +26,24 @@ const (
 )
 
 // Gate describes how a cc subprocess the daemon spawns is wired to the
-// PreToolUse permission gate. Build it ONCE at startup (server.Run does, into
-// Config.PermGate) and hand the same value to every cc spawn path, so no path
+// PreToolUse permission gate. Build it ONCE at startup — server.Run does, into
+// Config.PermGate — and hand that one value to every cc spawn path, so no path
 // can invent its own answer.
 //
-// That is not hypothetical tidiness: the endpoint reaches the hook through the
-// environment, and there are TWO places that build that environment — the chat
-// path in session.Registry and the shell path in server.buildPTYEnv. A sentinel
-// added to one and forgotten in the other fails open in exactly the branch it
-// was added to close.
+// NOT YET CONSUMED IN PRODUCTION. Env() has no non-test caller today, and
+// TETHER_DAEMON_MANAGED therefore never reaches a real subprocess: the mark is
+// available, not yet applied. tether#149 owns the two files that build a cc
+// child's environment (session/registry.go for chat, server/wt_shell.go for the
+// shell) and switches both to Env(). Until it lands, what closes A4b in
+// production is that the daemon now always reports its endpoint (see
+// server.setupPermGate) — the hook's deny branch below is a guard waiting to be
+// wired, so do not read it as an active defence.
+//
+// That the value is shared rather than recomputed is not hypothetical tidiness.
+// The endpoint reaches the hook through the environment, and TWO places build
+// that environment. A mark added to one and forgotten in the other fails open
+// in exactly the branch it was added to close, and no test inside either
+// package's own scope can see that.
 type Gate struct {
 	// Managed is true when this daemon owns the cc's permission gate. False
 	// leaves the child completely unmarked, which is what keeps the owner's own

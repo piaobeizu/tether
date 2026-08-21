@@ -90,14 +90,21 @@ func authorizeGetReqID(t *testing.T, mux http.Handler, challenge string) string 
 	return rest[:strings.Index(rest, `"`)]
 }
 
-func consentPost(reqID string, cookie string) *http.Request {
+// consentPost builds step 2. origin selects the shape of the caller: "" is the
+// curl shape (no Origin header at all, which is how the attack arrives and the
+// reason WithOriginGuard never stopped it — that guard only rejects an Origin
+// that is present AND disallowed), and a non-empty origin is the browser shape,
+// which the real consent form sends and which therefore has to clear
+// originAllowed as well as the cookie check.
+func consentPost(reqID, cookie, origin string) *http.Request {
 	form := url.Values{"req_id": {reqID}, "action": {"allow"}}
 	req := httptest.NewRequest("POST", "/oauth/authorize", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	// A remote peer, as on a --acme-domain deployment. No Origin header, so
-	// WithOriginGuard passes it through — that guard only rejects an Origin that
-	// is present and disallowed, which is why it never stopped this attack.
+	// A remote peer, as on a --acme-domain deployment.
 	req.RemoteAddr = "203.0.113.7:44444"
+	if origin != "" {
+		req.Header.Set("Origin", origin)
+	}
 	if cookie != "" {
 		req.AddCookie(&http.Cookie{Name: auth.CookieName, Value: cookie})
 	}
@@ -116,7 +123,7 @@ func TestOAuthMintChain_NoCredentials_YieldsNoToken(t *testing.T) {
 	// code sitting in the Location header, which is why the redirect_uri above
 	// never had to be reachable.
 	rr := httptest.NewRecorder()
-	mux.ServeHTTP(rr, consentPost(reqID, ""))
+	mux.ServeHTTP(rr, consentPost(reqID, "", ""))
 
 	loc := rr.Header().Get("Location")
 	if strings.Contains(loc, "code=") {
@@ -161,7 +168,9 @@ func TestOAuthMintChain_WithSession_StillIssuesAToken(t *testing.T) {
 	reqID := authorizeGetReqID(t, mux, s256(verifier))
 
 	rr := httptest.NewRecorder()
-	mux.ServeHTTP(rr, consentPost(reqID, cookie))
+	// The browser shape: the real consent form is served from this daemon, so it
+	// sends an Origin, and the request must clear WithOriginGuard too.
+	mux.ServeHTTP(rr, consentPost(reqID, cookie, "https://127.0.0.1:8899"))
 	if rr.Code != http.StatusFound {
 		t.Fatalf("consent POST from a signed-in browser: want 302, got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -232,7 +241,7 @@ func TestOAuthMintChain_WTTicketCookie_YieldsNoToken(t *testing.T) {
 	reqID := authorizeGetReqID(t, mux, s256(verifier))
 
 	rr := httptest.NewRecorder()
-	mux.ServeHTTP(rr, consentPost(reqID, ticket))
+	mux.ServeHTTP(rr, consentPost(reqID, ticket, "https://127.0.0.1:8899"))
 	if strings.Contains(rr.Header().Get("Location"), "code=") {
 		t.Fatalf("a wt-ticket in the session cookie minted a code: %s", rr.Header().Get("Location"))
 	}

@@ -33,6 +33,64 @@ describe('safeRedirectTarget (tether#117 A3)', () => {
     expect(new URL(got, ORIGIN).origin).toBe(ORIGIN)
   })
 
+  // `url.origin === location.origin` is necessary but not sufficient, and these
+  // are the inputs that prove it. Every one parses to OUR origin while leaving
+  // `url.pathname` protocol-relative, because `..` segments collapse — so a
+  // guard that returned `url.pathname` unchanged handed back `//evil.example`
+  // and the navigation left the site. Found by review, not by the corpus above,
+  // which is the point: the suite's strongest assertion
+  // (`got.startsWith('//') === false`) was never handed an input that could
+  // violate it.
+  it.each([
+    ['dot-dot collapsing into a double slash', '/..//evil.example'],
+    ['dot-dot with a path and query', '/..//evil.example/steal?t=1'],
+    ['single-dot then backslash', '/./\\evil.example'],
+    ['deeper dot-dot climb', '/a/../..//evil.example'],
+    ['absolute same-origin URL with a double-slash path', 'https://tether.example//evil.example'],
+    ['protocol-relative to our own host, then off-host', '//tether.example//evil.example'],
+    ['absolute same-origin URL with double backslash', 'https://tether.example\\\\evil.example'],
+    ['many leading slashes after a climb', '/..////evil.example'],
+  ])('rejects %s (same origin, off-origin pathname)', (_label, raw) => {
+    const got = safeRedirectTarget(raw, ORIGIN)
+    expect(new URL(got, ORIGIN).origin).toBe(ORIGIN)
+    expect(got.startsWith('//')).toBe(false)
+  })
+
+  // A generated corpus, so the trigger set is not a hand-picked list that
+  // happens to miss the next parser quirk. The assertion is the only thing that
+  // actually matters: whatever is returned, resolved by the same parser the
+  // browser uses, must stay on this origin.
+  it('never escapes the origin, over a generated cross-product', () => {
+    const prefixes = ['', '/', '//', '/..', '/../', '/..//', '/.', '/./', '/a/../..', '\\', '/\\', '/\t', '/\n', '////']
+    const middles = ['', '/', 'evil.example', '/evil.example', '//evil.example', 'tether.example//evil.example']
+    const suffixes = ['', '/steal', '?t=1', '#f', '/steal?t=1#f']
+    const schemes = ['', 'https://tether.example', 'https://evil.example', 'javascript:', 'data:text/html,']
+    let checked = 0
+    for (const s of schemes) {
+      for (const p of prefixes) {
+        for (const m of middles) {
+          for (const suf of suffixes) {
+            const raw = s + p + m + suf
+            const got = safeRedirectTarget(raw, ORIGIN)
+            checked++
+            // One assertion, stated as the property rather than as an expected
+            // value: it holds for every input, so a new quirk cannot slip past
+            // by not being in a list.
+            if (new URL(got, ORIGIN).origin !== ORIGIN || got.startsWith('//')) {
+              throw new Error(
+                `safeRedirectTarget(${JSON.stringify(raw)}) = ${JSON.stringify(got)} escapes ${ORIGIN}`,
+              )
+            }
+          }
+        }
+      }
+    }
+    // Guard the guard: if the loops ever stop generating, the test must not
+    // quietly become a no-op that passes.
+    expect(checked).toBe(schemes.length * prefixes.length * middles.length * suffixes.length)
+    expect(checked).toBeGreaterThan(1000)
+  })
+
   it('rejects an absolute URL to another origin', () => {
     expect(safeRedirectTarget('https://evil.example/x', ORIGIN)).toBe('/')
     expect(safeRedirectTarget('http://tether.example/x', ORIGIN)).toBe('/') // scheme downgrade
@@ -57,6 +115,14 @@ describe('safeRedirectTarget (tether#117 A3)', () => {
       '////evil.example',
       '/%2F%2Fevil.example',
       '\\\\evil.example',
+      '/..//evil.example',
+      // A blob URL of OUR origin: url.origin matches and url.pathname is the
+      // whole inner URL, "https://tether.example/x". Navigating there would not
+      // leave the origin, so it is not an escape — but it is not a path either,
+      // and "the return value is always a same-origin path" is the invariant
+      // this function documents. The post-condition is what makes that true
+      // rather than nearly true.
+      'blob:https://tether.example/x',
     ]
     for (const raw of inputs) {
       const got = safeRedirectTarget(raw, ORIGIN)

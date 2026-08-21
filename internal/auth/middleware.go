@@ -196,12 +196,19 @@ func (s *State) isExempt(r *http.Request) bool {
 		// internet because TLS-ALPN-01 requires it) three curl requests with no
 		// credentials at all turned into a 24h Bearer token in the same
 		// api-tokens store as a hand-issued one. GET renders the consent page
-		// and mints nothing, so it stays exempt: the MCP client opens this URL
-		// in the owner's browser and the browser may not have the cookie yet.
-		// Any other method falls through to the cookie check below, which is
-		// what makes consent come from an authenticated browser. oauth.Handlers
-		// carries the same check as its own second lock, so re-wiring the mux
-		// cannot re-open the mint.
+		// and mints nothing, so it stays exempt. Any other method falls through
+		// to the cookie check below, which is what makes consent come from an
+		// authenticated browser. oauth.Handlers carries the same check as its own
+		// second lock, so re-wiring the mux cannot re-open the mint.
+		//
+		// Keeping GET exempt does NOT mean a cookie-less browser can complete
+		// the flow: it renders the page, the owner clicks Allow, and the POST
+		// gets the 302 to /auth below — which carries no ?redirect=, so they
+		// land on / and the MCP client has to start over. That is a real
+		// dead-end, and the reason it is left here rather than papered over is
+		// that closing it is a UX decision (redirect back to the consent page,
+		// or tell the user to sign in first) and not a security one. Tracked
+		// separately; do not "fix" it by widening this exemption.
 		p == "/oauth/authorize" && r.Method == http.MethodGet,
 		// POST /oauth/token authenticates itself: the caller must present a
 		// single-use code AND the PKCE verifier for the challenge bound to it.

@@ -17,21 +17,38 @@ import { useState } from 'react'
  *
  * So the check is not "does this string look relative" but "where does this
  * actually resolve to", answered by the same parser the browser will use for the
- * navigation. Returning the parsed path rather than `raw` is part of the guard:
- * whatever comes back cannot carry an origin.
+ * navigation.
+ *
+ * `url.origin === origin` is necessary but NOT sufficient, which is the trap the
+ * first attempt at this fix fell into: `url.pathname` is not guaranteed to be a
+ * same-origin path. `..` segments collapse during parsing, so
+ * `/..//evil.example` yields origin=<ours> with pathname=`//evil.example` — and
+ * THAT string, assigned to location.href, is protocol-relative and leaves the
+ * site. `/./\evil.example` and `https://<our-host>//evil.example` do the same.
+ *
+ * So this validates and otherwise bails, rather than trying to repair the input.
+ * The guard has been wrong twice by being clever about transforming a string;
+ * every branch below is a refusal, and `/` is always a safe answer. The
+ * property — that no input can produce an off-origin return value — is asserted
+ * over a generated corpus in AuthPage.test.tsx rather than argued here.
  */
 export function safeRedirectTarget(raw: string | null, origin: string): string {
   if (!raw) return '/'
-  let url: URL
   try {
-    url = new URL(raw, origin)
+    const url = new URL(raw, origin)
+    // Covers off-origin hosts, scheme changes, and opaque schemes such as
+    // javascript: and data:, whose origin is the string "null".
+    if (url.origin !== origin) return '/'
+    const target = url.pathname + url.search + url.hash
+    // A path that does not start with a slash is not a path at all (a same-origin
+    // blob: URL puts its whole inner URL in pathname); one that starts with two
+    // is an authority. Anything else cannot be re-read as an origin, and neither
+    // a query nor a fragment can introduce one after a path has begun.
+    if (!target.startsWith('/') || target.startsWith('//')) return '/'
+    return target
   } catch {
     return '/'
   }
-  // Covers off-origin hosts, scheme changes, and opaque schemes such as
-  // javascript: and data:, whose origin is the string "null".
-  if (url.origin !== origin) return '/'
-  return url.pathname + url.search + url.hash
 }
 
 export default function AuthPage() {

@@ -1058,11 +1058,18 @@ func TestEntryTurnFlag_ErrorThenResultDoesNotUnderflow(t *testing.T) {
 	// Both signals applied — see awaitResultEnvelope for why this and not the count.
 	awaitResultEnvelope(t, sub)
 
-	// A literal 0, and this is the assertion the floor guard answers to: with
-	// endTurn as a plain Add(-1) it reads -1 (verified). It does NOT distinguish
-	// which of the two signals did the counting — neuter fanOut's EventError arm
-	// and this still passes; TestEntryTurnFlag_AnErrorEndsTheTurnToo is what
-	// covers that.
+	// A literal 0. This USED to be the assertion the floor guard answered to —
+	// with endTurn as a plain Add(-1) it read -1, and that was verified at the
+	// time — and tether#145 took that away rather than broke it: fanOut now refuses
+	// the second of the two signals, so only one decrement reaches endTurn here and
+	// the mutant no longer goes negative in this fixture. The floor is pinned by
+	// TestEntryTurnFlag_TheFloorAbsorbsASignalWithNoDeliveryBehindIt instead, which
+	// was written for exactly that reason; what this literal still pins is that the
+	// two signals net out to one settlement rather than none.
+	//
+	// It does NOT distinguish which of the two signals did the counting — neuter
+	// fanOut's EventError arm and this still passes;
+	// TestEntryTurnFlag_AnErrorEndsTheTurnToo is what covers that.
 	if got := e.turnsInFlight.Load(); got != 0 {
 		t.Fatalf("after one delivery and two end-of-turn signals the outstanding-turn count is %d, want 0", got)
 	}
@@ -1074,6 +1081,282 @@ func TestEntryTurnFlag_ErrorThenResultDoesNotUnderflow(t *testing.T) {
 	}
 	if got := reg.LiveTurns()[sid]; !got {
 		t.Fatal("a later real turn reported nothing in flight — the counter did not come back from the doubled end-of-turn")
+	}
+}
+
+// TestEntryTurnFlag_AStaleResultDoesNotConsumeTheNextTurn is tether#145 — the
+// OTHER direction of the same doubled end-of-turn the test above stages, and the
+// one that is a positive claim to a user rather than a bookkeeping curiosity.
+//
+// The test above proves the counter does not go NEGATIVE when one delivery
+// produces two end-of-turn signals. This one proves the second signal does not
+// count down a turn that BELONGS TO SOMEBODY ELSE. The floor guard cannot answer
+// this: it only refuses to go below zero, and here the count it decrements is a
+// legitimate 1.
+//
+// # The interleaving, and why every step of it is a real one
+//
+// opencodeSession's run goroutine emits an EventError for a scan failure and then
+// its terminal EventResult — two signals, one delivery. The exposure window is
+// NOT the gap between those two emits: SendPrompt CAS-gates on `busy` and
+// `defer s.busy.Store(false)` is that goroutine's FIRST defer, so it fires last,
+// and a prompt arriving inside the run is refused with its own EventError that
+// counts the speculative delivery straight back down. The reachable window is the
+// next one along — `busy` clears once the terminal result is in the provider's
+// 64-deep buffer, not once fanOut has APPLIED it, so a prompt accepted between
+// those two instants is the one whose turn the stale result consumes.
+//
+// pacedSession stages exactly that, and both of its knobs are load-bearing here:
+// pacedEventDelay keeps the queued result in flight while the next delivery is
+// accepted, and pacedSendDelay parks inside the provider write for four times as
+// long, so Entry.sendPrompt's Add(1) has landed and the stale result lands on top
+// of it. Without the pacing this is a microseconds-wide race — which is precisely
+// how it reached production.
+//
+// # What it does NOT cover, said here so the name is not read as a universal
+//
+// The wait for the error's envelope is not incidental: this stages the interleaving
+// in which fanOut had ALREADY applied the first signal when the next delivery
+// landed. Drop that wait and the test still fails — for the other interleaving,
+// which the fix does not close and provably cannot from this package. runSettled's
+// doc enumerates all three shapes and carries the demonstration.
+//
+// # What is asserted, and why not the count
+//
+// LiveTurns, because that is what a user sees: activity.go's States maps `true`
+// to SessionActivityWorking and `false` to something weaker, so a working session
+// renders `idle` for the WHOLE of the stolen turn — every poll inside it agrees,
+// which is why no amount of watching finds it.
+//
+// The gate is the stale result's own broadcast envelope and the ERROR's own
+// envelope before it, never a count: fanOut applies each signal strictly before
+// it broadcasts, so an envelope proves its decrement has landed, while a count
+// read cannot distinguish "the second signal has not arrived yet" (count 1, the
+// same value a correct implementation ends on) from "it arrived and was refused".
+// An assertion that holds in both states is not a gate — the lesson tether#140
+// left in the test above.
+func TestEntryTurnFlag_AStaleResultDoesNotConsumeTheNextTurn(t *testing.T) {
+	const sid = "sid-stale-steals01"
+	fs := newPacedSession(sid)
+	reg := NewRegistry(&pacedProvider{sess: fs})
+	e, err := reg.GetOrSpawnEntry(context.Background(), sid, "fake")
+	if err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	fs.announceInit()
+	waitForRegistered(t, reg, sid)
+
+	// Subscribed before the prompt, so neither of the turn's envelopes can be
+	// missed.
+	sub := make(chan wire.Envelope, 64)
+	e.Subscribe(sub)
+
+	// Delivery one.
+	if err := e.sendPrompt(context.Background(), "first"); err != nil {
+		t.Fatalf("sendPrompt: %v", err)
+	}
+
+	// The run's FIRST end-of-turn signal, and the wait is what makes this the
+	// tether#145 interleaving rather than tether#140's: the error must be APPLIED
+	// before the next delivery, or the two signals simply cancel the two
+	// deliveries and nothing is stolen.
+	fs.events <- agent.Event{Kind: agent.EventError, Err: errors.New("opencode run: stdout scan: boom")}
+	awaitErrorEnvelope(t, sub, "stdout scan")
+
+	// The same run's SECOND end-of-turn signal. Queued now and held by
+	// pacedEventDelay, so it is in flight — the provider's buffer, in production —
+	// across the delivery below.
+	fs.events <- agent.Event{Kind: agent.EventResult, Text: "stop"}
+
+	// Delivery two, accepted inside that window. This is a REAL turn: the agent
+	// has the prompt and will answer it with a result of its own.
+	if err := e.sendPrompt(context.Background(), "second"); err != nil {
+		t.Fatalf("sendPrompt: %v", err)
+	}
+
+	// The stale result has now been applied — see awaitResultEnvelope.
+	awaitResultEnvelope(t, sub)
+
+	if got := reg.LiveTurns()[sid]; !got {
+		t.Fatalf("LiveTurns()[%q] = false while the second delivery's turn is running (outstanding count %d, want 1). "+
+			"The first delivery's SECOND end-of-turn signal counted down the SECOND delivery's turn: the floor guard "+
+			"only refuses to go below zero, and 1 is not below zero. activity.go's States maps this to %q instead of %q, "+
+			"so the row claims nothing is running for the whole of a turn the user is waiting on.",
+			sid, e.turnsInFlight.Load(), SessionActivityIdle, SessionActivityWorking)
+	}
+
+	// And the real turn still ends when its own result arrives — a fix that
+	// simply stopped counting results down would satisfy the assertion above and
+	// leave the marker stuck on forever, which is the failure this whole slice
+	// exists to prevent.
+	fs.events <- agent.Event{Kind: agent.EventResult, Text: "stop"}
+	waitForTurnFlag(t, reg, sid, false,
+		"the second delivery's own result did not end its turn")
+}
+
+// TestEntryTurnFlag_ARefusedDeliverysErrorDoesNotMuteALiveRunsResult pins the one
+// condition that keeps tether#145's duplicate guard from reintroducing the very
+// bug tether#103's error arm was added to fix.
+//
+// The guard arms only when the error's decrement left NOTHING outstanding, and
+// that qualifier is the whole design rather than caution. An EventError is not
+// always a run's second end-of-turn signal: opencode reports a REFUSED prompt the
+// same way — SendPrompt's `busy` CAS emits its own EventError and returns nil —
+// and that error arrives in the middle of a live run, belonging to a delivery of
+// its own that Entry.sendPrompt has already counted up. Two turns are then
+// outstanding, the error ends one of them, and the run's terminal result still has
+// the other to end.
+//
+// "Then", not "always": a refusal implies a live run whose turn is still counted,
+// so the ordinary case is what this test drives — but if that run's own duplicate
+// error has already zeroed the count, a refusal landing in the run goroutine's
+// defer window does arm the flag. That corner is the residual runSettled's doc
+// names, not something this test can also cover, and saying so here keeps the
+// premise from reading as a universal it is not.
+//
+// Arm on every error instead and that result becomes a no-op: the count sits one
+// high with nothing running, and because opencode deliberately keeps the session
+// ALIVE after a busy refusal, Events() never closes and teardown never resets it —
+// the row reads "working" until the daemon restarts. That is the frozen marker
+// TestEntryTurnFlag_AnErrorEndsTheTurnToo exists for, arrived at from the
+// opposite side, and nothing else in this package would catch it.
+func TestEntryTurnFlag_ARefusedDeliverysErrorDoesNotMuteALiveRunsResult(t *testing.T) {
+	const sid = "sid-refused-plus-run"
+	fs := &fakeSession{sid: sid, events: make(chan agent.Event, 8)}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+	e, err := reg.GetOrSpawnEntry(context.Background(), sid, "fake")
+	if err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	fs.announceInit()
+	waitForRegistered(t, reg, sid)
+
+	sub := make(chan wire.Envelope, 64)
+	e.Subscribe(sub)
+
+	// The delivery the agent is actually running, and the one it refused. Both go
+	// through sendPrompt, so both are counted — the refusal is reported by event,
+	// not by a returned error (opencodeSession.SendPrompt returns nil for it).
+	for i, text := range []string{"running", "refused"} {
+		if err := e.sendPrompt(context.Background(), text); err != nil {
+			t.Fatalf("sendPrompt %d: %v", i, err)
+		}
+	}
+	if got := e.turnsInFlight.Load(); got != 2 {
+		t.Fatalf("outstanding turns after two deliveries = %d, want 2", got)
+	}
+
+	// The refusal, then the live run's terminal result. fanOut consumes one
+	// channel in order, so the error is applied first by construction.
+	fs.events <- agent.Event{Kind: agent.EventError, Err: errors.New("busy: another prompt is running")}
+	fs.events <- agent.Event{Kind: agent.EventResult, Text: "stop"}
+	awaitResultEnvelope(t, sub)
+
+	if got := e.turnsInFlight.Load(); got != 0 {
+		t.Fatalf("after a refusal and the live run's result the outstanding-turn count is %d, want 0 — the result was muted as if it were the refusal's twin, and nothing will lower it again on a session opencode keeps alive", got)
+	}
+	if got := reg.LiveTurns()[sid]; got {
+		t.Fatal("both deliveries are accounted for but the row still reports a turn in flight; on a session that survives its error there is no teardown coming to reset it")
+	}
+}
+
+// TestEntryTurnFlag_TheFloorAbsorbsASignalWithNoDeliveryBehindIt pins endTurn's
+// floor guard on its own, and it exists because tether#145 took away the only
+// test that was doing that.
+//
+// The floor was pinned INCIDENTALLY, by the doubled end-of-turn in
+// TestEntryTurnFlag_ErrorThenResultDoesNotUnderflow: two signals against one
+// delivery reached endTurn twice, so a bare Add(-1) read -1 and that test's literal
+// `want 0` caught it. tether#145 refuses the second of those two signals, which is
+// the whole point of it — and in doing so it removed the second decrement, so the
+// mutation stopped being detected anywhere in the package (verified: the bare
+// Add(-1) mutant passes the whole of internal/session without this test). A guard
+// whose only cover was a side effect of another test's fixture is a guard that
+// leaves silently.
+//
+// # The shape here is a production one, not a contrivance
+//
+// Entry.sendPrompt counts its delivery back DOWN when the write is refused,
+// because no result will ever arrive for a prompt the agent never received. Its
+// doc names the window that opens in the other direction in the same breath: the
+// write can report failure and the agent answer anyway, and then "a result
+// arriving afterwards would decrement a count the floor guard has already parked
+// at zero". That is this test, and it is the one remaining reason the floor is not
+// decoration now that the doubled signal is handled a level up.
+//
+// The gate is the result's own envelope rather than a count, for the reason
+// awaitResultEnvelope states, and the stream is deliberately left OPEN — a fixture
+// that closed it could be released by fanOut's end-of-stream KindResult, which
+// decrements nothing.
+func TestEntryTurnFlag_TheFloorAbsorbsASignalWithNoDeliveryBehindIt(t *testing.T) {
+	const sid = "sid-floor-absorbs1"
+	fs := &fakeSession{sid: sid, events: make(chan agent.Event, 8)}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+	e, err := reg.GetOrSpawnEntry(context.Background(), sid, "fake")
+	if err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	fs.announceInit()
+	waitForRegistered(t, reg, sid)
+
+	sub := make(chan wire.Envelope, 64)
+	e.Subscribe(sub)
+
+	// A refused write: sendPrompt counts its own delivery back down.
+	fs.sendFails.Store(true)
+	if err := e.sendPrompt(context.Background(), "go"); err == nil {
+		t.Fatal("sendPrompt reported success against a session whose write fails")
+	}
+	fs.sendFails.Store(false)
+
+	// ...and the agent answers regardless. Nothing is outstanding for this result
+	// to end.
+	fs.events <- agent.Event{Kind: agent.EventResult, Text: "stop"}
+	awaitResultEnvelope(t, sub)
+
+	if got := e.turnsInFlight.Load(); got != 0 {
+		t.Fatalf("an end-of-turn signal with no delivery behind it left the outstanding-turn count at %d, want 0", got)
+	}
+
+	// And the consequence, which is what makes the literal above worth asserting:
+	// a negative count makes the NEXT real turn read as idle, for its whole
+	// duration — the same user-visible false claim tether#145 is about, reached
+	// from the other side.
+	if err := e.sendPrompt(context.Background(), "again"); err != nil {
+		t.Fatalf("sendPrompt: %v", err)
+	}
+	if got := reg.LiveTurns()[sid]; !got {
+		t.Fatal("a real turn reported nothing in flight; the counter went below zero on a signal that had no delivery behind it and a later delivery could not lift it back over the line")
+	}
+}
+
+// awaitErrorEnvelope waits for a KindError envelope whose message contains want.
+// Bounded.
+//
+// The happens-after for an EventError's decrement, on the same argument
+// awaitResultEnvelope makes for a result's: fanOut's error arm calls endTurn
+// strictly before translateEvent's envelope is broadcast, so this envelope
+// arriving proves that decrement has landed.
+//
+// It matches on the MESSAGE and not merely on the kind, because a gate released
+// by the wrong envelope is a gate that proves nothing — the same failure mode,
+// one kind along, as awaitResultEnvelope's documented exclusion.
+func awaitErrorEnvelope(t *testing.T, sub <-chan wire.Envelope, want string) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case env := <-sub:
+			if env.Kind != wire.KindError {
+				continue
+			}
+			p, ok := env.Payload.(wire.ErrorPayload)
+			if ok && strings.Contains(p.Message, want) {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("no KindError envelope mentioning %q arrived, so the test cannot tell whether fanOut has applied the error's end-of-turn", want)
+		}
 	}
 }
 

@@ -84,8 +84,27 @@ type Registry struct {
 	// other than the one they were spawned under, so rekey's self-check warns ONCE
 	// per provider instead of once per session. Guarded by mu.
 	mintedIDIgnored map[string]bool
-	PermEndpoint    string        // injected into cc subprocess env if non-empty
-	History         *HistoryStore // nil = history disabled
+	// interruptedTurns holds the sids whose agent ended while a turn was still in
+	// flight, until the next client to attach on that sid has been told once
+	// (tether#137). See markTurnInterrupted for what qualifies and
+	// reportInterruptedTurn for the delivery.
+	//
+	// # Why it is remembered instead of announced
+	//
+	// The thing that needs telling is not connected yet. tether#134 §2.4 measured
+	// the reap at 0.03s for an ordinary graceful close, and a browser takes
+	// hundreds of milliseconds to load a page and dial — so by the time the reloaded
+	// tab subscribes, the broadcast that would have carried this is long over and
+	// went to nobody. Holding the fact until the attach is what makes it reach a
+	// reader at all.
+	//
+	// Guarded by its own mutex and never held with mu or obsMu, because both of the
+	// two sites that touch it already sit inside other locking stories: one is on a
+	// session's fanOut goroutine, the other inside Entry.Subscribe.
+	interruptedTurns   []string
+	interruptedTurnsMu sync.Mutex
+	PermEndpoint       string        // injected into cc subprocess env if non-empty
+	History            *HistoryStore // nil = history disabled
 	// Workdir is the DEFAULT agent subprocess cwd — the resolved
 	// --workspace-root; "" = daemon cwd. Wired by internal/server/lifecycle.go
 	// Step 3b once the workspace root is resolved (tether#51) — Step 1 builds the
@@ -165,6 +184,32 @@ type Registry struct {
 	// above: buildMux sets it before the listener accepts anything, so no session
 	// exists to read it concurrently.
 	PendingBackfill func() []wire.Envelope
+	// WithdrawPending is PendingBackfill's opposite number (tether#137): it is
+	// told the sid of a session that has just ENDED, so that the permission
+	// requests which belonged to it stop being offered as answerable.
+	//
+	// Called from teardown and nowhere else, which is what makes it safe. A
+	// permission request outlives its agent by design — the gate is a grandchild
+	// and survives, the Manager and its timeout are daemon-side, and the backfill
+	// re-delivers the request to whatever attaches next (tether#134 §2.5, §2.6).
+	// What does NOT outlive the agent is the only consumer of the decision: the
+	// gate's exit code, read by the agent that spawned it. So after the agent is
+	// reaped the prompt is present, answerable and inert, and this is where the
+	// daemon stops pretending otherwise. teardown is the one place that knows a
+	// session ended, runs exactly once for it, and — crucially — runs only after
+	// Events() has closed, i.e. strictly after the agent is really gone; a
+	// withdrawal driven from the disconnect instead would fire inside the 0–43s
+	// window tether#134 §2.4 measured, in which a reconnect adopts a LIVE agent
+	// and the prompt is still worth answering.
+	//
+	// nil = withdraw nothing, which is every daemon before tether#137 and every
+	// test that does not set it. Wired in internal/server/mux.go alongside
+	// PendingBackfill, because the withdrawal has to reach permission.Manager
+	// (which this package deliberately does not import) and then be announced as
+	// an envelope built next to the other permission envelope builders.
+	//
+	// Written once at startup, like PendingBackfill above.
+	WithdrawPending func(sid string)
 }
 
 // hadConversation reports whether ANY store this daemon can see holds a
@@ -656,7 +701,15 @@ func (e *Entry) Subscribe(ch chan wire.Envelope) {
 // in the daemon needs — on that wedged client. The drop is logged, and unlike
 // the drop it repairs it is a drop the operator can act on.
 func (e *Entry) backfill(ch chan wire.Envelope) {
-	if e.reg == nil || e.reg.PendingBackfill == nil {
+	if e.reg == nil {
+		return
+	}
+	// tether#137 — the other thing a just-attached client cannot ask for: that the
+	// answer it was waiting for died with its session. Placed BEFORE the early
+	// return below, because it is not a permission replay and must not be switched
+	// off by a daemon that wired no PendingBackfill.
+	e.reg.reportInterruptedTurn(e, ch)
+	if e.reg.PendingBackfill == nil {
 		return
 	}
 	envs := e.reg.PendingBackfill()
@@ -675,6 +728,142 @@ func (e *Entry) backfill(ch chan wire.Envelope) {
 	if sent > 0 {
 		slog.Info("replayed outstanding envelopes to a new subscriber", "count", sent)
 	}
+}
+
+// interruptedTurnNotice is the whole of what this daemon knows about a turn that
+// died with its session, and it is deliberately not one word more (tether#137).
+//
+// Every clause is measured. "Stopped when the session's agent ended" is what
+// fanOut observed — the event stream closed with a turn still counted in flight.
+// "The part that had arrived is above" is true because fanOut finalises the
+// half-answer to HistoryStore on this exact path (see the sawInit block at the
+// bottom of fanOut, and emitSegments writing history before every broadcast), so
+// a reload's transcript really does contain it, with an earlier timestamp than
+// this line. "The rest was never generated" is the honest form of the loss: those
+// tokens do not exist anywhere, so nothing can restore them.
+//
+// What it must never say is that a reconnect, a reload or a `--resume` will carry
+// on — none of them will, and tether#124 wrote up the cost of a notice a reader
+// catches out: they stop reading the true ones too.
+const interruptedTurnNotice = "That answer stopped when the session's agent ended — the part that had arrived is above, and the rest was never generated."
+
+// maxInterruptedTurns bounds Registry.interruptedTurns.
+//
+// The list only grows when a session dies mid-answer and only shrinks when
+// somebody attaches on that sid, so a user who abandons a half-answered session
+// and never returns leaves an entry behind for the life of the daemon. That is
+// one short string, but "one per abandoned session, forever" is unbounded, and
+// this repo has a written history of exactly that shape (tether#56). The oldest
+// entry is dropped instead.
+//
+// The number is not load-bearing: what this file guarantees is that the list
+// cannot grow without limit, and that holds for any N. Sixty-four, because the
+// fact is only useful to somebody who comes BACK to the session, and a reader who
+// has since started sixty-four others is not returning to that answer.
+const maxInterruptedTurns = 64
+
+// markTurnInterrupted records that sid's agent ended with a turn still running.
+//
+// Called from ONE place, the end of fanOut, and both of that site's conditions
+// matter:
+//
+//   - the turn count is above zero, i.e. a prompt was delivered and no result
+//     ever came back for it. teardown's own comment states the same fact from the
+//     other side: "a session that died mid-answer is still visible here with its
+//     count above zero".
+//   - the session had init'd (sawInit). Without that this would fire on the
+//     FAILED-`--resume` path, whose turn stays open on purpose because
+//     Attachment.resolve is about to respawn and answer that very prompt for real
+//     (tether#50). Telling the reader their answer was lost moments before it
+//     arrives is a lie with the same shape as the one this change exists to
+//     remove.
+//
+// Idempotent per sid, because the same sid can be torn down more than once and
+// one line is what the reader needs.
+func (r *Registry) markTurnInterrupted(sid string) {
+	if sid == "" {
+		return
+	}
+	r.interruptedTurnsMu.Lock()
+	defer r.interruptedTurnsMu.Unlock()
+	for _, s := range r.interruptedTurns {
+		if s == sid {
+			return
+		}
+	}
+	r.interruptedTurns = append(r.interruptedTurns, sid)
+	if n := len(r.interruptedTurns); n > maxInterruptedTurns {
+		r.interruptedTurns = append([]string(nil), r.interruptedTurns[n-maxInterruptedTurns:]...)
+	}
+}
+
+// takeTurnInterrupted reports whether sid was marked, and forgets it if so. The
+// read and the forget are one operation because "say it once" is the whole
+// contract: two subscribers arriving together must not both be told.
+func (r *Registry) takeTurnInterrupted(sid string) bool {
+	if sid == "" {
+		return false
+	}
+	r.interruptedTurnsMu.Lock()
+	defer r.interruptedTurnsMu.Unlock()
+	for i, s := range r.interruptedTurns {
+		if s == sid {
+			r.interruptedTurns = append(r.interruptedTurns[:i], r.interruptedTurns[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// reportInterruptedTurn tells a just-subscribed channel, once, that the turn its
+// session was running did not survive (tether#137, spec §5-F item 2).
+//
+// # What the reader sees today without it
+//
+// Nothing, in either direction. tether#134 §2.4 measured that a reload sometimes
+// keeps an in-flight turn (the reconnect lands inside the accidental 0–43s window
+// and ADOPTS the live agent) and sometimes kills it (the reconnect lands after the
+// reap and gets `--resume`, which restores the conversation and not the answer
+// being generated). The user-visible shape is therefore "a reload kills your
+// answer unless it doesn't", with no message either way — a rule nobody can learn.
+// This does not change which of the two happens; it says which one did.
+//
+// # Why the delivery rides Subscribe's backfill
+//
+// Because that is the one hop every reattachment goes through, whether it is a
+// page reload, the reconnect ladder, a second device, or Attachment.adopt moving
+// a channel onto a replacement entry. The cost is inherited from that hop and
+// worth stating plainly: the envelope lands in the subscriber's channel here, and
+// serveChat only forwards it once Attachment.Resolve has returned. On a genuine
+// respawn Resolve waits for the agent's system/init, which under
+// `--input-format stream-json` waits for the first prompt — so on that path this
+// line, like session_ready and the tether#50 notice that share the same channel,
+// is not on screen until the user types. Spec §7.3 records that nobody has
+// measured the respawn path's backfill visibility end to end; this does not claim
+// otherwise, and it is the same latency the existing session notices already have
+// rather than a new one.
+//
+// A notice that does not fit the channel is dropped and logged, exactly as
+// Entry.backfill argues for the permission replay it sits next to.
+func (r *Registry) reportInterruptedTurn(e *Entry, ch chan wire.Envelope) {
+	sid := r.regKeyOf(e)
+	if !r.takeTurnInterrupted(sid) {
+		return
+	}
+	// The same payload shape as the tether#50 fallback notice serveChat sends, so
+	// the frontend needs no new branch: web/src/lib/store.ts's `notice` case appends
+	// it to the list `loadHistory` does not own, which is what lets it survive the
+	// history refetch a reattachment triggers. SessionID is left unset because
+	// serveChat rewrites it to the receiving connection's sid on the way out.
+	env := wire.Envelope{Kind: wire.KindMessage, Payload: map[string]any{
+		"type": "notice",
+		"text": interruptedTurnNotice,
+	}}
+	if !trySend(ch, env) {
+		slog.Warn("interrupted-turn notice dropped: the new subscriber's channel is already full", "sid", sid)
+		return
+	}
+	slog.Info("told a new subscriber that its previous turn did not survive", "sid", sid)
 }
 
 // Unsubscribe removes ch from the subscriber set, and with it the drop
@@ -1567,6 +1756,19 @@ func (r *Registry) teardown(e *Entry) {
 	// die. The reap has no such urgency — nothing observes it but the OS.
 	r.evict(e)
 
+	// tether#137 — and for the same reason as the eviction above, BEFORE the Wait:
+	// a request nobody can usefully answer any more should stop being offered as
+	// soon as the session is off the map, not once a child that is slow to die has
+	// been harvested. The evidence that the agent is gone is already in hand at
+	// this point and does not improve after Close: reaching here means Events()
+	// closed and drained, which teardown's own os/exec argument above spells out as
+	// the LATER and stronger of the two available signals. See
+	// Registry.WithdrawPending for what is withdrawn and why teardown is the only
+	// place it can be done without taking away a prompt that was still answerable.
+	if r.WithdrawPending != nil && sid != "" {
+		r.WithdrawPending(sid)
+	}
+
 	// A non-nil error here is the normal case, not an alarm: the overwhelmingly
 	// common teardown is a client disconnect, which cancels the Spawn ctx, which
 	// SIGKILLs cc, so Wait reports "signal: killed". Debug, and logged only so an
@@ -2325,6 +2527,23 @@ func (r *Registry) fanOut(e *Entry) {
 	// (tether#59) or any later resume. Finalizing here makes the dead session's
 	// fragment its own assistant message instead.
 	if sawInit {
+		// tether#137 — remember that this answer was cut off, BEFORE the flush and
+		// the turn-ender below, because both of those are about tidying the corpse
+		// and neither one changes the count. The reader is told at the next attach;
+		// see Registry.markTurnInterrupted for why both `sawInit` and a non-zero
+		// count are required, and reportInterruptedTurn for what is said.
+		//
+		// Here and not in teardown, even though teardown is where the sibling
+		// withdrawal lives, and the difference is which sid is in scope. teardown
+		// has only `e.regKey`, which is non-empty on the failed-`--resume` path —
+		// so a teardown placement would report the loss of an answer that
+		// Attachment.resolve is about to produce for real. In here the sid is
+		// fanOut's own, which exists only once init was seen, and `sawInit` is that
+		// condition's name. Same instant either way (teardown is this function's own
+		// defer); not the same fact in hand.
+		if e.turnsInFlight.Load() > 0 {
+			r.markTurnInterrupted(sid)
+		}
 		emitSegments(e.fenceParser.Flush())
 		if r.History != nil && sid != "" {
 			r.History.FinalizeAssistant(sid)

@@ -81,6 +81,43 @@ func permissionEnvelope(req *permission.Request) wire.Envelope {
 	}
 }
 
+// permissionsWithdrawnEnvelope announces that a batch of permission requests can
+// no longer be answered (tether#137).
+//
+// # Why ids and nothing else
+//
+// The store matches on `id` and needs nothing more: it removes the ones it holds
+// and ignores the rest. Re-sending the whole request would invite a reader to
+// render a card from it, which is the opposite of the point.
+//
+// # Why there is no SessionID, which is deliberate and not an omission
+//
+// serveChat REWRITES env.SessionID to the sid of the connection it is writing to
+// (see its drain loop), so a sid put here would arrive at the browser claiming to
+// be the receiving session's — a lie for every client whose session is not the
+// one that ended. The frontend must therefore not key this on the session, and it
+// does not have to: request ids are unique across the daemon.
+//
+// # Why KindMessage and not a kind of its own
+//
+// wire.EnvelopeKind is a wire-type change and a regenerated wire.gen.ts; the
+// `{"type": ...}` discriminator inside a KindMessage payload is the shape this
+// daemon already uses for every session-lifecycle statement it makes
+// (session_ready, notice, tool_use), and the store dispatches on it in one place.
+func permissionsWithdrawnEnvelope(reqs []*permission.Request) wire.Envelope {
+	ids := make([]string, len(reqs))
+	for i, r := range reqs {
+		ids[i] = r.ID
+	}
+	return wire.Envelope{
+		Kind: wire.KindMessage,
+		Payload: map[string]any{
+			"type": "permissions_withdrawn",
+			"ids":  ids,
+		},
+	}
+}
+
 // buildMux constructs the shared route table used by both the TCP and UDP
 // listeners. Routes per §10.B.4:
 //
@@ -161,6 +198,40 @@ func buildMux(cfg *Config, certs *certHolder, wts *webtransport.Server, reg *ses
 				envs = append(envs, permissionEnvelope(req))
 			}
 			return envs
+		}
+		// tether#137 — the THIRD thing that has to happen to one of these
+		// envelopes: un-say it. Registry.teardown reports the sid of a session
+		// whose agent has been reaped; permission.Manager withdraws the requests
+		// whose decision that agent's gate was the only consumer of (and refuses to
+		// touch the MCP gateway's, whose consumer is this daemon — see
+		// Manager.WithdrawSession); and the browser is told, so a card already on
+		// screen stops being clickable instead of accepting an answer that lands
+		// nowhere.
+		//
+		// Wired HERE rather than in internal/session for the same reason
+		// PendingBackfill is: the withdrawal is a permission.Manager operation and
+		// its announcement is an envelope, and both of those live on this side of
+		// the seam.
+		//
+		// Announced with BroadcastAll and not to one session, because "which client
+		// is showing this card" is not a question the daemon can answer: the
+		// backfill above hands outstanding requests to every client that attaches,
+		// so a card for session X can be on screen in a tab attached to session Y.
+		// The ids are unique, and the store drops the ones it does not hold.
+		//
+		// Like PendingBackfill, this wiring is a hop no Go test can cover — nothing
+		// that can build a mux can also drive a WebTransport client. The two halves
+		// are each pinned on their own side (Manager.WithdrawSession's tests, and
+		// registry_test.go's teardown-calls-it tests), and the store's handling is
+		// pinned in web/src/lib/store.test.ts.
+		reg.WithdrawPending = func(sid string) {
+			withdrawn := pm.WithdrawSession(sid)
+			if len(withdrawn) == 0 {
+				return
+			}
+			slog.Info("withdrew permission requests whose session ended",
+				"sid", sid, "count", len(withdrawn))
+			reg.BroadcastAll(permissionsWithdrawnEnvelope(withdrawn))
 		}
 	}
 	permission.RegisterAPI(mux, pm, broadcastFn)

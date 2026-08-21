@@ -2093,3 +2093,497 @@ func TestBackfill_IsInertWithoutAWiredSource(t *testing.T) {
 		t.Fatalf("an empty backfill queued %d envelopes, want 0", got)
 	}
 }
+
+// ============================================================================
+// tether#137 — a session whose agent is gone stops offering its pending
+// permission requests. Registry.WithdrawPending is the seam; teardown is the
+// only caller, and WHEN it is called is the whole safety argument.
+// ============================================================================
+
+// withdrawSpy records the sids teardown reported, under a mutex because the call
+// happens on the session's own fanOut goroutine.
+type withdrawSpy struct {
+	mu   sync.Mutex
+	sids []string
+}
+
+func (w *withdrawSpy) hook() func(string) {
+	return func(sid string) {
+		w.mu.Lock()
+		w.sids = append(w.sids, sid)
+		w.mu.Unlock()
+	}
+}
+
+func (w *withdrawSpy) seen() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.sids...)
+}
+
+// waitForWithdrawn polls until the spy has been called n times, bounded.
+func waitForWithdrawn(t *testing.T, w *withdrawSpy, n int) {
+	t.Helper()
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(w.seen()) >= n {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("WithdrawPending was called %v, want %d call(s)", w.seen(), n)
+}
+
+// TestTeardown_WithdrawsThePendingRequestsOfTheEndedSession — the affirmative
+// direction of tether#137's core assertion, taken at the seam teardown owns.
+//
+// Driven by CLOSING Events(), which is the one signal that means the agent is
+// really gone, and it is closed by hand rather than by racing a disconnect: the
+// point is not how fast the reap is (tether#134 §2.4 measured that at anywhere
+// between 0.03s and ~43s) but that the withdrawal hangs off the reap and not off
+// the disconnect.
+func TestTeardown_WithdrawsThePendingRequestsOfTheEndedSession(t *testing.T) {
+	fs := &fakeSession{sid: "sid-withdraw", events: make(chan agent.Event, 8)}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+	spy := &withdrawSpy{}
+	reg.WithdrawPending = spy.hook()
+
+	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	fs.events <- agent.Event{Kind: agent.EventInit, SessionID: "sid-withdraw"}
+	waitForRegistered(t, reg, "sid-withdraw")
+
+	// A live session's requests are still worth answering, so nothing may have been
+	// withdrawn yet. Without this the test would also pass on an implementation
+	// that withdrew at spawn time.
+	if got := spy.seen(); len(got) != 0 {
+		t.Fatalf("WithdrawPending was called %v while the session was LIVE", got)
+	}
+
+	close(fs.events)
+	waitForEvicted(t, reg, "sid-withdraw")
+	waitForWithdrawn(t, spy, 1)
+
+	if got := spy.seen(); len(got) != 1 || got[0] != "sid-withdraw" {
+		t.Fatalf("WithdrawPending calls = %v, want exactly [sid-withdraw]", got)
+	}
+}
+
+// TestTeardown_DoesNotWithdrawFromASessionWhoseAgentIsStillAlive — the other
+// direction, and the one the spec singles out as this change's own failure mode
+// (§5-F, "misfire mode").
+//
+// tether#134 §2.4 measured an accidental grace period of 0 to ~43 seconds: a
+// reconnect that lands inside it ADOPTS the live Entry (§2.3 connection 3 — no
+// new pid, `SessionID resolved` logged before the prompt) and the turn keeps
+// running. A withdrawal driven from the client going away instead of from the
+// reap would take away a prompt that was still answerable in exactly that
+// window, and the user would watch a card vanish for a tool call that is still
+// waiting for it.
+//
+// So this drives the whole disconnect-and-adopt sequence on one live entry —
+// subscriber leaves, subscriber count reaches zero, a new subscriber attaches to
+// the SAME entry — and asserts nothing was withdrawn at any point. The positive
+// control at the end is what stops that from being vacuous: the identical hook
+// does fire once the agent's Events() really closes.
+func TestTeardown_DoesNotWithdrawFromASessionWhoseAgentIsStillAlive(t *testing.T) {
+	fs := &fakeSession{sid: "sid-adopted", events: make(chan agent.Event, 8)}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+	spy := &withdrawSpy{}
+	reg.WithdrawPending = spy.hook()
+
+	e, err := reg.GetOrSpawnEntry(context.Background(), "", "fake")
+	if err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	fs.events <- agent.Event{Kind: agent.EventInit, SessionID: "sid-adopted"}
+	waitForRegistered(t, reg, "sid-adopted")
+
+	// The connection that raised the request.
+	first := make(chan wire.Envelope, 32)
+	e.Subscribe(first)
+
+	// It goes away — a reload, or a phone that lost signal. This is the moment a
+	// naive implementation would call "the session ended".
+	e.Unsubscribe(first)
+	e.subsMu.RLock()
+	subs := len(e.subs)
+	e.subsMu.RUnlock()
+	if subs != 0 {
+		t.Fatalf("fixture: %d subscribers left, want 0 — the disconnect is not staged", subs)
+	}
+	if got := spy.seen(); len(got) != 0 {
+		t.Fatalf("WithdrawPending was called %v when the last CLIENT left; the agent "+
+			"is still alive and its requests are still answerable", got)
+	}
+
+	// The reconnect lands inside the window and adopts the live entry: same *Entry,
+	// no respawn. Asserted, because "adoption happened" is the premise of the whole
+	// case.
+	if got := entryFor(reg, "sid-adopted"); got != e {
+		t.Fatalf("fixture: the sid no longer resolves to the live entry (%p vs %p)", got, e)
+	}
+	second := make(chan wire.Envelope, 32)
+	e.Subscribe(second)
+	if got := spy.seen(); len(got) != 0 {
+		t.Fatalf("WithdrawPending was called %v after the reconnect adopted a LIVE agent", got)
+	}
+
+	// The turn that survived can still be answered, which is what "still
+	// answerable" means in practice.
+	fs.events <- agent.Event{Kind: agent.EventText, Text: "still answering"}
+	waitForEnvelope(t, second)
+
+	// Positive control. Every assertion above also holds for a hook that is wired
+	// to nothing, so prove the same hook does fire on the signal that means the
+	// agent is really gone.
+	close(fs.events)
+	waitForEvicted(t, reg, "sid-adopted")
+	waitForWithdrawn(t, spy, 1)
+	if got := spy.seen(); len(got) != 1 || got[0] != "sid-adopted" {
+		t.Fatalf("WithdrawPending calls after the agent died = %v, want [sid-adopted]", got)
+	}
+}
+
+// TestTeardown_WithdrawIsInertWithoutAWiredHook — every daemon before tether#137
+// and every fixture in this file that does not set the field. Cheap, and it is
+// what would catch a teardown that dereferenced the hook unconditionally.
+func TestTeardown_WithdrawIsInertWithoutAWiredHook(t *testing.T) {
+	fs := &fakeSession{sid: "sid-unwired", events: make(chan agent.Event, 8)}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+
+	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	fs.events <- agent.Event{Kind: agent.EventInit, SessionID: "sid-unwired"}
+	waitForRegistered(t, reg, "sid-unwired")
+
+	close(fs.events)
+	waitForEvicted(t, reg, "sid-unwired")
+}
+
+// entryFor is a test-only lookup of the entry registered under sid, so a case can
+// assert that a reconnect ADOPTED a live entry rather than that some entry exists.
+// A plain function and not a method, like regLen above: the production type's
+// method set is not the place for a fixture's convenience.
+func entryFor(reg *Registry, sid string) *Entry {
+	reg.mu.RLock()
+	defer reg.mu.RUnlock()
+	return reg.sessions[sid]
+}
+
+// waitForEnvelope polls until ch holds at least one envelope, bounded.
+func waitForEnvelope(t *testing.T, ch chan wire.Envelope) {
+	t.Helper()
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(ch) > 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("the adopting subscriber received nothing from the still-live session")
+}
+
+// ============================================================================
+// tether#137 F2 — say once, truthfully, that the turn did not survive.
+//
+// tether#134 §2.4 measured a reload that keeps the in-flight turn some of the
+// time and kills it the rest, decided by whether a UDP close got out — and
+// tether says nothing in either case, so "does a reload cost me my answer" has no
+// learnable answer. This does not change which happens; it reports which did.
+// ============================================================================
+
+// registerEntry publishes a hand-built Entry under sid, which is how these cases
+// model THE NEXT connection: the reload attaches to a brand-new Entry for the same
+// sid, and what has to survive the gap is a fact held by the Registry, not by the
+// corpse. Building it by hand rather than spawning again keeps the case about the
+// hand-off and not about the provider.
+func registerEntry(reg *Registry, sid string) *Entry {
+	e := &Entry{subs: make(map[chan wire.Envelope]struct{}), regKey: sid, reg: reg}
+	reg.mu.Lock()
+	reg.sessions[sid] = e
+	reg.mu.Unlock()
+	return e
+}
+
+// regKeyOfForTest reads the key an entry is registered under, so a fixture can
+// assert its own premise instead of assuming it.
+func regKeyOfForTest(reg *Registry, e *Entry) string { return reg.regKeyOf(e) }
+
+// noticeTexts returns the text of every `notice` payload queued on ch, and drains
+// it. Reading the payload rather than counting envelopes, because the whole point
+// of F2 is WHAT is said.
+func noticeTexts(ch chan wire.Envelope) []string {
+	var out []string
+	for {
+		select {
+		case env := <-ch:
+			p, ok := env.Payload.(map[string]any)
+			if !ok || p["type"] != "notice" {
+				continue
+			}
+			if s, ok := p["text"].(string); ok {
+				out = append(out, s)
+			}
+		default:
+			return out
+		}
+	}
+}
+
+// killTurnMidAnswer drives one session to the state this whole block is about: it
+// init'd, a prompt is in flight, and then the agent's event stream closes with no
+// result — which is what a client disconnect does, via the ctx cancel that SIGKILLs
+// the subprocess.
+//
+// The stream is closed BY HAND rather than by cancelling a context and hoping. The
+// reap latency is the one thing tether#134 measured as unpredictable (0.03s to
+// ~43s), so a case that waited for it would be timing the transport rather than
+// testing this code.
+func killTurnMidAnswer(t *testing.T, reg *Registry, fs *fakeSession, sid string, complete bool) {
+	t.Helper()
+	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	fs.events <- agent.Event{Kind: agent.EventInit, SessionID: sid}
+	waitForRegistered(t, reg, sid)
+
+	e := entryFor(reg, sid)
+	if e == nil {
+		t.Fatalf("fixture: %q is not registered", sid)
+	}
+	if err := e.sendPrompt(context.Background(), "how do I..."); err != nil {
+		t.Fatalf("sendPrompt: %v", err)
+	}
+	if n := e.turnsInFlight.Load(); n != 1 {
+		t.Fatalf("fixture: turnsInFlight = %d after one prompt, want 1", n)
+	}
+	if complete {
+		// The turn ends properly first, so the loss this block reports never happened.
+		fs.events <- agent.Event{Kind: agent.EventResult, Text: "done"}
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for time.Now().Before(deadline) && e.turnsInFlight.Load() != 0 {
+			time.Sleep(time.Millisecond)
+		}
+		if n := e.turnsInFlight.Load(); n != 0 {
+			t.Fatalf("fixture: turnsInFlight = %d after the result, want 0", n)
+		}
+	}
+	close(fs.events)
+	waitForEvicted(t, reg, sid)
+}
+
+// TestInterruptedTurn_TellsTheNextClientOnce — the affirmative direction.
+func TestInterruptedTurn_TellsTheNextClientOnce(t *testing.T) {
+	fs := &fakeSession{sid: "sid-cut", events: make(chan agent.Event, 8)}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+	killTurnMidAnswer(t, reg, fs, "sid-cut", false)
+
+	// The reload: a new connection on the same sid, subscribing a fresh channel.
+	next := registerEntry(reg, "sid-cut")
+	first := make(chan wire.Envelope, 8)
+	next.Subscribe(first)
+
+	got := noticeTexts(first)
+	if len(got) != 1 || got[0] != interruptedTurnNotice {
+		t.Fatalf("notices delivered to the reconnecting client = %v, want exactly one %q; "+
+			"without it a reload silently drops the answer the user was waiting for",
+			got, interruptedTurnNotice)
+	}
+
+	// ONCE. A second tab, or the reconnect ladder trying again, must not re-report a
+	// loss that has already been explained.
+	second := make(chan wire.Envelope, 8)
+	next.Subscribe(second)
+	if got := noticeTexts(second); len(got) != 0 {
+		t.Fatalf("a second subscriber was told again: %v", got)
+	}
+}
+
+// TestInterruptedTurn_SaysNothingWhenTheTurnCompleted — the other direction, and
+// the one that keeps this from being a line printed on every disconnect.
+//
+// Closing a session whose turn ENDED is the overwhelmingly common teardown: the
+// user read the answer and closed the tab. Nothing was lost, so nothing may be
+// claimed. Same fixture, one event different.
+func TestInterruptedTurn_SaysNothingWhenTheTurnCompleted(t *testing.T) {
+	fs := &fakeSession{sid: "sid-done", events: make(chan agent.Event, 8)}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+	killTurnMidAnswer(t, reg, fs, "sid-done", true)
+
+	next := registerEntry(reg, "sid-done")
+	ch := make(chan wire.Envelope, 8)
+	next.Subscribe(ch)
+	if got := noticeTexts(ch); len(got) != 0 {
+		t.Fatalf("a session whose turn completed still reported a loss: %v", got)
+	}
+}
+
+// TestInterruptedTurn_SaysNothingForAResumeThatNeverInitialised — the false
+// positive that would be a lie, not merely noise (tether#50).
+//
+// A failed `cc --resume` produces an event stream that closes without ever
+// emitting system/init, and its turn is left OPEN on purpose: Attachment.resolve
+// is about to respawn and answer that same prompt for real. Reporting "the rest
+// was never generated" moments before the answer arrives is exactly the
+// caught-out notice this change exists to remove, one layer along.
+//
+// The open turn is asserted BEFORE the stream closes, which is the only place it
+// can be: teardown's clearTurns resets the count, so a check afterwards reads zero
+// whatever happened and would turn this into a case that passes for the wrong
+// reason. Nothing between the assertion and the close can move the count — the
+// only decrementers are endTurn (reached from the result and error branches, and
+// the init-less result is dropped one line above it by fanOut's own guard) and
+// clearTurns. So "1 here" is "1 when the stream closed", and the discriminator
+// under test is sawInit and nothing else.
+func TestInterruptedTurn_SaysNothingForAResumeThatNeverInitialised(t *testing.T) {
+	fs := &fakeSession{sid: "sid-noinit", events: make(chan agent.Event, 8)}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+
+	// Spawned WITH a sid, which is what a failed resume is: a reconnect carrying
+	// one. What that buys the case is the thing that makes it a gate rather than a
+	// tautology — the entry ends up registered under a NON-EMPTY key even though no
+	// init ever arrives, so an implementation that read the entry's key instead of
+	// fanOut's `sid` (which is what a teardown placement has to do, since teardown
+	// cannot see sawInit) has a real sid to get wrong.
+	//
+	// The key is READ, not assumed: GetOrSpawnEntry mints a fresh id for a sid it
+	// does not track (tether#49), so it is not the one asked for here. Only its
+	// non-emptiness is load-bearing.
+	e, err := reg.GetOrSpawnEntry(context.Background(), "sid-noinit", "fake")
+	if err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	key := regKeyOfForTest(reg, e)
+	if key == "" {
+		t.Fatal("fixture: the entry has no registration, so this case cannot " +
+			"distinguish the sawInit gate from an empty-sid guard")
+	}
+	if err := e.sendPrompt(context.Background(), "the prompt resolve will replay"); err != nil {
+		t.Fatalf("sendPrompt: %v", err)
+	}
+	if n := e.turnsInFlight.Load(); n != 1 {
+		t.Fatalf("fixture: turnsInFlight = %d, want 1 — this case is only meaningful "+
+			"with a turn still open when the init-less stream ends", n)
+	}
+
+	// cc's failed-resume artefact: one init-less, text-less result, then EOF.
+	fs.events <- agent.Event{Kind: agent.EventResult}
+	close(fs.events)
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) && fs.Closes() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	if fs.Closes() == 0 {
+		t.Fatal("fixture: the session was never torn down")
+	}
+
+	// Attached under the SAME key the dead entry held, because that is the key a
+	// wrong implementation would have marked.
+	next := registerEntry(reg, key)
+	ch := make(chan wire.Envelope, 8)
+	next.Subscribe(ch)
+	if got := noticeTexts(ch); len(got) != 0 {
+		t.Fatalf("a failed resume reported the loss of an answer that is about to be "+
+			"replayed and answered: %v", got)
+	}
+}
+
+// TestInterruptedTurn_IsDeliveredWithoutAWiredBackfill — F2 rides Subscribe's
+// backfill hop, and PendingBackfill (tether#132) is nil on any daemon that wires
+// no permission API. The two must not share an off switch.
+func TestInterruptedTurn_IsDeliveredWithoutAWiredBackfill(t *testing.T) {
+	fs := &fakeSession{sid: "sid-nobackfill", events: make(chan agent.Event, 8)}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+	if reg.PendingBackfill != nil {
+		t.Fatal("fixture: PendingBackfill must be unwired for this case")
+	}
+	killTurnMidAnswer(t, reg, fs, "sid-nobackfill", false)
+
+	next := registerEntry(reg, "sid-nobackfill")
+	ch := make(chan wire.Envelope, 8)
+	next.Subscribe(ch)
+	if got := noticeTexts(ch); len(got) != 1 {
+		t.Fatalf("notices = %v, want one; a nil PendingBackfill must not switch this off", got)
+	}
+}
+
+// TestInterruptedTurn_TellsOnlyTheSessionItHappenedTo — the list is keyed by sid
+// because a reader attaching to a different conversation has lost nothing.
+func TestInterruptedTurn_TellsOnlyTheSessionItHappenedTo(t *testing.T) {
+	fs := &fakeSession{sid: "sid-mine", events: make(chan agent.Event, 8)}
+	reg := NewRegistry(&fakeProvider{sess: fs})
+	killTurnMidAnswer(t, reg, fs, "sid-mine", false)
+
+	other := registerEntry(reg, "sid-theirs")
+	ch := make(chan wire.Envelope, 8)
+	other.Subscribe(ch)
+	if got := noticeTexts(ch); len(got) != 0 {
+		t.Fatalf("a subscriber of an unrelated session was told: %v", got)
+	}
+
+	// Positive control: the fact is still there for the session it belongs to.
+	mine := registerEntry(reg, "sid-mine")
+	mineCh := make(chan wire.Envelope, 8)
+	mine.Subscribe(mineCh)
+	if got := noticeTexts(mineCh); len(got) != 1 {
+		t.Fatalf("notices for the session that lost the turn = %v, want one", got)
+	}
+}
+
+// TestInterruptedTurn_RememberedSetIsBounded — a user who abandons a half-answered
+// session never collects the notice, so the list has to be bounded by the code and
+// not by the traffic. tether#56 is this repo's own record of what "one per session,
+// held until the daemon exits" costs.
+func TestInterruptedTurn_RememberedSetIsBounded(t *testing.T) {
+	reg := NewRegistry()
+	for i := 0; i < maxInterruptedTurns*3; i++ {
+		reg.markTurnInterrupted(fmt.Sprintf("sid-%d", i))
+	}
+	reg.interruptedTurnsMu.Lock()
+	n := len(reg.interruptedTurns)
+	reg.interruptedTurnsMu.Unlock()
+	if n > maxInterruptedTurns {
+		t.Fatalf("interruptedTurns holds %d sids, want at most %d", n, maxInterruptedTurns)
+	}
+	// The ones kept are the most recent, which are the sessions somebody might
+	// still come back to.
+	if !reg.takeTurnInterrupted(fmt.Sprintf("sid-%d", maxInterruptedTurns*3-1)) {
+		t.Fatal("the most recent sid was evicted")
+	}
+	if reg.takeTurnInterrupted("sid-0") {
+		t.Fatal("the oldest sid survived the cap")
+	}
+}
+
+// TestInterruptedTurn_MarkIsIdempotentAndIgnoresAnEmptySid — a sid can be torn
+// down more than once, and an entry that never registered has none.
+func TestInterruptedTurn_MarkIsIdempotentAndIgnoresAnEmptySid(t *testing.T) {
+	reg := NewRegistry()
+	reg.markTurnInterrupted("sid-x")
+	reg.markTurnInterrupted("sid-x")
+	reg.markTurnInterrupted("")
+
+	// Read the list itself for the empty sid, not takeTurnInterrupted(""): that has
+	// a guard of its own, so asking it would answer "false" whether or not the empty
+	// sid was ever recorded. An unaddressable entry cannot be delivered to anyone
+	// and just occupies one of the bounded slots.
+	reg.interruptedTurnsMu.Lock()
+	held := append([]string(nil), reg.interruptedTurns...)
+	reg.interruptedTurnsMu.Unlock()
+	if len(held) != 1 || held[0] != "sid-x" {
+		t.Fatalf("interruptedTurns = %q, want exactly [sid-x]", held)
+	}
+
+	if !reg.takeTurnInterrupted("sid-x") {
+		t.Fatal("the sid was not remembered")
+	}
+	if reg.takeTurnInterrupted("sid-x") {
+		t.Fatal("the sid was remembered twice, so the reader would be told twice")
+	}
+	if reg.takeTurnInterrupted("") {
+		t.Fatal(`an empty sid matched`)
+	}
+}

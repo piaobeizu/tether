@@ -2,6 +2,7 @@
 package permission_test
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -167,5 +168,183 @@ func TestPending_DropsAnExpiredRequest(t *testing.T) {
 func TestPending_OfAnEmptyManagerIsEmpty(t *testing.T) {
 	if got := permission.New().Pending(); len(got) != 0 {
 		t.Fatalf("Pending() on a fresh Manager = %v, want empty", got)
+	}
+}
+
+// ============================================================================
+// tether#137 — WithdrawSession stops offering a request whose decision has no
+// consumer left. The whole point is that it is SELECTIVE, so most of what is
+// below is about what it must NOT take.
+// ============================================================================
+
+// TestWithdrawSession_TakesBackTheRequestOfTheSessionThatEnded — the affirmative
+// half. After this the request is out of Pending(), so the backfill cannot hand
+// it to the next client that attaches, and the blocked HTTP handler behind it is
+// released rather than left to wait out the remaining timeout.
+func TestWithdrawSession_TakesBackTheRequestOfTheSessionThatEnded(t *testing.T) {
+	m := permission.New()
+	req := &permission.Request{Source: "unknown", SessionID: "sid-dead", ToolName: "bash"}
+	ch := m.Add(req)
+
+	got := m.WithdrawSession("sid-dead")
+	if len(got) != 1 || got[0].ID != req.ID {
+		t.Fatalf("WithdrawSession returned %v, want the one request %q", idsOf(got), req.ID)
+	}
+	if p := m.Pending(); len(p) != 0 {
+		t.Fatalf("Pending() after the withdrawal = %v, want empty: the backfill would "+
+			"still hand this to the next client that attaches", idsOf(p))
+	}
+	if m.GetPending(req.ID) != nil {
+		t.Fatal("GetPending still answers for a withdrawn request")
+	}
+	// The waiter is released, not abandoned. A gate left blocked holds a process and
+	// a daemon goroutine until the 60s timer, for an answer nobody will act on.
+	select {
+	case dec := <-ch:
+		if dec.Allow {
+			t.Fatalf("withdrawal decided Allow=true: %+v", dec)
+		}
+		if dec.Reason != permission.WithdrawnReason {
+			t.Fatalf("Reason = %q, want %q", dec.Reason, permission.WithdrawnReason)
+		}
+	default:
+		t.Fatal("WithdrawSession left the request's waiter blocked")
+	}
+	// A second call must be a no-op, because teardown is once-per-session but the
+	// same sid can be reconnected and torn down again.
+	if got := m.WithdrawSession("sid-dead"); len(got) != 0 {
+		t.Fatalf("second WithdrawSession returned %v, want nothing", idsOf(got))
+	}
+}
+
+// TestWithdrawSession_LeavesADaemonConsumedRequestAlone — the regression this
+// change is most likely to cause, pinned (tether#134 §2.7).
+//
+// permission.Manager.Check is the MCP gateway's blocking check. The thing waiting
+// for that decision is a goroutine inside this daemon, and it does not die with a
+// chat connection — so the request is STILL ANSWERABLE after the chat session it
+// happens to name has ended, and withdrawing it would break a working feature by
+// answering the tool call "denied" behind the user's back.
+//
+// The sid is deliberately THE SAME as the withdrawn one, because a sid-only
+// filter is the obvious implementation and it would pass a test that used
+// different sids. Both of today's production Check call sites leave SessionID
+// empty (internal/server/mcp_loopback.go, internal/mcp/instance/instance.go), so
+// in the real daemon this collision cannot happen yet — which is exactly why it
+// has to be the fixture: threading the sid through those call sites is an
+// ordinary change, and this is what makes it safe.
+func TestWithdrawSession_LeavesADaemonConsumedRequestAlone(t *testing.T) {
+	m := permission.New()
+
+	gate := &permission.Request{Source: "unknown", SessionID: "sid-shared", ToolName: "gate-request"}
+	m.Add(gate)
+
+	// Check blocks, so it runs on its own goroutine; waitForPendingCount is what
+	// makes the request actually be in the map before the withdrawal. Without it
+	// the withdrawal could win the race and the test would pass having never had
+	// anything to protect.
+	mcpDone := make(chan *permission.Decision, 1)
+	mcpReq := permission.Request{Source: "mcp:polyforge", SessionID: "sid-shared", ToolName: "mcp-request"}
+	go func() {
+		dec, err := m.Check(context.Background(), &mcpReq)
+		if err != nil {
+			mcpDone <- nil
+			return
+		}
+		mcpDone <- dec
+	}()
+	waitForPendingCount(t, m, 2)
+
+	withdrawn := m.WithdrawSession("sid-shared")
+	if len(withdrawn) != 1 || withdrawn[0].ToolName != "gate-request" {
+		t.Fatalf("WithdrawSession took %v, want only [gate-request]", idsOf(withdrawn))
+	}
+
+	remaining := m.Pending()
+	if len(remaining) != 1 || remaining[0].ToolName != "mcp-request" {
+		t.Fatalf("Pending() after the withdrawal = %v, want only [mcp-request]: an "+
+			"MCP tool call's permission check is consumed by this daemon and survives "+
+			"a chat session ending", idsOf(remaining))
+	}
+	select {
+	case dec := <-mcpDone:
+		t.Fatalf("Check returned %+v — the MCP tool call was answered by a chat "+
+			"session's teardown", dec)
+	default:
+	}
+
+	// Positive control: it is still a live, answerable request and not merely one
+	// that WithdrawSession failed to reach.
+	if !m.Decide(remaining[0].ID, true, "user allowed") {
+		t.Fatal("Decide could not resolve the surviving MCP request")
+	}
+	dec := <-mcpDone
+	if dec == nil || !dec.Allow {
+		t.Fatalf("Check returned %+v, want an allow", dec)
+	}
+}
+
+// TestWithdrawSession_LeavesAnotherSessionsRequestAlone — one session ending must
+// not clear the daemon. Two live chats is the ordinary state of this product.
+func TestWithdrawSession_LeavesAnotherSessionsRequestAlone(t *testing.T) {
+	m := permission.New()
+	m.Add(&permission.Request{Source: "unknown", SessionID: "sid-a", ToolName: "for-a"})
+	m.Add(&permission.Request{Source: "unknown", SessionID: "sid-b", ToolName: "for-b"})
+
+	if got := m.WithdrawSession("sid-a"); len(got) != 1 || got[0].ToolName != "for-a" {
+		t.Fatalf("WithdrawSession(sid-a) took %v, want [for-a]", idsOf(got))
+	}
+	if got := idsOf(m.Pending()); len(got) != 1 || got[0] != "for-b" {
+		t.Fatalf("Pending() = %v, want [for-b]", got)
+	}
+}
+
+// TestWithdrawSession_OfAnEmptySidTakesNothing — a request whose producer named no
+// session carries SessionID "". "Every unattributed request in the daemon" is not
+// what teardown means by "this session's", and teardown reaches here with an empty
+// sid for any entry that never got registered under one.
+func TestWithdrawSession_OfAnEmptySidTakesNothing(t *testing.T) {
+	m := permission.New()
+	m.Add(&permission.Request{Source: "unknown", ToolName: "unattributed"})
+
+	if got := m.WithdrawSession(""); len(got) != 0 {
+		t.Fatalf(`WithdrawSession("") took %v, want nothing`, idsOf(got))
+	}
+	if got := idsOf(m.Pending()); len(got) != 1 || got[0] != "unattributed" {
+		t.Fatalf("Pending() = %v, want [unattributed]", got)
+	}
+}
+
+// TestWithdrawSession_ReturnsTheBatchInArrivalOrder — the caller announces these
+// to a UI that rendered them as a queue (tether#40's parallel-tool batch), so the
+// order is the same property Pending's own order test defends.
+func TestWithdrawSession_ReturnsTheBatchInArrivalOrder(t *testing.T) {
+	// Repeated with a fresh Manager each time, because one pass over a 3-entry map
+	// can come out sorted by luck.
+	for i := 0; i < 20; i++ {
+		mm := permission.New()
+		for _, tool := range []string{"first", "second", "third"} {
+			mm.Add(&permission.Request{Source: "unknown", SessionID: "sid-batch", ToolName: tool})
+		}
+		got := idsOf(mm.WithdrawSession("sid-batch"))
+		if len(got) != 3 || got[0] != "first" || got[1] != "second" || got[2] != "third" {
+			t.Fatalf("WithdrawSession = %v, want [first second third]", got)
+		}
+	}
+}
+
+// waitForPendingCount polls rather than sleeping, because Check registers its
+// request on another goroutine and a fixed sleep is either flaky or slow.
+func waitForPendingCount(t *testing.T, m *permission.Manager, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if len(m.Pending()) == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Pending() never reached %d entries (got %d)", want, len(m.Pending()))
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

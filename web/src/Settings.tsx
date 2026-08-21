@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { useStore } from './lib/store'
 import { Icon } from './lib/icons'
 import { useAppVersion } from './lib/version'
@@ -22,13 +22,83 @@ interface Props {
   initialTab?: SettingsTab
 }
 
+// ── The theme (tether#129) ───────────────────────────────────────────────────
+//
+// `data-theme` on <html> IS the theme. Not a cache of it — index.css keys every
+// dark-mode rule off that attribute, so whatever it says is what the user sees,
+// by construction. localStorage's `tether_theme` is only the persistence of it,
+// read once by main.tsx before React mounts.
+//
+// This component used to keep a COPY:
+//
+//   const [isDark, setIsDark] = useState(
+//     document.documentElement.getAttribute('data-theme') === 'dark')
+//
+// which is a useState INITIALIZER — sampled on open and never re-read. The other
+// writer is main.tsx's document-level ⌘⇧D / Ctrl+Shift+D handler, which sets the
+// attribute directly and knows nothing about this panel. So pressing the shortcut
+// with Settings open really did flip the theme while this copy went stale: the
+// appearance row's sub-label read the opposite of the screen, and `toggleTheme`
+// computed `!isDark` from the stale value, so the switch could ask for the theme
+// that was already in effect and appear to do nothing.
+//
+// The fix reads the attribute instead of copying it, and subscribes to it so
+// React re-renders when it moves. Two alternatives were considered:
+//
+//   · A tether:theme-changed event both writers dispatch. That is the existing
+//     house pattern (tether:provider-changed, tether:skills-changed) and it would
+//     work today — but it is a notification channel every writer has to remember
+//     to use, so the next one to set the attribute puts this bug straight back.
+//     Observing the ATTRIBUTE observes the effect rather than trusting the cause,
+//     which covers writers that have never heard of this file.
+//   · Promoting the theme into the zustand store as the "single source of truth".
+//     It would not be one: main.tsx must keep setting the attribute BEFORE first
+//     paint (see its `savedTheme` block) or the app flashes light on every dark
+//     load, so a store field would be a third artifact to keep in step with the
+//     attribute rather than a replacement for it — the same defect one layer up.
+//
+// Polling was not considered.
+const THEME_ATTR = 'data-theme'
+
+function subscribeToTheme(onStoreChange: () => void): () => void {
+  const observer = new MutationObserver(onStoreChange)
+  observer.observe(document.documentElement, { attributes: true, attributeFilter: [THEME_ATTR] })
+  return () => observer.disconnect()
+}
+
+/** Whether dark mode is on, right now, according to the document itself. */
+function isDarkNow(): boolean {
+  return document.documentElement.getAttribute(THEME_ATTR) === 'dark'
+}
+
+/**
+ * Dark mode, as a value that follows the document.
+ *
+ * Exported so a second reader of the theme subscribes rather than sampling. A
+ * boolean snapshot is safe to return from getSnapshot without memoisation —
+ * useSyncExternalStore compares with Object.is, and two `false`s are the same
+ * value where two freshly-built objects would not be.
+ */
+export function useIsDark(): boolean {
+  return useSyncExternalStore(subscribeToTheme, isDarkNow)
+}
+
+/** Write the theme. The only writer besides main.tsx's keyboard shortcut. */
+function applyTheme(dark: boolean): void {
+  if (dark) {
+    document.documentElement.setAttribute(THEME_ATTR, 'dark')
+    localStorage.setItem('tether_theme', 'dark')
+  } else {
+    document.documentElement.removeAttribute(THEME_ATTR)
+    localStorage.setItem('tether_theme', 'light')
+  }
+}
+
 export function Settings({ onClose, initialTab = 'connection' }: Props) {
   const [tab, setTab] = useState<SettingsTab>(initialTab)
   const { connection } = useStore()
   const appVersion = useAppVersion()
-  const [isDark, setIsDark] = useState(
-    document.documentElement.getAttribute('data-theme') === 'dark'
-  )
+  const isDark = useIsDark()
   const [providers, setProviders] = useState<string[]>([])
   const [defaultProvider, setDefaultProvider] = useState(
     localStorage.getItem('tether_default_provider') ?? 'claude-code'
@@ -85,17 +155,12 @@ export function Settings({ onClose, initialTab = 'connection' }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const toggleTheme = () => {
-    const next = !isDark
-    setIsDark(next)
-    if (next) {
-      document.documentElement.setAttribute('data-theme', 'dark')
-      localStorage.setItem('tether_theme', 'dark')
-    } else {
-      document.documentElement.removeAttribute('data-theme')
-      localStorage.setItem('tether_theme', 'light')
-    }
-  }
+  // No setState: `isDark` is derived from the attribute applyTheme writes, so the
+  // MutationObserver behind useIsDark is what re-renders this panel. That the
+  // writer no longer has to also tell React is the point — a writer that forgot
+  // was the whole defect. It also makes `!isDark` correct again: it is now
+  // negating what the document says rather than a snapshot from open time.
+  const toggleTheme = () => applyTheme(!isDark)
 
   const setProvider = (p: string) => {
     setDefaultProvider(p)

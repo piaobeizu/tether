@@ -1,11 +1,14 @@
 import { describe, it, expect } from 'vitest'
 import {
+  clampLeftWidth,
   clampRightWidth,
   defaultRightWidth,
   loadRightWidth,
   MIN_RIGHT,
   MAX_RIGHT,
   MIN_MID,
+  MIN_LEFT,
+  MAX_LEFT,
   DEFAULT_RIGHT,
   DEFAULT_RIGHT_SHARE,
   DEFAULT_LEFT,
@@ -105,6 +108,116 @@ describe('clampRightWidth', () => {
     // 900 - 48 - 320 = 532 of room, and the request (MAX_RIGHT) exceeds it.
     // Dropping the bar as well would leave 580.
     expect(clampRightWidth(MAX_RIGHT, 900, -1000)).toBe(532)
+  })
+})
+
+// tether#129 defect 1. Until this item the MIN_MID guarantee was held on exactly
+// one of the two dividers: App.tsx's `resizeRight` called clampRightWidth, and
+// `resizeLeft` — eight lines above it — clamped to the constant left bounds
+// inline and read neither the window nor the right pane. Dragging the tree to
+// MAX_LEFT therefore walked straight through the floor.
+//
+// The wiring hop (that the divider the user drags is the one calling this) is in
+// App.test.tsx, and has to be: a correct rule here proves nothing about which
+// rule App.tsx applies. What is left for this block is the arithmetic.
+//
+// Expected values are derived from the constants, not read off a run. `mid` is
+// the shared helper above, so every row is checked against the same definition
+// the right-hand rules are checked against:
+//
+//   tree allowed = window - 48 - right - MIN_MID, capped at MAX_LEFT
+//   1280 window, 556 right -> 1280 - 48 - 556 - 320 = 356
+//   1920 window, 914 right -> 1920 - 48 - 914 - 320 = 638, so MAX_LEFT (480) wins
+describe('clampLeftWidth (tether#129)', () => {
+  it('honours the requested width when the middle has room to give', () => {
+    // 1920 - (400 + 48) - 600 = 872 for the middle: nothing to protect against.
+    expect(clampLeftWidth(400, 1920, 600)).toBe(400)
+    expect(mid(1920, 400, 600)).toBeGreaterThanOrEqual(MIN_MID)
+  })
+
+  it('never exceeds MAX_LEFT even on a monitor with room to spare', () => {
+    expect(clampLeftWidth(99999, 5000, 260)).toBe(MAX_LEFT)
+  })
+
+  it('never goes below MIN_LEFT', () => {
+    expect(clampLeftWidth(0, 1920, 600)).toBe(MIN_LEFT)
+    expect(clampLeftWidth(-500, 1920, 600)).toBe(MIN_LEFT)
+  })
+
+  // The defect, at the viewport it was measured at. 480 is what the old inline
+  // clamp returned here, and 196 is what the middle got for it.
+  it('stops short of MAX_LEFT when MAX_LEFT would breach the floor', () => {
+    expect(clampLeftWidth(99999, 1280, 556)).toBe(356)
+    expect(mid(1280, 356, 556)).toBe(MIN_MID)
+    // What the pre-tether#129 clamp allowed, and what the middle was left with.
+    expect(mid(1280, MAX_LEFT, 556)).toBe(196)
+  })
+
+  // The contract, stated as the conditional it is — same shape, and same reason,
+  // as clampRightWidth's table above. Where no width satisfies every pane,
+  // MIN_LEFT wins; note that clampRightWidth has already returned MIN_RIGHT and
+  // given up on the floor everywhere that branch is reachable, so there is
+  // nothing here to rescue.
+  it.each([
+    [1280, 556],
+    [1440, 645],
+    [1920, 914],
+    [1024, 400],
+    [900, 500], // over-constrained: 48 + 160 + 500 + 320 = 1028 > 900
+    [700, 600], // ditto, harder
+  ])('respects the width contract at window=%i right=%i', (windowWidth, rightWidth) => {
+    const fits = windowWidth - 48 - rightWidth - MIN_MID >= MIN_LEFT
+    for (const desired of [0, 100, 240, 400, MAX_LEFT, 99999]) {
+      const tree = clampLeftWidth(desired, windowWidth, rightWidth)
+      expect(tree).toBeGreaterThanOrEqual(MIN_LEFT)
+      expect(tree).toBeLessThanOrEqual(MAX_LEFT)
+      if (fits) {
+        expect(mid(windowWidth, tree, rightWidth)).toBeGreaterThanOrEqual(MIN_MID)
+      } else {
+        expect(tree).toBe(MIN_LEFT)
+      }
+    }
+  })
+
+  // The clamp only ever binds DOWNWARD. A request the floor already allows must
+  // come back untouched — the assertion that keeps "charge the deficit to the
+  // tree" from being written as "pin the tree to the largest allowed width",
+  // which satisfies the floor and quietly makes the divider un-draggable inward.
+  it('leaves a request the floor already allows exactly alone', () => {
+    for (const desired of [MIN_LEFT, 200, 240, 300, 356]) {
+      expect(clampLeftWidth(desired, 1280, 556)).toBe(desired)
+    }
+  })
+
+  it('ignores a bogus window measurement instead of computing from it', () => {
+    for (const bogus of [0, -1, NaN, Infinity]) {
+      expect(clampLeftWidth(300, bogus, 556)).toBe(300)
+    }
+  })
+
+  // The activity bar is charged on this path too. Dropping it would allow 404
+  // here (1280 - 556 - 320) — a 48px wider tree and a middle of 272 against a
+  // floor of 320, which is the same under-count of the middle's chrome
+  // chromeLeftOfMiddle exists to make unexpressible, coming in through the new
+  // door this item opened.
+  it('charges the activity bar, once', () => {
+    expect(clampLeftWidth(99999, 1280, 556)).toBe(356)
+    expect(clampLeftWidth(99999, 1280, 556)).not.toBe(404) // bar forgotten
+    expect(clampLeftWidth(99999, 1280, 556)).not.toBe(308) // bar charged twice
+    expect(404 - clampLeftWidth(99999, 1280, 556)).toBe(ACTIVITY_BAR_PX)
+  })
+
+  // Not a `loadLeftWidth`. The read side is already guarded from the other end:
+  // loadRightWidth is handed the STORED tree width and reduces the right pane
+  // until the middle clears MIN_MID, which is what App.tsx's `rightW`
+  // initializer does on every load. Pinned here so that adding a read-side left
+  // clamp later has to confront the fact that two clamps would be arguing over
+  // which pane pays.
+  it('needs no read-side twin: the stored tree width is already answered for', () => {
+    const storedTree = MAX_LEFT // dragged wide on a big monitor, then reloaded at 1280
+    const right = loadRightWidth(String(MAX_RIGHT), 1280, storedTree)
+    expect(mid(1280, storedTree, right)).toBeGreaterThanOrEqual(MIN_MID)
+    expect(right).toBe(1280 - (storedTree + ACTIVITY_BAR_PX) - MIN_MID)
   })
 })
 
@@ -281,9 +394,9 @@ describe('the activity bar is charged inside layout.ts (tether#102)', () => {
   it.each([
     [-1000, 48, 832], // corrupt persisted tree width: no tree, bar still there
     [0, 48, 832], // tree fully collapsed
-    [160, 208, 672], // App.tsx MIN_LEFT
+    [160, 208, 672], // MIN_LEFT (in App.tsx until tether#129)
     [DEFAULT_LEFT, 288, 592], // the default — and what App.tsx passes
-    [480, 528, 352], // App.tsx MAX_LEFT
+    [480, 528, 352], // MAX_LEFT (ditto)
   ])('charges a %ipx tree as %ipx of chrome', (treeWidth, chrome, expected) => {
     expect(1200 - chrome - MIN_MID).toBe(expected) // the row is self-consistent
     expect(clampRightWidth(99999, 1200, treeWidth)).toBe(expected)

@@ -52,6 +52,12 @@ function selectTab(detail: 'chat' | 'work') {
 // (tether#90), so this file did not have to change with it.
 function CanvasHome() {
   const [ws, setWs] = useState<Workspace[]>([])
+  // tether#129 — WHICH workspace this line is about. store.activeWorkspace is the
+  // one the rest of the app is pointed at: WorkspacePane sets it, the left file
+  // tree lists it, and chatUrl.ts pins a new session's cwd to it. The listing
+  // fetched below is only where the NAME comes from — activeWorkspace carries an
+  // id and a path and no name.
+  const active = useStore((s) => s.activeWorkspace)
 
   useEffect(() => {
     let alive = true
@@ -61,7 +67,26 @@ function CanvasHome() {
     return () => { alive = false }
   }, [])
 
-  const primary = ws[0]
+  // This used to be `ws[0]` — the daemon's listing order, which is registration
+  // order and has nothing to do with what the user picked. With two workspaces
+  // registered and the second one active, the home printed the wrong name over
+  // the wrong path and put `· +N more` beside them, which reads as though the one
+  // named were the current one and the others merely also present.
+  //
+  // The `ws[0]` FALLBACK is deliberate and load-bearing, not a leftover: nothing
+  // is active until WorkspacePane's fetch settles (store.workspacesLoaded is the
+  // gate ChatPane waits on), so it is what the home shows for the first frames of
+  // every cold load. It also covers an active id the listing does not contain —
+  // activeWorkspace is persisted across runs, so it can name a workspace that has
+  // since been removed. Falling back to a real entry beats printing a blank label
+  // beside a path from a workspace that no longer exists.
+  //
+  // Written with the null check outside the predicate rather than as
+  // `ws.find(w => w.id === active?.id)`. The short form leans on no entry having
+  // an undefined id to make the no-selection case fall through, and this listing
+  // is unvalidated JSON off the wire (lib/aihub's getJSON just casts) — an entry
+  // missing its id would match `undefined` and be picked as the active one.
+  const primary = (active !== null ? ws.find((w) => w.id === active.id) : undefined) ?? ws[0]
 
   return (
     <div className="canvas-home">

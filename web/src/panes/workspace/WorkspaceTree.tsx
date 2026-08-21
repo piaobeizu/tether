@@ -50,17 +50,44 @@ export default function WorkspaceTree({ workspaceId }: WorkspaceTreeProps) {
     select({ file: { wsId: workspaceId, path } })
   }
 
+  // tether#129 — the two callbacks below INHERIT `expanded` from the state they
+  // land in; only the synchronous write above them may assert it.
+  //
+  // They used to write `expanded: true` unconditionally, which is an intent and
+  // not something the fetch learned. Folding a directory shut while its listing
+  // was in flight set it false, and then the arriving listing put it back —
+  // re-asserting a decision the user had already withdrawn, so the directory
+  // sprang open on its own. The `.catch` had the same line, so a flaky daemon
+  // popped it open too.
+  //
+  // `?? true` is for the key being absent entirely, which is not the collapse
+  // case (the write above always creates it): it is the workspace having changed
+  // under an in-flight load, since the `[workspaceId]` effect resets `nodes` to
+  // {}. Recreating the node expanded is what that path did before this change and
+  // still does — a listing arriving for the workspace you just left is a
+  // different defect, and it is not fixed here.
   const expand = (dir: string) => {
     setNodes(prev => ({
       ...prev,
       [dir]: { expanded: true, loading: true, error: null, entries: prev[dir]?.entries ?? null },
     }))
     cache.load(dir).then(entries => {
-      setNodes(prev => ({ ...prev, [dir]: { expanded: true, loading: false, error: null, entries } }))
+      setNodes(prev => ({
+        ...prev,
+        [dir]: { expanded: prev[dir]?.expanded ?? true, loading: false, error: null, entries },
+      }))
     }).catch((e: unknown) => {
       setNodes(prev => ({
         ...prev,
-        [dir]: { expanded: true, loading: false, error: e instanceof Error ? e.message : String(e), entries: null },
+        [dir]: {
+          expanded: prev[dir]?.expanded ?? true,
+          loading: false,
+          error: e instanceof Error ? e.message : String(e),
+          // Still null rather than `prev[dir]?.entries`: an error REPLACES the
+          // listing here, as it did before tether#129. Showing a stale listing
+          // under an error message is a product decision and not this fix.
+          entries: null,
+        },
       }))
     })
   }

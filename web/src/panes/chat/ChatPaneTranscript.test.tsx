@@ -25,13 +25,21 @@ import {
 // Everything else about a notice is asserted in store.test.ts: it is created,
 // it is bounded, it is ordered, and mergeTranscript projects it into a
 // `role: 'system'` Message. None of that says the pane still CALLS
-// mergeTranscript. ChatPane.test.tsx is 560 lines that render sub-components
-// directly and never mount ChatPane at all, so replacing
-// `mergeTranscript(messages, notices)` with `messages` at index.tsx's transcript
-// memo left the entire frontend suite green — every notice in the app silently
-// stops being rendered and no test notices (found by tether#77's review, filed
-// as this wi's N5; the general form is the team's
+// mergeTranscript, so replacing `mergeTranscript(messages, notices)` with
+// `messages` at index.tsx's transcript memo left the entire frontend suite green
+// while every notice in the app silently stopped being rendered (found by
+// tether#77's review, filed as this wi's N5; the general form is the team's
 // "test the WIRING hop, not just the unit").
+//
+// The tests below are what closed that hole, and they are still the only thing
+// closing it. That is a measurement rather than an argument, and it is cheap to
+// repeat: put `messages` back in place of the merge and run the whole web suite.
+// At 5f96f7f every failing test is in THIS file, and every other test file
+// passes — store.test.ts and ChatPane.test.tsx included. Repeat that instead of
+// reasoning about which other file might cover this hop. The sentence that stood
+// here until tether#133 did the reasoning, from another file's line count and
+// harness shape, and both halves went false: the count was already wrong on the
+// day it was written, and the shape was overturned by tether#130.
 //
 // That gap is worth more than usual here, because "the frame becomes a line a
 // human can read" is the whole point of this wi. A fix that produced a perfect

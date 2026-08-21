@@ -1,5 +1,39 @@
 import { useState } from 'react'
 
+/**
+ * Resolve the post-login `?redirect=` target to a same-origin path, or `/`.
+ *
+ * The producer is real and must keep working: `redirectToAuth()` in lib/auth.ts
+ * puts the current path + query here on a 401 so the owner lands back where they
+ * were. (A review pass called this parameter unused — it had grepped only the Go
+ * side.)
+ *
+ * The previous guard was `raw.startsWith('/') && !raw.startsWith('//')`, and it
+ * did not hold: WHATWG URL parsing treats `\` as `/` for special schemes, so
+ * `/\evil.example` resolves to `https://evil.example/`. Verified in headless
+ * Chrome against that exact code — `?redirect=//host` was contained, and
+ * `?redirect=/\/host` navigated off-site. `/<TAB>/evil.example` slips through
+ * the same way, because tabs are stripped before parsing.
+ *
+ * So the check is not "does this string look relative" but "where does this
+ * actually resolve to", answered by the same parser the browser will use for the
+ * navigation. Returning the parsed path rather than `raw` is part of the guard:
+ * whatever comes back cannot carry an origin.
+ */
+export function safeRedirectTarget(raw: string | null, origin: string): string {
+  if (!raw) return '/'
+  let url: URL
+  try {
+    url = new URL(raw, origin)
+  } catch {
+    return '/'
+  }
+  // Covers off-origin hosts, scheme changes, and opaque schemes such as
+  // javascript: and data:, whose origin is the string "null".
+  if (url.origin !== origin) return '/'
+  return url.pathname + url.search + url.hash
+}
+
 export default function AuthPage() {
   const [token, setToken] = useState('')
   const [error, setError] = useState('')
@@ -21,10 +55,7 @@ export default function AuthPage() {
       })
       if (res.ok) {
         const params = new URLSearchParams(window.location.search)
-        const raw = params.get('redirect') ?? '/'
-        // Prevent open redirect: only allow same-origin relative paths.
-        const safe = raw.startsWith('/') && !raw.startsWith('//') ? raw : '/'
-        window.location.href = safe
+        window.location.href = safeRedirectTarget(params.get('redirect'), window.location.origin)
       } else {
         setError('Invalid token. Check ~/.tether/access-token on the server.')
       }

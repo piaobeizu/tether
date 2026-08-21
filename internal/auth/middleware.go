@@ -190,7 +190,24 @@ func (s *State) isExempt(r *http.Request) bool {
 		// WebTransport CONNECT uses a new QUIC connection that may not carry
 		// SameSite=Strict cookies. Auth is checked inside the handler instead.
 		strings.HasPrefix(p, "/wt/"),
-		p == "/oauth/authorize",
+		// GET ONLY (tether#117 A1). The exemption used to cover every method,
+		// including the POST that MINTS an authorization code — so on a public
+		// --acme-domain deployment (TCP+UDP both on *:443, reachable from the
+		// internet because TLS-ALPN-01 requires it) three curl requests with no
+		// credentials at all turned into a 24h Bearer token in the same
+		// api-tokens store as a hand-issued one. GET renders the consent page
+		// and mints nothing, so it stays exempt: the MCP client opens this URL
+		// in the owner's browser and the browser may not have the cookie yet.
+		// Any other method falls through to the cookie check below, which is
+		// what makes consent come from an authenticated browser. oauth.Handlers
+		// carries the same check as its own second lock, so re-wiring the mux
+		// cannot re-open the mint.
+		p == "/oauth/authorize" && r.Method == http.MethodGet,
+		// POST /oauth/token authenticates itself: the caller must present a
+		// single-use code AND the PKCE verifier for the challenge bound to it.
+		// The MCP client performing the exchange has no cookie jar, so a cookie
+		// requirement here would break every remote client without adding a
+		// guard the code+verifier pair does not already provide.
 		p == "/oauth/token",
 		p == "/.well-known/oauth-authorization-server":
 		return true

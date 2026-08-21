@@ -100,6 +100,23 @@ type Config struct {
 	// If nil, Run() initialises one and stores it here.
 	MCPLifecycle *mcplifecycle.LifecycleManager
 
+	// PermGate is the ONE answer to "how is a cc subprocess this daemon spawns
+	// wired to the PreToolUse permission gate", decided by setupPermGate during
+	// startup step 3 and consumed by every cc spawn path.
+	//
+	// It exists as a field rather than a local because there is more than one
+	// spawn path — the chat path (session.Registry) and the shell path
+	// (buildPTYEnv) — and a gate decision made twice is a gate decision that can
+	// disagree with itself. The interesting case is not the happy one: a sentinel
+	// injected on one path and forgotten on the other fails OPEN precisely in the
+	// branch it was added to close (tether#117 A4b; the shell path is wired in
+	// tether#149).
+	//
+	// Zero value (unmanaged, no endpoint) is the correct state for
+	// TETHER_NO_PERMISSION_HOOK=1: it injects nothing, which leaves the hook's
+	// deliberate exit-0 fail-open in place for cc runs tether does not own.
+	PermGate cchook.Gate
+
 	// WIBindings records which work item each session belongs to (tether#91).
 	// Populated by Run() alongside the history store and the workspace bindings,
 	// which share its directory.
@@ -218,18 +235,20 @@ func Run(cfg *Config) error {
 	// Step 3: permission hook setup (D-05b §4–§5).
 	pm := permission.New()
 	noHook := os.Getenv("TETHER_NO_PERMISSION_HOOK") == "1"
-	if !noHook {
-		binPath := filepath.Join(binDir, "tether-permission-hook")
-		if err := cchook.EnsureHookBinary(binPath); err != nil {
-			return fmt.Errorf("perm hook compile: %w", err)
-		}
-		permEndpoint := fmt.Sprintf("https://127.0.0.1%s/api/v1/permission/request", cfg.addr())
-		if err := agent.InjectPermHook(binPath, permEndpoint); err != nil {
-			slog.Warn("inject perm hook failed", "err", err)
-		} else {
-			cfg.Registry.PermEndpoint = permEndpoint
-		}
+	gate, err := setupPermGate(
+		noHook,
+		filepath.Join(binDir, "tether-permission-hook"),
+		fmt.Sprintf("https://127.0.0.1%s/api/v1/permission/request", cfg.addr()),
+		cchook.EnsureHookBinary,
+		agent.InjectPermHook,
+	)
+	if err != nil {
+		return err
 	}
+	cfg.PermGate = gate
+	// The chat spawn path still reads this single string; tether#149 replaces
+	// both spawn paths with cfg.PermGate.Env() so the shell path is covered too.
+	cfg.Registry.PermEndpoint = gate.Endpoint
 
 	// Step 3b: MCP host + loopback (v0.3.1).
 	mcpPort := cfg.MCPPort
@@ -453,7 +472,7 @@ func Run(cfg *Config) error {
 		oauthIssuer = fmt.Sprintf("https://%s:%d", oauthHost, cfg.Port)
 	}
 	oauthCS := oauth.NewCodeStore()
-	oauthH := oauth.NewHandlers(oauthCS, apiTokens, oauthIssuer)
+	oauthH := oauth.NewHandlers(oauthCS, apiTokens, oauthIssuer, sessionAuthFor(authState))
 
 	// Step 5: build and start listeners.
 	certs := newCertHolder(bundle)
@@ -532,6 +551,76 @@ func Run(cfg *Config) error {
 	_ = srv.tcp.Shutdown(ctx)
 	_ = srv.h3.Close()
 	return nil
+}
+
+// sessionAuthFor adapts the auth middleware's cookie verifier into the predicate
+// oauth.Handlers uses to gate the consent POST (tether#117 A1).
+// ClientIDFromRequest returns "" for a cookie that is missing, malformed,
+// expired, or carries the wrong subject, so this is exactly the verification the
+// middleware performs — the second lock on the token mint, not a looser one.
+//
+// A named function rather than a closure written inline at the call site, so the
+// wiring is a thing a test can hold: TestOAuthMintChain_* drives the real mux
+// through this exact predicate. Inlined, the test would have had to retype the
+// expression, and a test that retypes the wiring cannot fail when the wiring
+// changes.
+func sessionAuthFor(authState *auth.State) oauth.SessionAuth {
+	return func(r *http.Request) bool {
+		return authState.ClientIDFromRequest(r) != ""
+	}
+}
+
+// setupPermGate performs startup step 3 and returns the ONE permission-gate
+// decision every cc spawn path must use. Its two side effects — compiling the
+// hook binary and patching ~/.claude/settings.json — arrive as parameters so a
+// test can drive their failure modes; Run passes cchook.EnsureHookBinary and
+// agent.InjectPermHook.
+//
+// The two failures are NOT symmetric, and it took tether#117 A4 to notice that
+// the code treated them as if they differed the other way round:
+//
+//   - No hook binary is fatal. Nothing can enforce anything, and cc treats every
+//     non-zero hook exit EXCEPT 2 as non-blocking, so a missing binary means
+//     every tool runs with no prompt at all. Refusing to start is the only
+//     honest answer.
+//
+//   - A failed settings.json patch is NOT fatal, and — this is the fix — it is
+//     not a reason to disarm the gate either. It used to leave Endpoint empty,
+//     which is what made the daemon dangerous rather than merely degraded: a
+//     hook entry left in settings.json by a PREVIOUS run still ran, found no
+//     endpoint in its environment, and exited 0. Every tool call in every
+//     session, ungated, announced by one slog line at startup.
+//
+//     The endpoint is a fact about this daemon's own listener, not about whether
+//     a file on disk was rewritten, so it is now always reported. Where the
+//     patch failed but a stale entry survives, the gate simply works. Where
+//     neither exists, cc runs no hook at all and there is nothing any value here
+//     could do about it — that residual hole closes only by refusing to start,
+//     which is the option this daemon deliberately does not take.
+func setupPermGate(
+	hookDisabled bool,
+	binPath, endpoint string,
+	ensureBinary func(string) error,
+	injectSettings func(hookBinPath, daemonEndpoint string) error,
+) (cchook.Gate, error) {
+	if hookDisabled {
+		// TETHER_NO_PERMISSION_HOOK=1 is an explicit opt-out. Mark nothing: a
+		// hook entry surviving in settings.json must keep exiting 0, which is
+		// what the operator asked for.
+		return cchook.Gate{}, nil
+	}
+	if err := ensureBinary(binPath); err != nil {
+		return cchook.Gate{}, fmt.Errorf("perm hook compile: %w", err)
+	}
+	if err := injectSettings(binPath, endpoint); err != nil {
+		// Error, not Warn: this is the difference between "the gate is armed and
+		// cc will consult it" and "the gate is armed and cc may never call it".
+		slog.Error("inject perm hook failed; cc will only run the hook if a previous "+
+			"run left it in ~/.claude/settings.json. The gate stays armed either way — "+
+			"a tether-spawned cc that reaches the hook without an endpoint now DENIES",
+			"err", err, "hook", binPath)
+	}
+	return cchook.Gate{Managed: true, Endpoint: endpoint}, nil
 }
 
 func tetherBinDir() (string, error) {

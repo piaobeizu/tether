@@ -141,6 +141,30 @@ type Registry struct {
 	// the workspace its client asks for (or the default). Wired in lifecycle.go
 	// Step 2a alongside History, which shares its directory.
 	Bindings *BindingStore
+	// PendingBackfill returns the daemon-wide envelopes a chat client that has
+	// just subscribed HAS NOT SEEN AND CANNOT ASK FOR (tether#132). Today that is
+	// exactly the permission requests still awaiting a decision; the function is
+	// wired in internal/server/mux.go, next to the live fan-out that produces the
+	// same envelopes, and both go through one builder there.
+	//
+	// nil = no backfill, which is every daemon before tether#132 and every test
+	// that does not set it.
+	//
+	// # Why the Registry pulls instead of the producer pushing
+	//
+	// The producer (permission.Manager) knows when a request STARTS; it does not
+	// know when a client attaches, and it is the attach that needs answering. The
+	// question this field asks — "what is outstanding right now" — has exactly one
+	// correct answer at exactly one moment, so the Registry asks it then rather
+	// than keeping a copy that a decision taken in between would make wrong. That
+	// is also why nothing here remembers what BroadcastAll dropped: a dropped
+	// request may well have been answered from another tab since, and replaying it
+	// would put a card on screen for a tool call that is already running.
+	//
+	// A plain field written once at startup, like PermEndpoint / History / Workdir
+	// above: buildMux sets it before the listener accepts anything, so no session
+	// exists to read it concurrently.
+	PendingBackfill func() []wire.Envelope
 }
 
 // hadConversation reports whether ANY store this daemon can see holds a
@@ -320,6 +344,16 @@ type spawnReservation struct {
 type Entry struct {
 	sess agent.Session
 	subs map[chan wire.Envelope]struct{}
+	// reg is the Registry that spawned this entry, and it is here for exactly one
+	// reason: Subscribe has to reach Registry.PendingBackfill (tether#132). Set by
+	// spawnEntry; nil for the Entry literals this package's own tests build, which
+	// is why backfill is nil-guarded rather than assumed.
+	//
+	// Deliberately not used for anything else. Handing an Entry the whole Registry
+	// makes it possible to reach back for state that Entry has no business
+	// reading, and the lock ordering (r.mu outside e.subsMu everywhere today) is
+	// not enforced by anything but convention.
+	reg *Registry
 	// lost counts, per subscriber channel, the envelopes deliver could not fit
 	// into it and had to drop — reset each time the subscriber is TOLD about them
 	// (see deliver and gapNotice). Every channel in subs has an entry here and
@@ -528,6 +562,10 @@ func (e *Entry) clearTurns() { e.turnsInFlight.Store(0) }
 // same channel across a fallback swap and can leave it on two entries at once, so
 // re-subscribing must not silently forgive a gap the subscriber has not been told
 // about yet.
+//
+// Since tether#132 it also hands the new subscriber the daemon-wide backfill —
+// see backfill, and see this method's placement argument there for why the
+// replay is HERE rather than at the call site that wanted it.
 func (e *Entry) Subscribe(ch chan wire.Envelope) {
 	e.subsMu.Lock()
 	e.subs[ch] = struct{}{}
@@ -540,6 +578,103 @@ func (e *Entry) Subscribe(ch chan wire.Envelope) {
 		e.lost[ch] = new(atomic.Int64)
 	}
 	e.subsMu.Unlock()
+	e.backfill(ch)
+}
+
+// backfill gives a just-subscribed channel the daemon-wide envelopes it could
+// not have received and cannot ask for — today the permission requests still
+// awaiting a decision (Registry.PendingBackfill).
+//
+// # What this repairs
+//
+// A permission request reaches the browser as ONE BroadcastAll envelope, and
+// deliverOutOfBand drops it if the subscriber's channel is full — which an
+// ordinary stall is enough to cause (see the subCh declaration in
+// internal/server/wt_chat.go). The frontend's pendingPermissions list is filled
+// from that envelope and nothing else, so the prompt simply never appears while
+// the tool call goes on waiting. Every client that attaches AFTER the drop now
+// gets the request: a second device, a second tab, and the channel migration
+// Attachment.adopt performs across a failed resume.
+//
+// # What it does NOT repair, which was measured and is not a small caveat
+//
+// A full page reload of the ONLY open tab. tether ties the agent subprocess to
+// the chat connection's context (Registry.Attach passes serveChat's
+// wtsess.Context() all the way into exec.CommandContext), so closing that
+// connection KILLS the agent — verified on a live daemon: after five chat
+// connections came and went, zero agent processes remained, and a reconnect
+// carrying the same sid took the `--resume` path rather than reusing a live
+// entry. The tool call the request belonged to dies with it, so there is nothing
+// a replay can usefully put back. tether#132's own description assumed a reload
+// was the reader's repair; it is not, and it is not this function's to make one.
+//
+// The second half of the same measurement: because the backfill rides subCh,
+// serveChat only forwards it AFTER Attachment.Resolve returns, and on the resume
+// path Resolve blocks until the agent emits system/init — which under
+// `--input-format stream-json` waits for the first prompt. So even where a
+// request does outlive a reload, it is not on screen until the user types.
+// Both of those are properties of the session's process lifetime, not of this
+// replay, and changing them is a separate piece of work.
+//
+// # Why in Subscribe and not in serveChat, which is the caller that wanted it
+//
+// Because then no caller has to remember. serveChat is one of the two paths a
+// chat channel gets registered on; Attachment.adopt is the other, and it
+// re-registers the same channels onto a REPLACEMENT entry after a failed
+// resume — a client that has just had its session swapped underneath it is
+// exactly one that should be re-told what is outstanding. Putting the replay at
+// the convergence point is the argument Entry.sendPrompt makes for itself one
+// screen up, and it has the same second benefit: this is reachable from a test,
+// whereas serveChat takes a concrete *webtransport.Session and needs a live QUIC
+// connection to enter at all.
+//
+// # Registered first, replayed second, and duplicates are the acceptable side
+//
+// The order is not arbitrary. Between the two there is a window in which a NEW
+// request can be broadcast, and the two orderings fail differently:
+//
+//   - replay then register: the new request is broadcast to a subscriber set
+//     this channel is not in yet, and it is not in the snapshot either. It is
+//     lost, which is the bug this function exists to fix, recreated one
+//     instruction wide.
+//   - register then replay (this one): the new request can arrive by both routes.
+//     The frontend's permission reducer dedupes on `id`, so the second copy is
+//     discarded — and even without that, a duplicated prompt is visible and
+//     answerable where a lost one is neither.
+//
+// The same reasoning covers a re-subscribe of a channel that is already here
+// (Attachment.Subscribe does this across a swap): it replays, and the duplicates
+// are deduped downstream.
+//
+// # A backfill that does not fit is dropped, not waited for
+//
+// trySend, like every other send onto a subscriber channel in this file, and for
+// the reason trySend's own doc gives. The channel a caller subscribes is
+// normally empty at this point (serveChat makes it one statement earlier), so
+// there is room for 32 outstanding requests; a full one means the client is
+// already wedged, and blocking here would hold subsMu — the lock every broadcast
+// in the daemon needs — on that wedged client. The drop is logged, and unlike
+// the drop it repairs it is a drop the operator can act on.
+func (e *Entry) backfill(ch chan wire.Envelope) {
+	if e.reg == nil || e.reg.PendingBackfill == nil {
+		return
+	}
+	envs := e.reg.PendingBackfill()
+	if len(envs) == 0 {
+		return
+	}
+	sent := 0
+	for _, env := range envs {
+		if !trySend(ch, env) {
+			slog.Warn("backfill dropped: new subscriber's channel is already full",
+				"kind", env.Kind, "sent", sent, "outstanding", len(envs))
+			break
+		}
+		sent++
+	}
+	if sent > 0 {
+		slog.Info("replayed outstanding envelopes to a new subscriber", "count", sent)
+	}
 }
 
 // Unsubscribe removes ch from the subscriber set, and with it the drop
@@ -983,6 +1118,7 @@ func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agen
 	e := &Entry{
 		sess:        sess,
 		subs:        make(map[chan wire.Envelope]struct{}),
+		reg:         r,
 		fenceParser: NewFenceParser(),
 		regKey:      key,
 		provider:    providerName,
@@ -2375,22 +2511,26 @@ func (e *Entry) deliverTurn(ch chan wire.Envelope, env wire.Envelope) {
 // The notice tells the reader to reload. That is only worth saying where reloading
 // gets the content back, and for these three producers it does not:
 //
-//   - A KindPermission request (mux.go) is the worst case. The frontend's
-//     pendingPermissions list is populated from THIS envelope and nothing else —
-//     there is no endpoint to ask for outstanding requests — and loadHistory
-//     CLEARS that list, so a reload does not recover the prompt, it destroys what
-//     was left of it. Meanwhile the tool call the request belongs to is still
-//     waiting.
+//   - A KindPermission request (mux.go) is the worst case, and since tether#132
+//     it is the one with a partial repair. The frontend's pendingPermissions list
+//     is populated from THIS envelope and nothing else, so a drop left the prompt
+//     nowhere while the tool call went on waiting. What addresses that is not a
+//     notice: it is Entry.backfill replaying the still-outstanding requests to
+//     every client that attaches next, plus store.ts's loadHistory no longer
+//     discarding the requests of the session it is reloading. Note the limit,
+//     because it is what keeps a notice off this path even now: a reload of the
+//     only open tab kills the agent (see Entry.backfill for the measurement), so
+//     "reload to get it back" would STILL be a promise this code cannot keep.
 //   - wt_shell.go's lock_held and lock_taken are transient affordances for the
-//     shell pane, with no history behind them either.
+//     shell pane, with no history and no backfill behind them.
 //
 // So a notice here would be a promise this code cannot keep, and its neighbours
 // in this package already argue what that costs: a notice a reader has caught
-// being wrong is one they stop reading. A dropped permission request IS a real and
-// worse defect than the one tether#124 fixes — it hangs a tool call with no way
-// for anyone to find out — but repairing it means a pending-requests endpoint and
-// a frontend that asks for it, which is neither this file nor this change. It is
-// tether#132, filed rather than papered over with a notice that would mislead.
+// being wrong is one they stop reading. Note what tether#132 did NOT change: this
+// path still says nothing to the reader. A permission request is repaired by
+// being re-sent, not by being announced, and the other two payloads have no
+// repair at all — so there is still nothing here that a sentence could truthfully
+// promise.
 //
 // It is deliberately NOT counted into Entry.lost either. That counter is what the
 // notice reports, and letting an unrepairable drop raise it would make the very

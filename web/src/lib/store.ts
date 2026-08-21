@@ -550,6 +550,48 @@ export interface PermissionRequest {
   input: unknown
 }
 
+/**
+ * PendingPermission is a PermissionRequest plus the sid of the chat connection
+ * that delivered it (tether#132).
+ *
+ * # Why the sid is kept at all
+ *
+ * Because `loadHistory` has to answer a question it could not previously ask.
+ * That reducer is the server-truth replace, and it cleared this whole queue on
+ * the grounds that the array it installs may belong to ANOTHER session — true for
+ * a deliberate switch, and wrong for every refetch of the session already on
+ * screen. There are several of those and none of them is a switch: a click on the
+ * already-open row in the session list (lib/session.ts's REFRESH_TRANSCRIPT_EVENT
+ * -> refreshTranscript), the held-session watcher's three-second reload, and a
+ * page reload. So a live permission card could be dismissed by a misclick, with
+ * nothing anywhere to bring it back. Without the sid, "the session I am
+ * reloading" and "the session I have left" are indistinguishable.
+ *
+ * # Not folded into PermissionRequest
+ *
+ * PermissionRequest is the WIRE payload (internal/server/mux.go builds exactly
+ * its three fields); this is store bookkeeping about an envelope. Keeping them
+ * apart is what stops a future reader from looking for `sessionId` in the daemon's
+ * payload.
+ *
+ * # Why the tag is OPTIONAL, which is a decision and not laziness
+ *
+ * The one writer — handleEnvelope's 'permission' case — always sets it, so no
+ * value this store produces is ever absent. What is optional for is the queue
+ * entries assembled DIRECTLY by tests that predate the tag, and the reducer reads
+ * absent and explicit-null identically: "claimed by no session", therefore not
+ * kept by a load for a named one. That is the pre-tether#132 outcome, which is
+ * the only safe thing an untagged entry can mean — so requiring the field would
+ * buy nothing here and cost a rewrite of fixtures in files this change does not
+ * own. Do not "tidy" it into a required field without checking those.
+ *
+ * Consumers keep taking PermissionRequest[] (fenced-blocks/PermissionBlock): this
+ * type is assignable to it, and the extra field is not theirs to read.
+ */
+export interface PendingPermission extends PermissionRequest {
+  sessionId?: string | null
+}
+
 export type ConnState = 'connecting' | 'live' | 'reconnecting' | 'dropped'
 
 export interface Connection {
@@ -606,8 +648,13 @@ interface AppState {
   notices: Notice[]
   // Pending PreToolUse permission requests (tether#40). A QUEUE, not one slot:
   // parallel tools each send their own KindPermission, so a single slot let the
-  // later request clobber the earlier one → all-but-one timed out. Live-only.
-  pendingPermissions: PermissionRequest[]
+  // later request clobber the earlier one → all-but-one timed out.
+  //
+  // Live-only in the sense that nothing persists it here — but since tether#132
+  // it is no longer live-ONCE: the daemon re-sends whatever is still outstanding
+  // to a client that attaches, so a second device or tab is given the requests it
+  // was never told about. See PendingPermission for the sid each entry carries.
+  pendingPermissions: PendingPermission[]
   connected: boolean
   streaming: boolean
   connection: Connection
@@ -932,8 +979,51 @@ export const useStore = create<AppState>((set, get) => ({
       const id = q?.shift()
       if (id !== undefined) reduced[i] = { ...reduced[i], id }
     }
-    // A session reset (page reload / session switch) drops any stale pending
-    // permission requests — they belong to the prior session (tether#40).
+    // Stale pending permission requests are dropped — they belong to a session
+    // this reducer is replacing (tether#40) — but ONLY the stale ones (tether#132).
+    //
+    // # What was wrong with dropping all of them
+    //
+    // "A session reset (page reload / session switch)" named two events and only
+    // one of them is a reset. Every other refetch of the session ALREADY on
+    // screen came through here too, and there are three: a click on the
+    // already-open row in the session list (lib/session.ts's
+    // REFRESH_TRANSCRIPT_EVENT -> refreshTranscript), the held-session watcher's
+    // three-second reload, and a page reload. A permission request reaches the
+    // browser as ONE broadcast envelope and is held nowhere else, so any of those
+    // could dismiss a live, undelivered-to-nobody-else permission card, and
+    // nothing would ever send it again. The daemon does now re-send what is still
+    // outstanding to a client that attaches (session.Entry.backfill) — and this
+    // line threw that away too.
+    //
+    // # Why filtering by sid is the whole fix, and why it is not "just delete the
+    // reset"
+    //
+    // The reset is correct for a SWITCH: those requests were raised in a
+    // conversation the reader has left, and leaving them on screen makes them
+    // approvable there. Both call sites establish the discriminator for free —
+    // ChatPane's `[sessionId]` effect and lib/session.ts's refreshTranscript each
+    // check `sessionId` against the response's sid before calling this, so
+    // `s.sessionId` here IS the session being installed. A request tagged with it
+    // belongs to the conversation on screen; anything else does not.
+    //
+    // It also removes an ORDERING dependency that neither side controls, and the
+    // ordering was measured rather than reasoned about. Against a live daemon,
+    // with the transcript GET and the WebTransport connect started at the same
+    // instant, the GET returned in 2.6ms and the re-sent permission envelope
+    // arrived at 24.4ms — so on a reload this reducer runs FIRST and the request
+    // arriving second is safe either way. That is one measurement of one link on
+    // one machine, which is exactly why it is not what the fix rests on: the other
+    // three refetch paths above run at arbitrary times, long after the request
+    // arrived, and they are the order that used to lose it.
+    //
+    // An entry with NO tag — null from an envelope that named no session, or
+    // absent because a test assembled the queue directly — matches nothing: the
+    // `!= null` is what keeps `null === s.sessionId` from becoming true for a
+    // reader who has no sid either. That preserves the pre-tether#132 outcome for
+    // anything the reducer did not tag, rather than inventing a survival rule for
+    // it. Nothing the chat route delivers is untagged: serveChat stamps
+    // env.SessionID on every envelope it forwards.
     //
     // tether#57 — note what is NOT in this return: `notices`. This reducer is
     // the server-truth replace, and it does not own the notice list, so it
@@ -945,7 +1035,8 @@ export const useStore = create<AppState>((set, get) => ({
     // any more. The two boundary FACTS are not reset here, because they come off the
     // response and the caller records them with setTranscriptBounds immediately after;
     // clearing them here would blank the marker for one render on every reload.
-    return { messages: reduced, streamingMsgId: null, streaming: false, curTurnId: null, thinkingStartTs: null, answerStartTs: null, stopped: false, pendingPermissions: [], transcriptPagesBack: 0 }
+    const keptPermissions = s.pendingPermissions.filter((p) => p.sessionId != null && p.sessionId === s.sessionId)
+    return { messages: reduced, streamingMsgId: null, streaming: false, curTurnId: null, thinkingStartTs: null, answerStartTs: null, stopped: false, pendingPermissions: keptPermissions, transcriptPagesBack: 0 }
   }),
   setTranscriptBounds: ({ earlier, otherRecord }) => set((s) => (
     // A real no-op when neither fact moved: ChatPane subscribes without a selector, so
@@ -981,7 +1072,10 @@ export const useStore = create<AppState>((set, get) => ({
    *    REPLACE and the array it installs may belong to another session; this adds
    *    older history to the session already on screen and reports nothing about the
    *    live turn. Resetting here would let a click on "load earlier messages" cancel
-   *    the reader's own in-flight turn.
+   *    the reader's own in-flight turn. (Since tether#132 loadHistory keeps the
+   *    pending requests raised in the session it is installing and drops only the
+   *    rest, which makes this omission the same rule rather than a stricter one:
+   *    every request in the list belongs to the session this page extends.)
    *  - It does not sort. Every page is a contiguous byte range of one append-only file,
    *    so an earlier page is entirely older than what it is prepended to. Sorting the
    *    union by ts would ALSO reorder the messages themselves, which mergeTranscript's
@@ -1808,11 +1902,23 @@ export const useStore = create<AppState>((set, get) => ({
         // Parallel tools each send their own KindPermission (tether#40): APPEND to
         // the queue instead of overwriting a single slot, so every request stays
         // approvable. Dedup by id so a re-emitted request doesn't duplicate a block.
+        //
+        // The dedupe is load-bearing rather than defensive since tether#132: a
+        // request the daemon re-sends on attach can arrive alongside a live
+        // broadcast of the same request (session.Entry.backfill registers the
+        // channel before it replays, deliberately — see its doc for why the other
+        // order loses requests instead of duplicating them). This is what makes
+        // that trade cost nothing.
         const req = env.payload as PermissionRequest
+        // Tagged with the sid this envelope came in on, which serveChat stamps on
+        // everything leaving a chat connection, so `loadHistory` can tell "the
+        // session I am reloading" from "the session I have left". An envelope with
+        // no sid is tagged null and is not claimed by any session — see the reducer.
+        const pending: PendingPermission = { ...req, sessionId: env.sessionId ?? null }
         set((s) => (
           s.pendingPermissions.some((p) => p.id === req.id)
             ? {}
-            : { pendingPermissions: [...s.pendingPermissions, req] }
+            : { pendingPermissions: [...s.pendingPermissions, pending] }
         ))
         break
       }

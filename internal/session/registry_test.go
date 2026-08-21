@@ -1871,3 +1871,225 @@ func TestUnsubscribe_ForgetsTheDropAccounting(t *testing.T) {
 		t.Fatalf("counters after Unsubscribe = %d, want 0 (one leaked per connection for the daemon's lifetime)", tracked)
 	}
 }
+
+// ============================================================================
+// tether#132 — a permission request BroadcastAll dropped must still reach the
+// next client that attaches.
+// ============================================================================
+
+// permReq builds the envelope internal/server/mux.go's permissionEnvelope
+// produces for one outstanding permission request. Hand-rolled here rather than
+// imported because internal/server imports this package, so the shape is
+// duplicated on purpose and the field names are what the frontend reads.
+func permReq(id, sid string) wire.Envelope {
+	return wire.Envelope{
+		Kind:      wire.KindPermission,
+		SessionID: wire.SessionID(sid),
+		Payload:   map[string]any{"id": id, "toolName": "Bash", "input": map[string]any{}},
+	}
+}
+
+// permIDsOf drains ch and returns the ids of the KindPermission envelopes it
+// held, in order. It returns after the channel is empty rather than after a
+// timeout: everything this file's fixtures deliver is enqueued synchronously by
+// the call under test, so "empty" is a complete answer and a wait would only
+// make a failure slow.
+func permIDsOf(ch chan wire.Envelope) []string {
+	var ids []string
+	for {
+		select {
+		case env := <-ch:
+			if env.Kind != wire.KindPermission {
+				continue
+			}
+			if p, ok := env.Payload.(map[string]any); ok {
+				if id, ok := p["id"].(string); ok {
+					ids = append(ids, id)
+				}
+			}
+		default:
+			return ids
+		}
+	}
+}
+
+// TestBackfill_ADroppedPermissionRequestReachesTheNextSubscriber is the whole of
+// tether#132 in one sequence, and it crosses the drop.
+//
+// The failure it pins: a permission request is announced by exactly one
+// BroadcastAll envelope, deliverOutOfBand drops that envelope onto a full
+// channel, and the frontend has no other way to learn the request exists — so
+// the tool call waits for a decision nobody can be asked for. The reader's only
+// move is a reload, which is a fresh subscribe, and this asserts that the fresh
+// subscribe is where the request comes back.
+//
+// The window is WIDENED rather than raced: the stalled subscriber's channel is
+// filled by ordinary turn envelopes first, so the drop is a property of the
+// fixture and not of how fast this machine is. `outstanding` stands in for
+// permission.Manager.Pending() — the daemon's own record, which the drop never
+// touched, and which is the reason this repair needs no new persistence.
+func TestBackfill_ADroppedPermissionRequestReachesTheNextSubscriber(t *testing.T) {
+	e := &Entry{subs: make(map[chan wire.Envelope]struct{}), regKey: "sid-perm"}
+	reg := &Registry{sessions: map[string]*Entry{"sid-perm": e}}
+	e.reg = reg
+
+	var outstanding []wire.Envelope
+	reg.PendingBackfill = func() []wire.Envelope { return outstanding }
+
+	// The tab that is about to stall. Nothing is outstanding yet, so it gets no
+	// backfill — which also means the two fillers below really do fill it.
+	stalled := make(chan wire.Envelope, 2)
+	e.Subscribe(stalled)
+
+	// It stalls: serveChat's drain loop is parked in OpenUniStreamSync and the
+	// channel fills with token increments.
+	reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "tok-1"})
+	reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "tok-2"})
+
+	// The hook posts a permission request. The daemon registers it and announces
+	// it daemon-wide; the announcement does not fit.
+	req := permReq("req-1", "sid-perm")
+	outstanding = append(outstanding, req)
+	reg.BroadcastAll(req)
+
+	if ids := permIDsOf(stalled); len(ids) != 0 {
+		t.Fatalf("fixture is not staging the bug: the stalled subscriber received %v, so the envelope was never dropped", ids)
+	}
+
+	// Another client attaches to the same live session — a second device, a
+	// second tab, or Attachment.adopt migrating the channel after a failed resume —
+	// and subscribes a fresh channel.
+	//
+	// NOT a reload of the only open tab, which is measured NOT to work and is said
+	// so in Entry.backfill's doc: closing that connection kills the agent, so the
+	// tool call is gone before anything can be replayed to it. The fixture here is
+	// deliberately the case the change does cover.
+	fresh := make(chan wire.Envelope, 32)
+	e.Subscribe(fresh)
+
+	ids := permIDsOf(fresh)
+	if len(ids) != 1 || ids[0] != "req-1" {
+		t.Fatalf("permission ids delivered to the reconnecting client = %v, want [req-1]; "+
+			"a dropped request is still invisible to every client, and the tool call is still waiting", ids)
+	}
+}
+
+// TestBackfill_ADecidedRequestIsNotReplayed — the backfill must be a live view of
+// what is outstanding, not a log of what was dropped.
+//
+// Replaying a request that has since been answered (from another device, or by
+// the timeout in permission.Manager.Add) would put a prompt on screen for a tool
+// call that is already running, and a second decision on it is a 404 the UI does
+// not explain. This is why nothing here remembers what BroadcastAll dropped: the
+// question "what is outstanding" only has a correct answer at the moment it is
+// asked.
+func TestBackfill_ADecidedRequestIsNotReplayed(t *testing.T) {
+	e := &Entry{subs: make(map[chan wire.Envelope]struct{}), regKey: "sid-perm"}
+	reg := &Registry{sessions: map[string]*Entry{"sid-perm": e}}
+	e.reg = reg
+
+	outstanding := []wire.Envelope{permReq("answered", "sid-perm"), permReq("still-waiting", "sid-perm")}
+	reg.PendingBackfill = func() []wire.Envelope { return outstanding }
+
+	// The first is decided before anyone reconnects, so the manager drops it and
+	// the backfill stops offering it.
+	outstanding = outstanding[1:]
+
+	fresh := make(chan wire.Envelope, 32)
+	e.Subscribe(fresh)
+	if ids := permIDsOf(fresh); len(ids) != 1 || ids[0] != "still-waiting" {
+		t.Fatalf("replayed %v, want [still-waiting] only", ids)
+	}
+}
+
+// TestBackfill_RegistersTheChannelBeforeReplayingIt pins the ORDER of the two
+// halves of Subscribe, which is a real choice with a real losing side.
+//
+// Between adding the channel to the audience and replaying the snapshot there is
+// a window, and a request broadcast inside it is either delivered twice (register
+// first) or lost outright (replay first) — and losing it is precisely the defect
+// tether#132 exists to remove, recreated one instruction wide.
+//
+// Staged deterministically rather than by racing: the backfill function itself
+// broadcasts the new request, so "inside the window" is where it happens by
+// construction. That is only possible because backfill runs with subsMu RELEASED;
+// a version holding the lock across both halves would deadlock here, which is the
+// second thing this test pins.
+func TestBackfill_RegistersTheChannelBeforeReplayingIt(t *testing.T) {
+	e := &Entry{subs: make(map[chan wire.Envelope]struct{}), regKey: "sid-perm"}
+	reg := &Registry{sessions: map[string]*Entry{"sid-perm": e}}
+	e.reg = reg
+
+	reg.PendingBackfill = func() []wire.Envelope {
+		// A request arriving in the window: announced live, to whoever is
+		// subscribed at this instant.
+		reg.BroadcastAll(permReq("arrived-mid-attach", "sid-perm"))
+		return []wire.Envelope{permReq("was-outstanding", "sid-perm")}
+	}
+
+	fresh := make(chan wire.Envelope, 32)
+	e.Subscribe(fresh)
+
+	got := permIDsOf(fresh)
+	var sawMid bool
+	for _, id := range got {
+		if id == "arrived-mid-attach" {
+			sawMid = true
+		}
+	}
+	if !sawMid {
+		t.Fatalf("delivered %v: a request broadcast while this client was attaching never reached it, "+
+			"which is the drop this whole change is about", got)
+	}
+}
+
+// TestBackfill_ReachesASubscriberOfARealSpawnedSession — the same repair, but
+// through the Entry the registry actually builds.
+//
+// The three tests above hand-build an Entry and set `reg` on it, so every one of
+// them passes with spawnEntry's `reg: r` deleted — the field would be nil for
+// every session a daemon ever serves and the backfill would be silently inert.
+// This is the test that fails for that mutation, and it is why it goes through
+// GetOrSpawnEntry rather than a literal.
+func TestBackfill_ReachesASubscriberOfARealSpawnedSession(t *testing.T) {
+	fp := &fakeProvider{sess: &fakeSession{sid: "spawned-sid", events: make(chan agent.Event, 8)}}
+	reg := NewRegistry(fp)
+	reg.PendingBackfill = func() []wire.Envelope {
+		return []wire.Envelope{permReq("req-spawned", "spawned-sid")}
+	}
+
+	e, err := reg.GetOrSpawnEntry(context.Background(), "", "fake")
+	if err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+
+	ch := make(chan wire.Envelope, 8)
+	e.Subscribe(ch)
+	if ids := permIDsOf(ch); len(ids) != 1 || ids[0] != "req-spawned" {
+		t.Fatalf("a subscriber of a registry-spawned session got %v, want [req-spawned]; "+
+			"the Entry the daemon builds cannot reach the backfill at all", ids)
+	}
+}
+
+// TestBackfill_IsInertWithoutAWiredSource — a Registry nobody wired (every
+// daemon before tether#132, and most of this file's fixtures) must behave exactly
+// as it did. Cheap, and it is the assertion that would catch a backfill that
+// synthesises envelopes of its own rather than reporting what it is given.
+func TestBackfill_IsInertWithoutAWiredSource(t *testing.T) {
+	e := &Entry{subs: make(map[chan wire.Envelope]struct{}), regKey: "sid-perm"}
+	reg := &Registry{sessions: map[string]*Entry{"sid-perm": e}}
+	e.reg = reg
+
+	ch := make(chan wire.Envelope, 4)
+	e.Subscribe(ch)
+	if got := len(ch); got != 0 {
+		t.Fatalf("an unwired Registry queued %d envelopes onto a new subscriber, want 0", got)
+	}
+
+	reg.PendingBackfill = func() []wire.Envelope { return nil }
+	ch2 := make(chan wire.Envelope, 4)
+	e.Subscribe(ch2)
+	if got := len(ch2); got != 0 {
+		t.Fatalf("an empty backfill queued %d envelopes, want 0", got)
+	}
+}

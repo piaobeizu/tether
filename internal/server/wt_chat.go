@@ -395,6 +395,29 @@ func serveChat(r *http.Request, wtsess *webtransport.Session, reg *session.Regis
 	//     trades a bounded per-connection rendering gap for unbounded daemon
 	//     memory growth under exactly the condition that triggers it. The owner's
 	//     daemon runs all day; that trade is worse.
+	// # What Subscribe also does now (tether#132)
+	//
+	// It hands this channel the daemon-wide envelopes this client could not have
+	// received and cannot ask for — the permission requests still awaiting a
+	// decision. See session.Entry.backfill, which is where that lives and why it
+	// lives at the convergence point rather than at this call site.
+	//
+	// Two consequences for THIS function, both measured against a live daemon:
+	//
+	//   - The backfill rides subCh, so it reaches the browser through the drain
+	//     loop at the bottom — i.e. only after Resolve returns below. On the
+	//     `--resume` path Resolve blocks until the agent emits system/init, which
+	//     under `--input-format stream-json` waits for the first prompt, so a
+	//     client that attaches and types nothing sits with the backfill queued and
+	//     unsent. Deliberately not given a send of its own before Resolve: that
+	//     would be a second delivery path with a different sid to stamp (see the
+	//     loop's `env.SessionID = realSID`), for a case the next point makes moot.
+	//   - It does NOT make a page reload a repair. Closing this connection cancels
+	//     ctx, which is the ctx Attach hands the provider, which is the ctx
+	//     exec.CommandContext watches — so the agent dies with the tab and takes
+	//     the waiting tool call with it. The backfill reaches a client that
+	//     attaches while the session is STILL ALIVE: another device, another tab,
+	//     or Attachment.adopt's migration.
 	subCh := make(chan wire.Envelope, 32)
 	att.Subscribe(subCh)
 	defer att.Unsubscribe(subCh)

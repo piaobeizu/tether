@@ -2012,7 +2012,7 @@ describe('loadHistory message identity (tether#106)', () => {
     useStore.getState().loadHistory([hist('user', 'ask', 1)])
     useStore.setState({
       streaming: true, streamingMsgId: 'x', curTurnId: 'x',
-      pendingPermissions: [{ id: 'p1', toolName: 'Bash', input: {} }],
+      pendingPermissions: [{ id: 'p1', toolName: 'Bash', input: {}, sessionId: 'sid-elsewhere' }],
     })
     useStore.getState().loadHistory([hist('user', 'ask', 1)])
 
@@ -2093,7 +2093,7 @@ describe('prependHistory (tether#107)', () => {
     seed({ id: 'live', role: 'assistant', text: 'mid-turn', ts: 900 })
     useStore.setState({
       streaming: true, streamingMsgId: 'live', curTurnId: 'live', answerStartTs: 800,
-      pendingPermissions: [{ id: 'p1', toolName: 'Bash', input: {} }],
+      pendingPermissions: [{ id: 'p1', toolName: 'Bash', input: {}, sessionId: 'sid-elsewhere' }],
     })
     useStore.getState().prependHistory([hist('user', 'older', 100)])
 
@@ -2820,5 +2820,129 @@ describe('setTranscriptBounds (tether#107)', () => {
     useStore.getState().setTranscriptBounds({ earlier: 4096, otherRecord: null })
     off()
     expect(updates).toBe(0)
+  })
+})
+
+// ============================================================================
+// tether#132 — a permission request must survive the refetch of its OWN session.
+//
+// The failure: a permission request reaches the browser as ONE broadcast
+// envelope, and `pendingPermissions` is filled from it and nothing else. So every
+// refetch of the session ALREADY on screen used to dismiss the card with nothing
+// anywhere to send it again — and three separate things refetch: a click on the
+// already-open row in the session list, the held-session watcher's three-second
+// reload, and a page reload. None of the first two is a session switch.
+//
+// The daemon also re-sends what is still outstanding to a client that attaches
+// (session.Entry.backfill), which needs the same thing of this reducer.
+// `loadHistory` now drops only the requests raised in a session it is REPLACING,
+// which the sid on each request is what makes answerable.
+//
+// The reset is NOT deleted, and the second test here is why: on a genuine switch
+// those requests belong to the conversation the reader has left, and leaving them
+// approvable there is its own defect (tether#40).
+// ============================================================================
+
+const permEnvFor = (sid: string, id: string): Envelope =>
+  ({ kind: 'permission', sessionId: sid, payload: { id, toolName: 'Bash', input: {} } } as unknown as Envelope)
+
+const histEntry = (text: string): Message => ({ id: 'm-' + text, role: 'assistant', text, ts: 1000 })
+
+describe('store pendingPermissions across a history refetch (tether#132)', () => {
+  afterEach(() => {
+    reset()
+    useStore.setState({ sessionId: null })
+  })
+
+  // The plainest form of the bug, and it needs no dropped envelope at all: any
+  // refetch of the session on screen threw the queue away. A click on the
+  // already-open row in the session list does exactly that
+  // (lib/session.ts's REFRESH_TRANSCRIPT_EVENT -> refreshTranscript ->
+  // loadHistory), so a live, never-dropped permission card could be dismissed by
+  // a misclick with nothing to bring it back.
+  it('a request raised in this session survives a refetch of THIS session', () => {
+    useStore.getState().setSessionId('sid-A')
+    useStore.getState().handleEnvelope(permEnvFor('sid-A', 'req-1'))
+    expect(useStore.getState().pendingPermissions.map((p) => p.id)).toEqual(['req-1'])
+
+    // The refetch. Both call sites reach this only after checking the response's
+    // sid against the store's, so `sessionId` here is the session being installed.
+    useStore.getState().loadHistory([histEntry('an older answer')])
+
+    expect(useStore.getState().pendingPermissions.map((p) => p.id)).toEqual(['req-1'])
+  })
+
+  // The behaviour tether#40 put there, which must not be lost: a switch retires
+  // the previous conversation's requests. Approving one after moving away would
+  // authorise a tool call in a session the reader is no longer looking at.
+  it('a switch to another session still drops the previous session\'s requests', () => {
+    useStore.getState().setSessionId('sid-A')
+    useStore.getState().handleEnvelope(permEnvFor('sid-A', 'req-1'))
+
+    useStore.getState().setSessionId('sid-B')
+    useStore.getState().loadHistory([histEntry('B has its own transcript')])
+
+    expect(useStore.getState().pendingPermissions).toHaveLength(0)
+  })
+
+  // Mixed queue: only the ones belonging to the arriving session are kept. This
+  // is the assertion a `pendingPermissions: s.pendingPermissions` (drop the
+  // filter entirely) mutation fails and the two tests above do not.
+  it('keeps only the arriving session\'s requests when the queue holds both', () => {
+    useStore.getState().setSessionId('sid-A')
+    useStore.getState().handleEnvelope(permEnvFor('sid-A', 'from-A'))
+    useStore.getState().setSessionId('sid-B')
+    useStore.getState().handleEnvelope(permEnvFor('sid-B', 'from-B'))
+
+    useStore.getState().loadHistory([histEntry('now looking at B')])
+
+    expect(useStore.getState().pendingPermissions.map((p) => p.id)).toEqual(['from-B'])
+  })
+
+  // ORDERING, measured rather than assumed. The backfill arrives over
+  // WebTransport and the refetch over HTTP; nothing sequences them, and either
+  // can land first. Both orders are exercised here, and the outcome is required
+  // to be the same — which is what makes the fix independent of a race neither
+  // side controls. (Before this change the two orders disagreed: a backfill
+  // landing after the refetch survived, one landing before it was wiped. A fix
+  // that relied on the first ordering would have worked on whichever machine it
+  // was measured on.)
+  it('survives with the refetch FIRST and the request second', () => {
+    useStore.getState().setSessionId('sid-A')
+    useStore.getState().loadHistory([histEntry('restored on reload')])
+    useStore.getState().handleEnvelope(permEnvFor('sid-A', 'req-1'))
+    expect(useStore.getState().pendingPermissions.map((p) => p.id)).toEqual(['req-1'])
+  })
+
+  it('survives with the request FIRST and the refetch second', () => {
+    useStore.getState().setSessionId('sid-A')
+    useStore.getState().handleEnvelope(permEnvFor('sid-A', 'req-1'))
+    useStore.getState().loadHistory([histEntry('restored on reload')])
+    expect(useStore.getState().pendingPermissions.map((p) => p.id)).toEqual(['req-1'])
+  })
+
+  // The daemon re-sends a request that may also arrive live, because
+  // Entry.backfill registers the channel BEFORE it replays (losing a request is
+  // worse than duplicating one — see its doc). The dedupe that makes that trade
+  // free is tether#40's, and this is what pins that it still holds for an
+  // envelope carrying a sid.
+  it('a re-sent request does not become a second card', () => {
+    useStore.getState().setSessionId('sid-A')
+    useStore.getState().handleEnvelope(permEnvFor('sid-A', 'req-1'))
+    useStore.getState().handleEnvelope(permEnvFor('sid-A', 'req-1'))
+    expect(useStore.getState().pendingPermissions).toHaveLength(1)
+  })
+
+  // An envelope that names no session is claimed by none, so a refetch for a
+  // named session drops it — the pre-tether#132 outcome, kept deliberately for a
+  // payload the chat route does not produce (serveChat stamps env.SessionID on
+  // everything it forwards). Stated as a test so it is a decision rather than an
+  // accident of `null === null`.
+  it('an untagged request does not survive a refetch of a named session', () => {
+    useStore.getState().setSessionId('sid-A')
+    useStore.getState().handleEnvelope(permEnv('untagged'))
+    expect(useStore.getState().pendingPermissions).toHaveLength(1)
+    useStore.getState().loadHistory([histEntry('anything')])
+    expect(useStore.getState().pendingPermissions).toHaveLength(0)
   })
 })

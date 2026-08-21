@@ -65,7 +65,8 @@ scope_notes:
     (no internal/pair pkg) -> split into its own WI.
   - Skills backend surface (internal/skill/api.go): GET /api/v1/skills (list: id,name,
     description,sourcePath,addedAt) · POST /api/v1/skills (install {name,sourcePath}) ·
-    DELETE /api/v1/skills/{id} · POST /api/v1/skills/{id}/{enable|disable} {workspacePath}.
+    DELETE /api/v1/skills/{id} · POST /api/v1/skills/{id}/{enable|disable} {workspaceId}
+    (a REGISTERED workspace id — was an unvalidated {workspacePath} until tether#142).
     NO version field, NO update-badge -> the design's skills "version + update badge" are
     cosmetic-only / backend-gated. The old right-pane SkillPane did management via browser
     prompt() and never used enable/disable.

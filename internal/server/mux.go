@@ -245,6 +245,28 @@ func buildMux(cfg *Config, certs *certHolder, wts *webtransport.Server, reg *ses
 		workspace.RegisterAPI(mux, cfg.WsRegistry)
 	}
 	if cfg.SkillRegistry != nil {
+		// The skill overlay WRITES into a workspace directory (symlink in, symlink
+		// out), so it needs this daemon's own answer to "which directories are
+		// workspaces" instead of trusting a path off the request body — which is what
+		// it did until tether#142. The workspace registry is that answer, and this is
+		// the one place both registries are in scope, so it is where they are joined.
+		//
+		// Passed straight in, including when it is nil. A nil *workspace.Registry
+		// stored in the skill.WorkspaceIndex interface is a NON-nil interface holding
+		// a nil pointer — the trap lifecycle.go documents for
+		// session.Registry.Workspaces — so it cannot be checked for here with `!=
+		// nil` anyway. BindWorkspaces detects that shape and stores nothing, and
+		// workspaceDir refuses when nothing is stored, which is what makes a failed
+		// workspace registry answer 503 instead of panicking.
+		//
+		// An earlier draft guarded this with a local `var wsIndex skill.WorkspaceIndex`
+		// assigned only when cfg.WsRegistry was non-nil. Review showed it was dead:
+		// removing it left the suite green, and removing it AND BindWorkspaces' own
+		// check still left the suite green, because workspaceDir catches the case
+		// regardless. Three checks for one condition, two of them unreachable, is not
+		// depth — it is three places for the next reader to keep in sync. The two that
+		// remain each have a test.
+		cfg.SkillRegistry.BindWorkspaces(cfg.WsRegistry)
 		skill.RegisterAPI(mux, cfg.SkillRegistry)
 	}
 

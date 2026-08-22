@@ -236,7 +236,7 @@ func TestAddWorkspaceEndpoint_RefusesAPathItCannotUse(t *testing.T) {
 	}
 }
 
-// TestWorkspaceEndpoints_DoNotEchoDaemonSideValues — the error-body convergence
+// TestRegistryMutations_DoNotEchoDaemonSideValues — the error-body convergence
 // (tether#147). The skill route file took this rule in tether#156 and this one was
 // left behind: both mutation handlers sent err.Error() as a 500 body.
 //
@@ -244,7 +244,20 @@ func TestAddWorkspaceEndpoint_RefusesAPathItCannotUse(t *testing.T) {
 // route to a 500 a test can arrange without mocking: saveLocked's os.WriteFile
 // fails with an *os.PathError naming the daemon's own path. Pre-fix, that path was
 // the response body verbatim.
-func TestWorkspaceEndpoints_DoNotEchoDaemonSideValues(t *testing.T) {
+//
+// # What this does NOT cover, named because the obvious name for it would lie
+//
+// "RegistryMutations", not "WorkspaceEndpoints": POST and DELETE are the two
+// handlers that mutate the registry and the two this change converged. The three
+// READ handlers in the same route file — /files, /file and /tree — still build
+// bodies with err.Error(), and at least one of them leaks a daemon-side absolute
+// path today (`?dir=<a regular file>` reaches os.ReadDir and answers 500 with
+// `open <abs path>: not a directory`, because builtin.SafeJoin checks containment
+// but not that the target is a directory). That is a pre-existing defect on a
+// different set of handlers, it needs a decision about what /files should answer
+// for a non-directory, and it is tracked as tether#159 rather than folded in
+// here. A test called "WorkspaceEndpoints_..." would be read as covering it.
+func TestRegistryMutations_DoNotEchoDaemonSideValues(t *testing.T) {
 	// A path component that is distinctive enough that finding it in a body cannot
 	// be a coincidence.
 	unwritable := func(t *testing.T) string {

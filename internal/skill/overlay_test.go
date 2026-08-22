@@ -101,6 +101,14 @@ func TestInstall_RefusesASourceThatIsNotAnExistingDirectory(t *testing.T) {
 			if got := reg.List(); len(got) != 0 {
 				t.Errorf("after a refused Install, List = %+v, want empty", got)
 			}
+			// And nothing reached skills.json. In memory and on disk are two
+			// assertions because they are two defects: Install appends to r.skills
+			// and THEN calls saveLocked, so "returns the refusal but records it
+			// anyway" and "records it and persists it" fail independently.
+			if _, statErr := os.Stat(reg.path); !errors.Is(statErr, os.ErrNotExist) {
+				t.Errorf("a refused Install wrote %s (stat error %v), want no file at all",
+					reg.path, statErr)
+			}
 		})
 	}
 
@@ -613,12 +621,16 @@ func TestDisable_RefusesToFollowASymlinkOutOfTheWorkspace(t *testing.T) {
 // own half of the same defect.
 //
 // workspace.canonicalPath resolves symlinks when it can and silently keeps the
-// unresolved absolute path when it cannot (a directory that did not exist yet, a
-// volume that was not mounted), which is the right policy there — it matches cc's
-// own, and it is what lets a not-yet-created directory be bookmarked. It means
-// the stored string is a best-effort answer, and this package is where that
-// maybe has to stop: an overlay write measures containment against the stored
-// path, so the stored path has to BE the directory, not a name for it.
+// unresolved absolute path when it cannot (a volume that is not mounted right
+// now), which is the right policy there — it matches cc's own, and it is what
+// lets an entry ALREADY in workspaces.json survive its directory being
+// temporarily absent. (It used to also be what let a not-yet-created directory
+// be bookmarked in the first place; tether#147 removed that by gating
+// workspace.Registry.Add, and deliberately left load() — and therefore this
+// function — permissive.) It means the stored string is a best-effort answer,
+// and this package is where that maybe has to stop: an overlay write measures
+// containment against the stored path, so the stored path has to BE the
+// directory, not a name for it.
 //
 // Verified rather than sanitised: the legal form is "a path that resolves to
 // itself", which is one comparison, instead of a list of the ways a path can
@@ -664,11 +676,17 @@ func TestOverlayWrites_RefuseARegisteredPathThatIsNotItsOwnResolution(t *testing
 
 // TestEnable_RefusesAWorkspaceDirectoryThatIsNotThere.
 //
-// A registration is a bookmark — canonicalPath deliberately allows one to a
-// directory that does not exist yet — and creating that directory is not
+// A registration is a bookmark, and creating the directory it points at is not
 // something an overlay write should be able to do. Refusing is also the honest
 // answer to "is this contained": a directory that is not there cannot be
 // resolved, and "I cannot check" must be a refusal rather than a pass.
+//
+// This stayed reachable after tether#147, and the reason is worth stating because
+// the obvious reading is that it stopped being: POST /api/v1/workspaces now
+// refuses a path that is not already a directory, so a registration cannot be
+// CREATED pointing at nothing. But load() is still permissive by design, so an
+// entry already in workspaces.json whose directory has since been deleted or
+// unmounted arrives here exactly as before — which is the case this test builds.
 //
 // Observed on the unfixed tree: for "not there" Enable returned nil, having
 // created the registered directory and two levels beneath it with os.MkdirAll;

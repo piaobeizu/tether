@@ -97,6 +97,11 @@ var (
 	// Enable refuses rather than creating the directory: a registration is a
 	// bookmark, and materialising a bookmark's target is not something an overlay
 	// write should be able to do.
+	//
+	// Still reachable after tether#147, which made POST /api/v1/workspaces refuse
+	// a path that is not already a directory. That gates only NEW registrations;
+	// load() stays permissive, so an entry whose directory has since been deleted
+	// or unmounted arrives here exactly as it did before.
 	ErrWorkspaceDirUnusable = errors.New("skill: the registered workspace directory is not usable")
 
 	// ErrSkillSourceUnusable — the sourcePath an install named is not there, or is

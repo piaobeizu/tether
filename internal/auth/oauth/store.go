@@ -34,12 +34,12 @@ const defaultTTL = 5 * time.Minute
 //     requests per second sustained for the whole window — no human produces
 //     that, so the ceiling is only reachable under a flood or a runaway client.
 //   - Cost of being at it. Worst-case retained memory is
-//     512 * (maxPendingEntryBytes + key + struct overhead) ~= 4.2 MiB, and the
-//     one reclaim pass an insert costs while full measures ~17us. Picking a much
-//     larger ceiling trades those two budgets away for headroom nobody uses:
-//     at 4096 the same pass measured 268us/insert, which would hand the same
-//     anonymous caller a CPU amplification in exchange for closing the memory
-//     one.
+//     512 * (maxPendingEntryBytes + key + struct overhead) ~= 4.2 MiB, and an
+//     insert while the map is full measures ~25us (the reclaim pass dominates
+//     it). Picking a much larger ceiling trades those two budgets away for
+//     headroom nobody uses: the same insert measures ~159us at maxPending=4096,
+//     which would hand the same anonymous caller a CPU amplification in
+//     exchange for closing the memory one.
 const defaultMaxPending = 512
 
 // maxPendingEntryBytes caps the caller-controlled bytes a single pending entry
@@ -215,9 +215,9 @@ func (s *CodeStore) StorePending(clientID, redirectURI, challenge, scope, state 
 // CodeStore (which internal/server/lifecycle.go constructs and never closes).
 //
 // The two bounds share one pass over the map rather than taking one each: the
-// pass is the dominant cost of an insert while the map is full (~17us at
-// maxPending=512), and this endpoint is anonymous-reachable, so the work an
-// unauthenticated caller can force per request is itself a budget worth
+// pass is the dominant cost of an insert while the map is full (~25us per
+// insert at maxPending=512), and this endpoint is anonymous-reachable, so the
+// work an unauthenticated caller can force per request is itself a budget worth
 // keeping small.
 func (s *CodeStore) reclaimPendingLocked(now time.Time) {
 	var oldestID string

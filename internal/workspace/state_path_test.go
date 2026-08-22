@@ -198,3 +198,62 @@ func TestAdd_RefusesARelativePath(t *testing.T) {
 			"if this fails the fixture is at fault, not the check", err)
 	}
 }
+
+// TestAdd_RegistersNothingWhenTheWriteFails — tether#159.
+//
+// The two tests above assert the on-disk state for the paths Add REFUSES. This is
+// the case they left uncovered: a path Add accepts, whose write then fails.
+//
+// # Both halves are asserted, because either alone passes on the broken build
+//
+// Pre-fix, Add appended to r.workspaces and returned saveLocked's error with the
+// entry still in it. So:
+//
+//   - "the error came back" was TRUE before the fix (it always was — this is not
+//     a test of the error);
+//   - "nothing is on disk" was TRUE before the fix (the write is what failed);
+//   - "nothing is in memory" was FALSE before the fix — List() returned one
+//     workspace that no file had ever held, which GET /api/v1/workspaces listed,
+//     Path resolved for the /wt/chat handshake, and skill.Enable would have
+//     written an overlay into, all of it gone at the next restart.
+//
+// So the memory half is the gate and the disk half is what makes the pair mean
+// "consistent" rather than just "empty": a fix that stopped writing altogether
+// would satisfy the memory half on its own.
+//
+// The fixture is the one route to a saveLocked failure that needs no mocking, and
+// the same one TestRegistryMutations_DoNotEchoDaemonSideValues uses for its 500:
+// a registry file under a directory that does not exist.
+func TestAdd_RegistersNothingWhenTheWriteFails(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "no-such-directory-9e31", "workspaces.json")
+	r := &Registry{path: file}
+
+	ws, err := r.Add("w", t.TempDir())
+	if err == nil {
+		t.Fatalf("Add with an unwritable registry = (%+v, nil), want the write error — "+
+			"the fixture is at fault if this fires", ws)
+	}
+	if ws != (Workspace{}) {
+		t.Errorf("Add returned %+v alongside its error, want the zero Workspace: a value "+
+			"naming a workspace nobody registered is the thing this test is about", ws)
+	}
+	if got := r.List(); len(got) != 0 {
+		t.Errorf("List = %+v, want empty.\nPre-fix: exactly this — one in-memory "+
+			"registration that saveLocked never persisted, so the daemon listed and "+
+			"resolved a workspace that would vanish on restart.", got)
+	}
+	if _, statErr := os.Stat(file); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("stat %s = %v, want it absent — the other half of the same assertion: "+
+			"memory and disk agree, and they agree on NOTHING", file, statErr)
+	}
+
+	// A writable registry still registers, so the rows above are not satisfied by
+	// an Add that refuses everything.
+	r.path = filepath.Join(t.TempDir(), "workspaces.json")
+	if _, err := r.Add("w", t.TempDir()); err != nil {
+		t.Fatalf("Add with a writable registry = %v, want it to register", err)
+	}
+	if got := r.List(); len(got) != 1 {
+		t.Fatalf("List = %+v, want the one workspace", got)
+	}
+}

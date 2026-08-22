@@ -3,6 +3,8 @@ package builtin_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -53,6 +55,112 @@ func TestSafeJoin_SiblingDirRejected(t *testing.T) {
 	_, err = reg.SafeJoin("../ws-evil/secret")
 	if err == nil {
 		t.Fatal("expected error for sibling dir escape")
+	}
+}
+
+// -- tether#159: the shape check, and where it must NOT be ------------------
+//
+// All three were run against the pre-fix tree. The first does not compile there
+// (SafeJoinDir did not exist); the second passes there and is a regression guard
+// rather than a new gate; the third fails there, because the two refusals it
+// matches were fmt.Errorf strings with no identity to match.
+
+// TestSafeJoinDir_RefusesANonDirectory covers both spellings of the same caller
+// mistake — a path whose last component IS a regular file, and a path that names
+// something UNDER one. The second never reaches the stat: EvalSymlinks fails
+// first, with a bare syscall.ENOTDIR, and the point of the assertion is that it
+// still arrives as the same sentinel so the boundary needs one case, not two.
+//
+// The last row is the companion that keeps the refusal from being satisfied by a
+// function that refuses everything.
+func TestSafeJoinDir_RefusesANonDirectory(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	reg, err := builtin.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		in      string
+		wantErr error // nil = must succeed
+	}{
+		{"a.txt", builtin.ErrNotDirectory},
+		{"a.txt/b", builtin.ErrNotDirectory},
+		{"sub", nil},
+		{"", nil}, // the workspace root itself, which is what ?dir= empty means
+	} {
+		got, err := reg.SafeJoinDir(tc.in)
+		switch {
+		case tc.wantErr == nil && err != nil:
+			t.Errorf("SafeJoinDir(%q) = error %v, want a resolved directory", tc.in, err)
+		case tc.wantErr != nil && !errors.Is(err, tc.wantErr):
+			t.Errorf("SafeJoinDir(%q) = (%q, %v), want an error matching %v", tc.in, got, err, tc.wantErr)
+		}
+	}
+}
+
+// TestSafeJoin_StillAcceptsARegularFile is the guard on WHERE the shape check
+// went. SafeJoin has file-reading callers — workspace_read_file here and
+// workspace.ReadFileContent — so a plain SafeJoin that refuses a regular file
+// would break both, which is the whole reason tether#159's check is a sibling
+// rather than three more lines inside SafeJoin.
+//
+// Fail this and the fix landed one layer too low.
+func TestSafeJoin_StillAcceptsARegularFile(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reg, err := builtin.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := reg.SafeJoin("a.txt")
+	if err != nil {
+		t.Fatalf("SafeJoin(%q) = error %v, want the resolved file — the IsDir check must "+
+			"NOT live in SafeJoin, whose other callers read files", "a.txt", err)
+	}
+	if filepath.Base(got) != "a.txt" {
+		t.Errorf("SafeJoin resolved to %q, want a path ending in a.txt", got)
+	}
+}
+
+// TestSafeJoin_RefusalsAreSentinels — the two refusals SafeJoin makes itself are
+// matchable with errors.Is, which is what lets a caller pick a status and a body
+// from the refusal's identity instead of from its text (tether#159). The texts
+// are unchanged from the fmt.Errorf strings they replaced, so the MCP tool
+// results these appear in say what they always said.
+//
+// The third assertion is on the one error this function still builds inline: it
+// must keep WRAPPING, because the workspace read routes' 404 is
+// errors.Is(err, fs.ErrNotExist) on the far side of it. Replace that %w with a %v
+// and a missing file becomes a 500.
+func TestSafeJoin_RefusalsAreSentinels(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "ws")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	reg, err := builtin.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := reg.SafeJoin("/etc/passwd"); !errors.Is(err, builtin.ErrAbsolutePath) {
+		t.Errorf("SafeJoin(absolute) = %v, want ErrAbsolutePath", err)
+	}
+	if _, err := reg.SafeJoin(".."); !errors.Is(err, builtin.ErrPathEscapesRoot) {
+		t.Errorf(`SafeJoin("..") = %v, want ErrPathEscapesRoot`, err)
+	}
+	if _, err := reg.SafeJoin("nope"); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("SafeJoin(missing) = %v, want an error wrapping fs.ErrNotExist — the 404 "+
+			"mapping on the workspace read routes rests on it", err)
 	}
 }
 

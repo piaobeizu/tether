@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/piaobeizu/tether/internal/mcp/builtin"
 )
@@ -19,9 +20,16 @@ import (
 //	                                          path must be absolute and must already
 //	                                          be a directory, else 400 (tether#147)
 //	DELETE /api/v1/workspaces/{id}          → remove workspace by ID
-//	GET    /api/v1/workspaces/{id}/files    → list files directly under {dir} (default: root)
+//	GET    /api/v1/workspaces/{id}/files    → list files directly under {dir} (default: root);
+//	                                          {dir} must name a directory inside the
+//	                                          workspace, else 400/404 (tether#159)
 //	GET    /api/v1/workspaces/{id}/file     → read one file's content ({"path":..,"content":..,"truncated":..})
 //	GET    /api/v1/workspaces/{id}/tree     → flat recursive file list for @-mention ({"files":[..],"truncated":..})
+//
+// No handler on this file puts err.Error() in a response body. The two mutations
+// go through refuse/registryRefusal and the three reads through
+// refuseRead/readRefusal; both pick the body from the refusal's identity, and
+// both log the detail instead of sending it.
 func RegisterAPI(mux *http.ServeMux, reg *Registry) {
 	mux.HandleFunc("/api/v1/workspaces", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -118,17 +126,19 @@ func RegisterAPI(mux *http.ServeMux, reg *Registry) {
 // maxWorkspaceBodyBytes bounds the one JSON body this file decodes.
 const maxWorkspaceBodyBytes = 4096
 
-// registryInternalErrorBody is what a 500 from a registry mutation says, in
+// registryInternalErrorBody is what a 500 from ANY handler on this file says, in
 // place of err.Error().
 //
-// A 500 here means this daemon's own state is wrong — saveLocked could not write
-// ~/.tether/workspaces.json, concretely — and there is nothing in the detail a
-// caller can act on. err.Error() in its place put daemon-side paths into an HTTP
-// body for no benefit (`open /home/.../workspaces.json.tmp: permission denied`).
-// The detail is logged, where an operator who has that filesystem in front of
-// them can use it. Same rule, same wording, as skill/api.go's
-// overlayInternalErrorBody (tether#147; the skill side took it in tether#156 and
-// this side was left behind).
+// A 500 here means this daemon's own state or filesystem is wrong — saveLocked
+// could not write ~/.tether/workspaces.json, or a read hit an EACCES/EIO under a
+// registered workspace — and there is nothing in the detail a caller can act on.
+// err.Error() in its place put daemon-side paths into an HTTP body for no benefit
+// (`open /home/.../workspaces.json.tmp: permission denied`). The detail is
+// logged, where an operator who has that filesystem in front of them can use it.
+// Same rule, same wording, as skill/api.go's overlayInternalErrorBody
+// (tether#147; the skill side took it in tether#156 and this side was left
+// behind. tether#159 extended it from the two mutations to the three reads,
+// which is why one constant now serves both).
 const registryInternalErrorBody = "the daemon could not complete this request"
 
 // refuse is the single exit for a failed registry mutation: it picks the status
@@ -181,6 +191,107 @@ func registryRefusal(err error) (int, string) {
 	}
 }
 
+// The bodies the three READ handlers send for the refusals they can name.
+//
+// Constants here rather than the sentinels' own Error() strings — which is what
+// registryRefusal does for this package's own sentinels — because two of the
+// three come from internal/mcp/builtin, where the text is worded for an MCP tool
+// result and is byte-pinned to the fmt.Errorf string it replaced. The rule
+// tether#147 established is that the body is chosen by the IDENTITY of the
+// refusal and never assembled from the error value; mapping a foreign sentinel
+// onto a local constant is that rule, not an exception to it.
+const (
+	// readMustBeRelativeBody — builtin.ErrAbsolutePath. `dir`/`path` name a
+	// location inside the workspace, and the caller does not get to say which
+	// workspace by naming an absolute path.
+	readMustBeRelativeBody = "workspace: that path must be relative to the workspace root"
+
+	// readOutsideWorkspaceBody — builtin.ErrPathEscapesRoot. Deliberately does not
+	// distinguish traversal from a symlink that pointed out: the difference is a
+	// property of the daemon's filesystem, and telling an authenticated caller
+	// which one it tripped is a probe of that filesystem, not an answer it can act
+	// on.
+	readOutsideWorkspaceBody = "workspace: that path is outside the workspace"
+
+	// readNotADirectoryBody — builtin.ErrNotDirectory, the leak this wi exists for.
+	readNotADirectoryBody = "workspace: that path is not a directory"
+)
+
+// refuseRead is the single exit for a failed READ on this route file — /files,
+// /file and /tree: it picks the status AND the body from readRefusal, and logs
+// the error rather than sending it.
+//
+// It is a second function rather than more cases in refuse because the two sets
+// of refusals do not overlap at all: a read cannot fail the way a registry
+// mutation fails, and the 404 below has no counterpart on the mutation side. What
+// the two DO share is the rule, and they share it by construction — the body
+// comes from the identity of the refusal in both.
+//
+// Only the 500 is logged. Every 400 here is fully determined by the caller's own
+// query string, so there is nothing in one an operator does not already have; the
+// mutation side logs its 409 because that one's cause was filesystem state the
+// response no longer carries.
+func refuseRead(w http.ResponseWriter, r *http.Request, err error) {
+	code, body := readRefusal(err)
+	switch code {
+	case http.StatusNotFound:
+		// net/http's own 404 body, which is what these routes have always sent for
+		// a target that is not there and what their tests pin.
+		http.NotFound(w, r)
+		return
+	case http.StatusInternalServerError:
+		slog.Error("workspace read request failed", "method", r.Method, "path", r.URL.Path, "error", err)
+	}
+	http.Error(w, body, code)
+}
+
+// readRefusal maps a read's refusals onto a code AND a body a caller can act on.
+//
+// The 404 is checked FIRST and is the oldest mapping on these routes: a
+// well-formed path whose target is not there is not a bad request. Both /files
+// and /file have tests pinning it, and tether#159 was explicitly not allowed to
+// change it. It is in this switch rather than in refuseRead so that the mapping
+// is total — a caller passing an fs.ErrNotExist cannot fall through to a 500 —
+// and its body is the one thing this function does not choose, hence the empty
+// string and refuseRead's special case.
+//
+// The four 400s are all "you named the wrong thing", and none of them is fixed by
+// retrying the same request: an absolute path, a path that leaves the workspace,
+// a non-directory where /files needs a directory, a directory where /file needs a
+// file. The last two are the pair tether#159 had to decide together, and they got
+// the same status because they are the same mistake from the two ends of one file
+// browser — and 400 specifically because /file already answered a directory with
+// 400 and had a test saying so, so the alternative was to change a behaviour
+// nobody had complained about in order to match one that was broken.
+//
+// Everything else is a 500 with no detail. That is the whole of the fix for the
+// three sites that used to send err.Error(): an *fs.PathError from os.ReadDir,
+// os.Stat, os.Open or a read carries the daemon's absolute path, and there is no
+// way to classify those individually that does not amount to handing an
+// authenticated caller a filesystem probe.
+func readRefusal(err error) (int, string) {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return http.StatusNotFound, ""
+	case errors.Is(err, builtin.ErrAbsolutePath):
+		return http.StatusBadRequest, readMustBeRelativeBody
+	case errors.Is(err, builtin.ErrPathEscapesRoot):
+		return http.StatusBadRequest, readOutsideWorkspaceBody
+	// Two identities, one refusal. The first is SafeJoinDir's, which /files
+	// resolves through. The second is for /file, which resolves through plain
+	// SafeJoin because it needs a FILE — so when its `path` names something under a
+	// regular file (`a.txt/b`), EvalSymlinks' bare syscall.ENOTDIR arrives
+	// unclassified, and a caller mistake would otherwise be reported as a daemon
+	// fault. Inert on Windows, which reports a path error instead.
+	case errors.Is(err, builtin.ErrNotDirectory), errors.Is(err, syscall.ENOTDIR):
+		return http.StatusBadRequest, readNotADirectoryBody
+	case errors.Is(err, ErrPathIsDirectory):
+		return http.StatusBadRequest, ErrPathIsDirectory.Error()
+	default:
+		return http.StatusInternalServerError, registryInternalErrorBody
+	}
+}
+
 // handleFiles serves GET /api/v1/workspaces/{id}/files?dir=<rel>.
 func handleFiles(w http.ResponseWriter, r *http.Request, reg *Registry, id string) {
 	ws, ok := reg.Get(id)
@@ -195,20 +306,26 @@ func handleFiles(w http.ResponseWriter, r *http.Request, reg *Registry, id strin
 		return
 	}
 
+	// SafeJoinDir, not SafeJoin: the shape check belongs to the resolver, so this
+	// handler never sees the os.ReadDir error whose *fs.PathError was the leak
+	// (tether#159 — see builtin.Registry.SafeJoinDir for why it is a sibling and
+	// not a check inside SafeJoin).
 	dir := r.URL.Query().Get("dir")
-	absDir, err := root.SafeJoin(dir)
+	absDir, err := root.SafeJoinDir(dir)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			http.NotFound(w, r) // well-formed path, target dir just doesn't exist
-			return
-		}
-		http.Error(w, "invalid dir: "+err.Error(), http.StatusBadRequest)
+		refuseRead(w, r, err)
 		return
 	}
 
 	entries, err := listFiles(absDir)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		// Reachable only if the directory SafeJoinDir just stat'd stops being a
+		// readable directory before os.ReadDir gets to it, or is unreadable to this
+		// process — so in practice a 404 (it was removed) or a 500 (EACCES/EIO).
+		// Routed through the same exit anyway: "no raw filesystem error leaves this
+		// handler" is worth more as a property of the handler than as a property of
+		// the branches someone could enumerate today.
+		refuseRead(w, r, err)
 		return
 	}
 	jsonResp(w, entries)
@@ -225,7 +342,9 @@ type fileContentResponse struct {
 // one file's content (capped at 1 MiB, see ReadFileContent), mirroring
 // handleFiles' workspace-resolution and error-mapping (tether#20 Task 6).
 // A bad path (traversal, missing, or a directory) never 500s: it maps to
-// 400 (bad path) or 404 (not found).
+// 400 (bad path) or 404 (not found). A path the daemon cannot READ does 500,
+// which is the one status this handler gained in tether#159 — it used to answer
+// those 400 with the *fs.PathError's text, absolute path and all.
 func handleFile(w http.ResponseWriter, r *http.Request, reg *Registry, id string) {
 	ws, ok := reg.Get(id)
 	if !ok {
@@ -241,11 +360,7 @@ func handleFile(w http.ResponseWriter, r *http.Request, reg *Registry, id string
 
 	content, truncated, err := ReadFileContent(ws.Path, path)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			http.NotFound(w, r) // well-formed path, target just doesn't exist
-			return
-		}
-		http.Error(w, "invalid path: "+err.Error(), http.StatusBadRequest)
+		refuseRead(w, r, err)
 		return
 	}
 	jsonResp(w, fileContentResponse{Path: path, Content: content, Truncated: truncated})
@@ -279,7 +394,14 @@ func handleTree(w http.ResponseWriter, r *http.Request, reg *Registry, id string
 	}
 	files, truncated, err := listFilesRecursive(ws.Path, limit)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		// Unreachable as written, and converted anyway. listFilesRecursive's WalkDir
+		// callback swallows every walk error and the only non-nil error it can
+		// return is its own stop sentinel, which it filters before returning — so no
+		// test can drive this branch and none pretends to (tether#159). It sent
+		// err.Error() before, and leaving one such site behind on the grounds that
+		// it is currently dead is how the next change to that walk turns a listing
+		// bug into a leak.
+		refuseRead(w, r, err)
 		return
 	}
 	jsonResp(w, treeResponse{Files: files, Truncated: truncated})

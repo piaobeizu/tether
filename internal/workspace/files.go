@@ -21,6 +21,24 @@ import (
 // read up to this limit and reported truncated rather than loaded whole.
 const maxFileReadBytes = 1 << 20 // 1 MiB
 
+// ErrPathIsDirectory — GET /api/v1/workspaces/{id}/file was given a path that
+// names a directory.
+//
+// The mirror of builtin.ErrNotDirectory, and the reason the two were decided
+// together (tether#159): /files handed a non-directory and /file handed a
+// directory are the same caller mistake seen from the two ends of one file
+// browser. Both are 400 — the caller named the wrong kind of thing and no retry
+// of the same request fixes it — and each gets a body that names which kind was
+// wanted, which is the only part of the old err.Error() body a caller could act
+// on.
+//
+// A sentinel rather than a bare fmt.Errorf because api.go has to derive a status
+// AND a body from it. It replaces `workspace: %s is a directory`, whose %s was
+// the caller's own string and so leaked nothing — but a body assembled from
+// err.Error() is one error away from carrying something else, which is the shape
+// tether#147 set out to remove rather than the wording of any one message.
+var ErrPathIsDirectory = errors.New("workspace: that path is a directory, not a file")
+
 // FileEntry describes a single directory entry returned by the files API,
 // annotated with git-dirty state relative to its nearest enclosing git repo.
 type FileEntry struct {
@@ -247,7 +265,14 @@ func repoRelPath(repoRoot, entryAbs string) string {
 // with truncated=true if the file is larger. rel is resolved via
 // builtin.Registry.SafeJoin, so traversal outside root (via ".." or a
 // symlink) is rejected with an error rather than ever reading outside the
-// workspace. A directory target is also an error (never silently listed).
+// workspace. A directory target is also an error (ErrPathIsDirectory — never
+// silently listed).
+//
+// Every error this returns reaches a client through api.go's refuseRead, which
+// derives the body from the error's identity: the ones this function names are
+// sentinels, and everything else — an *fs.PathError from os.Stat, os.Open or the
+// read itself, each of which carries the daemon's absolute path — is a 500 whose
+// body says nothing about the filesystem (tether#159).
 func ReadFileContent(root, rel string) (content string, truncated bool, err error) {
 	reg, err := builtin.New(root)
 	if err != nil {
@@ -263,7 +288,7 @@ func ReadFileContent(root, rel string) (content string, truncated bool, err erro
 		return "", false, err
 	}
 	if info.IsDir() {
-		return "", false, fmt.Errorf("workspace: %s is a directory", rel)
+		return "", false, fmt.Errorf("%w: %q", ErrPathIsDirectory, rel)
 	}
 
 	f, err := os.Open(abs)

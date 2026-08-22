@@ -18,12 +18,17 @@ package workspace
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+
+	"github.com/piaobeizu/tether/internal/mcp/builtin"
 )
 
 func postWS(t *testing.T, h http.Handler, path, body string) *httptest.ResponseRecorder {
@@ -249,14 +254,15 @@ func TestAddWorkspaceEndpoint_RefusesAPathItCannotUse(t *testing.T) {
 //
 // "RegistryMutations", not "WorkspaceEndpoints": POST and DELETE are the two
 // handlers that mutate the registry and the two this change converged. The three
-// READ handlers in the same route file — /files, /file and /tree — still build
-// bodies with err.Error(), and at least one of them leaks a daemon-side absolute
-// path today (`?dir=<a regular file>` reaches os.ReadDir and answers 500 with
-// `open <abs path>: not a directory`, because builtin.SafeJoin checks containment
-// but not that the target is a directory). That is a pre-existing defect on a
-// different set of handlers, it needs a decision about what /files should answer
-// for a non-directory, and it is tracked as tether#159 rather than folded in
-// here. A test called "WorkspaceEndpoints_..." would be read as covering it.
+// READ handlers in the same route file — /files, /file and /tree — were left
+// sending err.Error(), one of them leaking a daemon-side absolute path
+// (`?dir=<a regular file>` reached os.ReadDir and answered 500 with `open <abs
+// path>: not a directory`, because builtin.SafeJoin checked containment but not
+// that the target was a directory). tether#159 closed that, and the gate for it
+// is TestWorkspaceReads_DoNotEchoDaemonSideValues below — a separate test,
+// because it covers a separate set of handlers through a separate refusal map
+// (refuseRead/readRefusal, next to this one's refuse/registryRefusal). The name
+// here stays as it is: it says which half it holds.
 func TestRegistryMutations_DoNotEchoDaemonSideValues(t *testing.T) {
 	// A path component that is distinctive enough that finding it in a body cannot
 	// be a coincidence.
@@ -346,5 +352,202 @@ func TestDeleteWorkspaceEndpoint_ReportsAFailedDetach(t *testing.T) {
 	if strings.Contains(rec.Body.String(), "boom") {
 		t.Errorf("the refusal echoed the underlying error %q, which can carry daemon-side paths",
 			strings.TrimSpace(rec.Body.String()))
+	}
+}
+
+// -- tether#159: what the three READ handlers say when they refuse -----------
+
+// TestWorkspaceReads_DoNotEchoDaemonSideValues — the other half of
+// TestRegistryMutations_DoNotEchoDaemonSideValues, for /files and /file.
+//
+// Row 1 is the live leak this wi exists for and was observed to FAIL on c278802:
+// `?dir=<a regular file>` answered 500 with `open /tmp/.../a.txt: not a
+// directory`. Every other row was already refused before this change; they are
+// here because the refusal TEXT is what changed, and because a fix that turned
+// one of them into a 500 (or into a 404, unregistering the deliberate 404
+// mapping) would be a regression the leak test alone would not catch.
+//
+// # Three assertions per row, and the exact-equality one is the gate
+//
+// The status is checked, and then the body is checked for EQUALITY with the
+// expected refusal — not for absence of the path. "Does not contain <path>" is
+// satisfied by any wording that happens not to mention the one path a test
+// thought to look for, and every one of these bodies used to be assembled from
+// err.Error(), where the next error to carry a path leaks it. Equality is the
+// assertion that the body came from the refusal's IDENTITY. The containment check
+// is kept as well, on the daemon-side workspace root, purely so a failure reads
+// as "it leaked the path" rather than "the string differs".
+//
+// # Row 1 is NOT the gate on where the fix went, and the mutation battery says so
+//
+// The non-directory refusal has two independent layers — SafeJoinDir's stat, and
+// readRefusal's syscall.ENOTDIR arm, which catches os.ReadDir's own errno if the
+// first is gone — so removing EITHER leaves row 1 green. It fails on c278802,
+// where neither exists, and it is the right end-to-end assertion for the leak;
+// it is just not a discriminating one. Measured, not assumed: deleting
+// SafeJoinDir's IsDir check leaves this whole test passing and kills only
+// builtin.TestSafeJoinDir_RefusesANonDirectory, which is therefore the gate on
+// the source-layer half, and builtin.TestSafeJoin_StillAcceptsARegularFile is the
+// gate on that half not having been put one layer lower.
+func TestWorkspaceReads_DoNotEchoDaemonSideValues(t *testing.T) {
+	// The registry stores a canonicalised path, so resolve the fixture the same
+	// way before using it as the needle: on a host where TMPDIR is itself a
+	// symlink, an unresolved root appears in no body and the containment check
+	// would pass without measuring anything.
+	parent, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// outside.txt must EXIST for the traversal rows to reach the escape branch: a
+	// traversal to a target that is not there fails in EvalSymlinks first and is
+	// indistinguishable from a plain missing file, i.e. a 404 (the same fixture
+	// design TestFileHandler_TraversalPath400 explains).
+	root := filepath.Join(parent, "ws")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(parent, "outside.txt"), []byte("s"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	reg, id := newTestRegistry(t, root)
+	mux := http.NewServeMux()
+	RegisterAPI(mux, reg)
+
+	for _, tc := range []struct {
+		name     string
+		url      string
+		wantCode int
+		wantBody string
+	}{
+		{
+			"files: dir names a regular file",
+			"/files?dir=a.txt",
+			http.StatusBadRequest, readNotADirectoryBody,
+		},
+		{
+			// The same mistake spelled differently: EvalSymlinks fails before any
+			// stat, with ENOTDIR, and must still arrive as the same refusal.
+			"files: dir names something under a regular file",
+			"/files?dir=a.txt/b",
+			http.StatusBadRequest, readNotADirectoryBody,
+		},
+		{
+			"files: dir leaves the workspace",
+			"/files?dir=..",
+			http.StatusBadRequest, readOutsideWorkspaceBody,
+		},
+		{
+			"files: dir is absolute",
+			"/files?dir=/etc",
+			http.StatusBadRequest, readMustBeRelativeBody,
+		},
+		{
+			// Deliberate and pre-existing: a well-formed path whose target is not
+			// there is a 404, and tether#159 was not allowed to change it.
+			"files: dir does not exist",
+			"/files?dir=nope",
+			http.StatusNotFound, "404 page not found",
+		},
+		{
+			"file: path names a directory",
+			"/file?path=sub",
+			http.StatusBadRequest, ErrPathIsDirectory.Error(),
+		},
+		{
+			"file: path names something under a regular file",
+			"/file?path=a.txt/b",
+			http.StatusBadRequest, readNotADirectoryBody,
+		},
+		{
+			"file: path leaves the workspace",
+			"/file?path=../outside.txt",
+			http.StatusBadRequest, readOutsideWorkspaceBody,
+		},
+		{
+			"file: path does not exist",
+			"/file?path=nope",
+			http.StatusNotFound, "404 page not found",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			url := "/api/v1/workspaces/" + id + tc.url
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, url, nil))
+
+			if rec.Code != tc.wantCode {
+				t.Errorf("GET %s -> %d, want %d; body %q", tc.url, rec.Code, tc.wantCode,
+					strings.TrimSpace(rec.Body.String()))
+			}
+			if got := strings.TrimSpace(rec.Body.String()); got != tc.wantBody {
+				t.Errorf("GET %s body = %q, want exactly %q — the body must come from the "+
+					"sentinel, not from err.Error()", tc.url, got, tc.wantBody)
+			}
+			if strings.Contains(rec.Body.String(), root) {
+				t.Errorf("GET %s named the daemon's own workspace root: %q", tc.url,
+					strings.TrimSpace(rec.Body.String()))
+			}
+		})
+	}
+
+	// The companion that keeps every row above from being satisfied by handlers
+	// that refuse everything.
+	if got := getFiles(t, mux, id, "sub"); len(got) != 0 {
+		t.Errorf("GET /files?dir=sub = %+v, want an empty listing of the real directory", got)
+	}
+}
+
+// TestReadRefusal_EveryRefusalItCannotNameIsAn500WithNoDetail — the map itself,
+// including the case no request can reach.
+//
+// The default arm is the one that matters and the one no handler test can drive:
+// an *fs.PathError from os.ReadDir, os.Open or a read is what carried the
+// daemon's absolute path, and on this host every such failure is unreachable
+// because the tests run as root — chmod cannot make a directory unreadable, and
+// the only other route (a target that vanishes between the stat and the read) is
+// a race, not a fixture. So it is asserted here directly rather than left to a
+// handler test that would silently be covering nothing (tether#159).
+func TestReadRefusal_EveryRefusalItCannotNameIsAn500WithNoDetail(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		err      error
+		wantCode int
+		wantBody string
+	}{
+		{"missing target", fs.ErrNotExist, http.StatusNotFound, ""},
+		{"wrapped missing target", fmt.Errorf("stat /home/u/ws/x: %w", fs.ErrNotExist),
+			http.StatusNotFound, ""},
+		{"absolute", builtin.ErrAbsolutePath, http.StatusBadRequest, readMustBeRelativeBody},
+		{"escapes", builtin.ErrPathEscapesRoot, http.StatusBadRequest, readOutsideWorkspaceBody},
+		{"not a directory", builtin.ErrNotDirectory, http.StatusBadRequest, readNotADirectoryBody},
+		{
+			// What /file gets for `a.txt/b`: it resolves through plain SafeJoin, so
+			// EvalSymlinks' errno arrives with no sentinel around it.
+			"bare ENOTDIR", syscall.ENOTDIR, http.StatusBadRequest, readNotADirectoryBody,
+		},
+		{"is a directory", ErrPathIsDirectory, http.StatusBadRequest, ErrPathIsDirectory.Error()},
+		{
+			// The shape of every leak this wi closed.
+			"an unclassified path error",
+			&fs.PathError{Op: "open", Path: "/home/u/ws/secret", Err: errors.New("permission denied")},
+			http.StatusInternalServerError, registryInternalErrorBody,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			code, body := readRefusal(tc.err)
+			if code != tc.wantCode || body != tc.wantBody {
+				t.Errorf("readRefusal(%v) = (%d, %q), want (%d, %q)", tc.err, code, body,
+					tc.wantCode, tc.wantBody)
+			}
+			if strings.Contains(body, "/home/u/ws") {
+				t.Errorf("readRefusal built its body from the error value: %q", body)
+			}
+		})
 	}
 }

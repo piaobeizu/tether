@@ -122,18 +122,23 @@ func routeClientFrame(reg *session.Registry, f wire.ClientFrame) (*wire.ControlF
 }
 
 // handleResizeFrame applies a client-reported terminal size to the PTY behind
-// f.SessionID's shell (tether#68).
+// the shell f names (tether#68, tether#150).
 //
-// An unknown session is an expected race, not a bug — /wt/control is not
-// session-scoped, so a resize can arrive after the shell closed, or before it
-// opened. Log at debug and drop; there is nothing to tell the user.
+// f.ShellID is passed through rather than interpreted here: since tether#121 one
+// session can have a shell per tab and per device, and choosing between them is
+// Registry.ResizeShell's job — it is the only place that knows which of them are
+// still live.
+//
+// An unknown session or shell is an expected race, not a bug — /wt/control is
+// not session-scoped, so a resize can arrive after its shell closed, or before
+// it opened. Log at debug and drop; there is nothing to tell the user.
 func handleResizeFrame(reg *session.Registry, f wire.ClientFrame) {
 	if f.Cols == 0 || f.Rows == 0 {
 		return // a zero dimension would blank the remote TUI
 	}
-	if err := reg.ResizeShell(f.SessionID, f.Cols, f.Rows); err != nil {
+	if err := reg.ResizeShell(f.SessionID, f.ShellID, f.Cols, f.Rows); err != nil {
 		slog.Debug("serveControl: shell resize dropped",
-			"sid", f.SessionID, "cols", f.Cols, "rows", f.Rows, "err", err)
+			"sid", f.SessionID, "shell", f.ShellID, "cols", f.Cols, "rows", f.Rows, "err", err)
 	}
 }
 

@@ -157,7 +157,13 @@ export class ControlClient {
 
   /**
    * sendResize tells the daemon the size ShellPane is actually rendering the
-   * terminal at, so it can retarget that session's PTY (tether#68).
+   * terminal at, so it can retarget that shell's PTY (tether#68).
+   *
+   * `shellId` is the id the pane opened its /wt/shell with, and it is what makes
+   * this frame about ONE terminal: since tether#121 a session can have a shell
+   * per tab and per device, so a resize that named only the session was applied
+   * to whichever of them connected last — somebody else's terminal, from the
+   * point of view of every pane but the newest (tether#150).
    *
    * It rides the control lane because /wt/shell carries raw PTY bytes and has
    * nowhere to put a size. Best-effort like the rest of this class: if the
@@ -168,9 +174,9 @@ export class ControlClient {
    * A zero dimension is never sent — xterm reports 0 while the pane is
    * display:none, and a 0-wide PTY blanks the remote TUI.
    */
-  async sendResize(sessionId: string, cols: number, rows: number): Promise<void> {
+  async sendResize(sessionId: string, shellId: string, cols: number, rows: number): Promise<void> {
     if (cols <= 0 || rows <= 0) return
-    await this.writeFrame({ kind: ClientFrameResize, sessionId, cols, rows })
+    await this.writeFrame({ kind: ClientFrameResize, sessionId, shellId, cols, rows })
   }
 
   private async writeFrame(frame: ClientFrame): Promise<void> {

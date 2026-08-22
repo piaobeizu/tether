@@ -18,6 +18,7 @@ import (
 	"github.com/piaobeizu/tether/internal/auth"
 	"github.com/piaobeizu/tether/internal/permission/cchook"
 	"github.com/piaobeizu/tether/internal/session"
+	"github.com/piaobeizu/tether/internal/wire"
 )
 
 // handleWTShell handles /wt/shell WebTransport upgrades (s6 / D-05a §2 fact 4).
@@ -31,7 +32,9 @@ func handleWTShell(reg *session.Registry, wts *webtransport.Server, authState *a
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
 			return
 		}
-		sid := r.URL.Query().Get("sid")
+		// Everything this route takes from its URL, read in one place — see
+		// parseShellRequest for why that matters to the shell id in particular.
+		req := parseShellRequest(r.URL.Query())
 
 		wtSess, err := wts.Upgrade(w, r)
 		if err != nil {
@@ -55,7 +58,7 @@ func handleWTShell(reg *session.Registry, wts *webtransport.Server, authState *a
 		// buildPTYCommand). The sid is enough to look it up — the shell needs no
 		// workspace parameter of its own, and giving it one would let the two
 		// disagree.
-		cmd := buildPTYCommand(ctx, ResolveClaudePath(), sid, reg.WorkdirForSession(sid))
+		cmd := buildPTYCommand(ctx, ResolveClaudePath(), req.sid, reg.WorkdirForSession(req.sid))
 		cmd.Env = buildPTYEnv(reg.PermGate)
 
 		// Start the PTY at the size the browser already knows it will render
@@ -63,7 +66,7 @@ func handleWTShell(reg *session.Registry, wts *webtransport.Server, authState *a
 		// frame instead would paint one screenful of TUI at the wrong width and
 		// then reflow it, and would leave the size wrong for the whole session
 		// whenever /wt/control never connects.
-		ptmx, err := startPTY(cmd, parseWinsize(r.URL.Query()))
+		ptmx, err := startPTY(cmd, req.winsize)
 		if err != nil {
 			_, _ = stream.Write([]byte("\r\n[tether] failed to start shell: " + err.Error() + "\r\n"))
 			_ = stream.Close()
@@ -71,7 +74,7 @@ func handleWTShell(reg *session.Registry, wts *webtransport.Server, authState *a
 			return
 		}
 
-		defer attachShellResize(reg, sid, ptmx)()
+		defer attachShellResize(reg, req, ptmx)()
 
 		pumpShell(ctx, stream, ptmx, cmd.Wait, func() { _ = wtSess.CloseWithError(0, "") })
 	}
@@ -162,26 +165,83 @@ func pumpShell(ctx context.Context, stream io.ReadWriteCloser, ptmx io.ReadWrite
 //
 // Size changes cannot ride the /wt/shell stream — it is raw PTY bytes by
 // contract (D-05a §2 fact 4) — so they arrive on /wt/control and are routed
-// back by sid. tether#68.
+// back by (sid, shellID). tether#68, tether#150.
 //
 // Routing by sid alone was safe while the shell lock refused a second /wt/shell
 // for a sid that already had one. tether#121 removed that lock, so two shells on
-// one sid is now an ordinary state (two tabs, two devices) and the LAST one to
-// register owns the sid's resize slot: the older pane's resizes reach the newer
-// pane's PTY, and the newer pane's deferred detach drops the slot entirely. That
-// is a real regression of tether#68, left standing here deliberately rather than
-// papered over — fixing it means keying this map by shell instance instead of by
-// sid, which is a change to Registry's shape and not to this file.
+// one sid became an ordinary state (two tabs, two devices) while the resize map
+// still held one entry per sid — the older pane's resizes reached the newer
+// pane's PTY, and the newer pane's detach dropped the sid's only slot, leaving
+// the older pane unresizable for the rest of its life. tether#150 fixed that in
+// Registry: registrations are per shell now, and the detach this returns is the
+// one that Registry minted for THIS shell, so it cannot remove another's.
+//
+// req.shellID is what the client called this shell (wire.ShellQueryParam on the
+// /wt/shell URL, echoed as ClientFrame.ShellID on every resize). Empty means the
+// client named nothing, and its resizes fall back to "this session's newest
+// shell" — see Registry.ResizeShell.
+//
+// # Why this takes the whole shellRequest and not req.sid, req.shellID
+//
+// Because handleWTShell cannot be tested (it takes a concrete
+// *webtransport.Session), and taking two strings left a one-character edit at
+// the call site — `req.shellID` → `""` — that silently restores the entire
+// pre-tether#150 behaviour with every test still green. Passing the parsed value
+// itself removes that edit from the language: the two fields cannot come from
+// different places, because there is only one place they can come from. The
+// defect is still constructible in this package (`shellRequest{sid: req.sid}`),
+// which is not worth an opaque type to prevent — but it is now something a
+// reader sees rather than something a reader has to notice.
 //
 // Extracted from handleWTShell (rather than inlined there) so the whole path
 // from a control frame to the kernel's winsize is reachable from a test: the
 // handler itself needs a live WebTransport session, and an untested seam here
 // is exactly the kind that keeps compiling while doing nothing.
-func attachShellResize(reg *session.Registry, sid string, ptmx *os.File) func() {
-	reg.RegisterShellResize(sid, func(cols, rows uint16) error {
+func attachShellResize(reg *session.Registry, req shellRequest, ptmx *os.File) func() {
+	return reg.RegisterShellResize(req.sid, req.shellID, func(cols, rows uint16) error {
 		return pty.Setsize(ptmx, &pty.Winsize{Rows: rows, Cols: cols})
 	})
-	return func() { reg.UnregisterShellResize(sid) }
+}
+
+// shellRequest is everything handleWTShell takes from a /wt/shell URL.
+type shellRequest struct {
+	// sid is the chat session this shell resumes, and "" for a pane that opened
+	// before any chat session existed.
+	sid string
+	// shellID is what the client calls THIS shell (tether#150), and "" for a
+	// client that names none.
+	shellID string
+	// winsize is the size the browser is already rendering at, or nil to let the
+	// kernel default stand.
+	winsize *pty.Winsize
+}
+
+// parseShellRequest reads all three off the query string.
+//
+// One function rather than three reads scattered through the handler, because
+// handleWTShell itself is not reachable from a test — it takes a concrete
+// *webtransport.Session — so every query key read inside it is a key nothing
+// checks. That was survivable while the keys only chose a working directory and
+// a starting size: a wrong one degraded visibly. It is not survivable for the
+// shell id, whose absence is INVISIBLE — it silently selects the fallback in
+// Registry.ResizeShell, which is the pre-tether#150 behaviour the id exists to
+// replace. Reading the keys here puts them under TestParseShellRequest, and
+// attachShellResize takes this value whole so no caller can substitute one of
+// its fields; what remains uncovered is the single
+// `parseShellRequest(r.URL.Query())` call.
+//
+// Called before wts.Upgrade, which is where the sid read it replaced already
+// sat. Whether *http.Request stays usable after Upgrade hijacks the CONNECT
+// stream has not been established here, so the position is kept rather than
+// moved.
+func parseShellRequest(q url.Values) shellRequest {
+	return shellRequest{
+		sid: q.Get("sid"),
+		// Named by the shared constant, so the daemon and the SPA (which writes
+		// it from the generated wire module) cannot end up using different keys.
+		shellID: q.Get(wire.ShellQueryParam),
+		winsize: parseWinsize(q),
+	}
 }
 
 // parseWinsize reads the terminal size the browser reported on the /wt/shell

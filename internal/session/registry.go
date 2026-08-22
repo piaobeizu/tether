@@ -56,17 +56,30 @@ type Registry struct {
 	// fresh spawn onto "" and hand unrelated clients one agent, and cfg.SessionID
 	// would do the same to every resume. See spawnEntry.
 	spawning map[string]*spawnReservation
-	// shellResize is keyed by the sid a /wt/shell connection was opened with,
-	// and holds that PTY's resize func (tether#68). Deliberately NOT part of
-	// Entry: a shell can exist for a sid that has no chat Entry at all (the
-	// sid may even be ""), so hanging it off sessions would make resize
-	// unroutable in exactly the cases where the pane is already on screen.
+	// shellResize holds the resize func of every LIVE /wt/shell PTY (tether#68),
+	// keyed by a registration id this Registry mints — NOT by the sid the shell
+	// was opened with.
 	//
-	// One shell per sid is NOT an invariant since tether#121 removed the shell
-	// lock: two panes on one sid now both connect, and this map holds whichever
-	// registered last. See server.attachShellResize for what that costs and why
-	// the fix belongs to this map's key rather than to the shell handler.
-	shellResize map[string]func(cols, rows uint16) error
+	// One shell per sid stopped being an invariant when tether#121 removed the
+	// shell lock: two panes on one sid (two tabs, two devices) now both connect,
+	// each with its own PTY at its own size. Keyed by sid, this map held only
+	// whichever registered last, which cost two things (tether#150): the older
+	// pane's resizes reached the newer pane's PTY, and the newer pane's exit
+	// deleted the sid's only slot, so the older pane could never be resized
+	// again. Both follow from the key, not from the shell handler, which is why
+	// the fix is here.
+	//
+	// Deliberately NOT part of Entry: a shell can exist for a sid that has no
+	// chat Entry at all (the sid may even be ""), so hanging it off sessions
+	// would make resize unroutable in exactly the cases where the pane is
+	// already on screen.
+	shellResize map[uint64]shellResizeTarget
+	// shellResizeSeq is the last id handed out for shellResize. Monotonic and
+	// never reused, which makes it two things at once: an identity no live shell
+	// shares with another, and the registration ORDER — ResizeShell reads the
+	// larger id as "the more recently opened shell" when a frame names a session
+	// but no shell. Guarded by mu with the map.
+	shellResizeSeq uint64
 	// observers holds the READ-ONLY subscribers of each sid — the /wt/events
 	// attaches — and it is keyed by sid rather than hung off the Entry, which is
 	// the whole of tether#75. See Registry.SubscribeObserver for why that difference
@@ -928,7 +941,7 @@ func NewRegistry(providers ...agent.AgentProvider) *Registry {
 	return &Registry{
 		sessions:        make(map[string]*Entry),
 		spawning:        make(map[string]*spawnReservation),
-		shellResize:     make(map[string]func(cols, rows uint16) error),
+		shellResize:     make(map[uint64]shellResizeTarget),
 		observers:       make(map[string]*observerSet),
 		providers:       pm,
 		mintedIDIgnored: make(map[string]bool),
@@ -2280,53 +2293,113 @@ func (r *Registry) InterruptSession(sid string) error {
 	return e.sess.Interrupt()
 }
 
-// RegisterShellResize records how to resize the PTY behind sid's /wt/shell
-// connection (tether#68). handleWTShell calls this right after starting the
-// PTY and unregisters on the way out.
+// shellResizeTarget is one live /wt/shell PTY, as much of it as resize routing
+// needs: which session it belongs to, the id its client calls it by, and how to
+// change its size.
 //
-// A second registration for the same sid replaces the first rather than
-// erroring. That was chosen while the shell lock (GetLock) made two live shells
-// on one sid impossible, so the only way to reach here twice was a reconnect
-// whose predecessor had not finished its deferred unregister — and in that race
-// the newer PTY is the one a resize should reach.
-//
-// tether#121 removed that lock, so reaching here twice is now an ordinary state
-// (two tabs or two devices on one sid) and last-writer-wins is no longer a
-// tie-break in a race but the steady-state answer: the older pane's resizes go
-// to the newer pane's PTY, and the newer pane's exit unregisters the sid out
-// from under the older one. Making that correct needs this map keyed by shell
-// instance rather than by sid; it is deliberately NOT patched at the call site,
-// where it would only look fixed.
-func (r *Registry) RegisterShellResize(sid string, fn func(cols, rows uint16) error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.shellResize[sid] = fn
+// sid and shellID are stored rather than folded into a composite map key because
+// both halves are looked up by pattern, not by equality: ResizeShell needs "the
+// newest shell on this sid" when a frame names no shell, and a composite key
+// cannot be scanned for that without also parsing it back apart.
+type shellResizeTarget struct {
+	sid     string
+	shellID string
+	fn      func(cols, rows uint16) error
 }
 
-// UnregisterShellResize drops sid's PTY resize func. Safe to call for a sid
-// that was never registered.
-func (r *Registry) UnregisterShellResize(sid string) {
+// RegisterShellResize records how to resize the PTY behind one /wt/shell
+// connection (tether#68) and returns the func that removes THAT registration.
+// handleWTShell calls this right after starting the PTY and defers the returned
+// release.
+//
+// shellID is the id the client named this shell with (wire.ShellQueryParam); ""
+// means the client did not name it, and see ResizeShell for what that costs.
+//
+// # Why this returns its own release instead of taking a sid back
+//
+// The removal used to be UnregisterShellResize(sid), and while the shell lock
+// (GetLock) made two live shells on one sid impossible that was the same thing
+// as "remove mine". tether#121 removed the lock, so it became "remove whichever
+// shell on this sid registered most recently" — which, for the pane that opened
+// FIRST, is somebody else's (tether#150). A release closure that captures the id
+// this call minted cannot express that mistake: there is no argument to get
+// wrong, and a second shell on the same sid is no longer even visible from here.
+//
+// Calling the returned func twice, or after the process it belongs to is gone,
+// is a no-op: ids are never reused, so a second delete finds nothing.
+func (r *Registry) RegisterShellResize(sid, shellID string, fn func(cols, rows uint16) error) (release func()) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.shellResize, sid)
+	r.shellResizeSeq++
+	id := r.shellResizeSeq
+	r.shellResize[id] = shellResizeTarget{sid: sid, shellID: shellID, fn: fn}
+	r.mu.Unlock()
+
+	return func() {
+		r.mu.Lock()
+		delete(r.shellResize, id)
+		r.mu.Unlock()
+	}
 }
 
-// ResizeShell applies a client-reported terminal size to sid's PTY (tether#68).
+// ResizeShell applies a client-reported terminal size to one of sid's shells
+// (tether#68).
 //
 // Without this the PTY keeps whatever size it was started with while the
 // browser's xterm fits itself to the pane, so the remote TUI renders for one
 // width and is displayed at another — the wrapped/clipped Shell tab this
 // slice exists to fix.
 //
-// Returns an error (never panics) when sid has no registered shell — same
-// expected race as DeliverAction/InterruptSession, since /wt/control is not
-// session-scoped and a resize can arrive after the shell closed. Callers log
+// # Which shell
+//
+// shellID picks it, and it is matched WITHIN sid: a frame is applied to the live
+// shell that is on that session AND was opened under that id, and to nothing
+// else. A named shell that is not (or is no longer) live is an error, NOT a
+// fallback onto the session's other shells — retargeting a pane the user did not
+// resize is the whole of tether#150, and a fallback here would reintroduce it
+// for every stale frame.
+//
+// shellID == "" means the client did not name a shell, which is all any client
+// could do before tether#150. Such a frame is applied to the most recently
+// opened live shell on the session — the same shell the sid-keyed map used to
+// hold, so an unnamed client is no worse off than it was. It is worse off than a
+// named one, and unavoidably: "the session's shell" does not identify anything
+// once the session has two.
+//
+// Returns an error (never panics) when nothing matches — the same expected race
+// as DeliverAction/InterruptSession, since /wt/control is not session-scoped and
+// a resize can arrive after its shell closed, or before it opened. Callers log
 // and drop.
-func (r *Registry) ResizeShell(sid string, cols, rows uint16) error {
+func (r *Registry) ResizeShell(sid, shellID string, cols, rows uint16) error {
 	r.mu.RLock()
-	fn, ok := r.shellResize[sid]
+	// A scan rather than a keyed lookup: see shellResizeTarget. It is bounded by
+	// the number of live /wt/shell connections in the whole daemon, each of which
+	// holds a PTY master and a QUIC session, so the descriptor limit bounds it
+	// long before the loop costs anything — and a resize frame arrives at most
+	// once per column the user drags across.
+	var (
+		fn     func(cols, rows uint16) error
+		newest uint64
+	)
+	for id, t := range r.shellResize {
+		if t.sid != sid {
+			continue
+		}
+		if shellID != "" && t.shellID != shellID {
+			continue
+		}
+		// Highest id wins, so the answer does not depend on Go's map iteration
+		// order. For a named shell there should be exactly one candidate; if a
+		// client somehow reused an id, the newer shell is the one on screen.
+		if id > newest {
+			newest, fn = id, t.fn
+		}
+	}
 	r.mu.RUnlock()
-	if !ok {
+
+	if fn == nil {
+		if shellID != "" {
+			return fmt.Errorf("resize shell: no live shell %q on session %q", shellID, sid)
+		}
 		return fmt.Errorf("resize shell: no shell for session %q", sid)
 	}
 	return fn(cols, rows)

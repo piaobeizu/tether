@@ -331,13 +331,27 @@ export const ClientFramePing: ClientFrameKind = "ping";
 export const ClientFrameAction: ClientFrameKind = "action";
 export const ClientFrameResize: ClientFrameKind = "resize";
 /**
+ * ShellQueryParam is the /wt/shell query parameter a client names its shell
+ * instance with, and the same string it puts in ClientFrame.ShellID when it
+ * resizes that shell (tether#150).
+ * Declared here, in the one file the browser's types are generated from, so the
+ * two ends cannot drift: the daemon reads r.URL.Query().Get(wire.ShellQueryParam)
+ * and the SPA writes q.set(ShellQueryParam, id) from the generated
+ * web/src/lib/wire.gen.ts. A pair of hand-typed literals would still compile
+ * after one side was renamed, and the failure would be invisible — a shell whose
+ * id never arrives is routed by the fallback in Registry.ResizeShell, which is
+ * precisely the pre-tether#150 behaviour this parameter exists to end.
+ */
+export const ShellQueryParam = "shell";
+/**
  * ClientFrame is a client→server message on /wt/control. Kind selects the
  * interpretation of the remaining fields: "ping" carries only TS (RTT
  * probe); "action" carries SessionID/BlockID/Action/Skill — a fenced-block
  * callback (D-19 §5) routed to the named session (tether#8 T8); "resize"
- * carries SessionID/Cols/Rows and retargets that session's PTY (tether#68).
- * The /wt/control channel is not otherwise session-scoped, so SessionID is
- * the only way the daemon knows which session a frame targets.
+ * carries SessionID/ShellID/Cols/Rows and retargets that shell's PTY
+ * (tether#68, tether#150). The /wt/control channel is not otherwise
+ * session-scoped, so SessionID is the only way the daemon knows which session a
+ * frame targets.
  * Resize rides here rather than on /wt/shell because that stream is raw PTY
  * bytes by contract (D-05a §2 fact 4) — there is no field to put a size in
  * without introducing framing on the hot path.
@@ -346,6 +360,17 @@ export interface ClientFrame {
   kind: ClientFrameKind;
   ts?: number /* int64 */;
   sessionId?: string;
+  /**
+   * ShellID names WHICH of the session's shells a "resize" is about, and is
+   * ignored by every other kind.
+   * SessionID alone used to be enough because the shell lock made two live
+   * shells on one sid impossible. tether#121 removed that lock, so a sid can
+   * now have a shell per tab and per device, each with its own PTY at its own
+   * size — and a resize that names only the session can only be applied to one
+   * of them, which is tether#150. Clients that leave this empty keep the old,
+   * lossy routing: see Registry.ResizeShell.
+   */
+  shellId?: string;
   blockId?: string;
   action?: string;
   skill?: string;

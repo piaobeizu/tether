@@ -27,6 +27,29 @@ import (
 // another package's filesystem work and can name daemon-side paths.
 var ErrOverlayCleanup = errors.New("workspace: the overlays inside this workspace could not be detached")
 
+// The two refusals Add can produce, as sentinels rather than bare strings,
+// because api.go has to turn them into a status AND a body that carries no
+// daemon-side value (tether#147). Both are 400: the caller sent the path, and no
+// amount of retrying the same request fixes either.
+var (
+	// ErrWorkspacePathNotAbsolute — the registration named a relative path.
+	//
+	// filepath.Abs would resolve it against the DAEMON's working directory, which
+	// the caller does not know and cannot see: the same request answers with a
+	// different registration depending on where the daemon happens to have been
+	// started. Refusing is the only answer that means one thing.
+	ErrWorkspacePathNotAbsolute = errors.New("workspace: a workspace path must be absolute")
+
+	// ErrWorkspacePathUnusable — the registration named a path that is not there,
+	// or is there and is not a directory.
+	//
+	// One sentinel for both on purpose. They are the same caller mistake ("that is
+	// not a directory I can use") and keeping them apart would hand an
+	// authenticated caller a finer probe of the daemon's filesystem than a
+	// registration endpoint has any reason to give — see Add's doc.
+	ErrWorkspacePathUnusable = errors.New("workspace: a workspace path must be a directory that already exists")
+)
+
 // Workspace represents a single registered workspace entry.
 type Workspace struct {
 	ID        string    `json:"id"`
@@ -204,11 +227,20 @@ func (r *Registry) Path(id string) (string, bool) {
 // So this returns the absolute path when EvalSymlinks fails instead of an error,
 // and that is not a convenience fallback: it is the same branch cc takes, which
 // keeps the two sides agreeing in the failure case too — the entire reason this
-// function exists. It also preserves the pre-existing contract that a path need
-// not exist yet to be registered (filepath.Abs never required it), so a POST
-// that succeeds today does not start failing because a directory is on a volume
-// that is not mounted right now. A registry is a bookmark list; a bookmark to a
-// directory that is temporarily absent is worth keeping.
+// function exists.
+//
+// # This function does NOT decide what may be registered
+//
+// It used to argue the opposite as well: that the fallback also preserved a
+// contract in which a path need not exist yet to be registered. tether#147
+// reversed that contract, and deliberately did NOT touch this function to do it
+// (see Add). The reason to keep the two apart is that they answer different
+// questions. This one answers "what is the one string that names this
+// directory", and for that question a best-effort answer that matches cc is the
+// right one — it is used by load() on entries that are ALREADY registered, where
+// a directory on a currently-unmounted volume must keep its entry rather than
+// make the whole registry unloadable. Whether a NEW registration is acceptable
+// is Add's question, and Add is where it is now asked.
 //
 // The returned error is filepath.Abs's alone (it fails only when the process has
 // no working directory), kept so Add's signature still reports the one condition
@@ -242,10 +274,68 @@ func canonicalPath(path string) (string, error) {
 // it reads, so both sides of this comparison are canonical: a registry written
 // before this change does not grow a second entry for a directory it already
 // has. That is the whole reason the normalisation is in load as well as here.
+//
+// # A path must be absolute, and must already be a directory (tether#147)
+//
+// This REVERSES a written design intent, and the intent is worth stating before
+// the reason it was dropped. canonicalPath's doc used to argue that a path need
+// not exist to be registered — a registry is a bookmark list, and a bookmark to
+// a directory on a volume that is not mounted right now is worth keeping.
+//
+// What changed is that the benefit turned out to be zero while the costs stayed.
+// tether#156 made Enable refuse a registration whose directory is not on disk
+// (skill.ErrWorkspaceDirUnusable): it stats the recorded path first and will not
+// create it, on the grounds that materialising a bookmark's target is not
+// something an overlay write should be able to do. So "register it now, create
+// it later" already cannot be followed by anything that USES the registration
+// until the directory exists — the early registration buys nothing that
+// registering after mkdir would not also buy.
+//
+// The costs it left behind were three:
+//
+//   - The registry accepts arbitrary strings. It is the daemon's audit record of
+//     which directories an agent may execute in (workspaceDir in internal/skill,
+//     and the `?ws=` chat handshake), and a record that can hold anything is a
+//     weaker record.
+//   - A relative path was silently resolved against the DAEMON's working
+//     directory. Nothing told the caller which directory it got, and the caller
+//     generally cannot know.
+//   - The failure happened at the wrong request. A path that cannot work was
+//     reported by a later enable, with a worse message, instead of by the POST
+//     that named it.
+//
+// Two things this deliberately does NOT do, because they were considered and
+// refused rather than missed: it does not confine the path to any root or
+// allow-list (the credential that reaches this endpoint also reaches /wt/shell,
+// so the strong boundary is the permission hook on that path, tether#149 — a
+// weak boundary made narrower here would raise the bar without moving it), and
+// it does not apply to load(). Entries already in the file keep the
+// bookmark-survives-an-unmounted-volume behaviour; only new registrations are
+// gated. Making load() drop them would turn one absent directory into "this
+// daemon has no workspace registry" for every request (see NewRegistry).
+//
+// # Order, and why each refusal has one cause
+//
+// IsAbs is checked on the string the CALLER sent, before canonicalPath, because
+// canonicalPath's own filepath.Abs is exactly the silent resolution being
+// refused — after it, the relative input is indistinguishable from an absolute
+// one. The directory check then runs on the CANONICAL path, which is the value
+// that gets stored, handed out, and stat'd again by
+// skill.containedPluginsDir: checking anything else would leave those two able
+// to disagree.
 func (r *Registry) Add(name, path string) (Workspace, error) {
+	if !filepath.IsAbs(path) {
+		return Workspace{}, fmt.Errorf("%w: %q", ErrWorkspacePathNotAbsolute, path)
+	}
 	abs, err := canonicalPath(path)
 	if err != nil {
 		return Workspace{}, err
+	}
+	// Not there, and there-but-not-a-directory, collapse into one refusal. A
+	// dangling symlink lands here too: canonicalPath cannot resolve it and hands
+	// back the link itself, which os.Stat then follows to nothing.
+	if fi, statErr := os.Stat(abs); statErr != nil || !fi.IsDir() {
+		return Workspace{}, fmt.Errorf("%w: %q", ErrWorkspacePathUnusable, abs)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -379,6 +469,12 @@ func (r *Registry) Remove(id string) error {
 // value it had and stays in the list. A registry must not become unloadable —
 // which server/lifecycle.go turns into "this daemon has no workspace registry" —
 // because one bookmark points somewhere temporarily unreachable.
+//
+// That is a deliberate asymmetry with Add, which since tether#147 refuses a NEW
+// registration whose path is not an existing directory. It is not an oversight to
+// be tidied up later: the cost of refusing a new registration is one 400 the
+// caller can act on, and the cost of dropping a loaded entry is the sentence
+// above.
 func (r *Registry) load() error {
 	data, err := os.ReadFile(r.path)
 	if err != nil {

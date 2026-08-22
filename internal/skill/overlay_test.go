@@ -50,6 +50,136 @@ func installedSkill(t *testing.T, id string) (Skill, string) {
 	return Skill{ID: id, Name: "n-" + id, SourcePath: src}, src
 }
 
+// -- tether#147: what Install will accept ------------------------------------
+
+// TestInstall_RefusesASourceThatIsNotAnExistingDirectory.
+//
+// Every doc in this package describes a skill as a DIRECTORY, and os.Stat alone
+// accepted regular files: a plain file installed, and Enable then linked a
+// registered workspace's plugins entry to it for cc to read. The dangling-symlink
+// row is the same refusal through a third mechanism (os.Stat follows the link and
+// finds nothing).
+//
+// Run against the pre-fix tree: the file row returned a nil error and a
+// registration, and the missing/dangling rows returned `skill path not found:
+// stat <path>: no such file or directory` — an error the HTTP layer sent verbatim.
+//
+// The "still empty" half is asserted separately for the same reason it is in the
+// workspace package: an error return that has already appended to r.skills is a
+// distinct defect from no error at all.
+func TestInstall_RefusesASourceThatIsNotAnExistingDirectory(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func(t *testing.T, base string) string
+	}{
+		{"does not exist", func(t *testing.T, base string) string {
+			return filepath.Join(base, "not-there")
+		}},
+		{"exists but is a regular file", func(t *testing.T, base string) string {
+			p := filepath.Join(base, "skill.md")
+			if err := os.WriteFile(p, []byte("# not a skill dir"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return p
+		}},
+		{"is a dangling symlink", func(t *testing.T, base string) string {
+			p := filepath.Join(base, "dangling")
+			if err := os.Symlink(filepath.Join(base, "gone"), p); err != nil {
+				t.Fatal(err)
+			}
+			return p
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := tc.build(t, t.TempDir())
+			reg := newTestRegistry(t, fakeIndex{"ws1": t.TempDir()})
+
+			sk, err := reg.Install("s", src)
+			if !errors.Is(err, ErrSkillSourceUnusable) {
+				t.Fatalf("Install(%q) = (%+v, %v), want ErrSkillSourceUnusable", src, sk, err)
+			}
+			if got := reg.List(); len(got) != 0 {
+				t.Errorf("after a refused Install, List = %+v, want empty", got)
+			}
+			// And nothing reached skills.json. In memory and on disk are two
+			// assertions because they are two defects: Install appends to r.skills
+			// and THEN calls saveLocked, so "returns the refusal but records it
+			// anyway" and "records it and persists it" fail independently.
+			if _, statErr := os.Stat(reg.path); !errors.Is(statErr, os.ErrNotExist) {
+				t.Errorf("a refused Install wrote %s (stat error %v), want no file at all",
+					reg.path, statErr)
+			}
+		})
+	}
+
+	// Positive control: a real directory still installs, so the rows above cannot
+	// be satisfied by an Install that refuses everything. This is also what makes
+	// the "no file at all" checks above mean something — here skills.json IS
+	// written.
+	t.Run("an existing directory is still accepted", func(t *testing.T) {
+		reg := newTestRegistry(t, fakeIndex{"ws1": t.TempDir()})
+		if _, err := reg.Install("s", t.TempDir()); err != nil {
+			t.Fatalf("Install(a real directory) = %v, want it to install", err)
+		}
+		if got := reg.List(); len(got) != 1 {
+			t.Errorf("List = %+v, want the one skill", got)
+		}
+		if _, statErr := os.Stat(reg.path); statErr != nil {
+			t.Errorf("stat %s after an accepted Install: %v, want the registry written",
+				reg.path, statErr)
+		}
+	})
+}
+
+// TestInstall_RefusesARelativeSource — the same refusal workspace.Registry.Add
+// gives, for the same reason, on the endpoint next door.
+//
+// The fixture is a directory that EXISTS, named relative to a working directory
+// this test sets, and that is the whole design: filepath.Abs resolves it to a real
+// directory, so the IsDir check cannot refuse it and the IsAbs check is the only
+// thing that can. Remove the IsAbs line and this installs, silently recording
+// whatever the daemon's cwd made of the string — which is what it did before this
+// clause existed.
+//
+// t.Chdir rather than a hand-rolled os.Chdir with a defer: it restores the working
+// directory itself and fails the test if anything in the package is running in
+// parallel, which is the failure mode a manual version hides.
+func TestInstall_RefusesARelativeSource(t *testing.T) {
+	parent := t.TempDir()
+	if err := os.Mkdir(filepath.Join(parent, "a-skill"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(parent)
+
+	reg := newTestRegistry(t, fakeIndex{"ws1": t.TempDir()})
+
+	for _, rel := range []string{"a-skill", "./a-skill", filepath.Join("..", filepath.Base(parent), "a-skill")} {
+		sk, err := reg.Install("s", rel)
+		if !errors.Is(err, ErrSkillSourceNotAbsolute) {
+			t.Errorf("Install(%q) = (%+v, %v), want ErrSkillSourceNotAbsolute\n"+
+				"Pre-fix this resolved against the DAEMON's working directory and stored %q, "+
+				"which the caller had no way to predict.",
+				rel, sk, err, filepath.Join(parent, "a-skill"))
+		}
+	}
+	// Nothing recorded, in memory or on disk — the two halves the four other
+	// refusal tests in this change assert separately, for the same reason.
+	if got := reg.List(); len(got) != 0 {
+		t.Errorf("after refused Installs, List = %+v, want empty", got)
+	}
+	if _, statErr := os.Stat(reg.path); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("a refused Install wrote %s (stat error %v), want no file at all",
+			reg.path, statErr)
+	}
+
+	// The same directory, named absolutely, installs — so the rows above are
+	// refusals of the FORM of the path, not of the directory. If this fails the
+	// fixture is at fault, not the check.
+	if _, err := reg.Install("s", filepath.Join(parent, "a-skill")); err != nil {
+		t.Fatalf("Install(the same directory, absolute) = %v, want it to install", err)
+	}
+}
+
 // -- the asymmetry: Disable did not check its skill id -----------------------
 
 // TestDisable_RefusesAnIDThatIsNotAnInstalledSkill is the core of tether#142's
@@ -546,12 +676,16 @@ func TestDisable_RefusesToFollowASymlinkOutOfTheWorkspace(t *testing.T) {
 // own half of the same defect.
 //
 // workspace.canonicalPath resolves symlinks when it can and silently keeps the
-// unresolved absolute path when it cannot (a directory that did not exist yet, a
-// volume that was not mounted), which is the right policy there — it matches cc's
-// own, and it is what lets a not-yet-created directory be bookmarked. It means
-// the stored string is a best-effort answer, and this package is where that
-// maybe has to stop: an overlay write measures containment against the stored
-// path, so the stored path has to BE the directory, not a name for it.
+// unresolved absolute path when it cannot (a volume that is not mounted right
+// now), which is the right policy there — it matches cc's own, and it is what
+// lets an entry ALREADY in workspaces.json survive its directory being
+// temporarily absent. (It used to also be what let a not-yet-created directory
+// be bookmarked in the first place; tether#147 removed that by gating
+// workspace.Registry.Add, and deliberately left load() — and therefore this
+// function — permissive.) It means the stored string is a best-effort answer,
+// and this package is where that maybe has to stop: an overlay write measures
+// containment against the stored path, so the stored path has to BE the
+// directory, not a name for it.
 //
 // Verified rather than sanitised: the legal form is "a path that resolves to
 // itself", which is one comparison, instead of a list of the ways a path can
@@ -597,11 +731,17 @@ func TestOverlayWrites_RefuseARegisteredPathThatIsNotItsOwnResolution(t *testing
 
 // TestEnable_RefusesAWorkspaceDirectoryThatIsNotThere.
 //
-// A registration is a bookmark — canonicalPath deliberately allows one to a
-// directory that does not exist yet — and creating that directory is not
+// A registration is a bookmark, and creating the directory it points at is not
 // something an overlay write should be able to do. Refusing is also the honest
 // answer to "is this contained": a directory that is not there cannot be
 // resolved, and "I cannot check" must be a refusal rather than a pass.
+//
+// This stayed reachable after tether#147, and the reason is worth stating because
+// the obvious reading is that it stopped being: POST /api/v1/workspaces now
+// refuses a path that is not already a directory, so a registration cannot be
+// CREATED pointing at nothing. But load() is still permissive by design, so an
+// entry already in workspaces.json whose directory has since been deleted or
+// unmounted arrives here exactly as before — which is the case this test builds.
 //
 // Observed on the unfixed tree: for "not there" Enable returned nil, having
 // created the registered directory and two levels beneath it with os.MkdirAll;

@@ -96,12 +96,23 @@ Residuals:
   necessarily where chat is running. The shell pane follows the chat session's
   workspace, but only once chat *has* a session — a shell opened before that
   starts in `--workspace-root`.
-- **`POST /api/v1/workspaces` accepts any absolute path**, with no existence or
-  confinement check. "The client sends an id, never a path" is true of the chat
-  handshake, but an authenticated client can still choose any directory in two
-  requests. That endpoint predates this change; what changed is that the workspace
-  list now decides where the agent *executes*, not just what the file browser
-  shows.
+- **`POST /api/v1/workspaces` accepts any existing directory**, with no
+  confinement check — and `POST /api/v1/skills` accepts any existing directory as
+  a skill source, likewise unconfined. "The client sends an id, never a path" is
+  true of the chat handshake, but an authenticated client can still choose any
+  directory on the host in two requests.
+
+  tether#147 narrowed the *input* and left the *boundary* where it was, on
+  purpose. On **both** endpoints the path must now be absolute and must already be
+  a directory (400 otherwise), so neither registry can accumulate paths nobody can
+  explain, a relative path is no longer resolved silently against the daemon's
+  working directory, and the failure lands on the request that named the path
+  instead of on a later `enable`. Both refusals derive their body from a sentinel,
+  so no daemon-side path appears in a response. What it deliberately does **not**
+  add is an allow-list or a root: the credential that reaches these endpoints also
+  reaches `/wt/shell`, which runs an interactive coding agent as the daemon's
+  user, so a narrower registry would raise the bar without moving the boundary.
+  The boundary is the permission hook on that path (tether#149).
 - `Workspace.ActiveSID` remains unwired — it is a workspace→sid pointer, and the
   binding above is the sid→workspace direction the daemon actually needs.
 

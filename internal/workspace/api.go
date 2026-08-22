@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -14,7 +15,9 @@ import (
 // RegisterAPI wires workspace REST endpoints into mux (s7).
 //
 //	GET    /api/v1/workspaces               → list all workspaces
-//	POST   /api/v1/workspaces               → add workspace {"name":"...","path":"..."}
+//	POST   /api/v1/workspaces               → add workspace {"name":"...","path":"..."};
+//	                                          path must be absolute and must already
+//	                                          be a directory, else 400 (tether#147)
 //	DELETE /api/v1/workspaces/{id}          → remove workspace by ID
 //	GET    /api/v1/workspaces/{id}/files    → list files directly under {dir} (default: root)
 //	GET    /api/v1/workspaces/{id}/file     → read one file's content ({"path":..,"content":..,"truncated":..})
@@ -40,7 +43,7 @@ func RegisterAPI(mux *http.ServeMux, reg *Registry) {
 			}
 			ws, err := reg.Add(body.Name, body.Path)
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				refuse(w, r, err)
 				return
 			}
 			w.WriteHeader(http.StatusCreated)
@@ -105,16 +108,7 @@ func RegisterAPI(mux *http.ServeMux, reg *Registry) {
 			return
 		}
 		if err := reg.Remove(rest); err != nil {
-			// A registration whose overlays could not be detached is still
-			// registered, and the filesystem state that stopped it is the caller's
-			// to see and to fix — 409, and a retry finishes the job. The wrapped
-			// cause is not sent: it comes from another package's filesystem work and
-			// can name daemon-side paths (tether#156).
-			if errors.Is(err, ErrOverlayCleanup) {
-				http.Error(w, ErrOverlayCleanup.Error(), http.StatusConflict)
-				return
-			}
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			refuse(w, r, err)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -123,6 +117,69 @@ func RegisterAPI(mux *http.ServeMux, reg *Registry) {
 
 // maxWorkspaceBodyBytes bounds the one JSON body this file decodes.
 const maxWorkspaceBodyBytes = 4096
+
+// registryInternalErrorBody is what a 500 from a registry mutation says, in
+// place of err.Error().
+//
+// A 500 here means this daemon's own state is wrong — saveLocked could not write
+// ~/.tether/workspaces.json, concretely — and there is nothing in the detail a
+// caller can act on. err.Error() in its place put daemon-side paths into an HTTP
+// body for no benefit (`open /home/.../workspaces.json.tmp: permission denied`).
+// The detail is logged, where an operator who has that filesystem in front of
+// them can use it. Same rule, same wording, as skill/api.go's
+// overlayInternalErrorBody (tether#147; the skill side took it in tether#156 and
+// this side was left behind).
+const registryInternalErrorBody = "the daemon could not complete this request"
+
+// refuse is the single exit for a failed registry mutation: it picks the status
+// AND the body from registryRefusal, and logs the error rather than sending it.
+//
+// The rule that the body comes from the SENTINEL and never from the error value
+// is the fix, not the phrasing of any one message. err.Error() is assembled from
+// whatever the failure carried — an os.PathError's daemon-side path, or the
+// candidate path in Add's two refusals — and no caller can act on any of it.
+// Deriving the body from the identity of the refusal means the next error to
+// carry a path cannot leak it either.
+func refuse(w http.ResponseWriter, r *http.Request, err error) {
+	code, body := registryRefusal(err)
+	switch code {
+	case http.StatusInternalServerError:
+		slog.Error("workspace registry request failed", "method", r.Method, "path", r.URL.Path, "error", err)
+	case http.StatusConflict:
+		// The detach failure's cause was the whole of the old 500 body, and dropping
+		// it from the response without putting it anywhere would trade a leak for a
+		// blind spot. It is about the filesystem rather than about the request, so it
+		// belongs to the operator, who has that filesystem in front of them.
+		slog.Warn("workspace registry request refused", "method", r.Method, "path", r.URL.Path, "error", err)
+	}
+	http.Error(w, body, code)
+}
+
+// registryRefusal maps a registry mutation's refusals onto a code AND a body a
+// caller can act on.
+//
+// The two 400s are the caller's mistake and no retry of the same request fixes
+// either: it named a relative path, or it named something that is not a directory
+// on this host (tether#147). 400 rather than the 409 the skill package gives its
+// own ErrWorkspaceDirUnusable, because there the caller sent an ID and the
+// unusable path was the DAEMON's stored value; here the caller sent the path
+// itself.
+//
+// The 409 is tether#156's: the registration is still registered because the
+// overlays inside it could not be detached, the filesystem state that stopped
+// that is visible to the caller, and a retry finishes the job.
+func registryRefusal(err error) (int, string) {
+	switch {
+	case errors.Is(err, ErrWorkspacePathNotAbsolute):
+		return http.StatusBadRequest, ErrWorkspacePathNotAbsolute.Error()
+	case errors.Is(err, ErrWorkspacePathUnusable):
+		return http.StatusBadRequest, ErrWorkspacePathUnusable.Error()
+	case errors.Is(err, ErrOverlayCleanup):
+		return http.StatusConflict, ErrOverlayCleanup.Error()
+	default:
+		return http.StatusInternalServerError, registryInternalErrorBody
+	}
+}
 
 // handleFiles serves GET /api/v1/workspaces/{id}/files?dir=<rel>.
 func handleFiles(w http.ResponseWriter, r *http.Request, reg *Registry, id string) {

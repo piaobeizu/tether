@@ -97,7 +97,48 @@ var (
 	// Enable refuses rather than creating the directory: a registration is a
 	// bookmark, and materialising a bookmark's target is not something an overlay
 	// write should be able to do.
+	//
+	// Still reachable after tether#147, which made POST /api/v1/workspaces refuse
+	// a path that is not already a directory. That gates only NEW registrations;
+	// load() stays permissive, so an entry whose directory has since been deleted
+	// or unmounted arrives here exactly as it did before.
 	ErrWorkspaceDirUnusable = errors.New("skill: the registered workspace directory is not usable")
+
+	// ErrSkillSourceNotAbsolute — the install named a relative sourcePath.
+	// tether#147.
+	//
+	// Word for word the reason workspace.ErrWorkspacePathNotAbsolute exists, and
+	// the symmetry is the point: filepath.Abs resolves a relative path against the
+	// DAEMON's working directory, which the caller does not know and cannot see, so
+	// the same request installs a different source depending on where the daemon
+	// happens to have been started — and the resolved value is then stored.
+	// Refusing is the only answer that means one thing.
+	//
+	// This landed a beat after the directory check below, having first been left
+	// out on the grounds that it was "a smaller problem in this direction". It is
+	// not smaller, and "the other endpoint refuses this" was the whole argument
+	// needed: two endpoints on the same daemon disagreeing about whether a
+	// relative path is acceptable is a difference a caller cannot predict and
+	// nobody chose.
+	ErrSkillSourceNotAbsolute = errors.New("skill: a skill source must be absolute")
+
+	// ErrSkillSourceUnusable — the sourcePath an install named is not there, or is
+	// there and is not a directory. tether#147.
+	//
+	// One sentinel for both, and 400 rather than a 500 with the stat error, which
+	// is what this replaces. Every doc in this package describes a skill as a
+	// DIRECTORY (~/.tether/skills/<id>/) and os.Stat alone accepted regular files,
+	// so a plain file could be installed and then linked into a workspace's plugins
+	// directory for cc to read.
+	//
+	// Collapsing "not there" and "not a directory" into one body also narrows what
+	// the endpoint tells an authenticated caller about the host: the old 500 body
+	// was the stat error itself, which distinguished a missing path from a
+	// permission-denied one and quoted the path back. What remains — a 201 for an
+	// existing directory, a 400 for anything else — is inherent in an endpoint whose
+	// job is to accept existing directories, and it leaves a registry entry behind
+	// when it succeeds, so it is on the record rather than silent.
+	ErrSkillSourceUnusable = errors.New("skill: a skill source must be a directory that already exists")
 
 	// errNoOverlayDir — a component of the overlay directory is simply not there.
 	//
@@ -254,10 +295,10 @@ func isNilIndex(ws WorkspaceIndex) bool {
 // # What this does and does not guarantee — stated precisely
 //
 // It is NOT "the caller can no longer choose a directory". POST
-// /api/v1/workspaces (workspace/api.go) accepts {"path":"<anything>"} with no
-// validation — not even that it exists — so a caller holding the same session
-// cookie can register a directory of its choosing and then name it here. The
-// primitive is reduced from one request to two, not removed.
+// /api/v1/workspaces (workspace/api.go) accepts any absolute path that is
+// already a directory, with no allow-list and no root — so a caller holding the
+// same session cookie can register a directory of its choosing and then name it
+// here. The primitive is reduced from one request to two, not removed.
 //
 // What the second request buys is worth naming exactly, because it is the whole
 // benefit: the target must be declared as a workspace first, which puts it in
@@ -267,10 +308,16 @@ func isNilIndex(ws WorkspaceIndex) bool {
 // /api/v1/workspaces/{id} detaches the overlays the registration authorised
 // before it drops the entry (see DisableAll).
 //
-// Closing the rest means constraining what POST /api/v1/workspaces will accept,
-// which is a product decision (the workspace pane is a free-text path field) and
-// belongs to that endpoint, not to this one. Do not read this function as making
-// the class of bug impossible; read it as confining it to the declared set.
+// tether#147 asked whether to close the rest, and answered no, deliberately. It
+// tightened what that endpoint accepts to "an absolute path that is already a
+// directory" — which is what makes the audit record above mean something, and
+// what moves the failure onto the request that named the path — and it stopped
+// there, because the credential that reaches these endpoints also reaches
+// /wt/shell, where the PTY runs an interactive coding agent as this daemon's
+// user. A narrower registry would raise the bar without moving the boundary; the
+// boundary is the permission hook on that path (tether#149). Do not read this
+// function as making the class of bug impossible; read it as confining it to the
+// declared set.
 //
 // The IsAbs check is not redundant with `ok`. A registry entry whose Path field
 // is empty — a hand-edited or truncated workspaces.json — resolves to ("", true),
@@ -337,14 +384,21 @@ func (r *Registry) workspaceDir(workspaceID string) (string, error) {
 // already: EvalSymlinks must succeed and must return wsDir unchanged. That is
 // what stops this package inheriting workspace.canonicalPath's silent fallback —
 // it keeps the unresolved absolute path when resolution fails, correctly (it
-// matches cc's behaviour and it is what lets a not-yet-created directory be
-// bookmarked), which leaves the stored string a best-effort answer to "where is
-// this workspace". A stored path that resolves somewhere else is refused here
-// rather than followed, so the directory written into is the exact string the
-// registry hands out and the exact string GET /api/v1/workspaces shows.
+// matches cc's behaviour, and it is what lets an entry ALREADY in
+// workspaces.json survive its directory being temporarily absent), which leaves
+// the stored string a best-effort answer to "where is this workspace". A stored
+// path that resolves somewhere else is refused here rather than followed, so the
+// directory written into is the exact string the registry hands out and the exact
+// string GET /api/v1/workspaces shows.
 //
-// Where the root may itself POINT is a different question — it is decided by what
-// POST /api/v1/workspaces accepts, and that is tether#147's to answer.
+// Note that the check stays load-bearing even though tether#147 made
+// workspace.Registry.Add require an existing directory. Add gates NEW
+// registrations; load() still accepts whatever the file holds, by design, so the
+// stored string is still only best-effort at the moment this function reads it.
+//
+// Where the root may itself POINT is a different question. tether#147 answered
+// it: anywhere, as long as it is an absolute path that is already a directory.
+// Confinement is not this daemon's boundary — see workspaceDir above.
 func containedPluginsDir(wsDir string, create bool) (string, error) {
 	// Ordered so that each refusal has one cause. "Is it there, and is it a
 	// directory" first, because a missing or non-directory root has nothing to do
@@ -455,37 +509,63 @@ func (r *Registry) List() []Skill {
 
 // Install registers a skill from sourcePath and assigns an ID.
 //
-// # RESIDUAL GAP (tether#142): sourcePath is not contained
+// # RESIDUAL GAP (tether#142): sourcePath is still not contained
 //
-// os.Stat is the only check, so an authenticated caller can register ANY path on
-// the host — including a file rather than a directory, and including one it
-// cannot otherwise read. tether#142 contained where the overlay symlink is
-// CREATED; it did not contain what that symlink POINTS AT. Enable will happily
-// link a registered workspace's plugin entry to /etc, and cc — running as the
-// daemon's user — is what then reads it. So the write path is half-narrowed, and
-// this is the half that is left.
+// The source must now be an absolute path naming an existing DIRECTORY, and that
+// is all it must be: an authenticated caller can still register any directory on
+// the host. tether#142
+// contained where the overlay symlink is CREATED; it did not contain what that
+// symlink POINTS AT. Enable will happily link a registered workspace's plugin
+// entry to /etc, and cc — running as the daemon's user — is what then reads it.
+// So the write path is half-narrowed, and this is the half that is left.
 //
-// Two further consequences of the same os.Stat, recorded so they are not
-// rediscovered as new bugs:
-//
-//   - It is an existence oracle. A missing path comes back as a 500 whose body is
-//     the stat error, so an authenticated caller can probe the filesystem for what
-//     is there.
-//   - It accepts regular files, though every doc in this package describes a
-//     skill as a directory (~/.tether/skills/<id>/).
-//
-// Not fixed here on purpose rather than by omission: narrowing this means deciding
-// where skills are allowed to come from, and the Settings pane installs from a
+// It is left open on purpose rather than by omission, and tether#147 re-confirmed
+// the decision rather than inheriting it. Narrowing it means deciding where
+// skills are allowed to come from, and the Settings pane installs from a
 // free-text path field the user types (web/src/Settings.tsx). Restricting it to
-// ~/.tether/skills/ would be correct and would remove a feature, which is a
-// product call and its own change.
+// ~/.tether/skills/ would be correct and would remove a feature. It would also
+// buy less than it looks: the credential that reaches this endpoint reaches
+// /wt/shell too, where the PTY runs an interactive coding agent as this daemon's
+// user, so the strong boundary on that path is the permission hook (tether#149),
+// not an allow-list here.
+//
+// # What tether#147 DID change
+//
+// os.Stat alone was the check, and it left three consequences that were recorded
+// here as accepted and are now closed:
+//
+//   - It accepted regular files, though every doc in this package describes a
+//     skill as a directory (~/.tether/skills/<id>/). IsDir is now required.
+//
+//   - Its error was returned as `skill path not found: <stat error>` and the HTTP
+//     layer sent that verbatim as a 500 body, which made the endpoint a
+//     filesystem probe and named daemon-side paths. Both refusals now share one
+//     sentinel, ErrSkillSourceUnusable, and api.go derives the body from it (the
+//     rule tether#156 established for the overlay endpoints and did not reach
+//     this one).
+//
+//   - A relative sourcePath was resolved against the daemon's working directory,
+//     silently, and the resolved value stored. That is the identical defect
+//     workspace.Registry.Add refuses, for the identical reason, so it is refused
+//     identically here (ErrSkillSourceNotAbsolute).
+//
+// # Order
+//
+// IsAbs is checked on the string the CALLER sent, before filepath.Abs, because
+// filepath.Abs IS the silent resolution being refused — after it, a relative
+// input is indistinguishable from an absolute one. The directory check then runs
+// on the absolute form, which is the value that gets stored and that Enable later
+// hands to os.Symlink.
 func (r *Registry) Install(name, sourcePath string) (Skill, error) {
+	if !filepath.IsAbs(sourcePath) {
+		return Skill{}, fmt.Errorf("%w: %q", ErrSkillSourceNotAbsolute, sourcePath)
+	}
 	abs, err := filepath.Abs(sourcePath)
 	if err != nil {
 		return Skill{}, err
 	}
-	if _, err := os.Stat(abs); err != nil {
-		return Skill{}, fmt.Errorf("skill path not found: %w", err)
+	if fi, statErr := os.Stat(abs); statErr != nil || !fi.IsDir() {
+		return Skill{}, fmt.Errorf("%w: %q", ErrSkillSourceUnusable, abs)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()

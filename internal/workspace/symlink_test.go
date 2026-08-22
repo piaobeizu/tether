@@ -28,6 +28,14 @@ package workspace
 //	                                              | TestAddDedupsAnOldEntry
 //	listFilesRecursive resolves its own root      | TestListFilesRecursiveResolvesItsRoot
 //	canonicalPath falls back instead of erroring  | TestCanonicalPathKeepsWhatItCannotResolve
+//	load keeps an entry it cannot resolve         | TestLoad_KeepsAnEntryWhoseDirectoryIsGone
+//
+// The last two are one mechanism read at two moments, and tether#147 split them
+// apart on purpose: canonicalPath's fallback is what load() spends, so the row
+// above it tests the primitive and the row below it tests the consequence that
+// makes the primitive load-bearing. Registry.Add no longer spends it at all —
+// it refuses first, and TestAdd_RefusesAPathThatIsNotAnExistingDirectory is that
+// clause's gate.
 //
 // TestTreeHandlerServesASymlinkedWorkspace is deliberately NOT in that table: it
 // is the user-visible end-to-end proof, and EITHER the registry clause or the
@@ -188,14 +196,32 @@ func TestAddDedupsAnOldEntry(t *testing.T) {
 
 // TestCanonicalPathKeepsWhatItCannotResolve pins the failure policy, which is
 // cc's own (see canonicalPath's doc): a path that cannot be resolved keeps its
-// absolute form instead of becoming an error.
+// absolute form instead of becoming an error. That, and nothing else — the name
+// is the scope.
 //
-// Two things ride on this. Registering a directory that does not exist yet has
-// always been legal — filepath.Abs never required existence — so erroring would
-// make a POST that succeeds today start failing, including for a workspace on a
-// volume that simply is not mounted at the moment. And an unloadable registry is
-// not a local failure: server/lifecycle.go turns it into "this daemon has no
-// workspace registry" for every request.
+// # It used to assert two more things, and they now have their own names
+//
+// It also asserted that such a path was REGISTRABLE, and (after tether#147
+// reversed that) that it was refused, and that a planted entry naming it still
+// loaded. Both are gone from here, because a name that claims one scope while
+// asserting three sends the next reader to the wrong place: someone who breaks
+// Add and sees a test called "canonicalPath keeps what it cannot resolve" go red
+// starts by suspecting canonicalPath, where nothing is wrong.
+//
+// Where they went, and what each one is now the gate for:
+//
+//	assertion                                   | the test that owns it now
+//	--------------------------------------------+---------------------------------
+//	Add refuses such a path                     | TestAdd_RefusesAPathThatIsNotAnExistingDirectory
+//	                                            | (its "does not exist" and "is a
+//	                                            | dangling symlink" rows are the
+//	                                            | same two inputs — not duplicated
+//	                                            | here)
+//	a planted entry naming it still loads        | TestLoad_KeepsAnEntryWhoseDirectoryIsGone
+//
+// The division of labour those two record is the tether#147 reversal itself:
+// canonicalPath still does not error (here), Add refuses anyway (there), and
+// load() stays permissive (there).
 func TestCanonicalPathKeepsWhatItCannotResolve(t *testing.T) {
 	base := t.TempDir()
 	missing := filepath.Join(base, "not-created-yet")
@@ -217,16 +243,54 @@ func TestCanonicalPathKeepsWhatItCannotResolve(t *testing.T) {
 	if got, err := canonicalPath(dangling); err != nil || got != dangling {
 		t.Errorf("canonicalPath(dangling) = (%q, %v), want (%q, nil)", got, err, dangling)
 	}
+}
 
-	// And it must still be registrable, which is the behaviour a user would
-	// notice: this is the POST /api/v1/workspaces path.
-	r := &Registry{path: filepath.Join(t.TempDir(), "workspaces.json")}
-	ws, err := r.Add("later", missing)
-	if err != nil {
-		t.Fatalf("Add(a directory that does not exist yet) = %v, want it to register", err)
+// TestLoad_KeepsAnEntryWhoseDirectoryIsGone — the half of the pre-tether#147
+// behaviour that was deliberately KEPT, and the more serious of the two failures
+// this file guards, which is why it has its own name rather than a closing
+// paragraph in the test above.
+//
+// A registration whose directory has since been deleted, or is on a volume that
+// is not mounted right now, must still load. The cost of getting this wrong is
+// not one bad entry: load() returning an error leaves session.Registry.Workspaces
+// nil, and server/lifecycle.go turns that into "this daemon has no workspace
+// registry" for EVERY request — the whole /api/v1/workspaces family drops out of
+// the mux and answers 501. One absent directory would take the entire workspace
+// pane and the `?ws=` chat handshake down with it.
+//
+// This is why tether#147 gated Registry.Add and pointedly did not gate load(),
+// and why canonicalPath's fallback had to stay: the two are the same mechanism
+// read at two different moments. Add asks "may this become a registration"; load
+// asks "what does this registration name", and by then refusing is far too
+// expensive an answer.
+//
+// # Read together with TestAdd_RefusesAPathThatIsNotAnExistingDirectory
+//
+// On its own this reads as "missing directories are fine", which is the belief
+// tether#147 removed. The other half — that the SAME path is refused as a new
+// registration — is asserted THERE and deliberately not duplicated here, for the
+// reason this test exists at all: an assertion about Add, living under a name that
+// says load, sends whoever breaks Add to the wrong function. That is the mistake
+// this test was split out of, and repeating it one level down would be worse than
+// the original, because a second copy is also a second thing to keep in step.
+func TestLoad_KeepsAnEntryWhoseDirectoryIsGone(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "deleted-since-it-was-registered")
+
+	// planted() writes a registry file holding the path verbatim and loads it
+	// through the real load path, which is the whole point: Add would refuse this
+	// path today, so the entry has to arrive the way a pre-existing one does.
+	r := planted(t, missing)
+
+	p, ok := r.Path("old1")
+	if !ok {
+		t.Fatalf("Path(old1) = not found; the entry was dropped because its directory is "+
+			"absent, which makes a registry unloadable over one missing volume (%q)", missing)
 	}
-	if ws.Path != missing {
-		t.Errorf("Add(%q).Path = %q, want %q", missing, ws.Path, missing)
+	if p != missing {
+		t.Errorf("Path(old1) = %q, want %q unchanged", p, missing)
+	}
+	if got := r.List(); len(got) != 1 {
+		t.Errorf("List = %+v, want the one planted entry", got)
 	}
 }
 

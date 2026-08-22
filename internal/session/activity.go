@@ -350,43 +350,75 @@ func activityRank(state string) int {
 // "tether is holding this, nothing running" for a few milliseconds is a far
 // cheaper wrong answer than reporting a live one as finished.
 //
-// # The other direction is reachable too, and it is NOT the same shape (tether#140)
+// # The other direction is reachable too, and it is NOT the same shape (tether#140, HALF-fixed in tether#145)
 //
-// `false` for a sid whose turn IS running can happen. The entry window is narrow,
-// but unlike the corpse above the wrong answer then stands for the WHOLE of that
-// turn, and it is a claim rather than a shrug.
+// `false` for a sid whose turn IS running happens. The entry window is narrow, but
+// unlike the corpse above the wrong answer then stands for the WHOLE of that turn,
+// and it is a claim rather than a shrug.
 //
 // It takes a provider that produces two end-of-turn signals for one delivery —
-// opencodeSession's run goroutine emits an EventError for a scan failure and then
-// its terminal EventResult — plus a prompt accepted between them. fanOut counted
-// the original delivery down on the error, so the result's endTurn counts the NEW
-// turn down instead, and this map reports that turn as idle until its own result
-// arrives (where endTurn's floor absorbs it). The floor guard keeps the counter
-// out of negative territory; it cannot keep a stale signal from consuming a turn
-// that has one.
+// opencodeSession's run goroutine emits an EventError for a scan failure or a
+// non-zero run exit and then its terminal EventResult — plus a prompt accepted
+// between them. fanOut counts the original delivery down on the first signal, so
+// the second one counts the NEW turn down instead, and this map reports that turn
+// as idle until its own result arrives (where endTurn's floor absorbs it). The
+// floor guard keeps the counter out of negative territory; it cannot keep a stale
+// signal from consuming a turn that has one.
 //
-// What BOUNDS the window is worth naming, because the obvious reading of it is
-// wrong in the dangerous direction. The gap between those two emits is not the
-// exposure: opencodeSession.SendPrompt CAS-gates on `busy`, and `defer
-// s.busy.Store(false)` is the run goroutine's FIRST defer, so it fires LAST —
-// after the terminal EventResult. A prompt arriving anywhere inside the run,
-// including across the cmd.Wait() that follows the scan-failure kill, is REFUSED
-// with its own EventError, which counts the speculative delivery straight back
-// down. Nothing is running and this map is right.
+// tether#145 closed ONE of the two interleavings and left the other, and the
+// distinction is which of the pair fanOut had already applied when the new delivery
+// landed. If it had applied the first, fanOut's runSettled now refuses the second —
+// TestEntryTurnFlag_AStaleResultDoesNotConsumeTheNextTurn stages exactly that
+// rather than hoping for it. If it had applied NEITHER, the first signal's
+// decrement finds two turns outstanding, the guard is never armed, and the second
+// signal takes the new delivery's turn exactly as before.
+//
+// The remainder is not a loose end to be tidied here. From inside this package that
+// trace is INDISTINGUISHABLE from opencode's busy refusal — a second prompt
+// arriving mid-run, counted up by Entry.sendPrompt and counted back down by its own
+// EventError — and the two demand opposite answers from the same observable state.
+// runSettled's doc carries the mechanical demonstration of that, in this package's
+// own tests. Only the provider knows whether a signal was emitted before or after
+// the delivery was accepted, so correlating a signal with its run at the agent seam
+// is the fix, and it is a different write set.
+//
+// So this map's `false` still has a false-NEGATIVE shape, and the next consumer has
+// to be told so. Today there is one production consumer, States above; the second
+// would be a reaper that treats `false` as "safe to kill" (tether#139), and no
+// amount of polling can reveal this to it, because every reading inside the
+// affected turn agrees. It is also, in a test fixture, exactly what the tether#140
+// flake was.
+//
+// What BOUNDS the window is still worth naming, because the obvious reading of it
+// is wrong in the dangerous direction — and because it is what says which
+// interleaving a test has to stage. Both halves were re-read against
+// internal/agent/opencode_provider.go for tether#145 and both hold. The gap
+// between those two emits is not the exposure: opencodeSession.SendPrompt
+// CAS-gates on `busy` (its first statement), and `defer s.busy.Store(false)` is
+// the run goroutine's FIRST defer, so it fires LAST — after the terminal
+// EventResult. A prompt arriving anywhere inside the run, including across the
+// cmd.Wait() that follows the scan-failure kill, is REFUSED with its own
+// EventError, which counts the speculative delivery straight back down; that
+// refusal is delivered rather than dropped, because opencodeSession.emit blocks on
+// terminal kinds and EventError is one. Nothing is running and this map is right.
 //
 // The reachable window is the next one along, and it is small: `busy` clears once
 // the terminal result is IN the provider's 64-deep buffer, not once fanOut has
 // applied it. A prompt accepted between those two instants is the one whose turn
 // the stale result consumes. Microseconds to enter; the rest of that turn to live
-// with.
+// with. WHICH of the two interleavings above it becomes depends on how far behind
+// fanOut is, and fanOut can be behind for ordinary reasons — it writes history and
+// broadcasts to every subscriber on its own goroutine.
 //
-// Named rather than repaired here, and named for a reason beyond tidiness: the
-// counter belongs to registry.go, not to this reader. Today this map has exactly
-// one production consumer, States above; the second would be a reaper that treats
-// `false` as "safe to kill" (tether#139), and it has to know this answer has a
-// false-NEGATIVE shape at all — something no amount of polling can reveal,
-// because every reading inside the affected turn agrees. It is also, in a test
-// fixture, exactly what the tether#140 flake was.
+// tether#145 also introduced a residual in the OPPOSITE direction, named where the
+// fix lives (see runSettled): on the opencode paths that emit an error and then
+// leave the run without a result, the guard eats the NEXT delivery's result instead,
+// and on a session opencode keeps alive there is no teardown coming, so the count
+// sits one high for the rest of that session. That direction cannot produce the
+// false `idle` this section is about — this map answers `true`, and the tether#139
+// reaper reads `true` as "leave it alone" — but it is not free either: fanOut's
+// end-of-stream arm fires markTurnInterrupted on a non-zero count, so a turn that
+// completed normally can be reported to the next subscriber as one that was cut off.
 //
 // # Why the registry and not the entries themselves
 //

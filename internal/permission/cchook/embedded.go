@@ -30,14 +30,21 @@ const (
 // Config.PermGate — and hand that one value to every cc spawn path, so no path
 // can invent its own answer.
 //
-// NOT YET CONSUMED IN PRODUCTION. Env() has no non-test caller today, and
-// TETHER_DAEMON_MANAGED therefore never reaches a real subprocess: the mark is
-// available, not yet applied. tether#149 owns the two files that build a cc
-// child's environment (session/registry.go for chat, server/wt_shell.go for the
-// shell) and switches both to Env(). Until it lands, what closes A4b in
-// production is that the daemon now always reports its endpoint (see
-// server.setupPermGate) — the hook's deny branch below is a guard waiting to be
-// wired, so do not read it as an active defence.
+// Both cc spawn paths consume it since tether#149: session.Registry.spawnEntry
+// for chat and server.buildPTYEnv for the PTY shell pane, each appending Env()
+// to the child's environment and nothing else. Adding a THIRD spawn path means
+// calling Env() there too — see TestBothCCSpawnPathsCarryTheGate, which is the
+// only test that can observe more than one path at once.
+//
+// What the mark does NOT do, so it is not mis-read as the A4b fix: the deny
+// branch below (marked, no endpoint) is unreachable from server.setupPermGate
+// today, because Managed=true there always carries an endpoint — it is a
+// formatted string built from the daemon's own listen address, not something
+// that can go missing. What actually closed A4b in production is that the
+// endpoint no longer depends on the settings.json patch succeeding. The mark
+// exists so that a spawn path which forgets to wire the gate becomes VISIBLE
+// (the child is unmarked, the hook takes the "not our cc" branch, and the test
+// above goes red) instead of silently allowing every tool call.
 //
 // That the value is shared rather than recomputed is not hypothetical tidiness.
 // The endpoint reaches the hook through the environment, and TWO places build

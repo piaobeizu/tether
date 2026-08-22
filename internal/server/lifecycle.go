@@ -104,15 +104,14 @@ type Config struct {
 	// wired to the PreToolUse permission gate", decided by setupPermGate during
 	// startup step 3.
 	//
-	// NO CONSUMER YET. Both spawn paths — the chat path in session.Registry and
-	// the shell path in buildPTYEnv — still read Registry.PermEndpoint, which
-	// Run() fills from PermGate.Endpoint below. tether#149 owns those two files
-	// and switches them to PermGate.Env(), which is what finally puts the
-	// TETHER_DAEMON_MANAGED mark on a real subprocess. This field exists now so
-	// that change has one value to consume instead of two decisions to
-	// re-derive: a mark applied on one path and forgotten on the other fails
-	// OPEN precisely in the branch it was added to close, and no test inside
-	// either package's own scope can see that.
+	// Both spawn paths consume it, and neither derives anything of its own from
+	// it: Run() copies it onto session.Registry.PermGate below, the chat path
+	// (session.Registry.spawnEntry) appends PermGate.Env() to the provider's
+	// SpawnConfig, and the shell path (buildPTYEnv) appends the same Env() to the
+	// PTY child's environment. One value, two consumers, because a mark applied on
+	// one path and forgotten on the other fails OPEN precisely in the branch it was
+	// added to close, and no test inside either package's own scope can see that
+	// (tether#149; TestBothCCSpawnPathsCarryTheGate is the test that can).
 	//
 	// Zero value (unmanaged, no endpoint) is the correct state for
 	// TETHER_NO_PERMISSION_HOOK=1: it injects nothing, which leaves the hook's
@@ -248,13 +247,15 @@ func Run(cfg *Config) error {
 		return err
 	}
 	cfg.PermGate = gate
-	// This one string is what BOTH spawn paths read today — chat via
-	// Registry.PermEndpoint directly, shell via buildPTYEnv(reg.PermEndpoint) on
-	// this same Registry. So making it unconditional is the whole of the A4b fix
-	// that is live in production: neither path can now be left without an
-	// endpoint because a settings-file write failed. tether#149 moves both onto
-	// cfg.PermGate.Env(), which additionally applies the mark.
-	cfg.Registry.PermEndpoint = gate.Endpoint
+	// This one value is what BOTH spawn paths read — chat via Registry.PermGate
+	// directly, shell via buildPTYEnv(reg.PermGate) on this same Registry.
+	//
+	// Two separate things ride on it. The endpoint being unconditional is the
+	// whole of the A4b fix that is live in production: neither path can be left
+	// without an endpoint because a settings-file write failed. The mark on top of
+	// it (tether#149) is what makes a THIRD spawn path that forgets this wiring
+	// fail visibly instead of silently allowing every tool call.
+	cfg.Registry.PermGate = gate
 
 	// Step 3b: MCP host + loopback (v0.3.1).
 	mcpPort := cfg.MCPPort
@@ -611,7 +612,7 @@ func setupPermGate(
 	hookDisabled bool,
 	binPath, endpoint string,
 	ensureBinary func(string) error,
-	injectSettings func(hookBinPath, daemonEndpoint string) error,
+	injectSettings func(hookBinPath string) error,
 ) (cchook.Gate, error) {
 	if hookDisabled {
 		// TETHER_NO_PERMISSION_HOOK=1 is an explicit opt-out. Mark nothing: a
@@ -622,7 +623,7 @@ func setupPermGate(
 	if err := ensureBinary(binPath); err != nil {
 		return cchook.Gate{}, fmt.Errorf("perm hook compile: %w", err)
 	}
-	if err := injectSettings(binPath, endpoint); err != nil {
+	if err := injectSettings(binPath); err != nil {
 		// Error, not Warn: this is the difference between "the gate is armed and
 		// cc will consult it" and "the gate is armed and cc may never call it".
 		slog.Error("inject perm hook failed; cc will only run the hook if a previous "+

@@ -9,8 +9,8 @@ import (
 
 const testPermEndpoint = "https://127.0.0.1:8443/api/v1/permission/request"
 
-func okEnsure(string) error         { return nil }
-func okInject(string, string) error { return nil }
+func okEnsure(string) error { return nil }
+func okInject(string) error { return nil }
 
 // TestSetupPermGate_InjectFailureKeepsTheGateArmed pins tether#117 A4b.
 //
@@ -25,7 +25,7 @@ func okInject(string, string) error { return nil }
 // The endpoint is a property of this daemon's listener, not of whether a file
 // got rewritten, so it must survive the patch failing.
 func TestSetupPermGate_InjectFailureKeepsTheGateArmed(t *testing.T) {
-	failInject := func(string, string) error { return errors.New("settings.json is read-only") }
+	failInject := func(string) error { return errors.New("settings.json is read-only") }
 
 	gate, err := setupPermGate(false, "/tmp/hook", testPermEndpoint, okEnsure, failInject)
 	if err != nil {
@@ -80,7 +80,7 @@ func TestSetupPermGate_HookDisabledMarksNothing(t *testing.T) {
 	ensureCalled, injectCalled := false, false
 	gate, err := setupPermGate(true, "/tmp/hook", testPermEndpoint,
 		func(string) error { ensureCalled = true; return nil },
-		func(string, string) error { injectCalled = true; return nil },
+		func(string) error { injectCalled = true; return nil },
 	)
 	if err != nil {
 		t.Fatal(err)

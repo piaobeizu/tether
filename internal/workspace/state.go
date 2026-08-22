@@ -27,6 +27,32 @@ import (
 // another package's filesystem work and can name daemon-side paths.
 var ErrOverlayCleanup = errors.New("workspace: the overlays inside this workspace could not be detached")
 
+// ErrRemoveNotRecorded — the detach succeeded, the record was dropped, and then
+// the registry could not be written, so the record was put back (tether#162).
+//
+// # Why this is not "nothing happened"
+//
+// Putting the record back is the right end state (see Remove), but it is not a
+// state the caller can infer from a bare 500. The detach ran BEFORE the write and
+// deleting a symlink is not undone by a failed write, so what the caller is left
+// holding is a registration whose overlays are gone — and the registration alone
+// is what makes overlays reachable, so nothing tells them so afterwards. A 500
+// that only means "the write failed" would leave them to discover from the skill
+// pane that the workspace they still have is no longer the one they had.
+//
+// This is why the refusal is its own identity rather than the generic 500 body:
+// the sentence a caller needs here is a different sentence, and registryRefusal
+// can only pick it if there is something to pick it BY (tether#147's rule).
+//
+// "any skill overlays it had" is deliberate. The detach callback reports success
+// or failure and not a count, so this cannot promise that a link existed; what it
+// can promise exactly is that whatever was there was taken away and not restored.
+//
+// Raised ONLY when a detach actually ran. With no cleanup bound there are no
+// overlays to have detached, so a rolled-back write really is "nothing happened"
+// and the generic 500 is the honest answer — see Remove.
+var ErrRemoveNotRecorded = errors.New("workspace: the removal could not be recorded, so this workspace is still registered; any skill overlays it had were detached first and have not been put back")
+
 // The two refusals Add can produce, as sentinels rather than bare strings,
 // because api.go has to turn them into a status AND a body that carries no
 // daemon-side value (tether#147). Both are 400: the caller sent the path, and no
@@ -343,11 +369,9 @@ func canonicalPath(path string) (string, error) {
 // but a value that names a workspace nobody registered is exactly the thing this
 // paragraph is about.
 //
-// Remove has the mirror shape and is deliberately NOT changed here. Its
-// inconsistency points the other way (the record is gone from memory and still on
-// disk, so a restart brings it back), and undoing it would restore a registration
-// whose overlays the detach has already removed — a different question, with a
-// different answer, and one this wi did not scope.
+// Remove has the mirror shape and takes the same policy for the same reason
+// (tether#162). What it has to say when it rolls back is not the same, and that
+// difference lives on ErrRemoveNotRecorded rather than here.
 func (r *Registry) Add(name, path string) (Workspace, error) {
 	if !filepath.IsAbs(path) {
 		return Workspace{}, fmt.Errorf("%w: %q", ErrWorkspacePathNotAbsolute, path)
@@ -433,6 +457,36 @@ func (r *Registry) BindOverlayCleanup(clean func(workspaceID string) error) {
 // An id this registry does not hold is still a silent no-op, which is what the
 // handler's 204 has always rested on: there is no registration to unwind, so
 // there is nothing to call and nothing to refuse.
+//
+// # A write that failed removes nothing (tether#162)
+//
+// The record used to be dropped from memory before saveLocked and stay dropped
+// when saveLocked failed, which is Add's tether#159 defect pointing the other
+// way: memory said the workspace was gone, the file still held it, and a restart
+// brought it back — with its overlays already detached, because that step ran
+// first and a deleted symlink does not return.
+//
+// So the drop is undone. The reason this is better than leaving it is NOT that it
+// recovers anything — it cannot, the detach is final either way, and both roads
+// end at the same place: a registration whose overlays are gone. The difference is
+// WHEN. Rolling back arrives there now; leaving it arrives there at the next
+// restart and spends the time in between with GET /api/v1/workspaces and
+// workspaces.json disagreeing about what is registered. There is no third state
+// on offer, and a window of disagreement is worth nothing.
+//
+// Transactional ordering — write first, then detach — is not the missing option.
+// It just swaps this failure for the opposite one: the record gone and the
+// symlinks left behind with no id that can reach them, which is precisely the leak
+// tether#156 added the detach to close.
+//
+// # Why the refusal changes identity only when a detach ran
+//
+// The rolled-back state is not the state before the call, and ErrRemoveNotRecorded
+// exists to say the part a bare 500 cannot. But with no cleanup bound (server/mux.go
+// binds one only when there is a skill registry) nothing was detached, so the
+// rollback really does restore the state before the call and there is nothing extra
+// to report. Claiming overlays were detached there would be a false sentence, so the
+// error stays the plain write failure and api.go's generic 500 answers it.
 func (r *Registry) Remove(id string) error {
 	r.mu.RLock()
 	detach := r.detachOverlays
@@ -456,15 +510,27 @@ func (r *Registry) Remove(id string) error {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	n := 0
-	for _, w := range r.workspaces {
+	// A fresh slice rather than the in-place compaction this used to do, because
+	// compacting overwrites the entries it shifts down and there is then nothing
+	// left to put back. `before` is read under the same write lock that spans the
+	// save, so it is the exact list to restore — including an entry some other
+	// goroutine appended between the read lock above and this one.
+	before := r.workspaces
+	kept := make([]Workspace, 0, len(before))
+	for _, w := range before {
 		if w.ID != id {
-			r.workspaces[n] = w
-			n++
+			kept = append(kept, w)
 		}
 	}
-	r.workspaces = r.workspaces[:n]
-	return r.saveLocked()
+	r.workspaces = kept
+	if err := r.saveLocked(); err != nil {
+		r.workspaces = before
+		if detach != nil {
+			return fmt.Errorf("%w: %w", ErrRemoveNotRecorded, err)
+		}
+		return err
+	}
+	return nil
 }
 
 // load reads the registry file, then canonicalises every path it read IN MEMORY.

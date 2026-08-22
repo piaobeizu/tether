@@ -126,8 +126,13 @@ func RegisterAPI(mux *http.ServeMux, reg *Registry) {
 // maxWorkspaceBodyBytes bounds the one JSON body this file decodes.
 const maxWorkspaceBodyBytes = 4096
 
-// registryInternalErrorBody is what a 500 from ANY handler on this file says, in
-// place of err.Error().
+// registryInternalErrorBody is what a 500 from this file says when it has nothing
+// to add, in place of err.Error().
+//
+// "Nothing to add" is the whole of the qualifier, and there is exactly one 500
+// that does have something: ErrRemoveNotRecorded, whose caller is left with a side
+// effect that outlived the failure (see registryRefusal). Every other 500 here is
+// a bare write or read failure with no consequence the caller can be told about.
 //
 // A 500 here means this daemon's own state or filesystem is wrong — saveLocked
 // could not write ~/.tether/workspaces.json, or a read hit an EACCES/EIO under a
@@ -178,6 +183,17 @@ func refuse(w http.ResponseWriter, r *http.Request, err error) {
 // The 409 is tether#156's: the registration is still registered because the
 // overlays inside it could not be detached, the filesystem state that stopped
 // that is visible to the caller, and a retry finishes the job.
+//
+// The named 500 is tether#162's, and it is a 500 rather than a 409 because what
+// went wrong is on this side: the daemon could not write its own registry. What it
+// borrows from the 400s and the 409 is the rule — the body comes from the
+// sentinel's identity — because the sentence a caller needs after a rolled-back
+// removal is not the sentence the generic 500 says. It is the one refusal on this
+// switch whose text is about a side effect rather than about the request: the
+// overlays are already detached, and no later request will mention it. A retry is
+// still the right next move (skill.Disable is idempotent, so the detach re-runs
+// harmlessly), which is why the message says what state the workspace is in rather
+// than telling the caller to give up.
 func registryRefusal(err error) (int, string) {
 	switch {
 	case errors.Is(err, ErrWorkspacePathNotAbsolute):
@@ -186,6 +202,8 @@ func registryRefusal(err error) (int, string) {
 		return http.StatusBadRequest, ErrWorkspacePathUnusable.Error()
 	case errors.Is(err, ErrOverlayCleanup):
 		return http.StatusConflict, ErrOverlayCleanup.Error()
+	case errors.Is(err, ErrRemoveNotRecorded):
+		return http.StatusInternalServerError, ErrRemoveNotRecorded.Error()
 	default:
 		return http.StatusInternalServerError, registryInternalErrorBody
 	}

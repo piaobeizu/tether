@@ -511,8 +511,9 @@ type Entry struct {
 	// result fanOut suppresses, and teardown's unconditional reset. A provider that
 	// emits both an error and a result for ONE run is not one of them and never was
 	// — the floor only stops that pair going negative, not stealing a later
-	// delivery's turn — so it is refused a level up, in fanOut's runSettled
-	// (tether#145).
+	// delivery's turn — so it is refused a level up, in fanOut's settledRun, which
+	// tells the two apart by the run id on the event (tether#145, completed in
+	// tether#148).
 	//
 	// # Its concurrency story, because it is the first of its kind here
 	//
@@ -600,49 +601,47 @@ func (e *Entry) sendPrompt(ctx context.Context, text string) error {
 	return nil
 }
 
-// endTurn records that one turn has ended, never going below zero. It reports the
-// count that remains and whether this call is what took it there.
+// endTurn records that one turn has ended, never going below zero.
 //
 // The floor is not decoration. Three things reach here without a matching
 // delivery, and each of them would otherwise drive the count negative and make a
 // LATER real turn read as idle:
 //
-//   - a provider that reports one run with BOTH an error and a result
-//     (opencodeSession's run goroutine emits EventError on a scan failure and then
-//     its terminal EventResult),
+//   - a provider that reports one run with BOTH an error and a result whose run
+//     ids fanOut cannot tell apart, i.e. an UNATTRIBUTED pair (Event.RunID zero);
+//     an attributed one is refused a level up and never reaches here twice,
 //   - the second decrement of a session that dies immediately after its final
 //     result, and
 //   - any future event this daemon decides also ends a turn.
 //
-// The floor is not SUFFICIENT, and that is tether#145: it keeps the count out of
-// negative territory, and does nothing at all about a stale signal consuming a
-// turn that has one. The first case above is exactly that shape — see fanOut's
-// runSettled, which is where the duplicate is refused, one level above this floor.
+// The floor is not SUFFICIENT, and never was: it keeps the count out of negative
+// territory, and does nothing at all about a stale signal consuming a turn that
+// HAS one — the count it takes from is then a legitimate 1, not a 0. That is
+// tether#145/#148, and it is answered above this floor, in fanOut's settledRun.
 //
 // A compare-and-swap loop rather than Add(-1) plus a correction, because the
 // correction is not atomic with the add: two decrements racing at zero would each
 // read -1 and each store 0, which happens to be right, but at 1 they would land on
-// -1 and stay there. What still pins that floor now that the doubled signal is
-// refused upstream of it is
-// TestEntryTurnFlag_TheFloorAbsorbsASignalWithNoDeliveryBehindIt — the doubled
-// signal used to be its only cover, incidentally, and tether#145 took that away.
+// -1 and stay there. What pins that floor is
+// TestEntryTurnFlag_TheFloorAbsorbsASignalWithNoDeliveryBehindIt — written because
+// tether#145 took away the doubled signal that had been pinning it incidentally,
+// and still the right home for it now that tether#148 refuses the doubled signal
+// by identity rather than by count.
 //
-// # Why it returns anything
-//
-// Only for fanOut's duplicate guard, and the two values have to come from the CAS
-// rather than from a read afterwards: turnsInFlight is written by whichever
-// goroutine is delivering a prompt (see Entry.turnsInFlight), so by the time a
-// caller could re-Load it a fresh delivery may already have put the count back up
-// — and "did MY decrement empty the count" would answer no when it did. Callers
-// that do not care ignore both, which is what all but one of them do.
-func (e *Entry) endTurn() (remaining int64, settled bool) {
+// It returns nothing on purpose. It used to hand fanOut `(remaining, settled)` so
+// the tether#145 heuristic could ask "did MY decrement empty the count" — the only
+// question the count could answer about identity, and not enough of one (see
+// fanOut's settledRun for the mechanical proof). With the run id on the event there
+// is nothing left for a caller to inspect, and returning values nobody reads
+// invites the next reader to reconstruct a rule that no longer exists.
+func (e *Entry) endTurn() {
 	for {
 		n := e.turnsInFlight.Load()
 		if n <= 0 {
-			return n, false
+			return
 		}
 		if e.turnsInFlight.CompareAndSwap(n, n-1) {
-			return n - 1, true
+			return
 		}
 	}
 }
@@ -2473,9 +2472,9 @@ func (r *Registry) fanOut(e *Entry) {
 	// lifecycle is what is being tested there.
 	var sawInit bool
 
-	// runSettled records that the run whose signals this loop is currently reading
-	// has ALREADY had its turn counted down, so its terminal EventResult must not
-	// count down a second one. It is tether#145.
+	// settledRun is the highest agent.Event.RunID whose end-of-turn signal this loop
+	// has already applied. It is what makes "one run settles at most one turn" true
+	// (tether#148, completing tether#145).
 	//
 	// # What goes wrong without it
 	//
@@ -2491,92 +2490,105 @@ func (r *Registry) fanOut(e *Entry) {
 	// (activity.go's States maps false to a weaker state than working), and no
 	// amount of polling reveals it because every read inside that turn agrees.
 	//
-	// # Why it is armed only when the error EMPTIED the count
+	// # Why the identity had to come from the provider, and not from the count
 	//
-	// Because an EventError is not always a duplicate. opencode reports a REFUSED
-	// prompt the same way — SendPrompt's `busy` CAS emits its own EventError and
-	// returns nil — and that error arrives in the middle of a live run, belonging to
-	// a delivery of its own that Entry.sendPrompt has already counted up. Arming on
-	// every error would make the live run's real result a no-op and leave the count
-	// one high for the rest of the session: the frozen "working" marker tether#103
-	// added the error arm to prevent, reintroduced by its own fix.
+	// tether#145 tried to answer this from the count alone — "arm a one-shot flag
+	// when an EventError's decrement EMPTIES the count, and refuse the next result".
+	// Three interleavings reach this loop, and the count separates only two of them:
 	//
-	// The count is what tells the two apart. If a turn is still outstanding after
-	// the error, the terminal result has something of its own to settle and must be
-	// allowed to; if the error emptied the count, a result arriving after it can
-	// only take from a delivery that came LATER, which is the theft.
-	//
-	// # A local, not a field on Entry
-	//
-	// This loop is the only goroutine that reads or writes this flag: it is one
-	// goroutine per Entry and it sees the provider's events in emission order. A
-	// local therefore needs no concurrency story at all — every other mutable bit of
-	// turn state had to justify one (see Entry.turnsInFlight). The delivery side
-	// carries no epoch or ticket for the same reason: an identity minted at delivery
-	// time cannot be read back off a signal that was produced before the delivery
-	// existed, so it would buy a field and answer nothing.
-	//
-	// The COUNT the arming condition reads is a different matter and is deliberately
-	// not claimed to be race-free: Entry.sendPrompt's Add(1) and its failure
-	// decrement both run on whichever goroutine is delivering a prompt. That is
-	// exactly why the guard is only half a fix — see below.
-	//
-	// # What it does NOT distinguish, and the proof that it cannot
-	//
-	// Three interleavings arrive here looking the same, and they do not all want the
-	// same answer:
-	//
-	//  1. "first signal APPLIED, [new delivery], that same run's result" — the bug,
-	//     and the one this flag closes. The first signal emptied the count, so the
-	//     second can only take from a delivery that came later.
+	//  1. "first signal APPLIED, [new delivery], that same run's result" — the flag
+	//     armed, the result refused. Correct.
 	//  2. "[new delivery], first signal, that same run's result" — fanOut behind on
-	//     BOTH signals. The first signal's decrement finds two outstanding, this flag
-	//     is never armed, and the result steals the new turn exactly as before. NOT
-	//     fixed. (Reachable: `busy` clears once the result is in the buffer, so a
-	//     delivery can land before fanOut has applied either signal; fanOut also
-	//     writes history and broadcasts on this goroutine, so it can be behind.)
+	//     BOTH signals, which is ordinary (it writes history and broadcasts on this
+	//     goroutine). The first signal's decrement finds TWO outstanding, so the flag
+	//     never armed and the result stole the new turn.
 	//  3. "[refused delivery], its own EventError, the live run's result" —
 	//     opencode's busy rejection, which must count BOTH down.
 	//
-	// 2 and 3 present fanOut with the same state: two turns outstanding, an error,
-	// then a result. And they want opposite answers — 2 wants the result refused, 3
-	// wants it applied. The demonstration is mechanical rather than argued: relax
-	// this arming condition to "any settled error" and a staged version of 2 passes
-	// while TestEntryTurnFlag_ARefusedDeliverysErrorDoesNotMuteALiveRunsResult turns
-	// red, every time. What separates them is whether the result was EMITTED before
-	// or after the delivery was accepted, and only the provider knows that.
-	// Correlating a signal with the run that produced it, at the agent seam, is the
-	// complete fix; it is a different write set, so 2 is left open and named — in
-	// LiveTurns's doc as well, because that is where a consumer will read.
+	// 2 and 3 present identical observable state — two turns outstanding, an error,
+	// then a result — and demand opposite answers. The demonstration was mechanical:
+	// relaxing the arming condition to "any settled error" made a staged 2 pass and
+	// turned TestEntryTurnFlag_ARefusedDeliverysErrorDoesNotMuteALiveRunsResult red,
+	// every time. What separates them is whether the result was EMITTED before or
+	// after the delivery was accepted, and only the emitter knows that. So the answer
+	// moved to the emitter: agent.Event.RunID, one id per accepted run, stamped on
+	// every event that run produces. 2 and 3 are now different by inspection — in 2
+	// both signals carry the same run id, in 3 the refusal carries none (see
+	// opencodeSession.SendPrompt's busy branch for why "none" and not "a fresh one").
 	//
-	// # The residual this DOES introduce, in the other direction
+	// # Why a high-water mark and not a set of settled runs
 	//
-	// An EventError is not always followed by its run's result. opencode emits one
-	// and then leaves the run on four paths — the busy rejection, a failed serve
-	// relaunch after an Interrupt, and a StdoutPipe or Start failure inside the run
-	// goroutine — and whenever one of those EMPTIES the count the flag is armed with
-	// no twin coming, so it eats the NEXT delivery's legitimate result. Because
-	// opencode deliberately keeps those sessions ALIVE, Events() never closes and
-	// teardown never resets anything, so the count then sits one high for the rest of
-	// that session. The busy rejection is the one of the four that usually cannot
-	// arm it, since a refusal implies a live run whose turn is still counted — but
-	// only usually: if that run's own duplicate error already zeroed the count, a
-	// refusal landing in the run goroutine's defer window arms it too.
+	// A set would grow for the life of the session — one entry per turn, with no
+	// event that says a run can no longer speak, so nothing to prune on. A single
+	// int64 is enough because run ids are non-decreasing IN EMISSION ORDER, and that
+	// is a property both providers construct rather than one this loop hopes for:
+	// cc's ids are minted by parseLine on readLoop's single goroutine, and opencode
+	// mints inside the window `busy` holds, positioned so that every emit carrying a
+	// run id happens before the release (see opencodeSession.runSeq, which states
+	// where the mint has to sit and why the two paths that release `busy` before
+	// reporting carry no id). So a turn-closer for a run at or below the mark is, by
+	// construction, a run reporting twice.
 	//
-	// That direction is the survivable one — LiveTurns answers `true`, and the reaper
-	// that will read it next (tether#139) treats `true` as "leave it alone", so it
-	// cannot cost a live session — but it is not free: the end-of-stream arm below
-	// fires markTurnInterrupted on a non-zero count, so a turn that completed
-	// normally can be reported to the next subscriber as one that was cut off, which
-	// is the notice tether#137 removed.
+	// That premise is load-bearing in a direction worth naming, because getting it
+	// wrong does NOT look like this bug — it looks like the opposite one. A closer
+	// arriving BELOW the mark would be refused as a duplicate when it is in fact
+	// some run's only signal, leaving a turn counted forever on a session that stays
+	// alive (opencode keeps several such sessions, and teardown never runs on them).
+	// It is unreachable as the providers are written, which is exactly why the branch
+	// below logs instead of silently choosing: a frozen "working" marker is otherwise
+	// indistinguishable from a busy session, and no polling reveals it.
 	//
-	// Not covered at all, and reachable: a late EventError. This flag only ever
-	// refuses a RESULT, so an error applied after its own run's result and after a
-	// new delivery steals that delivery's turn identically. The emitter is the SSE
-	// `session.error` frame, which runs on sseLoop's goroutine with no ordering
-	// relation to the run goroutine's terminal result — the same absence of ordering
-	// the error arm below already concedes in the other direction.
-	var runSettled bool
+	// ZERO is the exception and always applies — Event.RunID defines it as "no run",
+	// which is a refused prompt, an accepted delivery that never started a run, and
+	// a provider that does not attribute at all. `0 <= settledRun` would otherwise
+	// refuse every signal from an untagged fixture after the first, which is a silent
+	// freeze rather than a degradation; see the same field's doc for why the
+	// degradation is allowed to exist and which tests catch a production emit site
+	// that forgets to stamp or stamps the wrong id.
+	//
+	// # A local, not a field on Entry
+	//
+	// This loop is the only goroutine that reads or writes it: one goroutine per
+	// Entry, seeing the provider's events in emission order. A local therefore needs
+	// no concurrency story at all — every other mutable bit of turn state had to
+	// justify one (see Entry.turnsInFlight).
+	//
+	// # What is still open, said here because it is where a reader will look
+	//
+	// One residual survives, and it is a provider-side one rather than a hole in
+	// this rule: opencode's SSE `session.error` frame is stamped with whichever run
+	// is current when sseLoop READS it, so an error about run N that is read after
+	// run N+1 was accepted is stamped N+1 and settles N+1's turn. Unchanged from
+	// before tether#148 (it counted down unconditionally then), and not closable from
+	// here — see opencodeSession.readSSE, which carries the frame's own lack of a
+	// correlation id.
+	var settledRun int64
+
+	// settles reports whether ev's end-of-turn signal is the FIRST from its run, and
+	// records it. Called from the two arms below and nowhere else — every caller must
+	// be a turn-closer, or a mid-turn event would move the mark and make its own
+	// run's result look like a duplicate.
+	settles := func(ev agent.Event) bool {
+		if ev.RunID == 0 {
+			return true
+		}
+		if ev.RunID <= settledRun {
+			if ev.RunID < settledRun {
+				// Not reachable as either provider is written, and refused anyway —
+				// applying it would let a genuine duplicate of an older run take a
+				// later delivery's turn, which is the whole defect. Logged because the
+				// cost of being wrong here is a marker stuck on "working" for the rest
+				// of a session, and a stuck marker looks exactly like a busy one.
+				slog.Warn("end-of-turn signal from a run older than the last one settled; refusing it, "+
+					"which leaves a turn counted if this was that run's only signal — a provider is emitting "+
+					"turn-closers out of run order (see fanOut's settledRun)",
+					"sid", sid, "run_id", ev.RunID, "settled_run", settledRun, "kind", ev.Kind)
+			}
+			return false
+		}
+		settledRun = ev.RunID
+		return true
+	}
 
 	emitSegments := func(segs []Segment) {
 		for _, seg := range segs {
@@ -2663,19 +2675,14 @@ func (r *Registry) fanOut(e *Entry) {
 			// SECOND result (measured — see Entry.turnsInFlight), so this result ends
 			// one turn and must not speak for the other.
 			//
-			// Unless this run's turn is already counted down, in which case this
-			// result is that run's SECOND end-of-turn signal and the only turn left
-			// for it to take is somebody else's (tether#145 — see runSettled).
+			// Unless this run has already reported its end, in which case this result
+			// is that run's SECOND end-of-turn signal and the only turn left for it to
+			// take is somebody else's (tether#148 — see settledRun).
 			//
-			// Reaching here clears the flag whichever branch is taken, because the
-			// terminal result is the last signal a run produces and whatever follows
-			// belongs to the next one. "Whichever branch", not "whatever happens": the
-			// init-less empty-result suppression above returns before this point, so
-			// that envelope neither counts down nor clears — correct, since it is a
-			// failed `--resume`'s artefact and not a run ending at all.
-			if runSettled {
-				runSettled = false
-			} else {
+			// The init-less empty-result suppression above returns before this point,
+			// so that envelope neither counts down nor moves the mark — correct, since
+			// it is a failed `--resume`'s artefact and not a run ending at all.
+			if settles(ev) {
 				e.endTurn()
 			}
 			emitSegments(e.fenceParser.Flush())
@@ -2702,20 +2709,20 @@ func (r *Registry) fanOut(e *Entry) {
 		// than assumed. cc emits EventError once, when its output stream ends in an
 		// error — teardown follows. opencode's other sites are its serve exiting, a
 		// scan failure it has just killed the child for, and a non-zero run exit;
-		// all three are a run that is over, and the two that are followed by the
-		// terminal EventResult decrement a count the floor guard has already parked.
-		// The one site where the turn can briefly outlive the error is the SSE
-		// `session.error` frame, whose run goroutine still has its EventResult to
-		// emit; that costs a marker that goes out early rather than one that never
-		// goes out, which is the direction to fail in.
+		// all three are a run that is over, and the two that are followed by that
+		// run's terminal EventResult now share its run id, so exactly one of the pair
+		// counts a turn down. The SSE `session.error` frame is the site where the
+		// turn can briefly outlive the error — its run goroutine still has its
+		// EventResult to emit — which costs a marker that goes out early rather than
+		// one that never goes out, the direction to fail in.
 		//
-		// And it is the arm that ARMS the duplicate guard, on the one condition that
-		// separates "this run is over and its result is still coming" from "a
-		// different, refused delivery just reported itself" — see runSettled.
-		if ev.Kind == agent.EventError {
-			if remaining, settled := e.endTurn(); settled && remaining == 0 {
-				runSettled = true
-			}
+		// Gated by the same run-identity test as the result arm, and it has to be
+		// gated in BOTH: tether#145's flag only ever refused a RESULT, so an error
+		// applied after its own run's result stole a turn identically and nothing
+		// noticed (see settledRun's residual section, and
+		// TestEntryTurnFlag_ALateErrorFromASettledRunDoesNotConsumeTheNextTurn).
+		if ev.Kind == agent.EventError && settles(ev) {
+			e.endTurn()
 		}
 
 		// tether#44 — persist thinking + tool activity so a reload reconstructs

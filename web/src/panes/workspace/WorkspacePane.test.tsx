@@ -8,6 +8,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import WorkspacePane, { resolveSelection } from './index'
 import { useStore, WORKSPACE_ID_KEY } from '../../lib/store'
 import { chatURL } from '../../lib/chatUrl'
+import { HTTP_ERROR_MAX_CHARS, HTTP_ERROR_TRUNCATED } from '../../lib/httpError'
 
 /** Route the pane's fetches by URL: workspaces and the file tree WorkspaceTree
  *  pulls for the auto-expanded workspace. Anything else throws rather than
@@ -515,5 +516,110 @@ describe('WorkspacePane selection survives a reload (tether#66)', () => {
     await waitFor(() => expect(screen.queryByLabelText('Remove workspace alpha')).toBeNull())
     expect(useStore.getState().activeWorkspace?.id).toBe('ws-beta') // selection untouched
     expect(screen.queryByText('/w/beta')).toBeNull()               // and still collapsed
+  })
+})
+
+// tether#161 — the pane's error row must carry the daemon's own words.
+//
+// tether#147 and tether#159 spent two rounds deriving these sentences from the
+// sentinel the daemon actually hit, deliberately without echoing a daemon-side
+// path. Both of this pane's fetches then threw the body away and built
+// `HTTP ${res.status}`, so a user who typed a relative workspace path was told
+// "HTTP 400" — the backend was right, its tests were green, and for the user the
+// two rounds were a no-op.
+//
+// Two cases because there are two call sites (load and addWorkspace) feeding one
+// `<div>`, and each built its own message. Every case asserts BOTH states: the
+// sentence is present, and the status-only string the defect produced is not.
+describe('Workspace pane surfaces the daemon\'s refusal (tether#161)', () => {
+  /** http.Error writes the message plus exactly one newline. */
+  const textBody = (body: string, status: number) =>
+    new Response(`${body}\n`, { status, headers: { 'Content-Type': 'text/plain; charset=utf-8' } })
+
+  it('shows why the registry could not be listed, not just the status', async () => {
+    // The one JSON error body reachable on this route: the auth middleware
+    // answers 401 with {"error":"unauthorized"} (internal/auth/middleware.go),
+    // and the pane must show the sentence rather than the envelope.
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url === '/api/v1/workspaces') {
+        return new Response('{"error":"unauthorized"}\n', {
+          status: 401, headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    }))
+
+    render(<WorkspacePane />)
+
+    await waitFor(() => expect(screen.getByText('unauthorized')).toBeTruthy())
+    expect(screen.queryByText('HTTP 401')).toBeNull()          // what the defect showed
+    expect(screen.queryByText('{"error":"unauthorized"}')).toBeNull()
+    // The gate is still released on failure (tether#52) — this case must not
+    // quietly become a test of a pane that never settles.
+    expect(useStore.getState().workspacesLoaded).toBe(true)
+  })
+
+  it('shows why an added workspace was refused', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: { method?: string }) => {
+      if (url === '/api/v1/workspaces' && (init?.method ?? 'GET') === 'GET') {
+        return new Response(JSON.stringify([WS_ALPHA]), { status: 200 })
+      }
+      if (url === '/api/v1/workspaces' && init?.method === 'POST') {
+        return textBody('workspace: a workspace path must be absolute', 400)
+      }
+      if (/^\/api\/v1\/workspaces\/ws-alpha\/files\?dir=/.test(url)) {
+        return new Response('[]', { status: 200 })
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    }))
+
+    render(<WorkspacePane />)
+    await waitFor(() => expect(screen.getByText('alpha')).toBeTruthy())
+
+    fireEvent.click(screen.getByLabelText('Add workspace'))
+    fireEvent.change(screen.getByPlaceholderText('workspace path'), {
+      target: { value: 'relative/path' },
+    })
+    fireEvent.click(screen.getByText('Add'))
+
+    await waitFor(() =>
+      expect(screen.getByText('workspace: a workspace path must be absolute')).toBeTruthy(),
+    )
+    expect(screen.queryByText('HTTP 400')).toBeNull()
+  })
+
+  // The cap, seen from where it matters. This row is one line next to a form, so
+  // a proxy's HTML page arriving on the same channel as a one-sentence refusal
+  // must not be pasted into it whole — and the cut has to SAY it was cut, or the
+  // row reads as the daemon having said something incoherent.
+  it('caps an enormous body and says it was truncated', async () => {
+    const huge = `<html><head><title>502 Bad Gateway</title></head><body>${'nginx '.repeat(400)}</body></html>`
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: { method?: string }) => {
+      if (url === '/api/v1/workspaces' && (init?.method ?? 'GET') === 'GET') {
+        return new Response(JSON.stringify([WS_ALPHA]), { status: 200 })
+      }
+      if (url === '/api/v1/workspaces' && init?.method === 'POST') {
+        return new Response(huge, { status: 502, headers: { 'Content-Type': 'text/html' } })
+      }
+      if (/^\/api\/v1\/workspaces\/ws-alpha\/files\?dir=/.test(url)) {
+        return new Response('[]', { status: 200 })
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    }))
+
+    render(<WorkspacePane />)
+    await waitFor(() => expect(screen.getByText('alpha')).toBeTruthy())
+
+    fireEvent.click(screen.getByLabelText('Add workspace'))
+    fireEvent.change(screen.getByPlaceholderText('workspace path'), { target: { value: '/w/new' } })
+    fireEvent.click(screen.getByText('Add'))
+
+    // The exact text on screen, spelled out rather than probed: the daemon's
+    // first 300 characters and then the mark.
+    const shown = huge.slice(0, HTTP_ERROR_MAX_CHARS) + HTTP_ERROR_TRUNCATED
+    await waitFor(() => expect(screen.getByText(shown)).toBeTruthy())
+    expect(shown).toContain('502 Bad Gateway')
+    expect(screen.queryByText(huge)).toBeNull()      // not the whole page
+    expect(screen.queryByText('HTTP 502')).toBeNull() // and not the defect's value
   })
 })

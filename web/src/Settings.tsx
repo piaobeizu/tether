@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { useStore } from './lib/store'
 import { Icon } from './lib/icons'
+import { httpErrorMessage } from './lib/httpError'
 import { useAppVersion } from './lib/version'
 
 // Fired after a skill is installed/removed so other views (right-pane
@@ -118,10 +119,18 @@ export function Settings({ onClose, initialTab = 'connection' }: Props) {
   const onCloseRef = useRef(onClose)
   onCloseRef.current = onClose
 
+  // tether#161 — all three of these fetches THROW THE DAEMON'S WORDS, not its
+  // status code. The three messages land in one `skillErr` div (see the skills
+  // tab below), and each of them used to read `HTTP ${res.status}`: the whole
+  // output of tether#147 and tether#159 is refusal wording the daemon derives
+  // from the sentinel it actually hit ("skill: a skill source must be absolute"),
+  // and it stopped one hop short of the screen. httpErrorMessage owns reading the
+  // body, JSON or text, and capping it; an empty body still degrades to the
+  // status, which is what these lines said before.
   const loadSkills = async () => {
     try {
       const res = await fetch('/api/v1/skills')
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      if (!res.ok) throw new Error(await httpErrorMessage(res))
       const list = await res.json()
       if (!mounted.current) return
       setSkills(list)
@@ -179,7 +188,7 @@ export function Settings({ onClose, initialTab = 'connection' }: Props) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name, sourcePath }),
       })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      if (!res.ok) throw new Error(await httpErrorMessage(res))
       window.dispatchEvent(new Event(SKILLS_CHANGED))
       if (mounted.current) {
         setNewName('')
@@ -197,7 +206,7 @@ export function Settings({ onClose, initialTab = 'connection' }: Props) {
     if (!confirm(`Remove skill "${name}"?`)) return
     try {
       const res = await fetch(`/api/v1/skills/${id}`, { method: 'DELETE' })
-      if (!res.ok && res.status !== 204) throw new Error(`HTTP ${res.status}`)
+      if (!res.ok && res.status !== 204) throw new Error(await httpErrorMessage(res))
       window.dispatchEvent(new Event(SKILLS_CHANGED))
       await loadSkills()
     } catch (e) {

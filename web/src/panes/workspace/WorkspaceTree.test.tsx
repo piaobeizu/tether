@@ -366,3 +366,68 @@ describe('WorkspaceTree fold racing the arriving listing (tether#144)', () => {
     expect(files.countFor('src')).toBe(1)
   })
 })
+
+// tether#161 — the file tree's error row is the one place three of tether#159's
+// read-path refusals can reach a user ("that path must be relative to the
+// workspace root", "that path is outside the workspace", "that path is not a
+// directory"). fileTreeCache built `HTTP ${res.status}` and dropped the body, so
+// all three arrived as "HTTP 400".
+//
+// The assertion is on the RENDERED ROW, not on the promise fileTreeCache
+// rejects with: the message reaching an Error object is what the old build
+// already did with the status, and it is not what was broken. Both render sites
+// are covered — WorkspaceTree puts the root's error above the tree and a
+// subdirectory's under its row, and they read `node.error` from two different
+// places.
+describe('WorkspaceTree shows the daemon\'s refusal (tether#161)', () => {
+  const textBody = (body: string, status: number) =>
+    new Response(`${body}\n`, { status, headers: { 'Content-Type': 'text/plain; charset=utf-8' } })
+
+  it('shows why the ROOT listing was refused', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      textBody('workspace: that path is not a directory', 400)))
+
+    render(<WorkspaceTree workspaceId="ws-1" />)
+
+    await waitFor(() =>
+      expect(screen.getByText('workspace: that path is not a directory')).toBeTruthy())
+    // What the defect rendered in this exact row.
+    expect(screen.queryByText('HTTP 400')).toBeNull()
+  })
+
+  it('shows why a SUBDIRECTORY listing was refused', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      const dir = new URL(url, 'http://localhost').searchParams.get('dir') ?? ''
+      if (dir === '') return new Response(JSON.stringify([{ name: 'src', isDir: true, dirty: false }]), { status: 200 })
+      return textBody('workspace: that path is outside the workspace', 400)
+    }))
+
+    render(<WorkspaceTree workspaceId="ws-1" />)
+    await waitFor(() => expect(screen.getByText('src')).toBeTruthy())
+
+    fireEvent.click(screen.getByText('src'))
+
+    await waitFor(() =>
+      expect(screen.getByText('workspace: that path is outside the workspace')).toBeTruthy())
+    expect(screen.queryByText('HTTP 400')).toBeNull()
+  })
+
+  it('shows the 404 body a missing directory produces', async () => {
+    // refuseRead short-circuits fs.ErrNotExist to http.NotFound, whose body is
+    // Go's own "404 page not found" — still more than the bare status was.
+    vi.stubGlobal('fetch', vi.fn(async () => textBody('404 page not found', 404)))
+
+    render(<WorkspaceTree workspaceId="ws-1" />)
+
+    await waitFor(() => expect(screen.getByText('404 page not found')).toBeTruthy())
+    expect(screen.queryByText('HTTP 404')).toBeNull()
+  })
+
+  it('still falls back to the status when the body is empty', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 503 })))
+
+    render(<WorkspaceTree workspaceId="ws-1" />)
+
+    await waitFor(() => expect(screen.getByText('HTTP 503')).toBeTruthy())
+  })
+})

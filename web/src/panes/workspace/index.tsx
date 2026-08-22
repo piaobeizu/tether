@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { httpErrorMessage } from '../../lib/httpError'
 import { Icon } from '../../lib/icons'
 import { rememberedWorkspaceId, useStore } from '../../lib/store'
 import WorkspaceTree from './WorkspaceTree'
@@ -95,10 +96,15 @@ export default function WorkspacePane() {
   const [newPath, setNewPath] = useState('')
   const [newName, setNewName] = useState('')
 
+  // tether#161 — the error row below renders whatever these two throws carry, and
+  // they used to carry `HTTP ${res.status}`. On the ADD path that is the difference
+  // between "HTTP 400" and "workspace: a workspace path must be absolute" — a
+  // sentence tether#147 wrote for exactly this moment, derived from the sentinel
+  // the daemon hit and deliberately free of any daemon-side path.
   const load = async () => {
     try {
       const res = await fetch('/api/v1/workspaces')
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      if (!res.ok) throw new Error(await httpErrorMessage(res))
       const data = await res.json() as Workspace[]
       setWorkspaces(data)
       setError(null)
@@ -176,7 +182,7 @@ export default function WorkspacePane() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name, path }),
       })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      if (!res.ok) throw new Error(await httpErrorMessage(res))
       setNewPath('')
       setNewName('')
       setAdding(false)

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { httpErrorMessage } from '../../lib/httpError'
 
 interface Skill {
   id: string
@@ -24,8 +25,13 @@ export default function SkillPane({ onManage }: Props) {
     let alive = true
     const load = () => {
       fetch('/api/v1/skills')
-        .then(res => {
-          if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        // tether#161 — the daemon's words, not its status code. This tab is a
+        // SECOND reader of this endpoint (Settings owns the other), and it had
+        // its own copy of the status-only throw; fixing one and not the other
+        // would make the same refusal legible on one screen and opaque on this
+        // one. `async` because the body has to be read before it can be shown.
+        .then(async res => {
+          if (!res.ok) throw new Error(await httpErrorMessage(res))
           return res.json()
         })
         .then((list: Skill[]) => { if (alive) { setSkills(list); setError(null) } })

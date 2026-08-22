@@ -4,6 +4,8 @@
 // unit-testable with a mocked `fetch` (no jsdom/React Testing Library is
 // configured in this project; see web/test/workspace-tree.spec.ts).
 
+import { httpErrorMessage } from '../../lib/httpError'
+
 export interface FileEntry {
   name: string
   isDir: boolean
@@ -35,7 +37,14 @@ export function createFileTreeCache(workspaceId: string, fetchFn: FetchFn = fetc
     const promise = (async () => {
       try {
         const res = await fetchFn(url)
-        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        // tether#161 — the daemon's own sentence, because WorkspaceTree renders
+        // this Error's message as the row under the directory. Three of
+        // tether#159's read-path refusals are only ever reachable here ("that
+        // path must be relative to the workspace root", "…is outside the
+        // workspace", "…is not a directory") and all three used to arrive as
+        // "HTTP 400". A stub with no `text()` — every fetch stub in this suite
+        // predating that wi — still gets `HTTP ${status}`.
+        if (!res.ok) throw new Error(await httpErrorMessage(res))
         const entries = await res.json() as FileEntry[]
         cache.set(dir, entries)
         return entries

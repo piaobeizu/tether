@@ -2,15 +2,20 @@ package server
 
 // tether#103 — the session-activity endpoint, and above all its ROUTING.
 //
-// The routing half is not ceremony. This daemon has three patterns whose text
-// differs by a hyphen or a plural, two of them PREFIX handlers, and the wrong
-// answer to "which one wins" is silent:
+// The routing half is not ceremony. This daemon has two patterns whose text
+// differs from this one by a hyphen or a plural, one of them a PREFIX handler,
+// and the wrong answer to "which one wins" is silent:
 //
 //	/api/v1/sessions          exact    the list
 //	/api/v1/sessions/         PREFIX   sessionSub — every path under it is a sid
-//	/api/v1/session/          PREFIX   handleLockForce (singular!)
 //	/api/v1/                  PREFIX   the 501 stub
 //	/api/v1/session-activity  exact    this
+//
+// A third neighbour used to sit in that table and was the sharpest of them:
+// "/api/v1/session/" (singular!), a PREFIX handler serving handleLockForce.
+// tether#121 unregistered it along with the shell input lock it served, so the
+// old path now falls through to the 501 stub — which shell_lock_removed_test.go
+// pins, in this same package.
 //
 // So the table below runs against buildMux itself. It has to: an earlier draft
 // re-declared those patterns in this file, and deleting the real registration from
@@ -87,18 +92,21 @@ func TestSessionActivityRoute_IsBehindTheAuthMiddleware(t *testing.T) {
 
 // TestSessionActivityRoute_IsNotShadowedByItsNeighbours.
 //
-// The third row is the one that would actually have bitten: `/api/v1/session/` is
-// a prefix handler, and "session-activity" is "session" plus a hyphen. It is NOT
-// inside that prefix (the prefix ends in a slash), and this is the assertion that
-// says so rather than the reasoning.
+// The row that would actually have bitten is gone, and so is the hazard it
+// guarded against: `/api/v1/session/` was a prefix handler, and "session-activity"
+// is "session" plus a hyphen — but it was never inside that prefix, because the
+// prefix ends in a slash. tether#121 unregistered that pattern with the shell
+// lock, so there is no longer a shadowing question to assert here; what pins the
+// pattern's absence is shell_lock_removed_test.go.
 //
-// The second row records what the un-registered path did BEFORE this slice, which
-// is worth pinning because it is not what it looks like: `/api/v1/sessions/activity`
-// is refused with 400 by sessionSub's five-segment check, which runs BEFORE
-// validSID — so "activity" is never treated as a sid there. It is treated as one
-// at `/api/v1/sessions/activity/<leaf>`, five segments, and "activity" happens to
-// satisfy validSID (8 alphanumerics). That is the real hazard in the neighbourhood
-// and the reason this endpoint is not a leaf under /sessions/.
+// The `/api/v1/sessions/activity` rows below record what the un-registered path
+// did BEFORE this slice, which is worth pinning because it is not what it looks
+// like: `/api/v1/sessions/activity` is refused with 400 by sessionSub's
+// five-segment check, which runs BEFORE validSID — so "activity" is never treated
+// as a sid there. It is treated as one at `/api/v1/sessions/activity/<leaf>`, five
+// segments, and "activity" happens to satisfy validSID (8 alphanumerics). That is
+// the real hazard in the neighbourhood and the reason this endpoint is not a leaf
+// under /sessions/.
 func TestSessionActivityRoute_IsNotShadowedByItsNeighbours(t *testing.T) {
 	mux, req := activityRouteMux(t, nil)
 

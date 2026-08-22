@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Removed
+- **Session lock (D-15)** — the shell pane's 60-second input lock is gone, along with
+  `internal/session/lock.go`, the `lock_held` / `lock_taken` shell events, and the
+  force-takeover endpoint `POST /api/v1/session/{sid}/lock/force` (tether#121, PR #224).
+  The `/api/v1/session/` (singular) PREFIX pattern that served it is unregistered, so
+  requests to it now reach the `/api/v1/` 501 stub. Removed rather than repaired: the
+  lock never gated keyboard input and no client ever called `lock/force` or read either
+  event, so what goes away is not arbitration between clients but a 60-second timer that
+  killed the PTY under a user who was still typing. The v0.1.0 entry below describes the
+  feature as it shipped and is left as the historical record.
+
 ## v0.5.0 — 2026-07-06 (PR #87)
 
 Per-task MCP server configuration and idle-instance resource management. Drop-in over

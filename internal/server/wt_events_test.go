@@ -91,11 +91,14 @@ func TestPumpEvents_StampsTheWatchedSidOntoAnUnlabelledEnvelope(t *testing.T) {
 // TestPumpEvents_LeavesAnEnvelopeThatNamesItsOwnSession — the other half of the
 // stamp, and the reason it is conditional.
 //
-// Registry.BroadcastAll is daemon-wide: its callers are a permission request for
-// a named session (server/mux.go) and the shell lock events (server/wt_shell.go),
-// and two of the three set Envelope.SessionID themselves. Stamping the watched
-// sid over that told an observer of X that another session's tool-permission
-// prompt belonged to X. The overwrite was unconditional before tether#75 and
+// Registry.BroadcastAll is daemon-wide, and both of its callers are in
+// server/mux.go: a permission request for a named session, which sets
+// Envelope.SessionID itself, and the permissions-withdrawn batch, which
+// deliberately leaves it empty (permissionsWithdrawnEnvelope's doc says why). The
+// shell lock events were the other two callers until tether#121 removed the shell
+// input lock. Stamping the watched sid over an envelope that already names its own
+// session told an observer of X that another session's tool-permission prompt
+// belonged to X. The overwrite was unconditional before tether#75 and
 // reached only observers of live sids; sid-keyed subscription widened the
 // audience to observers of sids with no registration at all, which would have
 // widened the mislabelling with it.

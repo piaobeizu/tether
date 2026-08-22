@@ -4,11 +4,13 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -63,6 +65,55 @@ func pkceTestPair() (verifier, challenge string) {
 	sum := sha256.Sum256([]byte(verifier))
 	challenge = base64.RawURLEncoding.EncodeToString(sum[:])
 	return
+}
+
+// reqIDMarker is the consent page's req_id input, up to the value. Only the
+// consent page contains it, which is what makes it usable both as the anchor
+// these helpers scan for and as the assertion that a consent page is what came
+// back at all.
+const reqIDMarker = `name="req_id" value="`
+
+// reqIDFromRecorder pulls the consent page's req_id out of an authorize GET
+// response, or fails the test with the response it actually got.
+//
+// Every helper here used to do this inline as three unchecked strings.Index
+// calls, which indexed into the body with the result of a FAILED lookup:
+// start became -1+len(marker) and end became -1, so any response that was not a
+// consent page produced a slice-bounds panic. A panic in a test helper does not
+// fail one test — it takes down the whole test binary, so every result that had
+// not been printed yet disappears and the run's failure list is silently a
+// truncated one. That is exactly how it was found (tether#117's mutation run,
+// filed as tether#155): the panic read like a defect in the code under test,
+// and the short red list nearly supported the wrong conclusion.
+//
+// So the contract is: a helper that cannot get what it came for reports what it
+// saw and fails ONLY its own test.
+func reqIDFromRecorder(t *testing.T, w *httptest.ResponseRecorder) string {
+	t.Helper()
+	body := w.Body.String()
+	start := strings.Index(body, reqIDMarker)
+	if start < 0 {
+		t.Fatalf("authorize GET returned no consent page (no %q in body): status %d, body %s",
+			reqIDMarker, w.Code, bodyExcerpt(body))
+	}
+	start += len(reqIDMarker)
+	end := strings.Index(body[start:], `"`)
+	if end < 0 {
+		t.Fatalf("consent page's req_id value is unterminated (no closing quote): status %d, body %s",
+			w.Code, bodyExcerpt(body))
+	}
+	return body[start : start+end]
+}
+
+// bodyExcerpt renders a response body for a failure message: quoted, so control
+// characters and an empty body are visible rather than blending into the line,
+// and truncated, so a large page cannot bury the message it is attached to.
+func bodyExcerpt(body string) string {
+	const max = 400
+	if len(body) <= max {
+		return strconv.Quote(body)
+	}
+	return strconv.Quote(body[:max]) + fmt.Sprintf(" … (truncated, %d bytes total)", len(body))
 }
 
 // --- Metadata ---
@@ -124,6 +175,24 @@ func TestAuthorizeGet_ValidRequest_ShowsApprovalPage(t *testing.T) {
 	}
 }
 
+// TestAuthorizeGet_XSSClientID_IsEscaped pins that client_id — an
+// attacker-chosen string that arrives in the query string and is rendered into
+// the consent page — cannot break out of the surrounding HTML.
+//
+// The order of the assertions is the point. This test used to consist of one
+// negative: the body does not contain "<script>". That is equally true when the
+// escaping works and when no page is rendered at all — a 401, a 400, an empty
+// body all pass it — so it held in both the intact and the broken state, which
+// is another way of saying it was not a gate (tether#155). Verified: with an
+// authorizeGet that answers 401 and renders nothing, the old assertion stayed
+// green.
+//
+// Hence: establish that a consent page came back FIRST, and only then look at
+// how it rendered the injected string. The escaping assertion is written as
+// "the escaped form is present", not merely "the raw form is absent", because
+// the presence form has an answer to "what would this value be if the defect
+// were there?" — with the escaping gone the body carries the raw string and
+// this substring is missing.
 func TestAuthorizeGet_XSSClientID_IsEscaped(t *testing.T) {
 	h, _ := makeHandlers(t)
 	_, challenge := pkceTestPair()
@@ -132,9 +201,22 @@ func TestAuthorizeGet_XSSClientID_IsEscaped(t *testing.T) {
 	w := httptest.NewRecorder()
 	h.Authorize().ServeHTTP(w, req)
 
+	// 1. A consent page was rendered. Without this, everything below is vacuous.
+	if w.Code != http.StatusOK {
+		t.Fatalf("want a rendered consent page (200), got %d: %s", w.Code, bodyExcerpt(w.Body.String()))
+	}
 	body := w.Body.String()
+	if !strings.Contains(body, reqIDMarker) {
+		t.Fatalf("200 but not the consent page (no %q): %s", reqIDMarker, bodyExcerpt(body))
+	}
+
+	// 2. That consent page rendered the attacker's client_id, escaped.
+	const escaped = "&lt;script&gt;alert(1)&lt;/script&gt;"
+	if !strings.Contains(body, escaped) {
+		t.Errorf("client_id must appear HTML-escaped (%q) in the consent page; got %s", escaped, bodyExcerpt(body))
+	}
 	if strings.Contains(body, "<script>") {
-		t.Error("client_id must be HTML-escaped in the approval page")
+		t.Errorf("a raw <script> tag must never reach the consent page; got %s", bodyExcerpt(body))
 	}
 }
 
@@ -195,14 +277,7 @@ func reqIDFromApprovalPage(t *testing.T, h *oauth.Handlers) string {
 	req := httptest.NewRequest("GET", authorizeURL(challenge, nil), nil)
 	w := httptest.NewRecorder()
 	h.Authorize().ServeHTTP(w, req)
-	body := w.Body.String()
-	start := strings.Index(body, `name="req_id" value="`)
-	if start < 0 {
-		t.Fatal("req_id not found in approval page")
-	}
-	start += len(`name="req_id" value="`)
-	end := strings.Index(body[start:], `"`)
-	return body[start : start+end]
+	return reqIDFromRecorder(t, w)
 }
 
 func TestAuthorizePost_Allow_IssuesCodeAndRedirects(t *testing.T) {
@@ -261,7 +336,10 @@ func TestAuthorizePost_ExpiredReqID_Returns400(t *testing.T) {
 
 // --- Token endpoint ---
 
-// fullPKCECode performs GET+POST authorize and returns the issued code + verifier.
+// fullPKCECode performs GET+POST authorize and returns the issued code +
+// verifier. Every step it depends on is checked: a helper that hands back an
+// empty code because the flow it drives stopped working turns its callers'
+// failures into a puzzle about the token endpoint.
 func fullPKCECode(t *testing.T, h *oauth.Handlers) (code, verifier string) {
 	t.Helper()
 	verifier, challenge := pkceTestPair()
@@ -277,20 +355,26 @@ func fullPKCECode(t *testing.T, h *oauth.Handlers) (code, verifier string) {
 	req := httptest.NewRequest("GET", "/oauth/authorize?"+v.Encode(), nil)
 	w := httptest.NewRecorder()
 	h.Authorize().ServeHTTP(w, req)
-	body := w.Body.String()
-	start := strings.Index(body, `name="req_id" value="`)
-	start += len(`name="req_id" value="`)
-	end := strings.Index(body[start:], `"`)
-	reqID := body[start : start+end]
+	reqID := reqIDFromRecorder(t, w)
 
 	form := url.Values{"req_id": {reqID}, "action": {"allow"}}
 	req2 := withSession(httptest.NewRequest("POST", "/oauth/authorize", strings.NewReader(form.Encode())))
 	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	w2 := httptest.NewRecorder()
 	h.Authorize().ServeHTTP(w2, req2)
+	if w2.Code != http.StatusFound {
+		t.Fatalf("consent POST did not redirect: want 302, got %d: %s", w2.Code, bodyExcerpt(w2.Body.String()))
+	}
 	loc := w2.Header().Get("Location")
-	u, _ := url.Parse(loc)
-	return u.Query().Get("code"), verifier
+	u, err := url.Parse(loc)
+	if err != nil {
+		t.Fatalf("consent POST redirected to an unparseable Location %q: %v", loc, err)
+	}
+	code = u.Query().Get("code")
+	if code == "" {
+		t.Fatalf("consent POST redirect carried no code: Location %q", loc)
+	}
+	return code, verifier
 }
 
 func TestToken_HappyPath(t *testing.T) {

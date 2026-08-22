@@ -8,6 +8,7 @@ package skill
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -404,19 +405,27 @@ func TestOverlayEndpoints_DoNotEchoDaemonSideValues(t *testing.T) {
 //     "permission denied", making the endpoint a filesystem probe.
 func TestInstallEndpoint_RefusesASourceThatIsNotAnExistingDirectory(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		build func(t *testing.T, base string) string
+		name     string
+		build    func(t *testing.T, base string) string
+		wantBody string
 	}{
 		{"does not exist", func(t *testing.T, base string) string {
 			return filepath.Join(base, "not-there")
-		}},
+		}, ErrSkillSourceUnusable.Error()},
 		{"exists but is a regular file", func(t *testing.T, base string) string {
 			p := filepath.Join(base, "skill.md")
 			if err := os.WriteFile(p, []byte("# not a skill dir"), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			return p
-		}},
+		}, ErrSkillSourceUnusable.Error()},
+		{"a relative path", func(t *testing.T, base string) string {
+			if err := os.Mkdir(filepath.Join(base, "a-skill"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Chdir(base)
+			return "a-skill" // exists, so only the IsAbs check can refuse it
+		}, ErrSkillSourceNotAbsolute.Error()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			reg := newTestRegistry(t, fakeIndex{"ws1": t.TempDir()})
@@ -437,8 +446,12 @@ func TestInstallEndpoint_RefusesASourceThatIsNotAnExistingDirectory(t *testing.T
 			if got := reg.List(); len(got) != 0 {
 				t.Errorf("a refused install still registered %+v, want an empty registry", got)
 			}
-			if got := strings.TrimSpace(rec.Body.String()); got != ErrSkillSourceUnusable.Error() {
-				t.Errorf("400 body = %q, want exactly %q", got, ErrSkillSourceUnusable.Error())
+			if _, statErr := os.Stat(reg.path); !errors.Is(statErr, os.ErrNotExist) {
+				t.Errorf("a refused install wrote %s (stat error %v), want no file at all",
+					reg.path, statErr)
+			}
+			if got := strings.TrimSpace(rec.Body.String()); got != tc.wantBody {
+				t.Errorf("400 body = %q, want exactly %q", got, tc.wantBody)
 			}
 			if strings.Contains(rec.Body.String(), src) {
 				t.Errorf("the refusal quoted the path back, so the body came from err.Error() "+

@@ -104,6 +104,24 @@ var (
 	// or unmounted arrives here exactly as it did before.
 	ErrWorkspaceDirUnusable = errors.New("skill: the registered workspace directory is not usable")
 
+	// ErrSkillSourceNotAbsolute — the install named a relative sourcePath.
+	// tether#147.
+	//
+	// Word for word the reason workspace.ErrWorkspacePathNotAbsolute exists, and
+	// the symmetry is the point: filepath.Abs resolves a relative path against the
+	// DAEMON's working directory, which the caller does not know and cannot see, so
+	// the same request installs a different source depending on where the daemon
+	// happens to have been started — and the resolved value is then stored.
+	// Refusing is the only answer that means one thing.
+	//
+	// This landed a beat after the directory check below, having first been left
+	// out on the grounds that it was "a smaller problem in this direction". It is
+	// not smaller, and "the other endpoint refuses this" was the whole argument
+	// needed: two endpoints on the same daemon disagreeing about whether a
+	// relative path is acceptable is a difference a caller cannot predict and
+	// nobody chose.
+	ErrSkillSourceNotAbsolute = errors.New("skill: a skill source must be absolute")
+
 	// ErrSkillSourceUnusable — the sourcePath an install named is not there, or is
 	// there and is not a directory. tether#147.
 	//
@@ -493,8 +511,9 @@ func (r *Registry) List() []Skill {
 //
 // # RESIDUAL GAP (tether#142): sourcePath is still not contained
 //
-// The source must now be an existing DIRECTORY, and that is all it must be: an
-// authenticated caller can still register any directory on the host. tether#142
+// The source must now be an absolute path naming an existing DIRECTORY, and that
+// is all it must be: an authenticated caller can still register any directory on
+// the host. tether#142
 // contained where the overlay symlink is CREATED; it did not contain what that
 // symlink POINTS AT. Enable will happily link a registered workspace's plugin
 // entry to /etc, and cc — running as the daemon's user — is what then reads it.
@@ -512,11 +531,12 @@ func (r *Registry) List() []Skill {
 //
 // # What tether#147 DID change
 //
-// os.Stat alone was the check, and it left two consequences that were recorded
+// os.Stat alone was the check, and it left three consequences that were recorded
 // here as accepted and are now closed:
 //
 //   - It accepted regular files, though every doc in this package describes a
 //     skill as a directory (~/.tether/skills/<id>/). IsDir is now required.
+//
 //   - Its error was returned as `skill path not found: <stat error>` and the HTTP
 //     layer sent that verbatim as a 500 body, which made the endpoint a
 //     filesystem probe and named daemon-side paths. Both refusals now share one
@@ -524,15 +544,22 @@ func (r *Registry) List() []Skill {
 //     rule tether#156 established for the overlay endpoints and did not reach
 //     this one).
 //
-// The relative-path case is deliberately NOT refused here, and that is a
-// difference from workspace.Registry.Add, which does refuse it. Worth naming so
-// it reads as a decision: filepath.Abs resolves a relative sourcePath against the
-// daemon's working directory, silently, exactly as it did there. It is a smaller
-// problem in this direction — the resolved value is stored and shown in GET
-// /api/v1/skills, and the IsDir check below means a relative path that resolves
-// nowhere useful is refused rather than recorded — and tightening it was outside
-// what tether#147 was scoped to decide.
+//   - A relative sourcePath was resolved against the daemon's working directory,
+//     silently, and the resolved value stored. That is the identical defect
+//     workspace.Registry.Add refuses, for the identical reason, so it is refused
+//     identically here (ErrSkillSourceNotAbsolute).
+//
+// # Order
+//
+// IsAbs is checked on the string the CALLER sent, before filepath.Abs, because
+// filepath.Abs IS the silent resolution being refused — after it, a relative
+// input is indistinguishable from an absolute one. The directory check then runs
+// on the absolute form, which is the value that gets stored and that Enable later
+// hands to os.Symlink.
 func (r *Registry) Install(name, sourcePath string) (Skill, error) {
+	if !filepath.IsAbs(sourcePath) {
+		return Skill{}, fmt.Errorf("%w: %q", ErrSkillSourceNotAbsolute, sourcePath)
+	}
 	abs, err := filepath.Abs(sourcePath)
 	if err != nil {
 		return Skill{}, err

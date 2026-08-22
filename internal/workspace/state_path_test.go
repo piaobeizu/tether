@@ -78,6 +78,14 @@ func TestRegistry_Path(t *testing.T) {
 // well as in memory — is asserted separately on purpose. "Answers 400 and writes
 // the entry anyway" is a distinct defect from "answers 201", and an assertion on
 // the status alone holds in both states.
+//
+// This test is where the tether#147 reversal is asserted. Its counterpart is
+// TestLoad_KeepsAnEntryWhoseDirectoryIsGone, which pins the half that was KEPT:
+// load() must still accept an entry naming a directory that is not there, or one
+// missing volume makes the whole registry unloadable. The two must be read
+// together — either one alone reads as a policy the codebase does not have.
+// canonicalPath's own fallback, which both of them rest on, is
+// TestCanonicalPathKeepsWhatItCannotResolve's.
 func TestAdd_RefusesAPathThatIsNotAnExistingDirectory(t *testing.T) {
 	for _, tc := range []struct {
 		name string

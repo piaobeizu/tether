@@ -113,7 +113,9 @@ func TestInstall_RefusesASourceThatIsNotAnExistingDirectory(t *testing.T) {
 	}
 
 	// Positive control: a real directory still installs, so the rows above cannot
-	// be satisfied by an Install that refuses everything.
+	// be satisfied by an Install that refuses everything. This is also what makes
+	// the "no file at all" checks above mean something — here skills.json IS
+	// written.
 	t.Run("an existing directory is still accepted", func(t *testing.T) {
 		reg := newTestRegistry(t, fakeIndex{"ws1": t.TempDir()})
 		if _, err := reg.Install("s", t.TempDir()); err != nil {
@@ -122,7 +124,60 @@ func TestInstall_RefusesASourceThatIsNotAnExistingDirectory(t *testing.T) {
 		if got := reg.List(); len(got) != 1 {
 			t.Errorf("List = %+v, want the one skill", got)
 		}
+		if _, statErr := os.Stat(reg.path); statErr != nil {
+			t.Errorf("stat %s after an accepted Install: %v, want the registry written",
+				reg.path, statErr)
+		}
 	})
+}
+
+// TestInstall_RefusesARelativeSource — the same refusal workspace.Registry.Add
+// gives, for the same reason, on the endpoint next door.
+//
+// The fixture is a directory that EXISTS, named relative to a working directory
+// this test sets, and that is the whole design: filepath.Abs resolves it to a real
+// directory, so the IsDir check cannot refuse it and the IsAbs check is the only
+// thing that can. Remove the IsAbs line and this installs, silently recording
+// whatever the daemon's cwd made of the string — which is what it did before this
+// clause existed.
+//
+// t.Chdir rather than a hand-rolled os.Chdir with a defer: it restores the working
+// directory itself and fails the test if anything in the package is running in
+// parallel, which is the failure mode a manual version hides.
+func TestInstall_RefusesARelativeSource(t *testing.T) {
+	parent := t.TempDir()
+	if err := os.Mkdir(filepath.Join(parent, "a-skill"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(parent)
+
+	reg := newTestRegistry(t, fakeIndex{"ws1": t.TempDir()})
+
+	for _, rel := range []string{"a-skill", "./a-skill", filepath.Join("..", filepath.Base(parent), "a-skill")} {
+		sk, err := reg.Install("s", rel)
+		if !errors.Is(err, ErrSkillSourceNotAbsolute) {
+			t.Errorf("Install(%q) = (%+v, %v), want ErrSkillSourceNotAbsolute\n"+
+				"Pre-fix this resolved against the DAEMON's working directory and stored %q, "+
+				"which the caller had no way to predict.",
+				rel, sk, err, filepath.Join(parent, "a-skill"))
+		}
+	}
+	// Nothing recorded, in memory or on disk — the two halves the four other
+	// refusal tests in this change assert separately, for the same reason.
+	if got := reg.List(); len(got) != 0 {
+		t.Errorf("after refused Installs, List = %+v, want empty", got)
+	}
+	if _, statErr := os.Stat(reg.path); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("a refused Install wrote %s (stat error %v), want no file at all",
+			reg.path, statErr)
+	}
+
+	// The same directory, named absolutely, installs — so the rows above are
+	// refusals of the FORM of the path, not of the directory. If this fails the
+	// fixture is at fault, not the check.
+	if _, err := reg.Install("s", filepath.Join(parent, "a-skill")); err != nil {
+		t.Fatalf("Install(the same directory, absolute) = %v, want it to install", err)
+	}
 }
 
 // -- the asymmetry: Disable did not check its skill id -----------------------

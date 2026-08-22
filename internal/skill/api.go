@@ -12,7 +12,8 @@ import (
 //
 //	GET  /api/v1/skills                           → list all skills
 //	POST /api/v1/skills                           → install skill {"name":"...","sourcePath":"..."};
-//	                                                sourcePath must already be a directory, else 400 (tether#147)
+//	                                                sourcePath must be absolute and must already
+//	                                                be a directory, else 400 (tether#147)
 //	DELETE /api/v1/skills/{id}                    → remove skill
 //	POST /api/v1/skills/{id}/enable               → enable in workspace {"workspaceId":"..."}
 //	POST /api/v1/skills/{id}/disable              → disable in workspace {"workspaceId":"..."}
@@ -175,12 +176,13 @@ const overlayInternalErrorBody = "the daemon could not complete this request"
 // registered directory that is not on disk. Each is visible to the caller and
 // fixable by it, and none is a daemon fault, which is why none is a 500.
 //
-// ErrSkillSourceUnusable is tether#147's, and it is not an overlay refusal at all
-// — it belongs to install. It sits here because the alternative was a second
-// mapping for one case, which is how the tether#142 asymmetry this file exists to
-// undo got started. 400 rather than the 409 its workspace-side cousin
-// ErrWorkspaceDirUnusable gets, because that one is about a path the DAEMON
-// stored while this one is about a path the caller just sent.
+// The two ErrSkillSource* refusals are tether#147's, and they are not overlay
+// refusals at all — they belong to install. They sit here because the alternative
+// was a second mapping for two cases, which is how the tether#142 asymmetry this
+// file exists to undo got started. 400 rather than the 409 their workspace-side
+// cousin ErrWorkspaceDirUnusable gets, because that one is about a path the
+// DAEMON stored while these are about a path the caller just sent — and the same
+// 400 that workspace/api.go gives the two refusals these mirror exactly.
 func overlayRefusal(err error) (int, string) {
 	switch {
 	case errors.Is(err, ErrNoWorkspaceIndex):
@@ -189,6 +191,8 @@ func overlayRefusal(err error) (int, string) {
 		return http.StatusNotFound, ErrUnknownSkill.Error()
 	case errors.Is(err, ErrUnknownWorkspace):
 		return http.StatusBadRequest, ErrUnknownWorkspace.Error()
+	case errors.Is(err, ErrSkillSourceNotAbsolute):
+		return http.StatusBadRequest, ErrSkillSourceNotAbsolute.Error()
 	case errors.Is(err, ErrSkillSourceUnusable):
 		return http.StatusBadRequest, ErrSkillSourceUnusable.Error()
 	case errors.Is(err, ErrOverlayEscapesWorkspace):

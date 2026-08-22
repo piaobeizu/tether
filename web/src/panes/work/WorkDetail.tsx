@@ -5,7 +5,7 @@
 // knowledge-graph now lives in the middle canvas (WorkGraphView); selecting
 // a node there routes here via store.selectedWiId.
 import { lazy, Suspense, useEffect, useState } from 'react'
-import { AihubError, fetchItem, fetchSteps } from '../../lib/aihub'
+import { describeError, fetchItem, fetchSteps } from '../../lib/aihub'
 import type { WorkItemDetail, WorkSteps } from '../../lib/wire.gen'
 import { openSession } from '../../lib/session'
 import { SessionRow } from '../../lib/SessionRow'
@@ -21,16 +21,6 @@ import type { DagEdge, DagNode } from './Dag'
 import EventTimeline from './EventTimeline'
 
 const Markdown = lazy(() => import('../canvas/Markdown'))
-
-function describeError(e: unknown): string {
-  if (e instanceof AihubError) {
-    if (e.status === 503) return 'aihub not configured'
-    if (e.status === 403) return 'not authorized for this project'
-    if (e.status === 404) return 'not found'
-    return `error (HTTP ${e.status})`
-  }
-  return e instanceof Error ? e.message : String(e)
-}
 
 // Build scenario-step edges for the DAG. Prefer the real prev-derived edges;
 // when a degraded steps response omits prev (e.g. global-routing#62

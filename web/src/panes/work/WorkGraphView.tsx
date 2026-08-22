@@ -14,21 +14,12 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { useStore } from '../../lib/store'
-import { AihubError, fetchDeps, fetchGraph } from '../../lib/aihub'
+import { describeError, fetchDeps, fetchGraph } from '../../lib/aihub'
 import type { WorkGraph, WorkGraphNode } from '../../lib/wire.gen'
 import type { FGEdge, FGNode } from './ForceGraph'
 
 const ForceGraph = lazy(() => import('./ForceGraph'))
 const POLL_MS = 8000
-
-function describeError(e: unknown): string {
-  if (e instanceof AihubError) {
-    if (e.status === 503) return 'aihub not configured'
-    if (e.status === 403) return 'not authorized for this project'
-    return `error (HTTP ${e.status})`
-  }
-  return e instanceof Error ? e.message : String(e)
-}
 
 // Terminal statuses are hidden by the default 'active' filter (tether#24).
 const TERMINAL = new Set(['done', 'wrapped', 'cancelled', 'failed'])

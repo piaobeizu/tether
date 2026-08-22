@@ -193,11 +193,18 @@ func TestAuthorizeGet_ValidRequest_ShowsApprovalPage(t *testing.T) {
 // the presence form has an answer to "what would this value be if the defect
 // were there?" — with the escaping gone the body carries the raw string and
 // this substring is missing.
+//
+// The GET carries a session, which the old version did not need because it
+// asserted nothing about what came back. Now that it demands a rendered consent
+// page, the entry it uses matters: whether an UNAUTHENTICATED GET renders the
+// page is a live question that tether#153 is changing, and it is not this
+// test's question. What this test guards is the escaping, and "a signed-in GET
+// renders the consent page" is the premise that holds either way.
 func TestAuthorizeGet_XSSClientID_IsEscaped(t *testing.T) {
 	h, _ := makeHandlers(t)
 	_, challenge := pkceTestPair()
 	xssID := `<script>alert(1)</script>`
-	req := httptest.NewRequest("GET", authorizeURL(challenge, url.Values{"client_id": {xssID}}), nil)
+	req := withSession(httptest.NewRequest("GET", authorizeURL(challenge, url.Values{"client_id": {xssID}}), nil))
 	w := httptest.NewRecorder()
 	h.Authorize().ServeHTTP(w, req)
 

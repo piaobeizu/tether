@@ -236,9 +236,16 @@ func buildMux(cfg *Config, certs *certHolder, wts *webtransport.Server, reg *ses
 	}
 	permission.RegisterAPI(mux, pm, broadcastFn)
 
-	// s6: shell WT channel + session lock API.
+	// s6: shell WT channel.
+	//
+	// The session-lock API that used to sit beside it — the PREFIX pattern
+	// "/api/v1/session/" (singular), whose only leaf was
+	// POST /api/v1/session/{sid}/lock/force — is gone with the lock itself
+	// (tether#121). The pattern served nothing else: handleLockForce 404'd every
+	// path under it that was not exactly {sid}/lock/force, so unregistering it
+	// removes a prefix rather than an endpoint. Requests to the old path now reach
+	// the /api/v1/ 501 stub, which is pinned by a routing test.
 	mux.HandleFunc("/wt/shell", handleWTShell(reg, wts, authState))
-	mux.HandleFunc("/api/v1/session/", handleLockForce(reg))
 
 	// s7: workspace + skill REST APIs.
 	if cfg.WsRegistry != nil {
@@ -366,9 +373,11 @@ func buildMux(cfg *Config, certs *certHolder, wts *webtransport.Server, reg *ses
 	// symptom is a marker that contradicts the transcript on screen.
 	//
 	// The path is its own TOP-LEVEL route rather than a leaf under
-	// /api/v1/sessions/ — see session.SessionActivityPath for why, including the
-	// neighbour that actually is a hazard: /api/v1/session/ (singular,
-	// handleLockForce above) is a PREFIX handler one hyphen away from this path.
+	// /api/v1/sessions/ — see session.SessionActivityPath for why. The neighbour
+	// named there as the real hazard, the singular PREFIX pattern
+	// "/api/v1/session/" one hyphen away from this path, was unregistered by
+	// tether#121 along with the session lock it served; the remaining neighbour
+	// "/api/v1/sessions/" is a plural away rather than a hyphen away.
 	mux.HandleFunc(session.SessionActivityPath, handleSessionActivity(&session.ActivityIndex{
 		Reg:    reg,
 		CCJobs: reg.CCJobs,

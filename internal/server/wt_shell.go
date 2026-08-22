@@ -2,8 +2,6 @@ package server
 
 import (
 	"context"
-	cryptorand "crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -11,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
-	"strings"
 	"sync"
 
 	"github.com/creack/pty"
@@ -20,7 +17,6 @@ import (
 	"github.com/piaobeizu/tether/internal/agent"
 	"github.com/piaobeizu/tether/internal/auth"
 	"github.com/piaobeizu/tether/internal/session"
-	"github.com/piaobeizu/tether/internal/wire"
 )
 
 // handleWTShell handles /wt/shell WebTransport upgrades (s6 / D-05a §2 fact 4).
@@ -50,27 +46,6 @@ func handleWTShell(reg *session.Registry, wts *webtransport.Server, authState *a
 			return
 		}
 
-		clientID := newShellID()
-		lock := reg.GetLock(sid)
-		acquired, preempted := lock.Acquire(clientID)
-		if !acquired {
-			holder := lock.Holder()
-			_, _ = stream.Write([]byte("\r\n[tether] session locked by " + holder + "\r\n"))
-			// Broadcast lock-held event so the browser can offer force-takeover.
-			reg.BroadcastAll(wire.Envelope{
-				Kind: wire.KindError,
-				Payload: map[string]any{
-					"code":      "lock_held",
-					"holder":    holder,
-					"sessionId": sid,
-				},
-			})
-			_ = stream.Close()
-			_ = wtSess.CloseWithError(0, "lock held")
-			return
-		}
-		defer lock.Release(clientID)
-
 		// Spawn claude under PTY. cc internally coordinates jsonl with any
 		// concurrent chat subprocess (D-05a §2 fact 3).
 		// WorkdirForSession, not reg.Workdir: since tether#52 the chat session this
@@ -97,37 +72,88 @@ func handleWTShell(reg *session.Registry, wts *webtransport.Server, authState *a
 
 		defer attachShellResize(reg, sid, ptmx)()
 
-		done := make(chan struct{})
-		var closeOnce sync.Once
-		closePTY := func() { closeOnce.Do(func() { ptmx.Close() }) }
-
-		// PTY → WT: forward raw output bytes.
-		go func() {
-			defer close(done)
-			_, _ = io.Copy(stream, ptmx)
-		}()
-
-		// WT → PTY: forward keyboard input.
-		go func() {
-			_, _ = io.Copy(ptmx, stream)
-			closePTY()
-		}()
-
-		select {
-		case <-done:
-			// PTY process exited normally.
-		case <-preempted:
-			// Force-taken by another client.
-			_, _ = stream.Write([]byte("\r\n[tether] session taken over\r\n"))
-			closePTY()
-		case <-ctx.Done():
-			// WebTransport session disconnected.
-			closePTY()
-		}
-
-		_ = stream.Close()
-		_ = cmd.Wait()
+		pumpShell(ctx, stream, ptmx, cmd.Wait, func() { _ = wtSess.CloseWithError(0, "") })
 	}
+}
+
+// pumpShell runs the two byte pumps of one /wt/shell connection and owns the
+// teardown of all three things it is handed: the PTY master, the stream, and the
+// WebTransport session.
+//
+// Extracted from handleWTShell rather than inlined there for the reason
+// attachShellResize gives above — the handler takes a concrete
+// *webtransport.Session, so nothing in it is reachable without a real QUIC
+// connection, and this teardown is where tether#121's leak lived. Everything the
+// fix consists of is in here, behind interfaces a test can supply.
+//
+// # A shell now ends for exactly two reasons
+//
+// The PTY process exited, or the client went away. There is no third arm and no
+// clock: until tether#121 a 60-second timer in the session lock closed a
+// `preempted` channel this select also watched, so a shell whose user was TYPING
+// (input never touched the lock) was killed mid-keystroke and told "session taken
+// over" by nobody. internal/session/lock.go went with it.
+//
+// # Why all three closes are unconditional
+//
+// The `<-done` arm — a user typing `exit`, the single most ordinary way a shell
+// ends — used to have an empty body and fall straight through to a bare
+// stream.Close(). That left, for as long as the browser held its QUIC connection:
+//
+//   - ptmx, the PTY master fd, never closed. ~1024 shell opens in one tab exhaust
+//     the daemon's descriptor limit, and what breaks then is not the shell — it is
+//     the next cert load and every listener with it.
+//   - the WT→PTY pump, parked forever in io.Copy reading `stream`.
+//     webtransport.Stream.Close() closes the SEND direction only (stream.go:404,
+//     "It does not close the receive-direction"), so the stream close below cannot
+//     wake it. Only destroying the session can.
+//   - the session itself, still registered with the webtransport server.
+//     Server.Upgrade builds it with context.WithoutCancel(r.Context())
+//     (server.go:379) precisely so the handler returning does NOT end it, over a
+//     CONNECT stream it hijacked from http3 (server.go:366) so http3 will not end
+//     it either. Nobody else was ever going to.
+//
+// So closeSession is not optional, and /wt/shell was the only WebTransport route
+// in this package without it — serveChat (wt_chat.go), serveControl (control.go)
+// and serveEvents (wt_events.go) all open with `defer CloseWithError(0, "")`.
+func pumpShell(ctx context.Context, stream io.ReadWriteCloser, ptmx io.ReadWriteCloser, wait func() error, closeSession func()) {
+	// Deferred as well as called explicitly below. The defer is what makes "every
+	// exit from here destroys the session" true of a panic too; the explicit call
+	// is what puts it BEFORE wait(), so the WT→PTY pump is woken before this
+	// goroutine blocks on the child rather than after. Calling it twice is free:
+	// Session.CloseWithError returns at session.go:397 when it was not the first
+	// caller.
+	defer closeSession()
+
+	done := make(chan struct{})
+	var closeOnce sync.Once
+	closePTY := func() { closeOnce.Do(func() { _ = ptmx.Close() }) }
+
+	// PTY → WT: forward raw output bytes.
+	go func() {
+		defer close(done)
+		_, _ = io.Copy(stream, ptmx)
+	}()
+
+	// WT → PTY: forward keyboard input.
+	go func() {
+		_, _ = io.Copy(ptmx, stream)
+		closePTY()
+	}()
+
+	select {
+	case <-done:
+		// The PTY process exited on its own — `exit`, or cc quitting.
+	case <-ctx.Done():
+		// The WebTransport session went away: tab closed, network gone.
+	}
+
+	// One teardown for both arms. Closing the master is also what makes wait()
+	// return rather than block: it hangs up the child's controlling terminal.
+	closePTY()
+	closeSession()
+	_ = stream.Close()
+	_ = wait()
 }
 
 // attachShellResize routes later /wt/control resize frames to this PTY and
@@ -135,8 +161,16 @@ func handleWTShell(reg *session.Registry, wts *webtransport.Server, authState *a
 //
 // Size changes cannot ride the /wt/shell stream — it is raw PTY bytes by
 // contract (D-05a §2 fact 4) — so they arrive on /wt/control and are routed
-// back by sid, the same key the shell lock uses, which is what guarantees at
-// most one live shell owns it. tether#68.
+// back by sid. tether#68.
+//
+// Routing by sid alone was safe while the shell lock refused a second /wt/shell
+// for a sid that already had one. tether#121 removed that lock, so two shells on
+// one sid is now an ordinary state (two tabs, two devices) and the LAST one to
+// register owns the sid's resize slot: the older pane's resizes reach the newer
+// pane's PTY, and the newer pane's deferred detach drops the slot entirely. That
+// is a real regression of tether#68, left standing here deliberately rather than
+// papered over — fixing it means keying this map by shell instance instead of by
+// sid, which is a change to Registry's shape and not to this file.
 //
 // Extracted from handleWTShell (rather than inlined there) so the whole path
 // from a control frame to the kernel's winsize is reachable from a test: the
@@ -170,58 +204,6 @@ func startPTY(cmd *exec.Cmd, ws *pty.Winsize) (*os.File, error) {
 		return pty.Start(cmd)
 	}
 	return pty.StartWithSize(cmd, ws)
-}
-
-// handleLockForce handles POST /api/v1/session/{sid}/lock/force (D-15 force-takeover).
-func handleLockForce(reg *session.Registry) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		// Path: /api/v1/session/{sid}/lock/force → parts = [{sid}, "lock", "force"]
-		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/session/"), "/")
-		if len(parts) != 3 || parts[1] != "lock" || parts[2] != "force" {
-			http.NotFound(w, r)
-			return
-		}
-		sid := parts[0]
-
-		var body struct {
-			ClientID string `json:"clientId"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		clientID := body.ClientID
-		if clientID == "" {
-			clientID = newShellID()
-		}
-
-		lock := reg.GetLock(sid)
-		lock.ForceAcquire(clientID)
-
-		reg.BroadcastAll(wire.Envelope{
-			Kind:      wire.KindMessage,
-			SessionID: wire.SessionID(sid),
-			Payload: map[string]any{
-				"type":     "lock_taken",
-				"clientId": clientID,
-			},
-		})
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"clientId": clientID})
-	}
-}
-
-// newShellID returns a random hex ID for shell session client tracking.
-// Defined here rather than in internal/permission to avoid coupling
-// unrelated identity domains to the permission package.
-func newShellID() string {
-	b := make([]byte, 8)
-	if _, err := cryptorand.Read(b); err != nil {
-		panic("server: crypto/rand unavailable: " + err.Error())
-	}
-	return hex.EncodeToString(b)
 }
 
 // buildPTYCommand builds the `claude` invocation for the PTY shell pane.

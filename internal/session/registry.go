@@ -1,4 +1,7 @@
-// Package session manages live cc sessions and multi-attach broadcast (D-08, D-15).
+// Package session manages live cc sessions and multi-attach broadcast (D-08).
+//
+// D-15's session lock used to live here too; tether#121 removed it, so this
+// package no longer arbitrates who may send input.
 package session
 
 import (
@@ -52,13 +55,16 @@ type Registry struct {
 	// fresh spawn onto "" and hand unrelated clients one agent, and cfg.SessionID
 	// would do the same to every resume. See spawnEntry.
 	spawning map[string]*spawnReservation
-	locks    map[string]*SessionLock
 	// shellResize is keyed by the sid a /wt/shell connection was opened with,
 	// and holds that PTY's resize func (tether#68). Deliberately NOT part of
 	// Entry: a shell can exist for a sid that has no chat Entry at all (the
 	// sid may even be ""), so hanging it off sessions would make resize
 	// unroutable in exactly the cases where the pane is already on screen.
-	// One shell per sid is already the invariant — locks is keyed the same way.
+	//
+	// One shell per sid is NOT an invariant since tether#121 removed the shell
+	// lock: two panes on one sid now both connect, and this map holds whichever
+	// registered last. See server.attachShellResize for what that costs and why
+	// the fix belongs to this map's key rather than to the shell handler.
 	shellResize map[string]func(cols, rows uint16) error
 	// observers holds the READ-ONLY subscribers of each sid — the /wt/events
 	// attaches — and it is keyed by sid rather than hung off the Entry, which is
@@ -883,24 +889,11 @@ func NewRegistry(providers ...agent.AgentProvider) *Registry {
 	return &Registry{
 		sessions:        make(map[string]*Entry),
 		spawning:        make(map[string]*spawnReservation),
-		locks:           make(map[string]*SessionLock),
 		shellResize:     make(map[string]func(cols, rows uint16) error),
 		observers:       make(map[string]*observerSet),
 		providers:       pm,
 		mintedIDIgnored: make(map[string]bool),
 	}
-}
-
-// GetLock returns (or lazily creates) the SessionLock for the given sid.
-func (r *Registry) GetLock(sid string) *SessionLock {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if l, ok := r.locks[sid]; ok {
-		return l
-	}
-	l := &SessionLock{}
-	r.locks[sid] = l
-	return l
 }
 
 // liveEntry looks sid up and returns its Entry ONLY if the agent behind it is
@@ -1624,10 +1617,9 @@ func (r *Registry) GetOrSpawn(ctx context.Context, sid, providerName string) (ag
 // Deleting during range is safe per the Go spec, and this runs once per session
 // lifetime — not on a hot path.
 //
-// r.locks is deliberately NOT cleaned here: the per-sid SessionLock is shared
-// with shell sessions (handleWTShell calls GetLock for the same sid), so its
-// lifetime is not bound to this chat Entry — reclaiming it safely needs a
-// cross-surface refcount, tracked as a separate follow-up.
+// The per-sid shell lock that used to be exempted here (r.locks, never cleaned
+// because its lifetime was not bound to this chat Entry) is gone with tether#121,
+// and with it the unbounded map this function could not reclaim.
 func (r *Registry) evict(e *Entry) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1788,21 +1780,24 @@ func (r *Registry) RecordUserMessage(sid, text string) {
 // BroadcastAll sends env to every subscriber across all sessions, and to every
 // read-only observer regardless of which sid it is watching.
 //
-// Its three callers in the daemon (the permission-request fan-out in
-// server/mux.go, and the two shell lock events in server/wt_shell.go) address
-// the whole daemon rather than one session, so an observer is included on the
-// strength of being connected, not of the sid it named resolving to a live
-// Entry. Before tether#75 an observer of a sid with no registration was not
-// merely skipped here but had never been subscribed at all (see
-// SubscribeObserver), so
-// this widens the audience by exactly the set that used to be dropped on the
-// floor.
+// Its callers in the daemon are the two permission fan-outs in server/mux.go —
+// permissionEnvelope and permissionsWithdrawnEnvelope. Both address the whole
+// daemon rather than one session, so an observer is included on the strength of
+// being connected, not of the sid it named resolving to a live Entry. Before
+// tether#75 an observer of a sid with no registration was not merely skipped
+// here but had never been subscribed at all (see SubscribeObserver), so this
+// widens the audience by exactly the set that used to be dropped on the floor.
 //
-// Two of the three name their own session in Envelope.SessionID and the third
-// (wt_shell.go's lock_held) names it inside its payload. That matters to the
-// /wt/events route, which stamps the WATCHED sid onto envelopes — it does so
-// only where the producer left the field empty, precisely so that widening this
-// audience does not also widen a mislabelling. See pumpEvents.
+// (This count read "three" until tether#121 and was wrong both before and after:
+// server/mux.go has always had TWO call sites here, so the two shell lock events
+// in server/wt_shell.go — removed with the lock — made four, not three.)
+//
+// permissionEnvelope names its own session in Envelope.SessionID;
+// permissionsWithdrawnEnvelope carries a batch spanning sessions and leaves the
+// field empty. That matters to the /wt/events route, which stamps the WATCHED sid
+// onto envelopes — it does so only where the producer left the field empty,
+// precisely so that widening this audience does not also widen a mislabelling.
+// See pumpEvents.
 func (r *Registry) BroadcastAll(env wire.Envelope) {
 	r.mu.RLock()
 	entries := make([]*Entry, 0, len(r.sessions))
@@ -2245,10 +2240,18 @@ func (r *Registry) InterruptSession(sid string) error {
 // PTY and unregisters on the way out.
 //
 // A second registration for the same sid replaces the first rather than
-// erroring: the shell lock (GetLock) already guarantees one live shell per
-// sid, so the only way to reach here twice is a reconnect whose predecessor
-// has not finished its deferred unregister — and in that race the newer PTY
-// is the one a resize should reach.
+// erroring. That was chosen while the shell lock (GetLock) made two live shells
+// on one sid impossible, so the only way to reach here twice was a reconnect
+// whose predecessor had not finished its deferred unregister — and in that race
+// the newer PTY is the one a resize should reach.
+//
+// tether#121 removed that lock, so reaching here twice is now an ordinary state
+// (two tabs or two devices on one sid) and last-writer-wins is no longer a
+// tie-break in a race but the steady-state answer: the older pane's resizes go
+// to the newer pane's PTY, and the newer pane's exit unregisters the sid out
+// from under the older one. Making that correct needs this map keyed by shell
+// instance rather than by sid; it is deliberately NOT patched at the call site,
+// where it would only look fixed.
 func (r *Registry) RegisterShellResize(sid string, fn func(cols, rows uint16) error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -2728,7 +2731,7 @@ func (e *Entry) deliverTurn(ch chan wire.Envelope, env wire.Envelope) {
 // # Why it does NOT get the gap notice, which is a finding and not an omission
 //
 // The notice tells the reader to reload. That is only worth saying where reloading
-// gets the content back, and for these three producers it does not:
+// gets the content back, and for the producers on this path it does not:
 //
 //   - A KindPermission request (mux.go) is the worst case, and since tether#132
 //     it is the one with a partial repair. The frontend's pendingPermissions list
@@ -2740,16 +2743,19 @@ func (e *Entry) deliverTurn(ch chan wire.Envelope, env wire.Envelope) {
 //     because it is what keeps a notice off this path even now: a reload of the
 //     only open tab kills the agent (see Entry.backfill for the measurement), so
 //     "reload to get it back" would STILL be a promise this code cannot keep.
-//   - wt_shell.go's lock_held and lock_taken are transient affordances for the
-//     shell pane, with no history and no backfill behind them.
+//   - wt_shell.go's lock_held and lock_taken used to be the other two producers:
+//     transient affordances for the shell pane, with no history and no backfill
+//     behind them. tether#121 removed both along with the shell lock, so the only
+//     other producer left here is mux.go's permissions_withdrawn (tether#137),
+//     which this paragraph has never been re-argued for — it carries a batch of
+//     request ids and no session, and what a reload owes it is #137's question.
 //
 // So a notice here would be a promise this code cannot keep, and its neighbours
 // in this package already argue what that costs: a notice a reader has caught
 // being wrong is one they stop reading. Note what tether#132 did NOT change: this
 // path still says nothing to the reader. A permission request is repaired by
-// being re-sent, not by being announced, and the other two payloads have no
-// repair at all — so there is still nothing here that a sentence could truthfully
-// promise.
+// being re-sent, not by being announced — so there is still nothing here that a
+// sentence could truthfully promise.
 //
 // It is deliberately NOT counted into Entry.lost either. That counter is what the
 // notice reports, and letting an unrepairable drop raise it would make the very

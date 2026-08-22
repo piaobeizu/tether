@@ -1,0 +1,103 @@
+{
+  "_comment": [
+    "Cross-language contract for the tether#153 sign-in redirect.",
+    "PRODUCER: signInURL() in internal/auth/oauth/handlers.go, asserted end to end (handler + html/template) by internal/auth/oauth/signin_prompt_test.go.",
+    "CONSUMER: safeRedirectTarget() in web/src/AuthPage.tsx, asserted by web/src/oauthSignInRedirect.test.ts.",
+    "Both sides READ this file; neither generates it. A producer change turns the Go test red until wantAuthURL is updated here, and the updated string is then re-validated against the real consumer. That is the whole point: two hand-copied lists would each hold a different subset and both look complete.",
+    "rawQuery is assigned to r.URL.RawQuery verbatim, so it is the exact byte string the handler sees."
+  ],
+  "entries": [
+    {
+      "label": "typical-mcp-client-request",
+      "why": "The shape an MCP client actually sends. Every parameter here has to survive the round trip or the consent page comes back unusable.",
+      "rawQuery": "response_type=code&client_id=cursor&redirect_uri=http%3A%2F%2Flocalhost%3A12345%2Fcallback&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&scope=mcp&state=xyz",
+      "wantAuthURL": "/auth?redirect=%2Foauth%2Fauthorize%3Fresponse_type%3Dcode%26client_id%3Dcursor%26redirect_uri%3Dhttp%253A%252F%252Flocalhost%253A12345%252Fcallback%26code_challenge%3DE9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM%26code_challenge_method%3DS256%26scope%3Dmcp%26state%3Dxyz",
+      "expectParams": {
+        "client_id": "cursor",
+        "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+        "code_challenge_method": "S256",
+        "redirect_uri": "http://localhost:12345/callback",
+        "response_type": "code",
+        "scope": "mcp",
+        "state": "xyz"
+      }
+    },
+    {
+      "label": "state-carrying-a-space-and-a-hash",
+      "why": "A '#' in a value must stay in the query and not become a fragment; '+' must still decode to a space after two encode/decode hops.",
+      "rawQuery": "response_type=code&client_id=cursor&redirect_uri=http%3A%2F%2Flocalhost%3A12345%2Fcallback&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&state=a+b%23frag",
+      "wantAuthURL": "/auth?redirect=%2Foauth%2Fauthorize%3Fresponse_type%3Dcode%26client_id%3Dcursor%26redirect_uri%3Dhttp%253A%252F%252Flocalhost%253A12345%252Fcallback%26code_challenge%3DE9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM%26code_challenge_method%3DS256%26state%3Da%2Bb%2523frag",
+      "expectParams": {
+        "client_id": "cursor",
+        "state": "a b#frag"
+      }
+    },
+    {
+      "label": "percent-and-plus-in-a-value",
+      "why": "Percent-encoding survives being percent-encoded again by url.QueryEscape and decoded once by URLSearchParams.",
+      "rawQuery": "response_type=code&client_id=cursor&redirect_uri=http%3A%2F%2Flocalhost%3A12345%2Fcallback&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&state=100%25+done",
+      "wantAuthURL": "/auth?redirect=%2Foauth%2Fauthorize%3Fresponse_type%3Dcode%26client_id%3Dcursor%26redirect_uri%3Dhttp%253A%252F%252Flocalhost%253A12345%252Fcallback%26code_challenge%3DE9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM%26code_challenge_method%3DS256%26state%3D100%2525%2Bdone",
+      "expectParams": {
+        "state": "100% done"
+      }
+    },
+    {
+      "label": "dot-dot-segments-percent-encoded-in-redirect-uri",
+      "why": "tether#117 A3 class 1: '..' segments collapse during URL parsing. Here they sit in a parameter VALUE, where they must not reach the path of the assembled target.",
+      "rawQuery": "response_type=code&client_id=cursor&redirect_uri=http%3A%2F%2Flocalhost%3A1%2F..%2F%2Fevil.example&code_challenge=abc&code_challenge_method=S256",
+      "wantAuthURL": "/auth?redirect=%2Foauth%2Fauthorize%3Fresponse_type%3Dcode%26client_id%3Dcursor%26redirect_uri%3Dhttp%253A%252F%252Flocalhost%253A1%252F..%252F%252Fevil.example%26code_challenge%3Dabc%26code_challenge_method%3DS256",
+      "expectParams": {
+        "redirect_uri": "http://localhost:1/..//evil.example"
+      }
+    },
+    {
+      "label": "dot-dot-segments-raw-in-a-value",
+      "why": "Same class, unencoded on the wire, so url.QueryEscape is the only thing standing between it and the /auth query string.",
+      "rawQuery": "response_type=code&client_id=cursor&redirect_uri=http%3A%2F%2Flocalhost%3A12345%2Fcallback&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&state=/..//evil.example",
+      "wantAuthURL": "/auth?redirect=%2Foauth%2Fauthorize%3Fresponse_type%3Dcode%26client_id%3Dcursor%26redirect_uri%3Dhttp%253A%252F%252Flocalhost%253A12345%252Fcallback%26code_challenge%3DE9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM%26code_challenge_method%3DS256%26state%3D%2F..%2F%2Fevil.example",
+      "expectParams": {
+        "state": "/..//evil.example"
+      }
+    },
+    {
+      "label": "same-origin-absolute-url-percent-encoded",
+      "why": "tether#117 A3 class 2: an absolute URL on OUR origin passes an origin check while carrying an off-origin path.",
+      "rawQuery": "response_type=code&client_id=cursor&redirect_uri=http%3A%2F%2Flocalhost%3A12345%2Fcallback&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&state=https%3A%2F%2Ftether.example%2F..%2F%2Fevil.example",
+      "wantAuthURL": "/auth?redirect=%2Foauth%2Fauthorize%3Fresponse_type%3Dcode%26client_id%3Dcursor%26redirect_uri%3Dhttp%253A%252F%252Flocalhost%253A12345%252Fcallback%26code_challenge%3DE9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM%26code_challenge_method%3DS256%26state%3Dhttps%253A%252F%252Ftether.example%252F..%252F%252Fevil.example",
+      "expectParams": {
+        "state": "https://tether.example/..//evil.example"
+      }
+    },
+    {
+      "label": "same-origin-absolute-url-raw",
+      "why": "Same class, unencoded: a raw '://' inside the query must not be able to restart the target as an absolute URL.",
+      "rawQuery": "response_type=code&client_id=cursor&redirect_uri=http%3A%2F%2Flocalhost%3A12345%2Fcallback&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&state=https://tether.example//evil.example",
+      "wantAuthURL": "/auth?redirect=%2Foauth%2Fauthorize%3Fresponse_type%3Dcode%26client_id%3Dcursor%26redirect_uri%3Dhttp%253A%252F%252Flocalhost%253A12345%252Fcallback%26code_challenge%3DE9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM%26code_challenge_method%3DS256%26state%3Dhttps%3A%2F%2Ftether.example%2F%2Fevil.example",
+      "expectParams": {
+        "state": "https://tether.example//evil.example"
+      }
+    },
+    {
+      "label": "backslash-and-protocol-relative-in-values",
+      "why": "The two shapes that navigated off-site against the pre-#225 guard: '\\' is read as '/' for special schemes, and '//host' is protocol-relative.",
+      "rawQuery": "response_type=code&client_id=cursor&redirect_uri=http%3A%2F%2Flocalhost%3A12345%2Fcallback&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&state=/\\evil.example&next=//evil.example",
+      "wantAuthURL": "/auth?redirect=%2Foauth%2Fauthorize%3Fresponse_type%3Dcode%26client_id%3Dcursor%26redirect_uri%3Dhttp%253A%252F%252Flocalhost%253A12345%252Fcallback%26code_challenge%3DE9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM%26code_challenge_method%3DS256%26state%3D%2F%5Cevil.example%26next%3D%2F%2Fevil.example",
+      "expectParams": {
+        "next": "//evil.example",
+        "state": "/\\evil.example"
+      }
+    },
+    {
+      "label": "literal-tab-and-newline-inside-the-query",
+      "why": "WHATWG URL parsing strips tab/LF/CR before parsing, which is how '/<TAB>/evil.example' slipped past a startsWith check. No expectParams: the stripping is the point, so the values legitimately change.",
+      "rawQuery": "response_type=code&client_id=cursor&redirect_uri=http%3A%2F%2Flocalhost%3A12345%2Fcallback&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&state=/\t/evil.example&next=/\n/evil.example",
+      "wantAuthURL": "/auth?redirect=%2Foauth%2Fauthorize%3Fresponse_type%3Dcode%26client_id%3Dcursor%26redirect_uri%3Dhttp%253A%252F%252Flocalhost%253A12345%252Fcallback%26code_challenge%3DE9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM%26code_challenge_method%3DS256%26state%3D%2F%09%2Fevil.example%26next%3D%2F%0A%2Fevil.example"
+    },
+    {
+      "label": "literal-hash-inside-the-raw-query",
+      "why": "Defensive: net/url splits the fragment off before RawQuery is set, so this cannot arrive over the wire today. It pins the producer against a future caller that assigns RawQuery from another source.",
+      "rawQuery": "response_type=code&client_id=cursor&redirect_uri=http%3A%2F%2Flocalhost%3A12345%2Fcallback&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&state=x#/..//evil.example",
+      "wantAuthURL": "/auth?redirect=%2Foauth%2Fauthorize%3Fresponse_type%3Dcode%26client_id%3Dcursor%26redirect_uri%3Dhttp%253A%252F%252Flocalhost%253A12345%252Fcallback%26code_challenge%3DE9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM%26code_challenge_method%3DS256%26state%3Dx%23%2F..%2F%2Fevil.example"
+    }
+  ]
+}

@@ -159,7 +159,9 @@ func authorizeURL(challenge string, extra url.Values) string {
 func TestAuthorizeGet_ValidRequest_ShowsApprovalPage(t *testing.T) {
 	h, _ := makeHandlers(t)
 	_, challenge := pkceTestPair()
-	req := httptest.NewRequest("GET", authorizeURL(challenge, nil), nil)
+	// withSession since tether#153: a signed-out GET gets the sign-in prompt, and
+	// what this test is about is the consent page.
+	req := withSession(httptest.NewRequest("GET", authorizeURL(challenge, nil), nil))
 	w := httptest.NewRecorder()
 	h.Authorize().ServeHTTP(w, req)
 
@@ -281,7 +283,9 @@ func TestAuthorizeGet_PlainPKCE_Rejects(t *testing.T) {
 func reqIDFromApprovalPage(t *testing.T, h *oauth.Handlers) string {
 	t.Helper()
 	_, challenge := pkceTestPair()
-	req := httptest.NewRequest("GET", authorizeURL(challenge, nil), nil)
+	// withSession since tether#153: only a signed-in GET renders the form that
+	// carries a req_id.
+	req := withSession(httptest.NewRequest("GET", authorizeURL(challenge, nil), nil))
 	w := httptest.NewRecorder()
 	h.Authorize().ServeHTTP(w, req)
 	return reqIDFromRecorder(t, w)
@@ -359,7 +363,8 @@ func fullPKCECode(t *testing.T, h *oauth.Handlers) (code, verifier string) {
 		"code_challenge_method": {"S256"},
 		"state":                 {"xyz"},
 	}
-	req := httptest.NewRequest("GET", "/oauth/authorize?"+v.Encode(), nil)
+	// withSession since tether#153 — see reqIDFromApprovalPage.
+	req := withSession(httptest.NewRequest("GET", "/oauth/authorize?"+v.Encode(), nil))
 	w := httptest.NewRecorder()
 	h.Authorize().ServeHTTP(w, req)
 	reqID := reqIDFromRecorder(t, w)
@@ -580,11 +585,16 @@ func TestAuthorizePost_NoSession_DoesNotBurnReqID(t *testing.T) {
 // TestAuthorizePost_NilSessionAuth_Returns401 pins the fail-closed default: a
 // caller that forgets to wire SessionAuth gets a broken approval flow, never a
 // public mint.
+//
+// Since tether#153 a nil SessionAuth also denies the GET, so there is no consent
+// page to lift a req_id from and this posts an arbitrary one. That does not
+// weaken the assertion: 401 and 400 are different answers, and an unknown req_id
+// is what produces the 400 (from ConsumePending) if the session check ever stops
+// running first.
 func TestAuthorizePost_NilSessionAuth_Returns401(t *testing.T) {
 	h := makeHandlersNoSessionAuth(t)
-	reqID := reqIDFromApprovalPage(t, h)
 
-	form := url.Values{"req_id": {reqID}, "action": {"allow"}}
+	form := url.Values{"req_id": {"any-req-id"}, "action": {"allow"}}
 	req := withSession(httptest.NewRequest("POST", "/oauth/authorize", strings.NewReader(form.Encode())))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	w := httptest.NewRecorder()
@@ -595,25 +605,14 @@ func TestAuthorizePost_NilSessionAuth_Returns401(t *testing.T) {
 	}
 }
 
-// TestAuthorizeGet_NoSession_StillShowsApprovalPage keeps the GET exemption
-// deliberate rather than incidental. The MCP client opens this URL in the
-// owner's browser and that browser may not hold the cookie yet; requiring one
-// here would replace the consent page with a login redirect and lose the
-// pending request. Nothing is minted by rendering the page.
-func TestAuthorizeGet_NoSession_StillShowsApprovalPage(t *testing.T) {
-	h, _ := makeHandlers(t)
-	_, challenge := pkceTestPair()
-	req := httptest.NewRequest("GET", authorizeURL(challenge, nil), nil)
-	w := httptest.NewRecorder()
-	h.Authorize().ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("GET without a session: want 200, got %d", w.Code)
-	}
-	if !strings.Contains(w.Body.String(), `name="req_id"`) {
-		t.Error("consent page should still render for an unauthenticated GET")
-	}
-}
+// The GET exemption in internal/auth/middleware.go is unchanged and still
+// deliberate: this endpoint is reachable without a cookie, and nothing is minted
+// by reaching it. What a cookie-less GET now RENDERS moved in tether#153 —
+// TestAuthorizeGet_NoSession_StillShowsApprovalPage used to pin the consent page
+// here and has been superseded by signin_prompt_test.go, which pins the sign-in
+// prompt and its return link. The reason is in that file: showing consent to a
+// signed-out browser only moved the failure one click later, since the POST is
+// session-gated and the /auth redirect behind it carries no ?redirect=.
 
 // TestToken_NoSession_StillExchanges keeps the /oauth/token exemption
 // deliberate too: the code is single-use and bound to a PKCE challenge, so the

@@ -15,11 +15,15 @@ import (
 // SessionAuth reports whether r carries an authenticated tether browser
 // session. The daemon wires this to the auth middleware's cookie verifier
 // (auth.State.ClientIDFromRequest); it is a function rather than a concrete
-// type so this package does not have to import internal/auth.
+// type so this package does not have to import internal/auth. Being the same
+// verifier the middleware uses is the point — a second, parallel notion of
+// "signed in" here would drift from the one the middleware enforces.
 //
-// It gates the consent POST only. A nil SessionAuth denies every consent POST,
-// which is the safe direction: an embedder that forgot to wire it gets a broken
-// approval flow, not a public token mint.
+// It gates the consent POST, which is the mint, and it decides which page the
+// consent GET renders (tether#153). A nil SessionAuth denies every consent POST
+// and shows every GET the sign-in prompt, which is the safe direction: an
+// embedder that forgot to wire it gets a broken approval flow, not a public
+// token mint.
 type SessionAuth func(*http.Request) bool
 
 // Handlers provides the three OAuth 2.1 endpoint handlers.
@@ -70,6 +74,76 @@ button{margin-right:1rem;padding:.5rem 1.5rem;font-size:1rem;cursor:pointer}</st
 </form>
 </body></html>`))
 
+// signInTmpl is what a signed-out browser gets from GET /oauth/authorize instead
+// of the consent page (tether#153).
+//
+// GET stays exempt from the auth middleware — this does not change whether the
+// endpoint is reachable without a cookie, only what a cookie-less browser is
+// shown once it arrives. (internal/auth/middleware.go says not to widen that
+// exemption back to every method; nothing here does.)
+//
+// Rendering consent to a signed-out browser was a dead end. tether#117 A1 put a
+// session gate on the POST, so the owner clicked Allow and got a 401; the
+// middleware then sent that non-API request to /auth carrying NO ?redirect=, and
+// they landed on / with the pending request lost. From the outside: "I clicked
+// approve and nothing happened." The pending record died either way — the consent
+// page only made it die one click later — so the fix is to put the sign-in step
+// in front of the consent step and carry the original request across it.
+//
+// The link is the whole feature: {{.AuthURL}} takes the browser to /auth with the
+// complete authorization request (path AND query) in ?redirect=, so after signing
+// in it comes straight back here with client_id, code_challenge, state and
+// redirect_uri intact and the consent page renders for real.
+var signInTmpl = template.Must(template.New("signin").Parse(`<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>tether — Sign in to continue</title>
+<style>body{font-family:sans-serif;max-width:480px;margin:4rem auto;padding:1rem}
+a.signin{display:inline-block;margin-top:.5rem;padding:.5rem 1.5rem;font-size:1rem;
+border:1px solid #888;border-radius:4px;text-decoration:none}</style>
+</head><body>
+<h2>tether — Sign in to continue</h2>
+<p><strong>{{.ClientID}}</strong> is requesting access to tether, but this browser is not signed in.</p>
+<p>Sign in first — you will come straight back to this approval page.</p>
+<p><a id="oauth-signin-continue" class="signin" href="{{.AuthURL}}">Sign in and continue</a></p>
+</body></html>`))
+
+// authorizePath is the only path this handler ever asks a browser to come back
+// to, and it is a constant rather than r.URL.Path on purpose.
+//
+// The request path is client-controlled, and echoing it into a return target is
+// the exact mistake tether#117 A3 made twice: `/..//evil.example` parses to OUR
+// origin, because `..` segments collapse during parsing, and leaves behind a
+// protocol-relative pathname that navigates off-site. Assembling the target from
+// a constant makes that unreachable instead of merely guarded against.
+const authorizePath = "/oauth/authorize"
+
+// signInURL builds the /auth?redirect= link that returns the browser to this
+// exact authorization request once it has signed in.
+//
+// The consumer is safeRedirectTarget() in web/src/AuthPage.tsx, and it is a
+// validator, not a sanitiser: it hands back "/" unless the decoded target
+// resolves to this origin AND begins with exactly one "/". So the target is built
+// to satisfy that by construction — constant path first, the raw query appended
+// after a "?", the whole thing percent-encoded into a single parameter, which is
+// what keeps the inner query from being read as /auth's own.
+//
+// url.QueryEscape emits only [A-Za-z0-9-_.~%+], so the value carries nothing that
+// is significant in an HTML attribute and nothing that could open a second
+// parameter; html/template's URL-context escaping is a no-op on it rather than
+// something this has to survive.
+//
+// That argument is not the gate, though. testdata/signin_redirect_corpus.json
+// pins the exact strings this produces, and web/src/oauthSignInRedirect.test.ts
+// feeds that same file through the real safeRedirectTarget — including the two
+// shapes A3 got wrong, `..` segments and same-origin absolute URLs.
+func signInURL(rawQuery string) string {
+	target := authorizePath
+	if rawQuery != "" {
+		target += "?" + rawQuery
+	}
+	return "/auth?redirect=" + url.QueryEscape(target)
+}
+
 // Authorize handles GET (show approval page) and POST (allow/deny submit).
 func (h *Handlers) Authorize() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -109,6 +183,25 @@ func (h *Handlers) authorizeGet(w http.ResponseWriter, r *http.Request) {
 	scope := q.Get("scope")
 	if scope != "mcp" {
 		scope = "mcp"
+	}
+	// A signed-out browser gets the sign-in step, not the consent page
+	// (tether#153) — see signInTmpl for why the consent page was a dead end.
+	//
+	// This sits AFTER request validation and BEFORE StorePending, and both halves
+	// are deliberate. After validation, because a malformed authorization request
+	// is malformed whether or not anyone is signed in, and a login prompt would
+	// only replay the same error once the round trip finished. Before
+	// StorePending, because a record created here would be an orphan: the browser
+	// returns through this same handler and stores a fresh one.
+	if h.session == nil || !h.session(r) {
+		h.log.Info("oauth.authorize.signin_required", "client_id", clientID, "remote_ip", remoteIP(r))
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = signInTmpl.Execute(w, struct {
+			ClientID string
+			AuthURL  string
+		}{clientID, signInURL(r.URL.RawQuery)})
+		return
 	}
 	reqID, err := h.codes.StorePending(clientID, redirectURI, challenge, scope, state)
 	if err != nil {

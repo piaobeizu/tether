@@ -64,10 +64,17 @@ func s256(verifier string) string {
 	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
-// authorizeGetReqID performs step 1 of the chain and returns the req_id from the
-// consent page. No cookie: the GET exemption is deliberate.
-func authorizeGetReqID(t *testing.T, mux http.Handler, challenge string) string {
-	t.Helper()
+// signInAnchor appears only on the sign-in prompt tether#153 renders for a
+// cookie-less GET. Reaching it through the real mux is what proves the two
+// halves are still wired the way they are meant to be: the middleware's GET
+// exemption has to let the request through (a middleware that gated GET too
+// would answer 302 /auth and the handler would never run), and the handler has to
+// be the one that decides what a signed-out browser sees.
+const signInAnchor = `id="oauth-signin-continue"`
+
+// authorizeGetStep builds step 1 of the chain. cookie is the tether_session
+// value, or "" for the cookie-less shape.
+func authorizeGetStep(challenge, cookie string) *http.Request {
 	v := url.Values{
 		"response_type":         {"code"},
 		"client_id":             {"attacker-cli"},
@@ -75,8 +82,22 @@ func authorizeGetReqID(t *testing.T, mux http.Handler, challenge string) string 
 		"code_challenge":        {challenge},
 		"code_challenge_method": {"S256"},
 	}
+	req := httptest.NewRequest("GET", "/oauth/authorize?"+v.Encode(), nil)
+	req.RemoteAddr = "203.0.113.7:44444" // a remote peer, as on a --acme-domain deployment
+	if cookie != "" {
+		req.AddCookie(&http.Cookie{Name: auth.CookieName, Value: cookie})
+	}
+	return req
+}
+
+// authorizeGetReqID performs step 1 of the chain and returns the req_id from the
+// consent page. The cookie is required since tether#153: the endpoint is still
+// exempt from the middleware, but a signed-out browser is shown the sign-in
+// prompt rather than a consent form, so there is no req_id to be had without one.
+func authorizeGetReqID(t *testing.T, mux http.Handler, challenge, cookie string) string {
+	t.Helper()
 	rr := httptest.NewRecorder()
-	mux.ServeHTTP(rr, httptest.NewRequest("GET", "/oauth/authorize?"+v.Encode(), nil))
+	mux.ServeHTTP(rr, authorizeGetStep(challenge, cookie))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("step 1 (GET consent page): want 200, got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -84,7 +105,7 @@ func authorizeGetReqID(t *testing.T, mux http.Handler, challenge string) string 
 	const marker = `name="req_id" value="`
 	i := strings.Index(body, marker)
 	if i < 0 {
-		t.Fatal("step 1: no req_id in the consent page")
+		t.Fatalf("step 1: no req_id in the consent page:\n%s", body)
 	}
 	rest := body[i+len(marker):]
 	return rest[:strings.Index(rest, `"`)]
@@ -112,12 +133,44 @@ func consentPost(reqID, cookie, origin string) *http.Request {
 }
 
 // TestOAuthMintChain_NoCredentials_YieldsNoToken replays all three requests with
-// zero credentials and asserts the chain dies at step 2.
+// zero credentials and asserts no token exists at the end.
+//
+// Since tether#153 the chain dies twice over: step 1 no longer yields a req_id
+// without a cookie, and step 2 still refuses one that was obtained with a cookie
+// and spent without. Both are asserted, because the first is a UX change and only
+// the second is load-bearing — a later revision that reopened step 1 must not be
+// able to quietly take the mint gate with it.
 func TestOAuthMintChain_NoCredentials_YieldsNoToken(t *testing.T) {
-	mux, tokens, _ := mintChainMux(t)
+	mux, tokens, cookie := mintChainMux(t)
 	const verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
 
-	reqID := authorizeGetReqID(t, mux, s256(verifier))
+	// Step 1, with no credentials, now ends the chain here (tether#153): there is
+	// no consent form, so there is no req_id to carry into step 2.
+	//
+	// The status is what separates the two ways this could look identical from
+	// the outside. 401 with the prompt in the body means the middleware still
+	// exempts GET and the handler answered; 302 would mean the exemption is gone
+	// and the middleware answered, which is the change tether#117 A1 explicitly
+	// warned against making to "fix" this dead end.
+	rr1 := httptest.NewRecorder()
+	mux.ServeHTTP(rr1, authorizeGetStep(s256(verifier), ""))
+	if rr1.Code != http.StatusUnauthorized {
+		t.Fatalf("step 1 without a cookie: want 401 from the handler, got %d (302 would mean the middleware's GET exemption was dropped): %s",
+			rr1.Code, rr1.Header().Get("Location"))
+	}
+	if !strings.Contains(rr1.Body.String(), signInAnchor) {
+		t.Errorf("step 1 should render the sign-in prompt:\n%s", rr1.Body.String())
+	}
+	if strings.Contains(rr1.Body.String(), `name="req_id"`) {
+		t.Error("step 1 handed a req_id to a caller with no credentials")
+	}
+
+	// The POST gate is the load-bearing one and has to hold on its own, so the
+	// rest of the chain is replayed against a req_id that really exists. A req_id
+	// is not a credential — it is a lookup key the owner's own browser was shown —
+	// so obtaining one with a cookie and spending it without one is exactly the
+	// attack step 2 must refuse.
+	reqID := authorizeGetReqID(t, mux, s256(verifier), cookie)
 
 	// Step 2 — the mint. This is the request that used to answer 302 with the
 	// code sitting in the Location header, which is why the redirect_uri above
@@ -165,7 +218,7 @@ func TestOAuthMintChain_WithSession_StillIssuesAToken(t *testing.T) {
 	mux, tokens, cookie := mintChainMux(t)
 	const verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
 
-	reqID := authorizeGetReqID(t, mux, s256(verifier))
+	reqID := authorizeGetReqID(t, mux, s256(verifier), cookie)
 
 	rr := httptest.NewRecorder()
 	// The browser shape: the real consent form is served from this daemon, so it
@@ -227,6 +280,15 @@ func TestOAuthMintChain_WTTicketCookie_YieldsNoToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A real session cookie, used for step 1 only. Since tether#153 the consent
+	// page needs one, and a wt-ticket is not one — which is the very thing this
+	// test is about, so the ticket cannot double as it. Handing step 1 a genuine
+	// cookie also keeps the question sharp: the ticket is refused at the mint on
+	// its own merits, not because the chain never got that far.
+	sessionCookie, err := auth.IssueJWT(secret, "owner-browser")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	tokens, err := apitoken.Open(filepath.Join(t.TempDir(), "api-tokens.json"))
 	if err != nil {
@@ -238,7 +300,7 @@ func TestOAuthMintChain_WTTicketCookie_YieldsNoToken(t *testing.T) {
 		nil, nil, oauthH, cfg.MCPLifecycle)
 
 	const verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
-	reqID := authorizeGetReqID(t, mux, s256(verifier))
+	reqID := authorizeGetReqID(t, mux, s256(verifier), sessionCookie)
 
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, consentPost(reqID, ticket, "https://127.0.0.1:8899"))

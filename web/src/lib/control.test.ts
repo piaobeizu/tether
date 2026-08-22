@@ -54,30 +54,46 @@ describe('ControlClient.sendResize', () => {
     sent = captureWriter(client)
   })
 
-  it('sends a resize frame carrying the session id and the given dimensions', async () => {
-    await client.sendResize('sid-42', 143, 41)
+  it('sends a resize frame carrying the session id, the shell id and the given dimensions', async () => {
+    await client.sendResize('sid-42', 'sh-abc', 143, 41)
 
     expect(sent).toHaveLength(1)
     expect(sent[0]).toEqual({
       kind: ClientFrameResize,
       sessionId: 'sid-42',
+      shellId: 'sh-abc',
       cols: 143,
       rows: 41,
     })
   })
 
+  // The shell id is the whole of tether#150 on this side: two tabs on one
+  // session send frames that differ ONLY here, and a frame that dropped it
+  // would be applied to whichever tab connected last. Asserted as its own case
+  // so it cannot be lost in an `toEqual` someone loosens later.
+  it('distinguishes two shells on one session by shell id alone', async () => {
+    await client.sendResize('sid-42', 'sh-tab-one', 100, 30)
+    await client.sendResize('sid-42', 'sh-tab-two', 100, 30)
+
+    expect(sent.map((f) => f.shellId)).toEqual(['sh-tab-one', 'sh-tab-two'])
+    expect(sent.map((f) => f.sessionId)).toEqual(['sid-42', 'sid-42'])
+  })
+
   // 143 !== 41 above, so a transposed cols/rows would fail that assertion; this
   // pins the orientation explicitly so the intent survives a future refactor.
   it('does not transpose cols and rows', async () => {
-    await client.sendResize('s', 200, 50)
+    await client.sendResize('s', 'sh-1', 200, 50)
     expect(sent[0].cols).toBe(200)
     expect(sent[0].rows).toBe(50)
   })
 
   it('keeps the empty session id — a shell can exist before any chat session', async () => {
-    await client.sendResize('', 80, 24)
+    await client.sendResize('', 'sh-1', 80, 24)
     expect(sent).toHaveLength(1)
     expect(sent[0].sessionId).toBe('')
+    // …and the shell is still named, which is what keeps a pre-session shell
+    // routable once a second one opens.
+    expect(sent[0].shellId).toBe('sh-1')
   })
 
   it.each([
@@ -86,13 +102,13 @@ describe('ControlClient.sendResize', () => {
     ['both zero', 0, 0],
     ['negative', -1, 24],
   ])('drops %s instead of blanking the remote TUI', async (_name, cols, rows) => {
-    await client.sendResize('sid', cols, rows)
+    await client.sendResize('sid', 'sh-1', cols, rows)
     expect(sent).toHaveLength(0)
   })
 
   it('is a no-op when the control lane is not connected', async () => {
     const disconnected = new ControlClient()
-    await expect(disconnected.sendResize('sid', 80, 24)).resolves.toBeUndefined()
+    await expect(disconnected.sendResize('sid', 'sh-1', 80, 24)).resolves.toBeUndefined()
   })
 })
 

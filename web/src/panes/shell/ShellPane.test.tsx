@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import ShellPane from './index'
+import { ShellQueryParam } from '../../lib/wire.gen'
 
 /**
  * tether#151 — the pane used to die in silence, and this file is the assertion
@@ -247,5 +248,44 @@ describe('ShellPane — the pane says what happened when the shell goes away (te
     // other assertion here.
     expect(container.querySelectorAll('.xterm')).toHaveLength(1)
     expect(shell.closes).toBe(1)
+  })
+
+  /**
+   * tether#150 — the pane has to tell the daemon WHICH shell it is, because a
+   * session can now have one per tab and one per device, and a resize that named
+   * only the session was applied to whichever connected last.
+   *
+   * Read off the /wt/shell URL rather than off a resize frame: xterm's onResize
+   * needs a real layout engine (see the note where control is mocked above), and
+   * the id on the URL is the same closure variable the frame carries — the pane
+   * mints it once and uses it in both places. The frame half is asserted in
+   * lib/control.test.ts, and the parameter NAME cannot drift from the daemon's
+   * because both sides read it from the generated wire module, which is why
+   * ShellQueryParam is imported here rather than typed out.
+   */
+  const shellIdOf = (url: string) =>
+    new URL(url, 'https://example.invalid').searchParams.get(ShellQueryParam)
+
+  it('names its shell on the /wt/shell URL', async () => {
+    const { shell } = await mountLive()
+    // THE DEFECT'S VALUE: null. The pre-#150 pane sent sid, cols and rows and
+    // nothing that identified the connection.
+    expect(shellIdOf(shell.url)).toBeTruthy()
+  })
+
+  it('gives the replacement shell a different id from the one it replaced', async () => {
+    const { shell } = await mountLive()
+    const first = shellIdOf(shell.url)
+
+    shell.endStream()
+    await settle()
+    await act(async () => { fireEvent.click(screen.getByText(RESTART_LABEL)) })
+    await settle()
+
+    const second = shellIdOf(wtFixture.instances[1].url)
+    expect(second).toBeTruthy()
+    // A constant would put both PTYs under one id and hand the daemon the
+    // ambiguity this parameter exists to remove.
+    expect(second).not.toBe(first)
   })
 })

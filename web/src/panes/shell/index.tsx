@@ -4,6 +4,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import { useStore } from '../../lib/store'
 import { createWT } from '../../lib/wt'
 import { activeControlClient } from '../../lib/control'
+import { ShellQueryParam } from '../../lib/wire.gen'
 
 // ── What this pane can, and cannot, tell the user about an ending (tether#151) ─
 //
@@ -69,6 +70,28 @@ const SHELL_RESTART_LABEL = 'Start a new shell'
 /** A finished connection, as shown to the user. `null` while one is live. */
 type ShellEnd = { headline: string; detail: string }
 
+/**
+ * A fresh id for one /wt/shell connection, sent on its URL and on every resize
+ * frame it later produces (tether#150).
+ *
+ * It has to be unique across the DAEMON, not just across this tab, because the
+ * thing it disambiguates is two tabs (or two devices) holding a shell on the SAME
+ * session — which is what tether#121 made possible by removing the shell lock. A
+ * per-tab counter would hand both tabs "1" and route both panes' resizes to one
+ * PTY, i.e. leave the bug in place while looking like a fix. Hence the clock and
+ * the random suffix; the counter only keeps two shells opened in the same
+ * millisecond by the same tab apart.
+ *
+ * Not crypto.randomUUID(): this is an opaque routing token the daemon never
+ * trusts for anything (Registry.ResizeShell matches it WITHIN a session it has
+ * already authenticated), and randomUUID is unavailable in a non-secure context.
+ */
+let shellSeq = 0
+function newShellId(): string {
+  shellSeq += 1
+  return `sh-${Date.now().toString(36)}-${shellSeq}-${Math.random().toString(36).slice(2, 8)}`
+}
+
 export default function ShellPane() {
   const containerRef = useRef<HTMLDivElement>(null)
   const { sessionId } = useStore()
@@ -120,17 +143,27 @@ export default function ShellPane() {
     refit()
 
     const sid = sessionId ?? ''
+    // One id per connection — minted here, in the same closure that puts it on
+    // the /wt/shell URL below and on every resize frame, so the two can never
+    // name different shells. A restart or a session switch re-runs this effect
+    // and therefore mints a new one, which is correct: it is a different PTY.
+    const shellId = newShellId()
 
     // Report every size xterm settles on so the daemon can retarget the PTY
     // (tether#68). Before this, fit() resized only the browser's view while the
     // remote TUI kept rendering for the size the PTY was started at — which is
     // what produced the clipped, overlapping Shell output.
     //
+    // Named with shellId (tether#150) so the frame is about THIS pane's PTY.
+    // Without it the daemon can only apply a resize to the session's most
+    // recently opened shell, so a second tab silently took over the first tab's
+    // sizing.
+    //
     // No debounce: xterm fires onResize only when the computed cols/rows
     // actually change, so dragging the divider across many pixels still emits
     // at most one frame per column crossed.
     term.onResize(({ cols, rows }) => {
-      void activeControlClient()?.sendResize(sid, cols, rows)
+      void activeControlClient()?.sendResize(sid, shellId, cols, rows)
     })
 
     let wt: WebTransport | null = null
@@ -158,6 +191,10 @@ export default function ShellPane() {
     const connect = async () => {
       const q = new URLSearchParams()
       if (sid) q.set('sid', sid)
+      // The param NAME comes from the generated wire module, not from a literal
+      // here: the daemon reads it with the same constant, so a rename cannot
+      // leave one side listening for a key the other stopped sending.
+      q.set(ShellQueryParam, shellId)
       // Start the PTY at the size we are already displaying. Relying on the
       // first resize frame instead would paint one screenful at the kernel
       // default and then reflow it, and would leave the size wrong for the

@@ -379,6 +379,484 @@ func TestOverlayWrites_RefuseARegistryEntryWhoseIDEscapesThePluginsDir(t *testin
 	}
 }
 
+// -- tether#156: nothing BELOW the root was ever checked ---------------------
+//
+// tether#142 made the overlay's directory come from the registry instead of from
+// the request body, and the change that shipped it asserted that an overlay can
+// only be written into a directory the registry holds. That sentence was not
+// true. No component between the workspace root and the link was ever lstat'd,
+// so a symlink at either of the two of them redirected os.MkdirAll, os.Symlink
+// AND os.Remove out of the workspace — a write primitive and a delete primitive,
+// anywhere on the host, for a caller that can put one link inside a workspace it
+// is allowed to use. Not one of the 21 tests tether#142 added planted a link,
+// which is exactly why they all stayed green over it.
+//
+// Every test in this section was run against the unfixed tree first (with only
+// the new error sentinels declared, so that it compiled) and observed to fail
+// there. The failures are recorded per test, and they are the ESCAPE — an entry
+// created outside the root, a file deleted outside the root — not merely a
+// missing error value.
+
+// resolvedTempDir is t.TempDir() with every symlink resolved.
+//
+// A containment assertion compares a path against the registered root, so a
+// fixture root that itself passes through a link (macOS resolves TMPDIR through
+// /private) would make the comparison answer about the fixture instead of about
+// the code — in either direction, and silently. Resolving once here also gives
+// the fixture the shape production has: workspace.Add stores canonicalPath's
+// output, which is resolved whenever it can be.
+func resolvedTempDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q): %v", dir, err)
+	}
+	return resolved
+}
+
+// escapeLayer is one of the two directory components between the registered root
+// and the overlay link. Both are inside a workspace the caller is entitled to
+// use, both are followed by every filesystem call the overlay makes, and the fix
+// has to refuse at both — which is why they are a table and not one test.
+type escapeLayer struct {
+	name string
+	// seed plants the symlink and returns the directory the overlay lands in when
+	// that link is followed.
+	seed func(t *testing.T, root, outside string) (landing string)
+}
+
+func escapeLayers() []escapeLayer {
+	return []escapeLayer{
+		{
+			// The overlay's OWN directory is the link.
+			name: "the plugins directory is a symlink",
+			seed: func(t *testing.T, root, outside string) string {
+				t.Helper()
+				if err := os.MkdirAll(filepath.Join(root, ".claude"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outside, filepath.Join(root, ".claude", "plugins")); err != nil {
+					t.Fatal(err)
+				}
+				return outside
+			},
+		},
+		{
+			// Its PARENT is the link, so MkdirAll creates `plugins` on the far side.
+			name: "the .claude directory is a symlink",
+			seed: func(t *testing.T, root, outside string) string {
+				t.Helper()
+				if err := os.Symlink(outside, filepath.Join(root, ".claude")); err != nil {
+					t.Fatal(err)
+				}
+				return filepath.Join(outside, "plugins")
+			},
+		},
+	}
+}
+
+// TestEnable_RefusesToFollowASymlinkOutOfTheWorkspace.
+//
+// Observed on the unfixed tree, both rows: Enable returned nil and the directory
+// outside the workspace gained an entry — the skill id for the first layer
+// (`<outside>/<skillID>` → the skill source), `plugins` for the second
+// (`<outside>/plugins/<skillID>`). Post-fix that directory holds zero entries and
+// the call returns ErrOverlayEscapesWorkspace.
+//
+// The count is the assertion that answers "what is this value when the defect is
+// present", and it is checked BEFORE the error so a failure reports the escape
+// itself rather than the symptom.
+func TestEnable_RefusesToFollowASymlinkOutOfTheWorkspace(t *testing.T) {
+	for _, layer := range escapeLayers() {
+		t.Run(layer.name, func(t *testing.T) {
+			sk, src := installedSkill(t, "cccc000000000001")
+			root := resolvedTempDir(t)
+			outside := resolvedTempDir(t)
+			layer.seed(t, root, outside)
+
+			r := newTestRegistry(t, fakeIndex{"ws1": root}, sk)
+			err := r.Enable(sk.ID, "ws1")
+
+			entries, readErr := os.ReadDir(outside)
+			if readErr != nil {
+				t.Fatalf("read the directory outside the workspace: %v", readErr)
+			}
+			if len(entries) != 0 {
+				names := make([]string, 0, len(entries))
+				for _, e := range entries {
+					names = append(names, e.Name())
+				}
+				overlayDir := filepath.Join(root, ".claude", "plugins")
+				landed, _ := filepath.EvalSymlinks(overlayDir)
+				t.Errorf("Enable created %v inside %s, which is OUTSIDE the registered workspace %s\n"+
+					"  the overlay directory %s resolves to %s\n"+
+					"  the link points at the skill source %s\n"+
+					"  so an authenticated caller who can place one symlink inside a workspace it may "+
+					"use has a write primitive anywhere this daemon's user can write",
+					names, outside, root, overlayDir, landed, src)
+			}
+			if !errors.Is(err, ErrOverlayEscapesWorkspace) {
+				t.Errorf("Enable with %s: error = %v, want ErrOverlayEscapesWorkspace", layer.name, err)
+			}
+		})
+	}
+}
+
+// TestDisable_RefusesToFollowASymlinkOutOfTheWorkspace — the same two layers on
+// the delete path, which is the half that is easy to forget: Disable's os.Remove
+// walks the identical join.
+//
+// Observed on the unfixed tree, both rows: Disable returned nil and the victim
+// file outside the workspace was gone. It is a plain file rather than a link so
+// that its destruction cannot be confused with os.Remove correctly unlinking a
+// symlink.
+func TestDisable_RefusesToFollowASymlinkOutOfTheWorkspace(t *testing.T) {
+	for _, layer := range escapeLayers() {
+		t.Run(layer.name, func(t *testing.T) {
+			sk, _ := installedSkill(t, "cccc000000000002")
+			root := resolvedTempDir(t)
+			outside := resolvedTempDir(t)
+			landing := layer.seed(t, root, outside)
+
+			if err := os.MkdirAll(landing, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			victim := filepath.Join(landing, sk.ID)
+			if err := os.WriteFile(victim, []byte("not this daemon's to delete"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			r := newTestRegistry(t, fakeIndex{"ws1": root}, sk)
+			err := r.Disable(sk.ID, "ws1")
+
+			if _, statErr := os.Lstat(victim); statErr != nil {
+				t.Errorf("Disable deleted %s, which is OUTSIDE the registered workspace %s: %v\n"+
+					"  the same join that writes the overlay also removes it, so an escape on the "+
+					"write path is an arbitrary-delete on the way back", victim, root, statErr)
+			}
+			if !errors.Is(err, ErrOverlayEscapesWorkspace) {
+				t.Errorf("Disable with %s: error = %v, want ErrOverlayEscapesWorkspace", layer.name, err)
+			}
+		})
+	}
+}
+
+// TestOverlayWrites_RefuseARegisteredPathThatIsNotItsOwnResolution — the root's
+// own half of the same defect.
+//
+// workspace.canonicalPath resolves symlinks when it can and silently keeps the
+// unresolved absolute path when it cannot (a directory that did not exist yet, a
+// volume that was not mounted), which is the right policy there — it matches cc's
+// own, and it is what lets a not-yet-created directory be bookmarked. It means
+// the stored string is a best-effort answer, and this package is where that
+// maybe has to stop: an overlay write measures containment against the stored
+// path, so the stored path has to BE the directory, not a name for it.
+//
+// Verified rather than sanitised: the legal form is "a path that resolves to
+// itself", which is one comparison, instead of a list of the ways a path can
+// name something else.
+//
+// Observed on the unfixed tree: enable returned nil and `<real>/.claude` existed.
+func TestOverlayWrites_RefuseARegisteredPathThatIsNotItsOwnResolution(t *testing.T) {
+	sk, _ := installedSkill(t, "cccc000000000003")
+	base := resolvedTempDir(t)
+	real := filepath.Join(base, "real")
+	if err := os.Mkdir(real, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	registered := filepath.Join(base, "registered-through-a-link")
+	if err := os.Symlink(real, registered); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, name := range []string{"enable", "disable"} {
+		t.Run(name, func(t *testing.T) {
+			r := newTestRegistry(t, fakeIndex{"ws1": registered}, sk)
+			var err error
+			if name == "enable" {
+				err = r.Enable(sk.ID, "ws1")
+			} else {
+				err = r.Disable(sk.ID, "ws1")
+			}
+
+			entries, readErr := os.ReadDir(real)
+			if readErr != nil {
+				t.Fatalf("read the link's target: %v", readErr)
+			}
+			if len(entries) != 0 {
+				t.Errorf("%s wrote through the registered path's symlink: %s holds %d entries, "+
+					"and the registry says this workspace is at %s", name, real, len(entries), registered)
+			}
+			if !errors.Is(err, ErrOverlayEscapesWorkspace) {
+				t.Errorf("%s into a registered path that resolves elsewhere: error = %v, want ErrOverlayEscapesWorkspace", name, err)
+			}
+		})
+	}
+}
+
+// TestEnable_RefusesAWorkspaceDirectoryThatIsNotThere.
+//
+// A registration is a bookmark — canonicalPath deliberately allows one to a
+// directory that does not exist yet — and creating that directory is not
+// something an overlay write should be able to do. Refusing is also the honest
+// answer to "is this contained": a directory that is not there cannot be
+// resolved, and "I cannot check" must be a refusal rather than a pass.
+//
+// Observed on the unfixed tree: for "not there" Enable returned nil, having
+// created the registered directory and two levels beneath it with os.MkdirAll;
+// for "a regular file" it returned a bare `mkdir <path>: not a directory`, which
+// the HTTP layer called a 500.
+//
+// The two rows are separate because they are refused by separate checks — the
+// second row is the only thing that fails if the "is it a directory" test goes
+// away, since a path that is not there fails to resolve as well.
+func TestEnable_RefusesAWorkspaceDirectoryItCannotUse(t *testing.T) {
+	base := resolvedTempDir(t)
+	regular := filepath.Join(base, "a-file-not-a-directory")
+	if err := os.WriteFile(regular, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, root := range map[string]string{
+		"the directory is not there": filepath.Join(base, "never-created"),
+		"it is a regular file":       regular,
+	} {
+		t.Run(name, func(t *testing.T) {
+			sk, _ := installedSkill(t, "cccc000000000004")
+			r := newTestRegistry(t, fakeIndex{"ws1": root}, sk)
+
+			err := r.Enable(sk.ID, "ws1")
+
+			if !errors.Is(err, ErrWorkspaceDirUnusable) {
+				t.Errorf("Enable into a registered path where %s: error = %v, want ErrWorkspaceDirUnusable", name, err)
+			}
+			// Discriminating for the first row only — os.MkdirAll used to create the
+			// registered directory and both levels under it — and kept for the
+			// second because it costs nothing; there the error identity is the gate.
+			if _, statErr := os.Lstat(filepath.Join(root, ".claude")); statErr == nil {
+				t.Errorf("Enable created %s/.claude; a registration is a bookmark, and an overlay "+
+					"write must not materialise its target", root)
+			}
+		})
+	}
+}
+
+// TestDisable_IsANoOpWhenTheRegisteredDirectoryIsGone — regression guard, and the
+// companion the test above needs.
+//
+// Removing a link from a tree that is not there is already done, so this must not
+// inherit Enable's refusal: DELETE-ing overlays for a workspace whose directory
+// the user removed is exactly when a caller is tidying up, and an error there
+// would make the tidying impossible. It also must not CREATE the tree on the way
+// to discovering there is nothing to remove.
+func TestDisable_IsANoOpWhenTheRegisteredDirectoryIsGone(t *testing.T) {
+	sk, _ := installedSkill(t, "cccc000000000005")
+	root := filepath.Join(resolvedTempDir(t), "never-created")
+	r := newTestRegistry(t, fakeIndex{"ws1": root}, sk)
+
+	if err := r.Disable(sk.ID, "ws1"); err != nil {
+		t.Errorf("Disable against a registered directory that is not on disk: error = %v, want nil", err)
+	}
+	if _, statErr := os.Lstat(root); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("Disable created %s on its way to finding nothing to remove (Lstat = %v)", root, statErr)
+	}
+}
+
+// TestEnable_RefusesWhenTheOverlayNameIsOccupied.
+//
+// `_ = os.Remove(link)` discarded the one failure it could actually hit. A
+// non-empty directory at the overlay's name fails ENOTEMPTY, the discarded error
+// left the name in place, and os.Symlink then failed EEXIST — which the HTTP
+// layer mapped to 500 with the daemon's own absolute path in the body. Three
+// wrong answers from one swallowed error: a caller-visible state reported as a
+// daemon fault, an unactionable message, and a path disclosure.
+//
+// Observed on the unfixed tree: error = "symlink <src> <link>: file exists"
+// (*os.LinkError), matching neither sentinel.
+func TestEnable_RefusesWhenTheOverlayNameIsOccupied(t *testing.T) {
+	sk, _ := installedSkill(t, "cccc000000000006")
+	root := resolvedTempDir(t)
+	occupied := filepath.Join(root, ".claude", "plugins", sk.ID)
+	if err := os.MkdirAll(occupied, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	keep := filepath.Join(occupied, "someone-elses-plugin.json")
+	if err := os.WriteFile(keep, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	r := newTestRegistry(t, fakeIndex{"ws1": root}, sk)
+	err := r.Enable(sk.ID, "ws1")
+
+	if !errors.Is(err, ErrOverlayLocationOccupied) {
+		t.Errorf("Enable onto an occupied name: error = %v, want ErrOverlayLocationOccupied", err)
+	}
+	if _, statErr := os.Stat(keep); statErr != nil {
+		t.Errorf("the occupant's contents were destroyed: %v", statErr)
+	}
+}
+
+// TestEnable_ReplacesAStaleLinkButNotADirectory — the companion that keeps the
+// test above from being satisfied by an Enable that refuses everything it finds.
+// A stale SYMLINK is exactly what os.Remove is there to clear, and clearing it
+// must survive the new refusal (TestEnable_ReplacesAStaleLink covers the
+// same-target case; this one changes the target so the replacement is visible).
+func TestEnable_ReplacesAStaleLinkButNotADirectory(t *testing.T) {
+	sk, src := installedSkill(t, "cccc000000000007")
+	root := resolvedTempDir(t)
+	plugins := filepath.Join(root, ".claude", "plugins")
+	if err := os.MkdirAll(plugins, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "somewhere-else"), filepath.Join(plugins, sk.ID)); err != nil {
+		t.Fatal(err)
+	}
+
+	r := newTestRegistry(t, fakeIndex{"ws1": root}, sk)
+	if err := r.Enable(sk.ID, "ws1"); err != nil {
+		t.Fatalf("Enable over a stale link: %v", err)
+	}
+	if got, err := os.Readlink(filepath.Join(plugins, sk.ID)); err != nil || got != src {
+		t.Fatalf("link -> %q (err %v), want the current source %q", got, err, src)
+	}
+}
+
+// TestEnable_CreatesTheOverlayDirectoriesPrivate.
+//
+// 0o700, the mode NewRegistry already uses for ~/.tether and ~/.tether/skills.
+// The overlay is daemon state that happens to live inside a user directory, and
+// it names, by directory entry, every skill enabled for that workspace; there is
+// no reader of it but cc, running as this daemon's user.
+//
+// Observed on the unfixed tree: 0o755 for both, from a single os.MkdirAll.
+// Only directories this call creates are affected — an existing `.claude` that cc
+// made is left exactly as it is.
+func TestEnable_CreatesTheOverlayDirectoriesPrivate(t *testing.T) {
+	sk, _ := installedSkill(t, "cccc000000000008")
+	root := resolvedTempDir(t)
+	r := newTestRegistry(t, fakeIndex{"ws1": root}, sk)
+
+	if err := r.Enable(sk.ID, "ws1"); err != nil {
+		t.Fatalf("Enable: %v", err)
+	}
+	for _, rel := range []string{".claude", filepath.Join(".claude", "plugins")} {
+		fi, err := os.Lstat(filepath.Join(root, rel))
+		if err != nil {
+			t.Fatalf("Lstat %s: %v", rel, err)
+		}
+		if got := fi.Mode().Perm(); got != 0o700 {
+			t.Errorf("%s created with mode %04o, want 0700 — the same mode NewRegistry gives ~/.tether", rel, got)
+		}
+	}
+}
+
+// TestDisableAll_RemovesTheOverlaysThisDaemonCreated is the teardown
+// DELETE /api/v1/workspaces/{id} needs: the registration is what authorised every
+// one of these links, so the registration going away has to take them with it.
+// Once the record is gone the id stops resolving and Disable can no longer reach
+// them at all, which is what made the leftovers unreachable rather than merely
+// untidy.
+//
+// The two bystanders are the reason this is a removal and not a wipe of the
+// plugins directory: a name this daemon never issued is not this daemon's to
+// delete, whether it is a file or a link.
+func TestDisableAll_RemovesTheOverlaysThisDaemonCreated(t *testing.T) {
+	one, _ := installedSkill(t, "dddd000000000001")
+	two, _ := installedSkill(t, "dddd000000000002")
+	root := resolvedTempDir(t)
+	r := newTestRegistry(t, fakeIndex{"ws1": root}, one, two)
+
+	for _, sk := range []Skill{one, two} {
+		if err := r.Enable(sk.ID, "ws1"); err != nil {
+			t.Fatalf("Enable %s: %v", sk.ID, err)
+		}
+	}
+	plugins := filepath.Join(root, ".claude", "plugins")
+	bystanderFile := filepath.Join(plugins, "installed-by-someone-else")
+	if err := os.WriteFile(bystanderFile, []byte("not ours"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bystanderLink := filepath.Join(plugins, "linked-by-someone-else")
+	if err := os.Symlink(root, bystanderLink); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.DisableAll("ws1"); err != nil {
+		t.Fatalf("DisableAll: %v", err)
+	}
+
+	for _, sk := range []Skill{one, two} {
+		if _, err := os.Lstat(filepath.Join(plugins, sk.ID)); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("overlay for %s survived DisableAll (Lstat = %v)", sk.ID, err)
+		}
+	}
+	for _, keep := range []string{bystanderFile, bystanderLink} {
+		if _, err := os.Lstat(keep); err != nil {
+			t.Errorf("DisableAll destroyed %s, which this daemon never created: %v", keep, err)
+		}
+	}
+}
+
+// TestDisableAll_DoesNotFollowASymlinkOutOfTheWorkspace — teardown is a delete
+// primitive too, so it gets the containment property rather than borrowing the
+// caller's trust. It reports success (there is nothing of this daemon's on the
+// far side of a link it would have refused to write through) and touches nothing.
+func TestDisableAll_DoesNotFollowASymlinkOutOfTheWorkspace(t *testing.T) {
+	for _, layer := range escapeLayers() {
+		t.Run(layer.name, func(t *testing.T) {
+			sk, _ := installedSkill(t, "dddd000000000003")
+			root := resolvedTempDir(t)
+			outside := resolvedTempDir(t)
+			landing := layer.seed(t, root, outside)
+			if err := os.MkdirAll(landing, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			victim := filepath.Join(landing, sk.ID)
+			if err := os.WriteFile(victim, []byte("not this daemon's to delete"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			r := newTestRegistry(t, fakeIndex{"ws1": root}, sk)
+			if err := r.DisableAll("ws1"); err != nil {
+				t.Errorf("DisableAll with %s: error = %v, want nil — a workspace whose overlay path "+
+					"escapes must still be removable from the registry", layer.name, err)
+			}
+			if _, statErr := os.Lstat(victim); statErr != nil {
+				t.Errorf("DisableAll deleted %s, OUTSIDE the registered workspace %s: %v", victim, root, statErr)
+			}
+		})
+	}
+}
+
+// TestRemove_RefusesASkillIDThatIsNotInstalled — tether#156 fact 5.
+//
+// DELETE /api/v1/skills/{unknown} answered 204 while enable and disable answered
+// 404 for the same id, and the asymmetry had no test at all: api_test.go only
+// ever deleted an id it had just created. 404 is the semantic that was already
+// written down — "the id in the URL is not a skill; 404 is about the addressed
+// resource" — so the DELETE is what moves, and it moves by reporting the same
+// sentinel the other two do.
+//
+// Observed on the unfixed tree: error = nil.
+func TestRemove_RefusesASkillIDThatIsNotInstalled(t *testing.T) {
+	sk, _ := installedSkill(t, "eeee000000000001")
+	r := newTestRegistry(t, fakeIndex{"ws1": resolvedTempDir(t)}, sk)
+
+	if err := r.Remove("no-such-skill"); !errors.Is(err, ErrUnknownSkill) {
+		t.Errorf("Remove(unknown id) error = %v, want ErrUnknownSkill", err)
+	}
+	if got := r.List(); len(got) != 1 {
+		t.Errorf("List = %+v, want the one installed skill untouched", got)
+	}
+	if err := r.Remove(sk.ID); err != nil {
+		t.Errorf("Remove(installed id) error = %v, want nil", err)
+	}
+	if got := r.List(); len(got) != 0 {
+		t.Errorf("List after removing the installed skill = %+v, want empty", got)
+	}
+}
+
 // -- fact 5: a swallowed load error became a silent, irreversible wipe -------
 
 // TestLoad_DistinguishesAMissingFileFromACorruptOne is the distinction the whole

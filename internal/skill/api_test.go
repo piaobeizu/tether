@@ -231,6 +231,164 @@ func TestOverlayEndpoints_UnavailableWithoutAWorkspaceIndex(t *testing.T) {
 	}
 }
 
+// -- tether#156: the HTTP surface --------------------------------------------
+
+// TestSkillEndpoints_RefuseAnOversizedInstallBody.
+//
+// tether#142 bounded the enable/disable body and left the install handler on the
+// same route file unbounded, which is the more attractive of the two: it is a
+// POST that takes a string the daemon then stores. Same limit, same reason —
+// without one an authenticated request streams unbounded input into a
+// json.Decoder.
+//
+// The padding sits in a field the handler ignores and every field it reads is
+// valid, so nothing but the size limit can refuse this: unfixed, the decoder
+// skipped the padding and answered 201 with a new skill.
+func TestSkillEndpoints_RefuseAnOversizedInstallBody(t *testing.T) {
+	reg := newTestRegistry(t, fakeIndex{"ws1": t.TempDir()})
+	mux := http.NewServeMux()
+	RegisterAPI(mux, reg)
+
+	src := t.TempDir()
+	body := `{"name":"s","sourcePath":"` + src + `","pad":"` + strings.Repeat("A", 1<<20) + `"}`
+	rec := post(t, mux, "/api/v1/skills", body)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST install with a %d-byte body -> %d, want 400; body %q",
+			len(body), rec.Code, strings.TrimSpace(rec.Body.String()))
+	}
+	if got := reg.List(); len(got) != 0 {
+		t.Fatalf("an over-limit install body still registered %+v", got)
+	}
+}
+
+// TestSkillEndpoints_DeleteAnUnknownIDIs404 — tether#156 fact 5, at the wire.
+//
+// DELETE answered 204 for an id that is not installed while enable and disable
+// answered 404 for the same id, and nothing asserted either way: the existing
+// DELETE test only ever removes an id it just created. 404 is the answer the rest
+// of this route file already gives, for the reason its own table states — the id
+// in the URL is not a skill, and 404 is about the addressed resource.
+//
+// Unfixed: 204, indistinguishable from a delete that did something.
+func TestSkillEndpoints_DeleteAnUnknownIDIs404(t *testing.T) {
+	h, sk, _ := serveSkills(t, true)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/skills/not-installed", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("DELETE an uninstalled id -> %d, want 404; body %q", rec.Code, strings.TrimSpace(rec.Body.String()))
+	}
+
+	// The installed id still answers 204 — the refusal has to be about the id,
+	// not about the endpoint.
+	req = httptest.NewRequest(http.MethodDelete, "/api/v1/skills/"+sk.ID, nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Errorf("DELETE an installed id -> %d, want 204; body %q", rec.Code, strings.TrimSpace(rec.Body.String()))
+	}
+}
+
+// TestOverlayEndpoints_ConflictWhenTheLocationIsUnusable.
+//
+// Both rows describe the filesystem the caller can see and can fix, which is
+// what 409 says and what 500 ("this daemon is broken") does not. Unfixed, the
+// first row was a 500 whose body was `symlink <source> <full daemon path>: file
+// exists` and the second was a 204 that had just written outside the workspace.
+func TestOverlayEndpoints_ConflictWhenTheLocationIsUnusable(t *testing.T) {
+	t.Run("the overlay name is occupied", func(t *testing.T) {
+		h, sk, wsDir := serveSkills(t, true)
+		occupied := filepath.Join(wsDir, ".claude", "plugins", sk.ID)
+		if err := os.MkdirAll(occupied, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(occupied, "x.json"), []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		rec := post(t, h, "/api/v1/skills/"+sk.ID+"/enable", `{"workspaceId":"ws1"}`)
+		if rec.Code != http.StatusConflict {
+			t.Errorf("POST enable onto an occupied name -> %d, want 409; body %q", rec.Code, strings.TrimSpace(rec.Body.String()))
+		}
+	})
+
+	t.Run("the overlay path leaves the workspace", func(t *testing.T) {
+		h, sk, wsDir := serveSkills(t, true)
+		outside := t.TempDir()
+		if err := os.Symlink(outside, filepath.Join(wsDir, ".claude")); err != nil {
+			t.Fatal(err)
+		}
+
+		for _, action := range []string{"enable", "disable"} {
+			rec := post(t, h, "/api/v1/skills/"+sk.ID+"/"+action, `{"workspaceId":"ws1"}`)
+			if rec.Code != http.StatusConflict {
+				t.Errorf("POST %s through a symlinked .claude -> %d, want 409; body %q",
+					action, rec.Code, strings.TrimSpace(rec.Body.String()))
+			}
+		}
+		if entries, err := os.ReadDir(outside); err != nil || len(entries) != 0 {
+			t.Errorf("the directory outside the workspace holds %d entries (err %v), want 0", len(entries), err)
+		}
+	})
+}
+
+// TestOverlayEndpoints_DoNotEchoDaemonSideValues.
+//
+// Two separate leaks, both of them values the CALLER did not send:
+//
+//   - the non-absolute refusal quoted the registry's STORED path back at the
+//     requester, who supplied an id;
+//   - every unclassified failure answered 500 with err.Error(), which is how a
+//     `mkdir /some/daemon/path: ...` ends up in an HTTP body.
+//
+// Low severity on its own — an authenticated caller can read the workspace list —
+// but a stable, value-free refusal is also the one that does not change shape
+// when the daemon's internals do. The detail belongs in the daemon's log.
+func TestOverlayEndpoints_DoNotEchoDaemonSideValues(t *testing.T) {
+	t.Run("a registered but non-absolute path", func(t *testing.T) {
+		sk, _ := installedSkill(t, "bbbb000000000002")
+		stored := "some/where/on/the/daemon"
+		reg := newTestRegistry(t, fakeIndex{"ws1": stored}, sk)
+		mux := http.NewServeMux()
+		RegisterAPI(mux, reg)
+
+		rec := post(t, mux, "/api/v1/skills/"+sk.ID+"/enable", `{"workspaceId":"ws1"}`)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("-> %d, want 400; body %q", rec.Code, strings.TrimSpace(rec.Body.String()))
+		}
+		if strings.Contains(rec.Body.String(), stored) {
+			t.Errorf("the refusal echoed the registry's stored path %q back to a caller that sent an id: %q",
+				stored, strings.TrimSpace(rec.Body.String()))
+		}
+	})
+
+	t.Run("an unclassified failure", func(t *testing.T) {
+		// A hand-edited registry entry is the one route to overlayRefusal's default
+		// branch a test can arrange: it is documented as a 500 precisely because it
+		// means this daemon's own skills.json is wrong.
+		//
+		// %2e%2e rather than a literal "..": ServeMux cleans the ESCAPED path while
+		// the handler reads the DECODED one, which is the routing quirk
+		// ErrUnsafeSkillID's own doc describes, and it is what delivers an id of
+		// ".." to a handler at all.
+		reg := newTestRegistry(t, fakeIndex{"ws1": t.TempDir()},
+			Skill{ID: "..", Name: "hand-edited", SourcePath: t.TempDir()})
+		mux := http.NewServeMux()
+		RegisterAPI(mux, reg)
+
+		rec := post(t, mux, "/api/v1/skills/%2e%2e/enable", `{"workspaceId":"ws1"}`)
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("-> %d, want 500; body %q", rec.Code, strings.TrimSpace(rec.Body.String()))
+		}
+		if got := strings.TrimSpace(rec.Body.String()); got != overlayInternalErrorBody {
+			t.Errorf("500 body = %q, want exactly %q — a 500 must not carry err.Error(), which is "+
+				"where daemon-side paths reach a client", got, overlayInternalErrorBody)
+		}
+	})
+}
+
 // TestSkillEndpoints_ListInstallRemoveUnaffected — regression guard. The three
 // endpoints the SPA actually calls are outside this change; folding the two
 // overlay handlers together must not have disturbed the routing around them.

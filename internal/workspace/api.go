@@ -25,6 +25,11 @@ func RegisterAPI(mux *http.ServeMux, reg *Registry) {
 		case http.MethodGet:
 			jsonResp(w, reg.List())
 		case http.MethodPost:
+			// A bound on the body, as auth/middleware.go, server/mcp_tokens.go and
+			// the skill endpoints all have. The payload is two short strings;
+			// without this an authenticated request streams unbounded input into a
+			// json.Decoder (tether#156). 4 KiB is the bound the others use.
+			r.Body = http.MaxBytesReader(w, r.Body, maxWorkspaceBodyBytes)
 			var body struct {
 				Name string `json:"name"`
 				Path string `json:"path"`
@@ -100,12 +105,24 @@ func RegisterAPI(mux *http.ServeMux, reg *Registry) {
 			return
 		}
 		if err := reg.Remove(rest); err != nil {
+			// A registration whose overlays could not be detached is still
+			// registered, and the filesystem state that stopped it is the caller's
+			// to see and to fix — 409, and a retry finishes the job. The wrapped
+			// cause is not sent: it comes from another package's filesystem work and
+			// can name daemon-side paths (tether#156).
+			if errors.Is(err, ErrOverlayCleanup) {
+				http.Error(w, ErrOverlayCleanup.Error(), http.StatusConflict)
+				return
+			}
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
 }
+
+// maxWorkspaceBodyBytes bounds the one JSON body this file decodes.
+const maxWorkspaceBodyBytes = 4096
 
 // handleFiles serves GET /api/v1/workspaces/{id}/files?dir=<rel>.
 func handleFiles(w http.ResponseWriter, r *http.Request, reg *Registry, id string) {

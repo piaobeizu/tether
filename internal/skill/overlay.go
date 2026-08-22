@@ -57,7 +57,60 @@ var (
 	// cleaning and becomes ".." in r.URL.Path. filepath.Join then collapses it, and
 	// the pre-fix Disable removed <workspace>/.claude itself.
 	ErrUnsafeSkillID = errors.New("skill: registry entry has an unsafe id")
+
+	// ErrOverlayEscapesWorkspace — the overlay path does not stay inside the
+	// registered directory, so this daemon cannot show that a write (or a delete)
+	// lands where the registry says it does. tether#156.
+	//
+	// Two shapes reach it, and they are the same defect at two depths:
+	//
+	//   - a component BELOW the root (`.claude`, or `.claude/plugins`) is a
+	//     symlink, or is not a directory at all. os.MkdirAll, os.Symlink and
+	//     os.Remove all follow it, so before this existed an authenticated caller
+	//     who could arrange one link inside a registered workspace could put the
+	//     overlay anywhere on the host — and take it back out again through
+	//     Disable.
+	//   - the ROOT is not its own resolution. workspace.canonicalPath resolves
+	//     symlinks when it can and silently keeps the unresolved absolute path
+	//     when it cannot, so the registry's stored string is only a best-effort
+	//     answer to "where is this workspace". Requiring the stored path to
+	//     resolve to itself is how this package stops inheriting that maybe.
+	ErrOverlayEscapesWorkspace = errors.New("skill: the overlay path leaves the registered workspace directory")
+
+	// ErrOverlayLocationOccupied — the overlay's own name inside the plugins
+	// directory is taken by something this daemon did not create and will not
+	// destroy (a non-empty directory, most concretely).
+	//
+	// A caller-visible state rather than a daemon fault, which is the whole point
+	// of naming it: `_ = os.Remove(link)` swallowed the failure and the EEXIST
+	// from the following os.Symlink surfaced as a 500 carrying the daemon's own
+	// path in the body (tether#156).
+	ErrOverlayLocationOccupied = errors.New("skill: the overlay location is occupied by something this daemon did not create")
+
+	// ErrWorkspaceDirUnusable — the id IS registered, but the directory recorded
+	// for it is not there (or is not a directory), so there is nothing to write
+	// an overlay into.
+	//
+	// Distinct from ErrUnknownWorkspace on purpose: "you named something I do not
+	// have" and "I have it and it is not on disk" send an operator to different
+	// places, which is the same distinction ErrNoWorkspaceIndex draws above.
+	// Enable refuses rather than creating the directory: a registration is a
+	// bookmark, and materialising a bookmark's target is not something an overlay
+	// write should be able to do.
+	ErrWorkspaceDirUnusable = errors.New("skill: the registered workspace directory is not usable")
+
+	// errNoOverlayDir — a component of the overlay directory is simply not there.
+	//
+	// Unexported because no caller is left holding it: Enable never sees it (it
+	// creates what is missing), and Disable and DisableAll turn it into "the link
+	// is already gone", which is what they mean.
+	errNoOverlayDir = errors.New("skill: the overlay directory does not exist")
 )
+
+// overlayComponents are the two path elements between a workspace root and the
+// overlay link. They are a list rather than a joined string because containment
+// is decided one component at a time — see containedPluginsDir.
+var overlayComponents = []string{".claude", "plugins"}
 
 // WorkspaceIndex resolves a client-supplied workspace id to the directory this
 // daemon has on record for it. It is the containment truth source for every
@@ -189,15 +242,14 @@ func isNilIndex(ws WorkspaceIndex) bool {
 // sent. So the path the overlay is resolved against is chosen by the registry
 // rather than by the caller.
 //
-// That is a claim about the PATH, not about the directory it lands in, and the
-// difference is load-bearing. Nothing here — or anywhere in this package — calls
-// Lstat or EvalSymlinks on the path components BELOW the workspace root, so a
-// symlink at the overlay's own directory (or at its parent) redirects the write
-// outside the workspace; os.MkdirAll and os.Symlink follow it, and Disable's
-// os.Remove follows it back out again. Even the root's guarantee is best-effort:
-// workspace.canonicalPath falls back to the unresolved absolute path when
-// EvalSymlinks fails. Resolving that is a containment strategy in its own right
-// and is tracked in tether#147; do not read this function as providing it.
+// That is a claim about the PATH and not yet about the directory it lands in.
+// Until tether#156 the difference was the whole hole: nothing in this package
+// called Lstat or EvalSymlinks on the components BELOW the root, so a symlink at
+// the overlay's own directory (or at its parent) redirected the write outside the
+// workspace — os.MkdirAll and os.Symlink followed it, and Disable's os.Remove
+// followed it back out again. containedPluginsDir is where that is now decided;
+// this function is only the first half, and its result is not a place to write
+// until that one has agreed.
 //
 // # What this does and does not guarantee — stated precisely
 //
@@ -210,9 +262,10 @@ func isNilIndex(ws WorkspaceIndex) bool {
 // What the second request buys is worth naming exactly, because it is the whole
 // benefit: the target must be declared as a workspace first, which puts it in
 // GET /api/v1/workspaces and in the SPA's left pane, so the write is no longer
-// invisible. It is a smaller blast radius plus an audit record, and the record is
-// itself erasable — DELETE /api/v1/workspaces/{id} removes the entry while the
-// symlink it authorised stays on disk.
+// invisible. It is a smaller blast radius plus an audit record — and since
+// tether#156 the record is no longer erasable while its effects stay: DELETE
+// /api/v1/workspaces/{id} detaches the overlays the registration authorised
+// before it drops the entry (see DisableAll).
 //
 // Closing the rest means constraining what POST /api/v1/workspaces will accept,
 // which is a product decision (the workspace pane is a free-text path field) and
@@ -242,6 +295,107 @@ func (r *Registry) workspaceDir(workspaceID string) (string, error) {
 	return dir, nil
 }
 
+// containedPluginsDir resolves <wsDir>/.claude/plugins and refuses anything it
+// cannot show to be inside wsDir. It is tether#156's first and main fix.
+//
+// # Verified, not sanitised
+//
+// It says what a legal overlay directory IS — the registered path, which must
+// already be its own resolution, followed by components that are real
+// directories — instead of listing the ways a path can be made to point
+// elsewhere. A sanitiser is only ever as complete as its author's list of tricks;
+// a definition of the legal form refuses everything that is not it, including the
+// shapes nobody thought of. (tether#117 shipped the other kind in its first draft
+// and had to be corrected: a necessary condition was written as if it were
+// sufficient.)
+//
+// # Why the components are walked instead of MkdirAll plus a check afterwards
+//
+// os.MkdirAll follows links, so by the time a post-hoc check could look, the
+// directories exist on the far side of one and the escape has already happened —
+// a check that fires after the write is a report, not a refusal. Creating each
+// missing component here with os.Mkdir means a component this daemon made cannot
+// be a link, and a component it did not make is inspected before it is used.
+// Nothing is created outside the workspace even on the refused path.
+//
+// For the same reason there is no second, post-hoc containment check: it would be
+// a redundant mechanism for one condition (and this file already argues that
+// three checks for one condition is not depth), and it could not close the gap
+// below anyway.
+//
+// # What it does not close, stated rather than implied
+//
+// Between the Lstat here and the os.Symlink that follows, something already able
+// to write inside the workspace could swap a component for a link. Closing that
+// needs openat2/O_NOFOLLOW rather than os and path/filepath. It is a strictly
+// smaller window than the one this removes — arranging a link and then racing the
+// request, versus arranging a link and taking as long as you like.
+//
+// # The root
+//
+// The root's own symlinks are RESOLVED and then required to have been resolved
+// already: EvalSymlinks must succeed and must return wsDir unchanged. That is
+// what stops this package inheriting workspace.canonicalPath's silent fallback —
+// it keeps the unresolved absolute path when resolution fails, correctly (it
+// matches cc's behaviour and it is what lets a not-yet-created directory be
+// bookmarked), which leaves the stored string a best-effort answer to "where is
+// this workspace". A stored path that resolves somewhere else is refused here
+// rather than followed, so the directory written into is the exact string the
+// registry hands out and the exact string GET /api/v1/workspaces shows.
+//
+// Where the root may itself POINT is a different question — it is decided by what
+// POST /api/v1/workspaces accepts, and that is tether#147's to answer.
+func containedPluginsDir(wsDir string, create bool) (string, error) {
+	// Ordered so that each refusal has one cause. "Is it there, and is it a
+	// directory" first, because a missing or non-directory root has nothing to do
+	// with containment and should not be reported as an escape; only then "is it
+	// the directory the registry named", which is the containment question.
+	if fi, err := os.Stat(wsDir); err != nil || !fi.IsDir() {
+		return "", fmt.Errorf("%w: %q", ErrWorkspaceDirUnusable, wsDir)
+	}
+	resolved, err := filepath.EvalSymlinks(wsDir)
+	if err != nil {
+		// Near-unreachable: the os.Stat above already followed every component of
+		// this path. Kept rather than ignored because "I cannot check" has to be a
+		// refusal — a fall-through here would be the silent best-effort this
+		// function exists to stop inheriting.
+		return "", fmt.Errorf("%w: %q cannot be resolved: %w", ErrWorkspaceDirUnusable, wsDir, err)
+	}
+	if resolved != wsDir {
+		return "", fmt.Errorf("%w: the registered path %q resolves to %q", ErrOverlayEscapesWorkspace, wsDir, resolved)
+	}
+
+	dir := wsDir
+	for _, name := range overlayComponents {
+		next := filepath.Join(dir, name)
+		fi, err := os.Lstat(next)
+		switch {
+		case err == nil && fi.Mode().IsDir():
+			// A real directory. Lstat does not follow, and Mode().IsDir() is false
+			// for the link itself, so this branch is exactly "not a symlink".
+		case err == nil:
+			return "", fmt.Errorf("%w: %q is a %s, not a directory",
+				ErrOverlayEscapesWorkspace, next, fi.Mode().Type())
+		case errors.Is(err, fs.ErrNotExist):
+			if !create {
+				return "", fmt.Errorf("%w: %q", errNoOverlayDir, next)
+			}
+			// 0o700, the mode NewRegistry gives ~/.tether and ~/.tether/skills.
+			// This is daemon state that happens to live in a user's directory, its
+			// entries name every skill enabled for that workspace, and its only
+			// reader is cc running as this daemon's user. Directories that already
+			// exist are left exactly as they are — cc creates .claude itself.
+			if mkErr := os.Mkdir(next, 0o700); mkErr != nil {
+				return "", fmt.Errorf("mkdir %q: %w", next, mkErr)
+			}
+		default:
+			return "", fmt.Errorf("lstat %q: %w", next, err)
+		}
+		dir = next
+	}
+	return dir, nil
+}
+
 // lookup finds an installed skill by id.
 //
 // It returns a COPY, and that is a fix rather than a style choice: Enable used to
@@ -260,8 +414,9 @@ func (r *Registry) lookup(skillID string) (Skill, error) {
 	return Skill{}, fmt.Errorf("%w: %q", ErrUnknownSkill, skillID)
 }
 
-// overlayLink is the one place the overlay's target path is spelled, so Enable
-// and Disable cannot disagree about where a link lives — which is how the
+// overlayLink is the one place the overlay's target path is spelled AND the one
+// place it is checked, so Enable and Disable cannot disagree about where a link
+// lives or about whether they are allowed to touch it — which is how the
 // tether#142 asymmetry arose in the first place.
 //
 // The single-element check on skillID makes the containment of the FILENAME
@@ -271,11 +426,22 @@ func (r *Registry) lookup(skillID string) (Skill, error) {
 // today, but neither is a statement about this join, and load() validates nothing
 // it reads from disk. One line here means a hand-edited skills.json cannot
 // re-arm a traversal that used to be reachable over HTTP (see ErrUnsafeSkillID).
-func overlayLink(workspaceDir, skillID string) (string, error) {
+// The skill id is checked FIRST, before the workspace is resolved and therefore
+// before containedPluginsDir can create anything. A request refused on its id
+// must not leave directories behind that only that request caused.
+func (r *Registry) overlayLink(skillID, workspaceID string, create bool) (string, error) {
 	if skillID == "" || skillID == "." || skillID == ".." || skillID != filepath.Base(skillID) {
 		return "", fmt.Errorf("%w: %q is not a single path element", ErrUnsafeSkillID, skillID)
 	}
-	return filepath.Join(workspaceDir, ".claude", "plugins", skillID), nil
+	dir, err := r.workspaceDir(workspaceID)
+	if err != nil {
+		return "", err
+	}
+	plugins, err := containedPluginsDir(dir, create)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(plugins, skillID), nil
 }
 
 // List returns all installed skills.
@@ -339,15 +505,28 @@ func (r *Registry) Install(name, sourcePath string) (Skill, error) {
 }
 
 // Remove uninstalls a skill by ID (does NOT remove workspace symlinks).
+//
+// An id that is not installed is an error rather than a silent success, which is
+// tether#156 fact 5: DELETE /api/v1/skills/{id} answered 204 for an id this
+// registry had never heard of while enable and disable answered 404 for the same
+// id, and nothing asserted either. 404 is the answer the rest of the route file
+// already gives, for the reason its own tests state — the id in the URL is not a
+// skill, and 404 is about the addressed resource — so the outlier moves.
 func (r *Registry) Remove(id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	n := 0
+	found := false
 	for _, s := range r.skills {
-		if s.ID != id {
-			r.skills[n] = s
-			n++
+		if s.ID == id {
+			found = true
+			continue
 		}
+		r.skills[n] = s
+		n++
+	}
+	if !found {
+		return fmt.Errorf("%w: %q", ErrUnknownSkill, id)
 	}
 	r.skills = r.skills[:n]
 	return r.saveLocked()
@@ -381,19 +560,24 @@ func (r *Registry) Enable(skillID, workspaceID string) error {
 	if err != nil {
 		return err
 	}
-	dir, err := r.workspaceDir(workspaceID)
+	link, err := r.overlayLink(skillID, workspaceID, true)
 	if err != nil {
 		return err
 	}
-	link, err := overlayLink(dir, skillID)
-	if err != nil {
-		return err
+	// Clear a stale entry, and refuse rather than guess when what is there is not
+	// one. os.Remove unlinks a SYMLINK itself (it does not follow it) and deletes
+	// an empty directory; anything else — a non-empty directory, concretely —
+	// fails. That failure was discarded (`_ = os.Remove(link)`), so os.Symlink
+	// answered EEXIST and the HTTP layer reported a caller-visible, caller-fixable
+	// state as a broken daemon, in a body carrying this daemon's own paths
+	// (tether#156).
+	if rmErr := os.Remove(link); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
+		return fmt.Errorf("%w: %q: %w", ErrOverlayLocationOccupied, link, rmErr)
 	}
-	if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
-		return fmt.Errorf("mkdir plugins: %w", err)
+	if err := os.Symlink(sk.SourcePath, link); err != nil {
+		return fmt.Errorf("symlink the overlay: %w", err)
 	}
-	_ = os.Remove(link) // remove stale link
-	return os.Symlink(sk.SourcePath, link)
+	return nil
 }
 
 // Disable removes the symlink for skillID from the workspace registered under
@@ -410,36 +594,96 @@ func (r *Registry) Enable(skillID, workspaceID string) error {
 // # What validating skillID costs, stated rather than hidden
 //
 // A link this refuses to delete is a link that stays on disk forever, and there
-// are TWO ways to get one, both reachable from the shipped UI:
+// were TWO ways to get one, both reachable from the shipped UI:
 //
 //   - DELETE /api/v1/skills/{id}. Remove() deliberately does not clear workspace
-//     symlinks, so the id stops resolving while the link remains.
-//   - DELETE /api/v1/workspaces/{id}. The workspace leaves the registry, so
-//     workspaceDir can no longer resolve it — the same dead end by the other
-//     argument.
+//     symlinks, so the id stops resolving while the link remains. STILL OPEN, for
+//     the reason below.
+//   - DELETE /api/v1/workspaces/{id}. The workspace left the registry, so
+//     workspaceDir could no longer resolve it — the same dead end by the other
+//     argument. CLOSED by tether#156: that endpoint now detaches the overlays its
+//     registration authorised before it drops the record (see DisableAll), which
+//     it can do because the workspace id is in hand at exactly that moment.
 //
-// The orphan is accepted anyway, and the reason is not "no client does this
-// today": this endpoint's threat model is an authenticated caller, so an argument
-// from what the SPA happens to call would be answering a different question. It
-// is accepted because the alternative is to act on an id nothing vouches for,
-// which is the hole itself. A caller that is going to delete the workspace
-// registration should disable first, and cleaning up on Remove is the real fix —
-// it needs the set of workspaces a skill is enabled in, state this registry does
-// not keep. Worth its own change, not a silent widening here.
+// The first is accepted, and the reason is not "no client does this today": this
+// endpoint's threat model is an authenticated caller, so an argument from what
+// the SPA happens to call would be answering a different question. It is accepted
+// because the alternative is to act on an id nothing vouches for, which is the
+// hole itself. Cleaning it up properly needs the set of workspaces a skill is
+// enabled in — state this registry does not keep. Worth its own change, not a
+// silent widening here.
 func (r *Registry) Disable(skillID, workspaceID string) error {
 	if _, err := r.lookup(skillID); err != nil {
 		return err
 	}
-	dir, err := r.workspaceDir(workspaceID)
-	if err != nil {
+	link, err := r.overlayLink(skillID, workspaceID, false)
+	switch {
+	case err == nil:
+	case errors.Is(err, errNoOverlayDir), errors.Is(err, ErrWorkspaceDirUnusable):
+		// Nothing to remove: the tree the link would live in is not there, so the
+		// link is not there either. Disable has always been idempotent, and a
+		// caller tidying up after the workspace directory itself went away is
+		// exactly when that has to keep holding — an error would make the tidying
+		// impossible. Note this deliberately does NOT create the tree on its way to
+		// finding that out, which os.MkdirAll would have.
+		return nil
+	default:
 		return err
 	}
-	link, err := overlayLink(dir, skillID)
-	if err != nil {
-		return err
+	if rmErr := os.Remove(link); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
+		return fmt.Errorf("%w: %q: %w", ErrOverlayLocationOccupied, link, rmErr)
 	}
-	if err := os.Remove(link); err != nil && !os.IsNotExist(err) {
-		return err
+	return nil
+}
+
+// DisableAll removes every overlay this daemon created inside the workspace
+// registered under workspaceID. DELETE /api/v1/workspaces/{id} runs it before it
+// drops the registration; server/mux.go is where the two registries are joined.
+//
+// # Why the deletion had to grow a teardown at all
+//
+// The registration is what authorised each of these links, and dropping it used
+// to leave them on disk — which is not merely untidy. Disable resolves its
+// workspace THROUGH the registry, so the moment the record is gone the id it
+// needs stops existing and nothing can reach the links again. Disable's doc
+// called that an accepted orphan and said the real fix needed state this registry
+// does not keep; that is true of the OTHER orphan (below) and was not true of
+// this one — here the workspace id is in hand at exactly the right moment.
+//
+// # What it covers, stated exactly
+//
+// One link per INSTALLED skill, at the name this package would have created, and
+// only where the containment rule holds. That is precisely the set Enable can
+// produce and Disable can remove, which is why it is the set that is unwound —
+// and it is why a name this daemon never issued is left alone, whether it is a
+// file or a link someone else put in the plugins directory.
+//
+// It does NOT cover a link whose skill was uninstalled first: DELETE
+// /api/v1/skills/{id} deliberately leaves workspace symlinks alone, so that name
+// no longer resolves here either. Cleaning that one up needs the set of
+// workspaces a skill is enabled in — state this registry does not keep, and a
+// separate change.
+//
+// # Why an escaping or missing directory is success rather than an error
+//
+// Both mean there is nothing here this daemon would have created: it refuses to
+// write through a link, and in the second case there is no tree at all. Erroring
+// would make such a workspace impossible to unregister, which is a worse state
+// than the one this prevents — and following the link to clean up would BE the
+// escape this change exists to stop.
+func (r *Registry) DisableAll(workspaceID string) error {
+	for _, sk := range r.List() {
+		err := r.Disable(sk.ID, workspaceID)
+		switch {
+		case err == nil:
+		case errors.Is(err, ErrOverlayEscapesWorkspace):
+			// See the paragraph above: nothing of ours is on the far side.
+		case errors.Is(err, ErrUnknownSkill):
+			// Uninstalled between List and here. Nothing this call can do about a
+			// name that has just stopped being ours.
+		default:
+			return err
+		}
 	}
 	return nil
 }

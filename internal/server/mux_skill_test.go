@@ -121,6 +121,49 @@ func TestSkillOverlay_IsWiredToTheWorkspaceRegistry(t *testing.T) {
 	}
 }
 
+// TestSkillOverlay_DeletingAWorkspaceTakesItsOverlaysWithIt — tether#156.
+//
+// The teardown hop has the same shape as the containment hop above and the same
+// blind spot: one hand-written line in buildMux, with nothing in either package's
+// own tests able to see whether it exists. Unwired, this daemon answers DELETE
+// with 204 and leaves the symlink behind — and the id it would need to remove it
+// later has just been deleted, so nothing can reach it again.
+//
+// Observed on the unfixed tree: 204, and the link still there.
+func TestSkillOverlay_DeletingAWorkspaceTakesItsOverlaysWithIt(t *testing.T) {
+	mux, req, sk, ws := skillRouteMux(t, true)
+
+	body, err := json.Marshal(map[string]string{"workspaceId": ws.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req(http.MethodPost, "/api/v1/skills/"+sk.ID+"/enable", string(body)))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("POST enable -> %d, want 204; body %q", rec.Code, strings.TrimSpace(rec.Body.String()))
+	}
+	link := filepath.Join(ws.Path, ".claude", "plugins", sk.ID)
+	if _, err := os.Readlink(link); err != nil {
+		t.Fatalf("expected a link at %s: %v", link, err)
+	}
+
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req(http.MethodDelete, "/api/v1/workspaces/"+ws.ID, ""))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE the workspace -> %d, want 204; body %q", rec.Code, strings.TrimSpace(rec.Body.String()))
+	}
+
+	if _, err := os.Lstat(link); err == nil {
+		t.Errorf("the overlay %s outlived the registration that authorised it — and DELETE has just "+
+			"removed the id that Disable would have needed to take it back out", link)
+	}
+	// The plugins directory itself stays: it is the workspace's, not this
+	// daemon's, and cc may have put things in it.
+	if _, err := os.Stat(filepath.Dir(link)); err != nil {
+		t.Errorf("the plugins directory was removed along with the overlay: %v", err)
+	}
+}
+
 // TestSkillOverlay_RefusesAnUnregisteredWorkspaceEndToEnd — the other side of the
 // same wiring. If the index were bound to something that vouches for everything,
 // the test above would still pass; this one would not.

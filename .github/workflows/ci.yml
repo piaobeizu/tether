@@ -144,3 +144,18 @@ jobs:
       # local convenience edit to the Makefile can never weaken CI.
       - name: Run Go tests
         run: go test -count=1 -race ./...
+
+      # ── opt-in test compiles, but does not run (tether#160) ────────────────
+      # internal/agent/opencode_provider_realbin_test.go is behind
+      # //go:build opencode_real because it needs a real `opencode` binary,
+      # which this runner does not have. The step above therefore does not
+      # compile it, and a build tag with nothing compiling it is a test that
+      # stops building and tells no one — the same class of silent hole the tag
+      # was introduced to close, just moved.
+      #
+      # `go vet` and not `go build`: `go build ./...` skips _test.go files
+      # entirely, so it would pass no matter what is in there. Compile only, on
+      # purpose — running it would mean installing opencode and spawning a real
+      # subprocess per PR, which is a cost this test does not earn.
+      - name: Type-check opt-in real-binary tests
+        run: go vet -tags=opencode_real ./internal/agent/

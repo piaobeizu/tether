@@ -579,58 +579,19 @@ func TestOpenCodeInterruptAfterRealStartServe_StaysAlive(t *testing.T) {
 	}
 }
 
-// TestOpenCodeServeCrash_RealBinary is the same regression against the genuine
-// `opencode serve`, covering the wiring the fixtures above stub out: that
-// startServe really arms the watcher, and that a SIGKILL from outside the
-// session really ends it.
+// The same regression against a real `opencode serve` — TestOpenCodeServeCrash_RealBinary
+// — used to live here, gated on `exec.LookPath("opencode")` and skipped when it
+// was absent. It now lives in opencode_provider_realbin_test.go behind
+// `//go:build opencode_real`, so the default suite does not list it (tether#160).
 //
-// Unlike TestOpenCodeInterrupt_Integration this needs no credentials and makes
-// no model call — it starts a serve, kills it, and watches the session react —
-// so it is gated only on the binary being present rather than behind an env
-// var. CI has no opencode and skips it.
-func TestOpenCodeServeCrash_RealBinary(t *testing.T) {
-	if _, err := exec.LookPath("opencode"); err != nil {
-		t.Skip("opencode binary not found in PATH")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	sess, err := NewOpenCodeProvider().Spawn(ctx, SpawnConfig{Workdir: t.TempDir()})
-	if err != nil {
-		t.Fatalf("spawn: %v", err)
-	}
-	defer sess.Close()
-	oc := sess.(*opencodeSession)
-
-	if !sess.Alive() {
-		t.Fatal("Alive() = false for a freshly spawned session")
-	}
-
-	// Drain like Registry.fanOut does, and record when the stream ends.
-	streamEnded := make(chan struct{})
-	go func() {
-		defer close(streamEnded)
-		for range sess.Events() {
-		}
-	}()
-
-	oc.mu.RLock()
-	proc := oc.serve.Process
-	oc.mu.RUnlock()
-	t.Logf("killing real `opencode serve` pid=%d from outside the session", proc.Pid)
-	if err := proc.Kill(); err != nil {
-		t.Fatalf("kill serve: %v", err)
-	}
-
-	select {
-	case <-streamEnded:
-	case <-time.After(15 * time.Second):
-		t.Fatal("event stream never ended after the serve was killed (tether#58)")
-	}
-	if sess.Alive() {
-		t.Error("Alive() = true after the real serve was killed")
-	}
-}
+// It moved because CI has no opencode: the test skipped on every CI run ever,
+// yet every run counted it as a test that had passed. Meanwhile a developer box
+// does have opencode, so the same test spawned a real serve inside `-race` and
+// went red under parallel load — a red that cannot be told apart from a real
+// regression. A build tag makes both halves honest: the default suite makes no
+// claim about it, and asking for it by name is the only way to get a result.
+//
+//	GOWORK=off go test -tags=opencode_real -count=1 ./internal/agent/ -run RealBinary -v
 
 // TestOpenCodeInterrupt_Integration exercises the real spawn -> prompt ->
 // interrupt -> resume flow against an installed `opencode` binary. It is gated

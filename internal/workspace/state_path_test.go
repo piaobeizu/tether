@@ -1,9 +1,11 @@
 package workspace
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -255,5 +257,202 @@ func TestAdd_RegistersNothingWhenTheWriteFails(t *testing.T) {
 	}
 	if got := r.List(); len(got) != 1 {
 		t.Fatalf("List = %+v, want the one workspace", got)
+	}
+}
+
+// -- tether#162: what Remove leaves behind when the write does not land -------
+
+// registryOnDisk reads the ids the registry FILE holds, which is the half of every
+// assertion below that r.List() cannot answer.
+func registryOnDisk(t *testing.T, file string) []string {
+	t.Helper()
+	b, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("read %s: %v — the fixture is at fault, not the code under test", file, err)
+	}
+	var got []Workspace
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal %s: %v", file, err)
+	}
+	return workspaceIDs(got)
+}
+
+func workspaceIDs(ws []Workspace) []string {
+	out := make([]string, 0, len(ws))
+	for _, w := range ws {
+		out = append(out, w.ID)
+	}
+	return out
+}
+
+// blockTheNextWrite makes saveLocked's os.WriteFile fail while leaving the registry
+// file itself readable and intact — which is what this test needs and what the
+// fixture TestAdd_RegistersNothingWhenTheWriteFails uses cannot give it. That one
+// points the registry at a directory that does not exist, so there is no file to
+// assert about; here the file must still hold the record.
+//
+// It occupies the `.tmp` path saveLocked writes through with a DIRECTORY, so the
+// open fails EISDIR. Deliberately not a chmod: this suite runs as root on at least
+// one machine it has to pass on, and root ignores the permission bits, so a chmod
+// fixture would let the write SUCCEED and every assertion below would hold for the
+// wrong reason. EISDIR is refused for every uid.
+//
+// The failure is real in the sense that matters: it comes out of the same
+// os.WriteFile on the same line of saveLocked that a full disk, an EIO or a
+// read-only mount comes out of, and no branch exists in the production code that
+// only a test can reach.
+func blockTheNextWrite(t *testing.T, file string) {
+	t.Helper()
+	if err := os.Mkdir(file+".tmp", 0o700); err != nil {
+		t.Fatalf("plant the blocking .tmp directory: %v", err)
+	}
+}
+
+func unblockWrites(t *testing.T, file string) {
+	t.Helper()
+	if err := os.Remove(file + ".tmp"); err != nil {
+		t.Fatalf("remove the blocking .tmp directory: %v", err)
+	}
+}
+
+// TestRemove_KeepsTheRegistrationWhenTheWriteFails — tether#162, the mirror of
+// TestAdd_RegistersNothingWhenTheWriteFails above.
+//
+// # What was true on the broken build, assertion by assertion
+//
+// Pre-fix, Remove detached the overlays, compacted the record out of
+// r.workspaces, and returned saveLocked's error with the record still gone from
+// memory. So of the four things asserted here:
+//
+//	assertion                       | pre-fix value
+//	--------------------------------+---------------------------------------------
+//	memory and disk agree           | FALSE — List() had 0, the file had 1
+//	the record is in memory         | FALSE — 0
+//	the record is on disk           | TRUE  — the write is what failed
+//	the error is ErrRemoveNotRecorded | FALSE — it was the bare *fs.PathError
+//
+// The first is the gate, and it is checked first so that a regression reads as the
+// defect ("memory and disk disagree") rather than as a count. The third is the
+// half that makes the pair mean CONSISTENT rather than merely non-empty: a
+// "rollback" that also managed to delete the record from the file would satisfy
+// the memory half on its own, and that is the reverse inconsistency this pair
+// exists to refuse.
+//
+// # Why the detach count is asserted
+//
+// ErrRemoveNotRecorded's text tells the caller its overlays were detached and not
+// put back. That sentence is only true if the detach really ran before the write,
+// so the message and the callback are asserted together — a fix that raised the
+// sentinel without the detach having happened would be a lie with a test on it.
+func TestRemove_KeepsTheRegistrationWhenTheWriteFails(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "workspaces.json")
+	r := &Registry{path: file}
+
+	ws, err := r.Add("w", t.TempDir())
+	if err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	detached := 0
+	r.BindOverlayCleanup(func(string) error { detached++; return nil })
+
+	blockTheNextWrite(t, file)
+
+	err = r.Remove(ws.ID)
+	if !errors.Is(err, ErrRemoveNotRecorded) {
+		t.Fatalf("Remove with an unwritable registry = %v, want ErrRemoveNotRecorded.\n"+
+			"Pre-fix this was saveLocked's bare error, which says the write failed and "+
+			"nothing about the overlays that were already taken away.", err)
+	}
+	if detached != 1 {
+		t.Errorf("the overlay cleanup ran %d times, want 1 — ErrRemoveNotRecorded says the "+
+			"overlays were detached, and this is what makes that sentence true", detached)
+	}
+
+	inMemory := workspaceIDs(r.List())
+	onDisk := registryOnDisk(t, file)
+
+	if !slices.Equal(inMemory, onDisk) {
+		t.Errorf("memory and disk disagree after a removal that could not be written: "+
+			"List = %v, %s = %v.\nPre-fix: exactly this, with memory empty and the file "+
+			"still holding the record — so a restart brought the registration back, and its "+
+			"overlays did not come with it.", inMemory, filepath.Base(file), onDisk)
+	}
+	if !slices.Equal(inMemory, []string{ws.ID}) {
+		t.Errorf("List = %v, want [%s] put back.\nPre-fix: [] — the record was compacted out "+
+			"and left out.", inMemory, ws.ID)
+	}
+	if !slices.Equal(onDisk, []string{ws.ID}) {
+		t.Errorf("%s = %v, want [%s] untouched.\nThe other half of the same assertion: a "+
+			"rollback that had also emptied the FILE would satisfy the memory check above "+
+			"while being the reverse inconsistency.", filepath.Base(file), onDisk, ws.ID)
+	}
+
+	// Positive control, and the retry the message implies. Nothing above is
+	// satisfied by a Remove that never removes anything: with the write unblocked
+	// the same call succeeds and BOTH sides go empty. It also exercises the second
+	// detach, which must be harmless — skill.Disable tolerates a link that is
+	// already gone, and the retry story rests on that.
+	unblockWrites(t, file)
+	if err := r.Remove(ws.ID); err != nil {
+		t.Fatalf("Remove with a writable registry = %v, want it to remove", err)
+	}
+	if detached != 2 {
+		t.Errorf("the overlay cleanup ran %d times in total, want 2 — the retry must run it "+
+			"again, since the first attempt is not recorded anywhere", detached)
+	}
+	if got := workspaceIDs(r.List()); len(got) != 0 {
+		t.Errorf("List = %v, want empty after the successful retry", got)
+	}
+	if got := registryOnDisk(t, file); len(got) != 0 {
+		t.Errorf("%s = %v, want empty after the successful retry", filepath.Base(file), got)
+	}
+}
+
+// TestRemove_WithNoCleanupBoundRollsBackWithoutClaimingADetach — the condition on
+// ErrRemoveNotRecorded, which the test above cannot measure.
+//
+// Two separate things are asserted, and only one of them is a gate on the
+// rollback:
+//
+//   - The record is put back, on both sides. Pre-fix memory was empty here too,
+//     so this half is the same gate as above with the callback taken away.
+//   - The error is NOT ErrRemoveNotRecorded. This was ALSO true pre-fix (there was
+//     no such sentinel), so it is not a gate on the rollback — it is the gate on
+//     the `detach != nil` condition, and it fails if that condition is dropped.
+//     Stated rather than left implicit, because an assertion that held on the
+//     broken build is not evidence of the fix and should not be counted as any.
+//
+// It matters in production and not only in this file: server/mux.go binds the
+// cleanup only when the daemon has a skill registry, so with none there is nothing
+// that could have been detached and the honest answer is the plain write failure.
+func TestRemove_WithNoCleanupBoundRollsBackWithoutClaimingADetach(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "workspaces.json")
+	r := &Registry{path: file}
+
+	ws, err := r.Add("w", t.TempDir())
+	if err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	blockTheNextWrite(t, file)
+
+	err = r.Remove(ws.ID)
+	if err == nil {
+		t.Fatal("Remove with an unwritable registry = nil, want the write error — " +
+			"the fixture is at fault if this fires")
+	}
+	if errors.Is(err, ErrRemoveNotRecorded) {
+		t.Errorf("Remove = %v, want the bare write error: with no cleanup bound nothing was "+
+			"detached, so a refusal that says the overlays were taken away is a sentence "+
+			"about something that did not happen", err)
+	}
+
+	inMemory := workspaceIDs(r.List())
+	onDisk := registryOnDisk(t, file)
+	if !slices.Equal(inMemory, onDisk) {
+		t.Errorf("memory and disk disagree: List = %v, %s = %v.\nPre-fix: exactly this.",
+			inMemory, filepath.Base(file), onDisk)
+	}
+	if !slices.Equal(inMemory, []string{ws.ID}) {
+		t.Errorf("List = %v, want [%s] put back.\nPre-fix: [].", inMemory, ws.ID)
 	}
 }

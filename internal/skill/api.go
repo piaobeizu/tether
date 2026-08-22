@@ -11,7 +11,8 @@ import (
 // RegisterAPI wires skill REST endpoints into mux (s7).
 //
 //	GET  /api/v1/skills                           → list all skills
-//	POST /api/v1/skills                           → install skill {"name":"...","sourcePath":"..."}
+//	POST /api/v1/skills                           → install skill {"name":"...","sourcePath":"..."};
+//	                                                sourcePath must already be a directory, else 400 (tether#147)
 //	DELETE /api/v1/skills/{id}                    → remove skill
 //	POST /api/v1/skills/{id}/enable               → enable in workspace {"workspaceId":"..."}
 //	POST /api/v1/skills/{id}/disable              → disable in workspace {"workspaceId":"..."}
@@ -42,7 +43,12 @@ func RegisterAPI(mux *http.ServeMux, reg *Registry) {
 			}
 			sk, err := reg.Install(body.Name, body.SourcePath)
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				// Through the same refusal map as everything else on this route file.
+				// tether#156 made the overlay endpoints derive their body from the
+				// sentinel and left this handler sending err.Error() as a 500 — which is
+				// how `skill path not found: stat /some/path: no such file` reached a
+				// client (tether#147).
+				refuse(w, r, err)
 				return
 			}
 			w.WriteHeader(http.StatusCreated)
@@ -115,8 +121,10 @@ func overlayWrite(w http.ResponseWriter, r *http.Request, skillID string, apply 
 // server/mcp_tokens.go use.
 const maxSkillBodyBytes = 4096
 
-// refuse is the single exit for a failed overlay call: it picks the status AND
-// the body from overlayRefusal, and logs the error rather than sending it.
+// refuse is the single exit for ANY failed call on this route file — the two
+// overlay writes, the delete, and (since tether#147) the install: it picks the
+// status AND the body from overlayRefusal, and logs the error rather than sending
+// it.
 //
 // The rule that the body comes from the SENTINEL and never from the error value
 // is the fix, not the phrasing of any one message (tether#156). err.Error() is
@@ -166,6 +174,13 @@ const overlayInternalErrorBody = "the daemon could not complete this request"
 // the workspace, a name already taken by something this daemon did not create, a
 // registered directory that is not on disk. Each is visible to the caller and
 // fixable by it, and none is a daemon fault, which is why none is a 500.
+//
+// ErrSkillSourceUnusable is tether#147's, and it is not an overlay refusal at all
+// — it belongs to install. It sits here because the alternative was a second
+// mapping for one case, which is how the tether#142 asymmetry this file exists to
+// undo got started. 400 rather than the 409 its workspace-side cousin
+// ErrWorkspaceDirUnusable gets, because that one is about a path the DAEMON
+// stored while this one is about a path the caller just sent.
 func overlayRefusal(err error) (int, string) {
 	switch {
 	case errors.Is(err, ErrNoWorkspaceIndex):
@@ -174,6 +189,8 @@ func overlayRefusal(err error) (int, string) {
 		return http.StatusNotFound, ErrUnknownSkill.Error()
 	case errors.Is(err, ErrUnknownWorkspace):
 		return http.StatusBadRequest, ErrUnknownWorkspace.Error()
+	case errors.Is(err, ErrSkillSourceUnusable):
+		return http.StatusBadRequest, ErrSkillSourceUnusable.Error()
 	case errors.Is(err, ErrOverlayEscapesWorkspace):
 		return http.StatusConflict, ErrOverlayEscapesWorkspace.Error()
 	case errors.Is(err, ErrOverlayLocationOccupied):

@@ -50,6 +50,73 @@ func installedSkill(t *testing.T, id string) (Skill, string) {
 	return Skill{ID: id, Name: "n-" + id, SourcePath: src}, src
 }
 
+// -- tether#147: what Install will accept ------------------------------------
+
+// TestInstall_RefusesASourceThatIsNotAnExistingDirectory.
+//
+// Every doc in this package describes a skill as a DIRECTORY, and os.Stat alone
+// accepted regular files: a plain file installed, and Enable then linked a
+// registered workspace's plugins entry to it for cc to read. The dangling-symlink
+// row is the same refusal through a third mechanism (os.Stat follows the link and
+// finds nothing).
+//
+// Run against the pre-fix tree: the file row returned a nil error and a
+// registration, and the missing/dangling rows returned `skill path not found:
+// stat <path>: no such file or directory` — an error the HTTP layer sent verbatim.
+//
+// The "still empty" half is asserted separately for the same reason it is in the
+// workspace package: an error return that has already appended to r.skills is a
+// distinct defect from no error at all.
+func TestInstall_RefusesASourceThatIsNotAnExistingDirectory(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func(t *testing.T, base string) string
+	}{
+		{"does not exist", func(t *testing.T, base string) string {
+			return filepath.Join(base, "not-there")
+		}},
+		{"exists but is a regular file", func(t *testing.T, base string) string {
+			p := filepath.Join(base, "skill.md")
+			if err := os.WriteFile(p, []byte("# not a skill dir"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return p
+		}},
+		{"is a dangling symlink", func(t *testing.T, base string) string {
+			p := filepath.Join(base, "dangling")
+			if err := os.Symlink(filepath.Join(base, "gone"), p); err != nil {
+				t.Fatal(err)
+			}
+			return p
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := tc.build(t, t.TempDir())
+			reg := newTestRegistry(t, fakeIndex{"ws1": t.TempDir()})
+
+			sk, err := reg.Install("s", src)
+			if !errors.Is(err, ErrSkillSourceUnusable) {
+				t.Fatalf("Install(%q) = (%+v, %v), want ErrSkillSourceUnusable", src, sk, err)
+			}
+			if got := reg.List(); len(got) != 0 {
+				t.Errorf("after a refused Install, List = %+v, want empty", got)
+			}
+		})
+	}
+
+	// Positive control: a real directory still installs, so the rows above cannot
+	// be satisfied by an Install that refuses everything.
+	t.Run("an existing directory is still accepted", func(t *testing.T) {
+		reg := newTestRegistry(t, fakeIndex{"ws1": t.TempDir()})
+		if _, err := reg.Install("s", t.TempDir()); err != nil {
+			t.Fatalf("Install(a real directory) = %v, want it to install", err)
+		}
+		if got := reg.List(); len(got) != 1 {
+			t.Errorf("List = %+v, want the one skill", got)
+		}
+	})
+}
+
 // -- the asymmetry: Disable did not check its skill id -----------------------
 
 // TestDisable_RefusesAnIDThatIsNotAnInstalledSkill is the core of tether#142's

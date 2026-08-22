@@ -37,6 +37,7 @@ package workspace
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -190,12 +191,24 @@ func TestAddDedupsAnOldEntry(t *testing.T) {
 // cc's own (see canonicalPath's doc): a path that cannot be resolved keeps its
 // absolute form instead of becoming an error.
 //
-// Two things ride on this. Registering a directory that does not exist yet has
-// always been legal — filepath.Abs never required existence — so erroring would
-// make a POST that succeeds today start failing, including for a workspace on a
-// volume that simply is not mounted at the moment. And an unloadable registry is
-// not a local failure: server/lifecycle.go turns it into "this daemon has no
-// workspace registry" for every request.
+// What rides on this, as of tether#147, is load() rather than Add. An entry
+// ALREADY in workspaces.json whose directory is missing or on an unmounted volume
+// keeps the value it had and stays in the list; making that an error would make
+// the whole registry unloadable, which server/lifecycle.go turns into "this
+// daemon has no workspace registry" for every request.
+//
+// # This test used to assert one more thing, and tether#147 reversed it
+//
+// It also asserted that such a path was REGISTRABLE — that Add accepted a
+// directory which did not exist yet. That was true, and it was written down as a
+// design intent, and tether#147 dropped it: tether#156 had already made Enable
+// refuse a registration whose directory is not on disk, so the early registration
+// bought nothing, while the registry stayed able to hold arbitrary strings and
+// the failure surfaced at the wrong request. The assertion below is the reversed
+// half, kept in place rather than deleted so that the two halves stay visibly
+// separate: canonicalPath still does NOT error (the clause this test guards), and
+// Add refuses anyway (the clause TestAdd_RefusesAPathThatIsNotAnExistingDirectory
+// guards).
 func TestCanonicalPathKeepsWhatItCannotResolve(t *testing.T) {
 	base := t.TempDir()
 	missing := filepath.Join(base, "not-created-yet")
@@ -218,15 +231,19 @@ func TestCanonicalPathKeepsWhatItCannotResolve(t *testing.T) {
 		t.Errorf("canonicalPath(dangling) = (%q, %v), want (%q, nil)", got, err, dangling)
 	}
 
-	// And it must still be registrable, which is the behaviour a user would
-	// notice: this is the POST /api/v1/workspaces path.
+	// The reversal: canonicalPath hands the unresolved path back without
+	// complaining, and Add is what declines to write it down.
 	r := &Registry{path: filepath.Join(t.TempDir(), "workspaces.json")}
-	ws, err := r.Add("later", missing)
-	if err != nil {
-		t.Fatalf("Add(a directory that does not exist yet) = %v, want it to register", err)
+	if _, err := r.Add("later", missing); !errors.Is(err, ErrWorkspacePathUnusable) {
+		t.Errorf("Add(a directory that does not exist yet) = %v, want ErrWorkspacePathUnusable", err)
 	}
-	if ws.Path != missing {
-		t.Errorf("Add(%q).Path = %q, want %q", missing, ws.Path, missing)
+
+	// And a registry entry that ALREADY names it survives being loaded, which is
+	// the half of the old behaviour that was kept. planted() goes through load().
+	if p, ok := planted(t, missing).Path("old1"); !ok || p != missing {
+		t.Errorf("Path of a planted entry at a missing directory = (%q, %v), want (%q, true) — "+
+			"a bookmark to a temporarily absent directory must not make the registry unloadable",
+			p, ok, missing)
 	}
 }
 

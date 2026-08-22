@@ -389,6 +389,65 @@ func TestOverlayEndpoints_DoNotEchoDaemonSideValues(t *testing.T) {
 	})
 }
 
+// TestInstallEndpoint_RefusesASourceThatIsNotAnExistingDirectory — tether#147 at
+// the wire, and the half of it that overlay_test.go cannot see.
+//
+// Three assertions, three distinct pre-fix defects:
+//
+//   - 400, not 201 (the file row) and not 500 (the missing row). A caller that
+//     sent a bad path gets an answer it can act on.
+//   - the registry is still empty. "400 but installed anyway" would pass a
+//     status-only test.
+//   - the body is exactly the sentinel. Pre-fix the missing row answered
+//     `skill path not found: stat <path>: no such file or directory` — the stat
+//     error verbatim, which both named the path and distinguished "absent" from
+//     "permission denied", making the endpoint a filesystem probe.
+func TestInstallEndpoint_RefusesASourceThatIsNotAnExistingDirectory(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func(t *testing.T, base string) string
+	}{
+		{"does not exist", func(t *testing.T, base string) string {
+			return filepath.Join(base, "not-there")
+		}},
+		{"exists but is a regular file", func(t *testing.T, base string) string {
+			p := filepath.Join(base, "skill.md")
+			if err := os.WriteFile(p, []byte("# not a skill dir"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return p
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := newTestRegistry(t, fakeIndex{"ws1": t.TempDir()})
+			mux := http.NewServeMux()
+			RegisterAPI(mux, reg)
+
+			src := tc.build(t, t.TempDir())
+			body, err := json.Marshal(map[string]string{"name": "s", "sourcePath": src})
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec := post(t, mux, "/api/v1/skills", string(body))
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("POST install %q -> %d, want 400; body %q",
+					src, rec.Code, strings.TrimSpace(rec.Body.String()))
+			}
+			if got := reg.List(); len(got) != 0 {
+				t.Errorf("a refused install still registered %+v, want an empty registry", got)
+			}
+			if got := strings.TrimSpace(rec.Body.String()); got != ErrSkillSourceUnusable.Error() {
+				t.Errorf("400 body = %q, want exactly %q", got, ErrSkillSourceUnusable.Error())
+			}
+			if strings.Contains(rec.Body.String(), src) {
+				t.Errorf("the refusal quoted the path back, so the body came from err.Error() "+
+					"rather than from the sentinel: %q", strings.TrimSpace(rec.Body.String()))
+			}
+		})
+	}
+}
+
 // TestSkillEndpoints_ListInstallRemoveUnaffected — regression guard. The three
 // endpoints the SPA actually calls are outside this change; folding the two
 // overlay handlers together must not have disturbed the routing around them.

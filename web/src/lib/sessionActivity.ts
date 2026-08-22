@@ -95,8 +95,14 @@ export const SESSION_ACTIVITY_HELD = 'held'
 
 /**
  * The endpoint. A top-level path, NOT a leaf under `/api/v1/sessions/` — see
- * session.SessionActivityPath (Go) for why, and for the neighbour that is the real
- * hazard (`/api/v1/session/`, singular, is a prefix handler one hyphen away).
+ * session.SessionActivityPath (Go) for why.
+ *
+ * The neighbour that used to be the real hazard is gone: `/api/v1/session/`
+ * (singular) was also a prefix handler, and "session-activity" is one hyphen away
+ * from it — but tether#121 unregistered that pattern along with the shell input lock
+ * it served, and a routing test pins that the old path now reaches the `/api/v1/`
+ * 501 stub. The neighbour that remains, `/api/v1/sessions/`, is a plural away rather
+ * than a hyphen away.
  */
 export const SESSION_ACTIVITY_PATH = '/api/v1/session-activity'
 

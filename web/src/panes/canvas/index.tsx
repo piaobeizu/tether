@@ -17,20 +17,10 @@
 // files keep the plain <pre> fallback.
 import { lazy, Suspense, useEffect, useState } from 'react'
 import { useStore } from '../../lib/store'
-import { AihubError, fetchFile, fetchWorkspaces, type Workspace } from '../../lib/aihub'
+import { describeError, fetchFile, fetchWorkspaces, type Workspace } from '../../lib/aihub'
 import { Icon } from '../../lib/icons'
 
 const Markdown = lazy(() => import('./Markdown'))
-
-function describeError(e: unknown): string {
-  if (e instanceof AihubError) {
-    if (e.status === 503) return 'aihub not configured'
-    if (e.status === 403) return 'not authorized for this project'
-    if (e.status === 404) return 'not found'
-    return `error (HTTP ${e.status})`
-  }
-  return e instanceof Error ? e.message : String(e)
-}
 
 export default function Canvas() {
   const selectedFile = useStore((s) => s.selectedFile)

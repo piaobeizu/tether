@@ -10,7 +10,7 @@
 // fourth tab). The right pane is Chat / Skills / Shell again.
 import { useEffect, useState } from 'react'
 import { useStore } from '../../lib/store'
-import { AihubError, fetchProjects } from '../../lib/aihub'
+import { describeError, fetchProjects } from '../../lib/aihub'
 import type { WorkProject } from '../../lib/wire.gen'
 import WorkGraphView from './WorkGraphView'
 import DetailDrawer from './DetailDrawer'
@@ -23,15 +23,6 @@ interface Props {
    *  Canvas rather than tearing its state down, so the drawer really can be
    *  alive and invisible. */
   active?: boolean
-}
-
-function describeError(e: unknown): string {
-  if (e instanceof AihubError) {
-    if (e.status === 503) return 'aihub not configured'
-    if (e.status === 403) return 'not authorized for this project'
-    return `error (HTTP ${e.status})`
-  }
-  return e instanceof Error ? e.message : String(e)
 }
 
 export default function WorkPane({ active }: Props) {

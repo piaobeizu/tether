@@ -6,19 +6,9 @@
 // proxied events endpoint (no write path), completing the queue/wi/TIMELINE
 // MVP triad. Not polled (the drawer detail isn't either); reopen to refresh.
 import { useEffect, useRef, useState } from 'react'
-import { AihubError, fetchEvents } from '../../lib/aihub'
+import { describeError, fetchEvents } from '../../lib/aihub'
 import type { WorkEvent } from '../../lib/wire.gen'
 import { relTime } from '../../lib/timefmt'
-
-function describeError(e: unknown): string {
-  if (e instanceof AihubError) {
-    if (e.status === 503) return 'aihub not configured'
-    if (e.status === 403) return 'not authorized'
-    if (e.status === 404) return 'not found'
-    return `error (HTTP ${e.status})`
-  }
-  return e instanceof Error ? e.message : String(e)
-}
 
 // payload is `unknown` on the wire — read every field defensively (any shape,
 // never throw). These helpers keep the per-type formatter readable.

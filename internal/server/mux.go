@@ -274,6 +274,22 @@ func buildMux(cfg *Config, certs *certHolder, wts *webtransport.Server, reg *ses
 		// depth — it is three places for the next reader to keep in sync. The two that
 		// remain each have a test.
 		cfg.SkillRegistry.BindWorkspaces(cfg.WsRegistry)
+
+		// The reverse half of the same join, and it is a hop with no other home:
+		// DELETE /api/v1/workspaces/{id} removed the registration and left the
+		// symlinks that registration had authorised on disk, where nothing could
+		// then reach them — Disable resolves its workspace through the registry, so
+		// the id it needs stops existing at the same instant (tether#156).
+		//
+		// A func rather than an interface, deliberately. The trap the paragraph
+		// above describes — a nil *T stored in an interface is a NON-nil interface
+		// that panics on first call — does not exist for a method value taken from
+		// the non-nil pointer this branch has already tested. Removing the failure
+		// mode beats detecting it a third time.
+		if cfg.WsRegistry != nil {
+			cfg.WsRegistry.BindOverlayCleanup(cfg.SkillRegistry.DisableAll)
+		}
+
 		skill.RegisterAPI(mux, cfg.SkillRegistry)
 	}
 

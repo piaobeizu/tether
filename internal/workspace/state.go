@@ -14,6 +14,19 @@ import (
 	"time"
 )
 
+// ErrOverlayCleanup — a registration could not be removed because the things it
+// authorised to be written inside the workspace could not be detached first
+// (tether#156).
+//
+// The registry keeps the record when this happens. A DELETE that answered 204
+// would be promising that the registration and everything it authorised are both
+// gone, and only half of that would be true — which is the orphan this wraps
+// rather than an improvement on it.
+//
+// The underlying error is wrapped but never handed to a client: it comes from
+// another package's filesystem work and can name daemon-side paths.
+var ErrOverlayCleanup = errors.New("workspace: the overlays inside this workspace could not be detached")
+
 // Workspace represents a single registered workspace entry.
 type Workspace struct {
 	ID        string    `json:"id"`
@@ -28,6 +41,9 @@ type Registry struct {
 	mu         sync.RWMutex
 	workspaces []Workspace
 	path       string // resolved path to workspaces.toml (stored as JSON for simplicity)
+
+	// detachOverlays is installed by BindOverlayCleanup; nil until then.
+	detachOverlays func(workspaceID string) error
 }
 
 // NewRegistry loads (or creates) the workspace registry from ~/.tether/workspaces.json.
@@ -248,8 +264,77 @@ func (r *Registry) Add(name, path string) (Workspace, error) {
 	return w, r.saveLocked()
 }
 
-// Remove removes a workspace by ID.
+// BindOverlayCleanup installs the callback Remove runs before it drops a
+// registration, so that whatever the registration authorised inside the
+// workspace goes with it (tether#156). Binding nothing leaves Remove as it was.
+//
+// # Why a func and not an interface
+//
+// This package's other join in the same direction — skill.WorkspaceIndex — is an
+// interface declared in the consumer, and the price of that shape is documented
+// at length in server/lifecycle.go and skill.BindWorkspaces: a nil *T stored in
+// an interface is a NON-nil interface whose first call is a nil-receiver call, so
+// every such binding has to carry a reflect-based guard. A method value taken
+// from a pointer the caller has already tested cannot have that shape at all.
+// Removing the failure mode is better than detecting it in a fourth place.
+//
+// The dependency direction is unchanged either way: this package still names no
+// type from internal/skill, and internal/skill names none from this one. The one
+// site that has both registries in scope (server/mux.go) is where they meet.
+func (r *Registry) BindOverlayCleanup(clean func(workspaceID string) error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.detachOverlays = clean
+}
+
+// Remove removes a workspace by ID, after detaching what its registration
+// authorised to be written inside it.
+//
+// # Why the detach is here and not left to the caller
+//
+// The registration is the ONLY thing that makes those files reachable. The skill
+// registry resolves a workspace through this one, so the instant this record is
+// gone the id it needs stops existing: a symlink left behind by this deletion
+// cannot be removed through any endpoint afterwards. Deleting the record without
+// unwinding it is therefore not "untidy but recoverable" — it is a leak by
+// construction (tether#156).
+//
+// # Three orderings that are each load-bearing
+//
+//   - The detach runs BEFORE the record is dropped, because it resolves the id
+//     through this registry.
+//   - It runs OUTSIDE the write lock. It calls back into Path, which takes the
+//     read lock, and sync.RWMutex is not reentrant — under the write lock this
+//     would deadlock rather than fail.
+//   - A detach that FAILS keeps the record. A 204 here promises that the
+//     registration and everything it authorised are both gone; if only half
+//     happened, the honest answer is a refusal the caller can retry, not the
+//     orphan this change exists to remove with an error message on top.
+//
+// An id this registry does not hold is still a silent no-op, which is what the
+// handler's 204 has always rested on: there is no registration to unwind, so
+// there is nothing to call and nothing to refuse.
 func (r *Registry) Remove(id string) error {
+	r.mu.RLock()
+	detach := r.detachOverlays
+	known := false
+	for _, w := range r.workspaces {
+		if w.ID == id {
+			known = true
+			break
+		}
+	}
+	r.mu.RUnlock()
+
+	if !known {
+		return nil
+	}
+	if detach != nil {
+		if err := detach(id); err != nil {
+			return fmt.Errorf("%w: %w", ErrOverlayCleanup, err)
+		}
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	n := 0

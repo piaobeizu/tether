@@ -323,6 +323,31 @@ func canonicalPath(path string) (string, error) {
 // that gets stored, handed out, and stat'd again by
 // skill.containedPluginsDir: checking anything else would leave those two able
 // to disagree.
+//
+// # A write that failed registers nothing (tether#159)
+//
+// The append used to happen before saveLocked and stay there when saveLocked
+// failed, so a POST that answered 500 left a registration in memory that no file
+// had ever held. That is worse than either half of it on its own. The caller was
+// told the request failed, and meanwhile GET /api/v1/workspaces listed the
+// workspace, Path resolved its id for the /wt/chat handshake, and skill.Enable
+// would write an overlay into it — all of it gone at the next restart, with
+// nothing on disk to say it had been there. A 500 that also has to be read as
+// "and something was registered anyway" is not a report of the write failure, it
+// is a second failure.
+//
+// So the append is undone and the zero Workspace returned. Truncating by one is
+// exact rather than approximate: the write lock is held across everything below,
+// so nothing else can have appended in between. Returning Workspace{} rather than
+// the entry that did not survive matters for the same reason — api.go discards it,
+// but a value that names a workspace nobody registered is exactly the thing this
+// paragraph is about.
+//
+// Remove has the mirror shape and is deliberately NOT changed here. Its
+// inconsistency points the other way (the record is gone from memory and still on
+// disk, so a restart brings it back), and undoing it would restore a registration
+// whose overlays the detach has already removed — a different question, with a
+// different answer, and one this wi did not scope.
 func (r *Registry) Add(name, path string) (Workspace, error) {
 	if !filepath.IsAbs(path) {
 		return Workspace{}, fmt.Errorf("%w: %q", ErrWorkspacePathNotAbsolute, path)
@@ -351,7 +376,11 @@ func (r *Registry) Add(name, path string) (Workspace, error) {
 		AddedAt: time.Now().UTC(),
 	}
 	r.workspaces = append(r.workspaces, w)
-	return w, r.saveLocked()
+	if err := r.saveLocked(); err != nil {
+		r.workspaces = r.workspaces[:len(r.workspaces)-1]
+		return Workspace{}, err
+	}
+	return w, nil
 }
 
 // BindOverlayCleanup installs the callback Remove runs before it drops a

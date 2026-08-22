@@ -13,9 +13,36 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+// The refusals SafeJoin and SafeJoinDir produce themselves, as sentinels rather
+// than bare strings, so a caller can turn one into a status AND a body without
+// reading err.Error() (tether#159 — internal/workspace/api.go is the caller that
+// needs it, and its readRefusal is where the mapping lives).
+//
+// Each text is byte-identical to the fmt.Errorf string it replaced, so every MCP
+// tool result below says exactly what it said before: this changes the errors'
+// IDENTITY, not their wording. The remaining error this file builds inline —
+// `path not accessible: %w` — keeps wrapping, because the thing a caller needs
+// from it is the wrapped fs.ErrNotExist, not the sentence.
+var (
+	// ErrAbsolutePath — the input named an absolute path. Every SafeJoin input is
+	// relative to the workspace root by construction, so an absolute one is not a
+	// path this Registry can resolve at all.
+	ErrAbsolutePath = errors.New("absolute path not allowed")
+
+	// ErrPathEscapesRoot — the input resolved to something outside the root,
+	// through `..`, through a symlink, or through a sibling whose name starts with
+	// the root's.
+	ErrPathEscapesRoot = errors.New("path escapes workspace root")
+
+	// ErrNotDirectory — the input does not name a directory, and the caller asked
+	// for one. Only SafeJoinDir produces it; see its doc for why SafeJoin does not.
+	ErrNotDirectory = errors.New("path is not a directory")
 )
 
 const (
@@ -41,9 +68,14 @@ func New(workspaceRoot string) (*Registry, error) {
 
 // SafeJoin resolves input relative to the workspace root, rejecting any path
 // that escapes the root via traversal or symlinks. Exported for testing.
+//
+// It answers exactly one question — is this inside the root — and deliberately
+// says nothing about the SHAPE of what it found. SafeJoinDir is the variant for a
+// caller that needs a directory, and its doc explains why that check cannot be
+// folded in here.
 func (r *Registry) SafeJoin(input string) (string, error) {
 	if filepath.IsAbs(input) {
-		return "", fmt.Errorf("absolute path not allowed")
+		return "", ErrAbsolutePath
 	}
 	joined := filepath.Join(r.root, input)
 	resolved, err := filepath.EvalSymlinks(joined)
@@ -53,7 +85,71 @@ func (r *Registry) SafeJoin(input string) (string, error) {
 	// Separator-suffixed prefix prevents /tmp/ws matching /tmp/ws-evil.
 	rootWithSep := r.root + string(os.PathSeparator)
 	if resolved != r.root && !strings.HasPrefix(resolved, rootWithSep) {
-		return "", fmt.Errorf("path escapes workspace root")
+		return "", ErrPathEscapesRoot
+	}
+	return resolved, nil
+}
+
+// SafeJoinDir is SafeJoin for a caller that will then read the target AS a
+// directory: it adds the one check SafeJoin does not make.
+//
+// # Why this is a sibling and not a check inside SafeJoin
+//
+// There were five call sites when this was written, and they do not agree on
+// what shape the target must have. Two want a FILE: handleReadFile below
+// (os.ReadFile) and workspace.ReadFileContent, which stats the result and refuses
+// a directory itself. Three want a directory: handleListFiles (os.ReadDir),
+// handleRunShell (Cmd.Dir), and workspace.handleFiles (os.ReadDir via listFiles),
+// which is the one that now comes through here instead. An IsDir gate inside
+// SafeJoin would therefore refuse every workspace_read_file call and every GET
+// /api/v1/workspaces/{id}/file, so the check cannot live there however much the
+// /files caller wants it to (tether#159). Not an argument: putting the check in
+// SafeJoin fails TestSafeJoin_StillAcceptsARegularFile,
+// TestReadFile_ReturnsContent, both TestReadFileContent_* and
+// TestFileHandler_ReadsFileContent, which is what that first test is for.
+//
+// The two MCP tools stay on the plain SafeJoin. Their error text is returned to
+// the agent that supplied the path and never reaches an HTTP client, so rewording
+// it buys nothing and would only put a second set of strings under test.
+//
+// # What leaving the shape unchecked was costing
+//
+// GET /api/v1/workspaces/{id}/files?dir=<a regular file> passed containment,
+// reached os.ReadDir, and the *fs.PathError that came back — `open
+// /home/u/ws/a.txt: not a directory` — was the 500 body verbatim, so any
+// authenticated caller could read the daemon's absolute path for any file in a
+// workspace in one request. Refusing here is a stronger fix than rewording that
+// body: after this there is no raw filesystem error on the path to reword.
+//
+// # Both ways of not being a directory answer the same
+//
+// A path whose LAST component is a regular file is caught by the stat below. A
+// path that names something UNDER a regular file (`a.txt/b`) never gets that far:
+// EvalSymlinks fails first, with a bare syscall.ENOTDIR. They are one caller
+// mistake with two spellings, so they share one sentinel. The ENOTDIR test is
+// inert on Windows, which reports a path error instead — that leaves `a.txt/b`
+// there in the caller's unclassified default, which is a worse STATUS for one odd
+// request and not a leak, because the body is chosen by the refusal's identity
+// either way.
+func (r *Registry) SafeJoinDir(input string) (string, error) {
+	resolved, err := r.SafeJoin(input)
+	if err != nil {
+		if errors.Is(err, syscall.ENOTDIR) {
+			return "", fmt.Errorf("%w: %w", ErrNotDirectory, err)
+		}
+		return "", err
+	}
+	// resolved came back from EvalSymlinks, so it exists and holds no links:
+	// os.Stat and os.Lstat cannot disagree about it.
+	fi, err := os.Stat(resolved)
+	if err != nil {
+		return "", err
+	}
+	if !fi.IsDir() {
+		// input, not resolved: the caller's own string is safe to carry into a log
+		// line, and the daemon-side path is what this whole function exists to keep
+		// out of one.
+		return "", fmt.Errorf("%w: %q", ErrNotDirectory, input)
 	}
 	return resolved, nil
 }

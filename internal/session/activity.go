@@ -74,9 +74,12 @@ package session
 //     sid, so putting it in that subtree would add the one route in it that is not
 //     about a session id.
 //
-// The hazard that is real and easy to miss is the other neighbour: /api/v1/session/
-// (singular, handleLockForce) is also a prefix handler, and "session-activity"
-// is one hyphen away from being inside it. A routing test pins that negative.
+// The neighbour that used to be the real hazard is gone: /api/v1/session/
+// (singular, handleLockForce) was also a prefix handler, and "session-activity" is
+// one hyphen away from it — but tether#121 unregistered that pattern along with the
+// shell input lock it served, and a routing test pins that the old path now reaches
+// the /api/v1/ 501 stub. The neighbour that remains, /api/v1/sessions/, is a plural
+// away rather than a hyphen away.
 const SessionActivityPath = "/api/v1/session-activity"
 
 // The three states a row can be in. Absence from the map is the fourth answer and

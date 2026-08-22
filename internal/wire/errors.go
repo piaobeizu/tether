@@ -273,14 +273,15 @@ func (c ErrorCode) Terminal() bool {
 // Terminal can never be set by hand at a call site — see the package doc
 // comment for why that single choke point is the point.
 //
-// A convention, not an enforced invariant: Envelope's fields are exported, so
-// a caller CAN hand-build a KindError, and one still does —
-// internal/server/wt_shell.go's lock_held, on the shell channel, with its own
-// extra fields. That one predates this file and is left alone deliberately
-// (different route, different payload, no frontend consumer). It stays harmless
-// because the browser's parseErrorPayload requires `message` and `terminal`
-// and treats anything else as unclassified, i.e. retryable — the pre-tether#63
-// behaviour.
+// A convention, not an enforced invariant: Envelope's fields are exported, so a
+// caller CAN hand-build a KindError. None does today. The last one that did was
+// internal/server/wt_shell.go's lock_held on the shell channel — a different
+// route, a different payload, no frontend consumer — and tether#121 removed it
+// along with the shell input lock it announced. It is still worth stating as a
+// convention rather than an invariant, because nothing in the type system stops
+// the next one and such an envelope would degrade quietly rather than loudly: the
+// browser's parseErrorPayload requires `message` and `terminal` and treats
+// anything else as unclassified, i.e. retryable — the pre-tether#63 behaviour.
 func NewErrorEnvelope(code ErrorCode, msg string) Envelope {
 	return Envelope{
 		Kind: KindError,

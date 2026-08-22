@@ -649,12 +649,13 @@ const refusalDrainGrace = 300 * time.Millisecond
 // sendEnvelope directly, so that "a refusal the daemon decided is a refusal the
 // browser is told about" is a property of the one function they all share
 // instead of something each site is trusted to remember. It is a convention,
-// not something the type system enforces — wire.Envelope's fields are exported
-// and internal/server/wt_shell.go still builds a KindError by hand for the
-// shell pane's lock_held (a different channel, with extra fields and no
-// frontend consumer). What IS structural is that no refusal on the CHAT route
-// can be written without going through here or being obviously different from
-// its four neighbours.
+// not something the type system enforces — wire.Envelope's fields are exported,
+// so a KindError can be built by hand. The last one that was is gone:
+// internal/server/wt_shell.go built one for the shell pane's lock_held (a
+// different channel, with extra fields and no frontend consumer) until
+// tether#121 removed the shell input lock. What IS structural is that no
+// refusal on the CHAT route can be written without going through here or being
+// obviously different from its four neighbours.
 //
 // The wait ends early if the client has already gone: ctx is the WebTransport
 // session's, so on the ErrCodeConnectionClosed path — where the refusal exists

@@ -503,9 +503,16 @@ func TestObserver_RekeyRetiresTheOldKeysObservers(t *testing.T) {
 // ─── housekeeping ───────────────────────────────────────────────────────────
 
 // TestObserver_BroadcastAllReachesAnObserverWithNoLiveSession — BroadcastAll's
-// three callers (the permission fan-out and the two shell lock events) address
-// the whole daemon, and an observer is part of it on the strength of being
-// connected. Before tether#75 such an observer had never been subscribed at all
+// two callers (the permission request fan-out and the permissions-withdrawn
+// batch, both in server/mux.go) address the whole daemon, and an observer is part
+// of it on the strength of being connected. This sentence said "three (the
+// permission fan-out and the two shell lock events)" and had drifted twice by the
+// time it was corrected: it was right when the tether#75 work wrote it (PR #167),
+// tether#137 made it four by adding the permissions-withdrawn batch without
+// touching it, and tether#121 took the two shell lock events away with the shell
+// input lock. Hence two, and hence the callers named rather than counted.
+//
+// Before tether#75 such an observer had never been subscribed at all
 // when its sid had no registration, so it missed daemon-wide notices for a
 // reason that had nothing to do with them.
 func TestObserver_BroadcastAllReachesAnObserverWithNoLiveSession(t *testing.T) {

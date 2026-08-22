@@ -235,7 +235,20 @@ func (s *opencodeSession) watchServeExit(serve *exec.Cmd, exitDone chan struct{}
 	if werr != nil {
 		msg += ": " + werr.Error()
 	}
-	s.emit(Event{Kind: EventError, Err: errors.New(msg)})
+	// Stamped with the CURRENT run and not a fresh one (tether#148): this is the
+	// session's obituary, not a run of its own, and minting an id for it would give
+	// it an identity no other signal shares.
+	//
+	// What that buys HERE is narrower than the same stamp buys cc's abandon, and
+	// worth separating so the two are not read as one argument. `busy` means the
+	// only delivery that can be outstanding is the current run's, whose id runSeq
+	// already holds — so this error is normally APPLIED, closing that run's turn,
+	// and the run's own terminal result (if it still manages one before closeEvents)
+	// is what gets refused as the duplicate. The refusal direction only appears in
+	// the window between Entry.sendPrompt's Add(1) and this session's next
+	// runSeq.Add(1), which is a few instructions wide. cc has no busy gate and
+	// reaches it broadly; see ccSession.abandon.
+	s.emit(Event{Kind: EventError, RunID: s.runSeq.Load(), Err: errors.New(msg)})
 	// 4. End the stream. This is what turns Alive() false and lets fanOut's
 	//    deferred evict drop the registry entry.
 	s.closeEvents()
@@ -280,7 +293,33 @@ type opencodeSession struct {
 	env      []string
 	spawnCtx context.Context
 
-	busy     atomic.Bool
+	busy atomic.Bool
+	// runSeq is this session's run counter and doubles as "which run is current"
+	// (tether#148). Add(1) mints the next id; Load() is the id every event that is
+	// NOT emitted from a run goroutine has to be attributed to.
+	//
+	// One field for both jobs because `busy` already serializes runs — but the
+	// serialization argument is about WHERE the mint sits, not about the CAS alone,
+	// and getting that wrong is how the ordering contract breaks. SendPrompt
+	// CAS-gates on `busy`, and `defer s.busy.Store(false)` is the run goroutine's
+	// FIRST defer, so it fires LAST — after the terminal EventResult. That covers
+	// every emit that carries a run id ONLY because the mint is placed after the
+	// last statement that can release `busy` without emitting first (see
+	// SendPrompt). Given that placement, run N+1 cannot be minted until every emit
+	// of run N has been made, which is the "strictly increasing in emission order"
+	// half of the Event.RunID contract and what lets fanOut keep one high-water mark
+	// instead of a set.
+	//
+	// The two paths that release `busy` and then report — the busy rejection and a
+	// failed serve relaunch — carry no run id at all, so they are outside this
+	// argument rather than exceptions to it.
+	//
+	// It is deliberately NOT reset when a run ends. A stale signal arriving after
+	// its own run finished — the SSE session.error frame, which runs on sseLoop's
+	// goroutine with no ordering relation to the run goroutine — is then stamped
+	// with the run it belongs to and refused, instead of counting down whatever
+	// delivery is outstanding.
+	runSeq   atomic.Int64
 	events   chan Event
 	eventsMu sync.RWMutex // guards closed
 	closed   bool
@@ -411,7 +450,16 @@ func (s *opencodeSession) Events() <-chan Event { return s.events }
 
 func (s *opencodeSession) SendPrompt(ctx context.Context, text string) error {
 	if !s.busy.CompareAndSwap(false, true) {
-		s.emit(Event{Kind: EventError, Err: fmt.Errorf("busy: another prompt is running")})
+		// RunID stays ZERO, and that is the design rather than an omission
+		// (tether#148). This prompt was refused before any run existed, so there is
+		// no run for its error to belong to — and it must not borrow one: run ids are
+		// strictly increasing over ACCEPTED runs, and a refusal minting the NEXT id
+		// would put a higher number on a signal that precedes the live run's own
+		// terminal result, which fanOut's high-water mark would then read as "already
+		// settled" and mute. Zero says "cannot be a run's second signal", which is
+		// exactly true here: this error is the only end-of-turn this delivery will
+		// ever get, and Entry.sendPrompt has already counted the delivery up.
+		s.emit(Event{Kind: EventError, RunID: 0, Err: fmt.Errorf("busy: another prompt is running")})
 		return nil
 	}
 
@@ -428,7 +476,24 @@ func (s *opencodeSession) SendPrompt(ctx context.Context, text string) error {
 		if err := s.startServe(s.spawnCtx); err != nil {
 			s.lifeMu.Unlock()
 			s.busy.Store(false)
-			s.emit(Event{Kind: EventError, Err: fmt.Errorf("opencode resume serve: %w", err)})
+			// RunID ZERO, like the busy rejection above and for the same reason: no
+			// run ever started. `opencode run` is never spawned on this path, so
+			// nothing else will ever speak for this delivery, and this error cannot be
+			// some run's second signal.
+			//
+			// It also has to be zero, which is the part worth writing down. This is
+			// the ONE accepted-delivery path whose only turn-closer is emitted AFTER
+			// `busy` has been released (the line above), so a second SendPrompt can
+			// win the CAS while this emit is still in flight. Minting an id here would
+			// therefore be the one way to get turn-closers onto the channel in
+			// DECREASING run order — and fanOut's high-water mark reads a lower id as
+			// "that run already settled" and refuses it. On a path that deliberately
+			// keeps the session alive and dormant, teardown never runs, so the count
+			// would sit one high for the rest of the session: the frozen "working"
+			// marker, reached from the direction tether#148 claims to have closed.
+			// Zero is not a workaround for that ordering; it is what makes the ordering
+			// irrelevant, because a zero-run signal is always applied.
+			s.emit(Event{Kind: EventError, RunID: 0, Err: fmt.Errorf("opencode resume serve: %w", err)})
 			return nil
 		}
 		s.mu.Lock()
@@ -436,6 +501,19 @@ func (s *opencodeSession) SendPrompt(ctx context.Context, text string) error {
 		s.mu.Unlock()
 	}
 	s.lifeMu.Unlock()
+
+	// A run — an accepted prompt the agent is actually going to answer — begins
+	// HERE, and the placement is what makes the Event.RunID ordering contract true
+	// by construction rather than by inspection (tether#148).
+	//
+	// Every emit that carries this id is inside the goroutine below, whose
+	// `defer s.busy.Store(false)` is its FIRST defer and therefore fires LAST —
+	// after the terminal EventResult. So run N+1 cannot be minted until every emit
+	// of run N has been made, and fanOut sees turn-closers in non-decreasing run
+	// order. Minting any earlier would put the id on the far side of the one
+	// `busy.Store(false)` that runs before its own emit (the resume-serve failure
+	// above), which is exactly the inversion that contract cannot survive.
+	runID := s.runSeq.Add(1)
 
 	// Derive a cancelable ctx for this run so Interrupt() can stop the client
 	// cleanly: cancellation suppresses the run's exit error (see below) and the
@@ -476,11 +554,11 @@ func (s *opencodeSession) SendPrompt(ctx context.Context, text string) error {
 
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
-			s.emit(Event{Kind: EventError, Err: fmt.Errorf("opencode run: stdout pipe: %w", err)})
+			s.emit(Event{Kind: EventError, RunID: runID, Err: fmt.Errorf("opencode run: stdout pipe: %w", err)})
 			return
 		}
 		if err := cmd.Start(); err != nil {
-			s.emit(Event{Kind: EventError, Err: fmt.Errorf("opencode run: start: %w", err)})
+			s.emit(Event{Kind: EventError, RunID: runID, Err: fmt.Errorf("opencode run: start: %w", err)})
 			return
 		}
 
@@ -520,7 +598,7 @@ func (s *opencodeSession) SendPrompt(ctx context.Context, text string) error {
 				_ = cmd.Process.Kill()
 				killedByUs = true
 			}
-			s.emit(Event{Kind: EventError, Err: fmt.Errorf("opencode run: stdout scan: %w", err)})
+			s.emit(Event{Kind: EventError, RunID: runID, Err: fmt.Errorf("opencode run: stdout scan: %w", err)})
 		}
 		// A non-zero exit that is the result of an Interrupt() (runCtx cancelled),
 		// session teardown (ctx cancelled) or the scan-error kill just above is
@@ -529,12 +607,12 @@ func (s *opencodeSession) SendPrompt(ctx context.Context, text string) error {
 		// killed") for a signal tether sent, and the two context checks cannot
 		// catch it: on that path both contexts are deliberately still live.
 		if err := cmd.Wait(); err != nil && !killedByUs && ctx.Err() == nil && runCtx.Err() == nil {
-			s.emit(Event{Kind: EventError, Err: fmt.Errorf("opencode run exited: %w", err)})
+			s.emit(Event{Kind: EventError, RunID: runID, Err: fmt.Errorf("opencode run exited: %w", err)})
 		}
 		// Emit EventResult after opencode run exits (or is interrupted) — closes
 		// the turn for the consumer. More reliable than the session.idle SSE
 		// (which can fire spuriously before text is done).
-		s.emit(Event{Kind: EventResult, Text: "stop"})
+		s.emit(Event{Kind: EventResult, RunID: runID, Text: "stop"})
 	}()
 	return nil
 }
@@ -699,6 +777,30 @@ type ssePayload struct {
 	} `json:"payload"`
 }
 
+// readSSE parses one SSE body and emits the frames this daemon forwards.
+//
+// # Run attribution here is a snapshot, and its one residual is named
+//
+// Every event below is stamped with s.runSeq.Load() — the run that is current at
+// the instant the frame is read (tether#148). This loop has no run of its own:
+// it belongs to a serve incarnation, and a serve serves many runs.
+//
+// For the frame that matters, `session.error`, the snapshot is what closes the
+// gap tether#145's guard could not even see. That frame is emitted on THIS
+// goroutine while the run goroutine is separately emitting its terminal
+// EventResult, with no ordering between them — so an error can be applied AFTER
+// its own run's result, and before tether#148 it then counted down whatever
+// delivery had arrived in the meantime. Stamped, it carries the same id as that
+// result and fanOut refuses it.
+//
+// What the snapshot does NOT cover, stated rather than implied: if a whole new
+// run is accepted before this loop reaches the frame, s.runSeq has already moved
+// on and the error is stamped with the NEW run — which is the theft, one run
+// later. It is unchanged from before tether#148 (that error counted down
+// unconditionally), it is not distinguishable from an error that really is about
+// the new run, and closing it would need a correlation id opencode's
+// session.error frame does not carry (its properties are an error object only —
+// see the case below).
 func (s *opencodeSession) readSSE(ctx context.Context, r io.Reader, emit func(Event)) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 1<<16), 1<<20)
@@ -737,7 +839,7 @@ func (s *opencodeSession) readSSE(ctx context.Context, r io.Reader, emit func(Ev
 						close(s.sidCh)
 					})
 				}
-				emit(Event{Kind: EventText, Text: props.Delta})
+				emit(Event{Kind: EventText, RunID: s.runSeq.Load(), Text: props.Delta})
 			}
 
 		case "session.created":
@@ -754,7 +856,7 @@ func (s *opencodeSession) readSSE(ctx context.Context, r io.Reader, emit func(Ev
 					s.mu.Unlock()
 					close(s.sidCh)
 				})
-				emit(Event{Kind: EventInit, SessionID: props.SessionID})
+				emit(Event{Kind: EventInit, RunID: s.runSeq.Load(), SessionID: props.SessionID})
 			}
 
 		case "session.error":
@@ -765,7 +867,7 @@ func (s *opencodeSession) readSSE(ctx context.Context, r io.Reader, emit func(Ev
 			}
 			if err := json.Unmarshal(wrapper.Payload.Properties, &props); err == nil {
 				if props.Error.Message != "" {
-					emit(Event{Kind: EventError, Err: errors.New(props.Error.Message)})
+					emit(Event{Kind: EventError, RunID: s.runSeq.Load(), Err: errors.New(props.Error.Message)})
 				}
 			}
 		}

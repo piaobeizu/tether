@@ -248,6 +248,60 @@ type ccSession struct {
 	// closeOnce/closeErr make Close idempotent — see Close for why it has to be.
 	closeOnce sync.Once
 	closeErr  error
+	// runSeq/runOpen carry the Event.RunID contract for this provider (tether#148).
+	// Plain fields with NO guard, deliberately, and the enumeration is the whole
+	// argument: they are WRITTEN only by openRun/closeRun, which are called only
+	// from parseLine, which is called only from readLoop's scan loop. The one other
+	// reader is abandon — a read and nothing more, which is the point of it (see
+	// there) — and readLoop calls that straight-line after the same loop. One
+	// goroutine, so a mutex or an atomic here would be documenting a concurrency
+	// story that does not exist. A future write from anywhere else invalidates this
+	// paragraph, not just extends it. See openRun for what the fields mean.
+	runSeq  int64
+	runOpen bool
+}
+
+// openRun returns the id of the run this stream position belongs to, starting a
+// new one if the previous run has already reported its end (tether#148).
+//
+// # Why the boundary is "the first event after a turn-closer" and not "init"
+//
+// cc gives no correlation id: nothing on a `result` line says which prompt it
+// answers. What the stream does give is ORDER, and one turn's events never
+// interleave with another's — cc finishes a turn before starting the next, which
+// is what the tether#83 measurement in Entry.turnsInFlight records ("that turn's
+// `result` at 19209ms; only then a fresh system/init at 19246ms"). So a run
+// boundary is derivable: the first event after a turn-closer opens the next run.
+//
+// `system/init` is the obvious candidate boundary and is deliberately NOT used.
+// cc re-emitting init per turn is cc's behaviour, not tether's contract with it,
+// and a turn that emitted no init would then share the previous turn's id — which
+// would make fanOut refuse a legitimate turn-closer and freeze the row on
+// "working" for the rest of the session, the exact failure tether#103 exists to
+// prevent. Advancing on ANY event cannot do that: two turn-closers can never
+// collide, because the first one closes the run and the second one opens a fresh
+// id even with nothing in between.
+//
+// What this buys over "a fresh id per turn-closer" is abandon — see there.
+func (s *ccSession) openRun() int64 {
+	if !s.runOpen {
+		s.runSeq++
+		s.runOpen = true
+	}
+	return s.runSeq
+}
+
+// closeRun returns this run's id and records that it has now reported its end, so
+// the next event opens a new run.
+//
+// For the turn-closers parseLine emits, which today is the `result` line and only
+// that. cc's other terminal event, abandon's EventError, deliberately does NOT come
+// through here — it is the stream dying rather than a run reporting, and reusing the
+// id without closing anything is exactly what makes its three cases come out right.
+func (s *ccSession) closeRun() int64 {
+	id := s.openRun()
+	s.runOpen = false
+	return id
 }
 
 // SessionID blocks until cc emits system/init (which resolves s.sid) OR the
@@ -525,7 +579,16 @@ func (s *ccSession) abandon(err error) {
 	// frontend clears "thinking…" on the error envelope as well as the result one
 	// (see isTerminal). This mirrors what the opencode run path already does with
 	// its own scan error.
-	s.emit(Event{Kind: EventError, Err: fmt.Errorf("agent output stream ended in an error: %w", err)})
+	// s.runSeq directly and NOT openRun (tether#148): the stream dying is not a run
+	// of its own, so this must not mint an id. Reading the field gives the right
+	// answer in all three states, which is the whole reason openRun advances lazily:
+	// a turn still open owns runSeq, so this error closes it; a turn that already
+	// reported its result owns runSeq too, so fanOut refuses this one and the
+	// non-zero count survives to reach fanOut's end-of-stream arm, which is what
+	// makes markTurnInterrupted report the delivery that really was cut off; and a
+	// stream that died before any event at all leaves runSeq at zero, which
+	// Event.RunID defines as "no run" and fanOut always applies.
+	s.emit(Event{Kind: EventError, RunID: s.runSeq, Err: fmt.Errorf("agent output stream ended in an error: %w", err)})
 }
 
 // guardStdout force-closes cc's stdout read end once the Spawn context has been
@@ -697,7 +760,7 @@ func (s *ccSession) parseLine(line []byte) []Event {
 			s.sid = raw.SessionID
 			close(s.sidReady)
 		})
-		return []Event{{Kind: EventInit, SessionID: raw.SessionID}}
+		return []Event{{Kind: EventInit, RunID: s.openRun(), SessionID: raw.SessionID}}
 	}
 
 	// stream_event lines carry token-level deltas (--include-partial-messages).
@@ -710,7 +773,7 @@ func (s *ccSession) parseLine(line []byte) []Event {
 		if raw.Event.Type == "content_block_delta" &&
 			raw.Event.Delta.Type == "text_delta" &&
 			raw.Event.Delta.Text != "" {
-			return []Event{{Kind: EventText, Text: raw.Event.Delta.Text}}
+			return []Event{{Kind: EventText, RunID: s.openRun(), Text: raw.Event.Delta.Text}}
 		}
 		// Extended-thinking tokens (tether#34). Forwarded as EventThinking;
 		// registry.fanOut routes it through translateEvent (bypassing the
@@ -719,7 +782,7 @@ func (s *ccSession) parseLine(line []byte) []Event {
 		if raw.Event.Type == "content_block_delta" &&
 			raw.Event.Delta.Type == "thinking_delta" &&
 			raw.Event.Delta.Thinking != "" {
-			return []Event{{Kind: EventThinking, Text: raw.Event.Delta.Thinking}}
+			return []Event{{Kind: EventThinking, RunID: s.openRun(), Text: raw.Event.Delta.Thinking}}
 		}
 		return nil
 	}
@@ -734,7 +797,8 @@ func (s *ccSession) parseLine(line []byte) []Event {
 			if block.Type == "tool_use" {
 				// tool_use is a content block, NOT a top-level event (D-05a §3, Risk #4).
 				evs = append(evs, Event{
-					Kind: EventToolUse,
+					Kind:  EventToolUse,
+					RunID: s.openRun(),
 					ToolUse: &ToolUseEvent{
 						ID:    block.ID,
 						Name:  block.Name,
@@ -757,7 +821,8 @@ func (s *ccSession) parseLine(line []byte) []Event {
 		for _, block := range raw.Message.Content {
 			if block.Type == "tool_result" {
 				evs = append(evs, Event{
-					Kind: EventToolResult,
+					Kind:  EventToolResult,
+					RunID: s.openRun(),
 					ToolResult: &ToolResultEvent{
 						ToolUseID: block.ToolUseID,
 						Content:   toolResultText(block.Content),
@@ -775,16 +840,16 @@ func (s *ccSession) parseLine(line []byte) []Event {
 		// first means the frontend still has the open turn bubble to attach it to.
 		var evs []Event
 		if raw.Usage != nil {
-			evs = append(evs, Event{Kind: EventUsage, Usage: &UsageEvent{
+			evs = append(evs, Event{Kind: EventUsage, RunID: s.openRun(), Usage: &UsageEvent{
 				Input:  raw.Usage.InputTokens,
 				Output: raw.Usage.OutputTokens,
 			}})
 		}
-		return append(evs, Event{Kind: EventResult, Text: raw.Result})
+		return append(evs, Event{Kind: EventResult, RunID: s.closeRun(), Text: raw.Result})
 	}
 
 	if raw.Type == "rate_limit_event" {
-		return []Event{{Kind: EventRateLimit}}
+		return []Event{{Kind: EventRateLimit, RunID: s.openRun()}}
 	}
 
 	// control_response is cc's reply to a control_request WE sent (currently

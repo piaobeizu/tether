@@ -29,14 +29,15 @@ import (
 // file over. Every check below therefore names what the response IS, and the
 // comment on each says what it evaluated to while the bug was live.
 
-// signInAnchor appears only on the sign-in prompt; consentAnchor appears only on
-// the consent page. Keeping both, and asserting on both in both directions, is
-// what makes these tests able to tell the two pages apart rather than merely
-// notice that one of them is missing.
+// signInAnchor appears only on the sign-in prompt, as reqIDMarker (tether#155,
+// in handlers_test.go) appears only on the consent page. Asserting on both, in
+// both directions, is what lets these tests tell the two pages apart rather than
+// merely notice that one of them is missing. reqIDMarker is reused rather than
+// restated so there is one definition of "this is the consent page" in the
+// package.
 const (
-	signInAnchor  = `id="oauth-signin-continue"`
-	consentAnchor = `name="req_id"`
-	consentForm   = `<form method="POST" action="/oauth/authorize">`
+	signInAnchor = `id="oauth-signin-continue"`
+	consentForm  = `<form method="POST" action="/oauth/authorize">`
 )
 
 // getWithRawQuery builds GET /oauth/authorize whose RawQuery is exactly raw.
@@ -59,18 +60,18 @@ func signInHref(t *testing.T, body string) string {
 	t.Helper()
 	i := strings.Index(body, signInAnchor)
 	if i < 0 {
-		t.Fatalf("no sign-in anchor %s in the response body:\n%s", signInAnchor, body)
+		t.Fatalf("no sign-in anchor %s in the response body: %s", signInAnchor, bodyExcerpt(body))
 	}
 	rest := body[i:]
 	const marker = `href="`
 	j := strings.Index(rest, marker)
 	if j < 0 {
-		t.Fatalf("sign-in anchor carries no href:\n%s", body)
+		t.Fatalf("sign-in anchor carries no href: %s", bodyExcerpt(body))
 	}
 	rest = rest[j+len(marker):]
 	k := strings.Index(rest, `"`)
 	if k < 0 {
-		t.Fatalf("unterminated href on the sign-in anchor:\n%s", body)
+		t.Fatalf("unterminated href on the sign-in anchor: %s", bodyExcerpt(body))
 	}
 	return rest[:k]
 }
@@ -98,7 +99,7 @@ func TestAuthorizeGet_NoSession_RendersSignInPromptNotConsentPage(t *testing.T) 
 
 	// Was 200 while the bug was live — the consent page rendered happily.
 	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("unauthenticated GET: want 401, got %d\n%s", w.Code, body)
+		t.Fatalf("unauthenticated GET: want 401, got %d: %s", w.Code, bodyExcerpt(body))
 	}
 	// Was "text/html; charset=utf-8" then too. Asserted because the two checks
 	// below only mean anything about a rendered page if a page was rendered.
@@ -109,12 +110,12 @@ func TestAuthorizeGet_NoSession_RendersSignInPromptNotConsentPage(t *testing.T) 
 	// with no body, or a 500, fails here, so "not the consent page" cannot pass
 	// by being nothing at all.
 	if !strings.Contains(body, signInAnchor) {
-		t.Errorf("sign-in prompt not rendered: no %s in\n%s", signInAnchor, body)
+		t.Errorf("sign-in prompt not rendered: no %s in %s", signInAnchor, bodyExcerpt(body))
 	}
 	// Was present, twice over: the form and its hidden req_id are exactly what
 	// let the owner click Allow into a dead end.
-	if strings.Contains(body, consentAnchor) {
-		t.Errorf("consent page rendered to a signed-out browser: found %s", consentAnchor)
+	if strings.Contains(body, reqIDMarker) {
+		t.Errorf("consent page rendered to a signed-out browser: found %q", reqIDMarker)
 	}
 	if strings.Contains(body, consentForm) {
 		t.Errorf("consent form rendered to a signed-out browser")
@@ -139,13 +140,13 @@ func TestAuthorizeGet_WithSession_StillRendersConsentPage(t *testing.T) {
 	body := w.Body.String()
 
 	if w.Code != http.StatusOK {
-		t.Fatalf("signed-in GET: want 200, got %d\n%s", w.Code, body)
+		t.Fatalf("signed-in GET: want 200, got %d: %s", w.Code, bodyExcerpt(body))
 	}
-	if !strings.Contains(body, consentAnchor) {
-		t.Errorf("consent page missing %s:\n%s", consentAnchor, body)
+	if !strings.Contains(body, reqIDMarker) {
+		t.Errorf("consent page missing %q: %s", reqIDMarker, bodyExcerpt(body))
 	}
 	if !strings.Contains(body, consentForm) {
-		t.Errorf("consent form missing:\n%s", body)
+		t.Errorf("consent form missing: %s", bodyExcerpt(body))
 	}
 	if strings.Contains(body, signInAnchor) {
 		t.Errorf("a signed-in browser was told to sign in")
@@ -193,13 +194,13 @@ func TestAuthorizeGet_NoSession_EscapesClientID(t *testing.T) {
 	body := w.Body.String()
 
 	if !strings.Contains(body, signInAnchor) {
-		t.Fatalf("expected the sign-in prompt, got:\n%s", body)
+		t.Fatalf("expected the sign-in prompt, got: %s", bodyExcerpt(body))
 	}
 	if strings.Contains(body, "<script>") {
 		t.Errorf("client_id must be HTML-escaped in the sign-in prompt")
 	}
 	if !strings.Contains(body, "&lt;script&gt;") {
-		t.Errorf("client_id should still be shown, escaped; body:\n%s", body)
+		t.Errorf("client_id should still be shown, escaped; body: %s", bodyExcerpt(body))
 	}
 }
 
@@ -222,7 +223,7 @@ func TestAuthorizeGet_InvalidRequest_ReportsTheOAuthErrorWithoutASession(t *test
 		w := httptest.NewRecorder()
 		h.Authorize().ServeHTTP(w, getWithRawQuery(raw))
 		if w.Code != http.StatusBadRequest {
-			t.Fatalf("want 400, got %d: %s", w.Code, w.Body.String())
+			t.Fatalf("want 400, got %d: %s", w.Code, bodyExcerpt(w.Body.String()))
 		}
 		if strings.Contains(w.Body.String(), signInAnchor) {
 			t.Error("a bad redirect_uri should be reported, not swallowed by a login prompt")
@@ -236,7 +237,7 @@ func TestAuthorizeGet_InvalidRequest_ReportsTheOAuthErrorWithoutASession(t *test
 		w := httptest.NewRecorder()
 		h.Authorize().ServeHTTP(w, getWithRawQuery(raw))
 		if w.Code != http.StatusFound {
-			t.Fatalf("want 302, got %d: %s", w.Code, w.Body.String())
+			t.Fatalf("want 302, got %d: %s", w.Code, bodyExcerpt(w.Body.String()))
 		}
 		if !strings.Contains(w.Header().Get("Location"), "error=invalid_request") {
 			t.Errorf("want invalid_request, got %s", w.Header().Get("Location"))
@@ -321,7 +322,7 @@ func TestSignInRedirectCorpus_MatchesHandlerOutput(t *testing.T) {
 			h.Authorize().ServeHTTP(w, getWithRawQuery(e.RawQuery))
 
 			if w.Code != http.StatusUnauthorized {
-				t.Fatalf("want 401 (%s), got %d: %s", e.Why, w.Code, w.Body.String())
+				t.Fatalf("want 401 (%s), got %d: %s", e.Why, w.Code, bodyExcerpt(w.Body.String()))
 			}
 			// The rendered href, not the return value of a helper: html/template
 			// applies URL-context escaping to this attribute, and an escaping that

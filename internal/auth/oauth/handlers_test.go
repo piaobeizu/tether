@@ -16,6 +16,25 @@ import (
 	"github.com/piaobeizu/tether/internal/auth/oauth"
 )
 
+// sessionCookieName is the cookie these tests use to stand in for a signed-in
+// browser. The real wiring hands NewHandlers auth.State.ClientIDFromRequest,
+// which HMAC-verifies the tether_session JWT; what this package's tests need to
+// pin is that the consent POST consults SessionAuth AT ALL and obeys it, not how
+// a JWT is verified (internal/auth/jwt_test.go covers that).
+const sessionCookieName = "tether_session"
+
+// testSessionAuth accepts a request iff it carries sessionCookieName.
+func testSessionAuth(r *http.Request) bool {
+	c, err := r.Cookie(sessionCookieName)
+	return err == nil && c.Value != ""
+}
+
+// withSession marks req as coming from a signed-in browser.
+func withSession(req *http.Request) *http.Request {
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "signed-in"})
+	return req
+}
+
 func makeHandlers(t *testing.T) (*oauth.Handlers, *apitoken.Store) {
 	t.Helper()
 	tokens, err := apitoken.Open(filepath.Join(t.TempDir(), "tokens.json"))
@@ -23,8 +42,20 @@ func makeHandlers(t *testing.T) (*oauth.Handlers, *apitoken.Store) {
 		t.Fatal(err)
 	}
 	cs := oauth.NewCodeStore()
-	h := oauth.NewHandlers(cs, tokens, "https://localhost:8897")
+	h := oauth.NewHandlers(cs, tokens, "https://localhost:8897", testSessionAuth)
 	return h, tokens
+}
+
+// makeHandlersNoSessionAuth builds Handlers the way a caller that forgot to wire
+// SessionAuth would. Kept separate so the nil case is exercised on purpose
+// rather than by accident.
+func makeHandlersNoSessionAuth(t *testing.T) *oauth.Handlers {
+	t.Helper()
+	tokens, err := apitoken.Open(filepath.Join(t.TempDir(), "tokens.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return oauth.NewHandlers(oauth.NewCodeStore(), tokens, "https://localhost:8897", nil)
 }
 
 func pkceTestPair() (verifier, challenge string) {
@@ -179,7 +210,7 @@ func TestAuthorizePost_Allow_IssuesCodeAndRedirects(t *testing.T) {
 	reqID := reqIDFromApprovalPage(t, h)
 
 	form := url.Values{"req_id": {reqID}, "action": {"allow"}}
-	req := httptest.NewRequest("POST", "/oauth/authorize", strings.NewReader(form.Encode()))
+	req := withSession(httptest.NewRequest("POST", "/oauth/authorize", strings.NewReader(form.Encode())))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	w := httptest.NewRecorder()
 	h.Authorize().ServeHTTP(w, req)
@@ -202,7 +233,7 @@ func TestAuthorizePost_Deny_RedirectsWithAccessDenied(t *testing.T) {
 	reqID := reqIDFromApprovalPage(t, h)
 
 	form := url.Values{"req_id": {reqID}, "action": {"deny"}}
-	req := httptest.NewRequest("POST", "/oauth/authorize", strings.NewReader(form.Encode()))
+	req := withSession(httptest.NewRequest("POST", "/oauth/authorize", strings.NewReader(form.Encode())))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	w := httptest.NewRecorder()
 	h.Authorize().ServeHTTP(w, req)
@@ -218,7 +249,7 @@ func TestAuthorizePost_Deny_RedirectsWithAccessDenied(t *testing.T) {
 func TestAuthorizePost_ExpiredReqID_Returns400(t *testing.T) {
 	h, _ := makeHandlers(t)
 	form := url.Values{"req_id": {"doesnotexist"}, "action": {"allow"}}
-	req := httptest.NewRequest("POST", "/oauth/authorize", strings.NewReader(form.Encode()))
+	req := withSession(httptest.NewRequest("POST", "/oauth/authorize", strings.NewReader(form.Encode())))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	w := httptest.NewRecorder()
 	h.Authorize().ServeHTTP(w, req)
@@ -253,7 +284,7 @@ func fullPKCECode(t *testing.T, h *oauth.Handlers) (code, verifier string) {
 	reqID := body[start : start+end]
 
 	form := url.Values{"req_id": {reqID}, "action": {"allow"}}
-	req2 := httptest.NewRequest("POST", "/oauth/authorize", strings.NewReader(form.Encode()))
+	req2 := withSession(httptest.NewRequest("POST", "/oauth/authorize", strings.NewReader(form.Encode())))
 	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	w2 := httptest.NewRecorder()
 	h.Authorize().ServeHTTP(w2, req2)
@@ -390,5 +421,131 @@ func TestToken_RedirectURIMismatch_Returns400(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("want 400, got %d", w.Code)
+	}
+}
+
+// --- A1: the consent POST needs an authenticated browser (tether#117) ---
+
+// TestAuthorizePost_NoSession_Returns401 is the head of the attack chain the
+// wi documents. Three requests used to mint a 24h MCP Bearer token with zero
+// credentials:
+//
+//  1. GET  /oauth/authorize?...&redirect_uri=http://127.0.0.1:1/ → req_id
+//  2. POST /oauth/authorize  req_id=…&action=allow               → 302 with ?code=
+//  3. POST /oauth/token      code + code_verifier                → access_token
+//
+// Step 2 is the one that needs a human at a keyboard, and it is the one that
+// asked for nothing. Note step 1's redirect_uri never has to be reachable: the
+// code arrives in the Location header of step 2's response.
+func TestAuthorizePost_NoSession_Returns401(t *testing.T) {
+	h, _ := makeHandlers(t)
+	reqID := reqIDFromApprovalPage(t, h)
+
+	form := url.Values{"req_id": {reqID}, "action": {"allow"}}
+	req := httptest.NewRequest("POST", "/oauth/authorize", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.RemoteAddr = "203.0.113.7:44444" // a remote peer, as on a --acme-domain deployment
+	w := httptest.NewRecorder()
+	h.Authorize().ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("want 401, got %d: %s", w.Code, w.Body.String())
+	}
+	if loc := w.Header().Get("Location"); loc != "" {
+		t.Fatalf("no redirect must be issued; got Location: %s", loc)
+	}
+	if strings.Contains(w.Body.String(), "code=") {
+		t.Error("response body must not carry an authorization code")
+	}
+}
+
+// TestAuthorizePost_NoSession_DoesNotBurnReqID is why the session check sits
+// BEFORE ConsumePending. req_ids are single-use, so an unauthenticated POST that
+// consumed one would let anyone who can guess or observe a req_id cancel the
+// owner's approval mid-flow.
+func TestAuthorizePost_NoSession_DoesNotBurnReqID(t *testing.T) {
+	h, _ := makeHandlers(t)
+	reqID := reqIDFromApprovalPage(t, h)
+
+	form := url.Values{"req_id": {reqID}, "action": {"allow"}}
+	unauth := httptest.NewRequest("POST", "/oauth/authorize", strings.NewReader(form.Encode()))
+	unauth.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w1 := httptest.NewRecorder()
+	h.Authorize().ServeHTTP(w1, unauth)
+	if w1.Code != http.StatusUnauthorized {
+		t.Fatalf("setup: want 401, got %d", w1.Code)
+	}
+
+	// The same req_id must still work for the signed-in owner.
+	authed := withSession(httptest.NewRequest("POST", "/oauth/authorize", strings.NewReader(form.Encode())))
+	authed.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w2 := httptest.NewRecorder()
+	h.Authorize().ServeHTTP(w2, authed)
+	if w2.Code != http.StatusFound {
+		t.Fatalf("the rejected POST consumed the req_id: want 302, got %d: %s", w2.Code, w2.Body.String())
+	}
+}
+
+// TestAuthorizePost_NilSessionAuth_Returns401 pins the fail-closed default: a
+// caller that forgets to wire SessionAuth gets a broken approval flow, never a
+// public mint.
+func TestAuthorizePost_NilSessionAuth_Returns401(t *testing.T) {
+	h := makeHandlersNoSessionAuth(t)
+	reqID := reqIDFromApprovalPage(t, h)
+
+	form := url.Values{"req_id": {reqID}, "action": {"allow"}}
+	req := withSession(httptest.NewRequest("POST", "/oauth/authorize", strings.NewReader(form.Encode())))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	h.Authorize().ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("nil SessionAuth must deny: want 401, got %d", w.Code)
+	}
+}
+
+// TestAuthorizeGet_NoSession_StillShowsApprovalPage keeps the GET exemption
+// deliberate rather than incidental. The MCP client opens this URL in the
+// owner's browser and that browser may not hold the cookie yet; requiring one
+// here would replace the consent page with a login redirect and lose the
+// pending request. Nothing is minted by rendering the page.
+func TestAuthorizeGet_NoSession_StillShowsApprovalPage(t *testing.T) {
+	h, _ := makeHandlers(t)
+	_, challenge := pkceTestPair()
+	req := httptest.NewRequest("GET", authorizeURL(challenge, nil), nil)
+	w := httptest.NewRecorder()
+	h.Authorize().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET without a session: want 200, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `name="req_id"`) {
+		t.Error("consent page should still render for an unauthenticated GET")
+	}
+}
+
+// TestToken_NoSession_StillExchanges keeps the /oauth/token exemption
+// deliberate too: the code is single-use and bound to a PKCE challenge, so the
+// exchange authenticates itself, and the MCP client that performs it has no
+// cookie jar. Requiring a session here would break every remote client without
+// adding a guard the code+verifier pair does not already give.
+func TestToken_NoSession_StillExchanges(t *testing.T) {
+	h, _ := makeHandlers(t)
+	code, verifier := fullPKCECode(t, h)
+
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"code_verifier": {verifier},
+		"redirect_uri":  {"http://localhost:12345/callback"},
+		"client_id":     {"cursor"},
+	}
+	req := httptest.NewRequest("POST", "/oauth/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	h.Token().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("cookie-less token exchange must still work: got %d: %s", w.Code, w.Body.String())
 	}
 }

@@ -22,6 +22,15 @@ const (
 	CookieMaxAge = cookieMaxAge
 	jwtTTL       = 90 * 24 * time.Hour
 	WtTicketTTL  = 60 * time.Second
+
+	// subjSession and subjWTTicket are the `sub` claims that separate the two
+	// token kinds. They are signed with the SAME secret by the SAME algorithm,
+	// so `sub` is the only thing that distinguishes a 90-day session cookie from
+	// a 60-second WebTransport ticket — and the ticket travels in a URL query
+	// param (?ticket=), which means proxy logs, browser history and Referer
+	// headers. Both verifiers must check it, in both directions (tether#117 A2).
+	subjSession  = "tether"
+	subjWTTicket = "wt-ticket"
 )
 
 // LoadOrGenSecret returns the HMAC signing secret from ~/.tether/jwt-secret,
@@ -59,7 +68,7 @@ func IssueJWT(secret []byte, clientID string) (string, error) {
 	now := time.Now()
 	header := base64url([]byte(`{"alg":"HS256","typ":"JWT"}`))
 	payload, err := json.Marshal(map[string]any{
-		"sub": "tether",
+		"sub": subjSession,
 		"iat": now.Unix(),
 		"exp": now.Add(jwtTTL).Unix(),
 		"jti": clientID,
@@ -72,7 +81,20 @@ func IssueJWT(secret []byte, clientID string) (string, error) {
 	return body + "." + sig, nil
 }
 
-// VerifyJWT returns (clientID, true) if the token has a valid signature and is not expired.
+// VerifyJWT returns (clientID, true) if the token is a session JWT with a valid
+// signature that has not expired.
+//
+// It rejects any token whose sub is not subjSession, which is what stops a
+// WebTransport ticket from being spent as a session (tether#117 A2). Before that
+// check the claims struct did not even have a sub field, so ANY unexpired token
+// signed with the daemon secret verified here — including the 60-second ticket
+// that rides in a ?ticket= URL param. Pasted into the tether_session cookie it
+// bought a 90-day session, and since clientID is carried in jti, one under the
+// victim's client identity (which is what session ownership is decided on).
+//
+// Requiring the claim invalidates nothing: IssueJWT has always written
+// sub=tether, so this only adds the missing direction of a guard
+// VerifyWTTicket already had.
 func VerifyJWT(secret []byte, token string) (clientID string, ok bool) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
@@ -88,10 +110,14 @@ func VerifyJWT(secret []byte, token string) (clientID string, ok bool) {
 		return "", false
 	}
 	var claims struct {
+		Sub string `json:"sub"`
 		Exp int64  `json:"exp"`
 		Jti string `json:"jti"`
 	}
 	if err := json.Unmarshal(raw, &claims); err != nil {
+		return "", false
+	}
+	if claims.Sub != subjSession {
 		return "", false
 	}
 	if time.Now().Unix() > claims.Exp {
@@ -115,7 +141,7 @@ func IssueWTTicket(secret []byte, clientID string) (string, error) {
 	now := time.Now()
 	header := base64url([]byte(`{"alg":"HS256","typ":"JWT"}`))
 	payload, err := json.Marshal(map[string]any{
-		"sub": "wt-ticket",
+		"sub": subjWTTicket,
 		"iat": now.Unix(),
 		"exp": now.Add(WtTicketTTL).Unix(),
 		"jti": clientID,
@@ -152,7 +178,7 @@ func VerifyWTTicket(secret []byte, token string) (clientID string, ok bool) {
 	if err := json.Unmarshal(raw, &claims); err != nil {
 		return "", false
 	}
-	if claims.Sub != "wt-ticket" {
+	if claims.Sub != subjWTTicket {
 		return "", false
 	}
 	if time.Now().Unix() > claims.Exp {

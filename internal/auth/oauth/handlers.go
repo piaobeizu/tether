@@ -12,17 +12,29 @@ import (
 	"github.com/piaobeizu/tether/internal/auth/apitoken"
 )
 
+// SessionAuth reports whether r carries an authenticated tether browser
+// session. The daemon wires this to the auth middleware's cookie verifier
+// (auth.State.ClientIDFromRequest); it is a function rather than a concrete
+// type so this package does not have to import internal/auth.
+//
+// It gates the consent POST only. A nil SessionAuth denies every consent POST,
+// which is the safe direction: an embedder that forgot to wire it gets a broken
+// approval flow, not a public token mint.
+type SessionAuth func(*http.Request) bool
+
 // Handlers provides the three OAuth 2.1 endpoint handlers.
 type Handlers struct {
-	codes  *CodeStore
-	tokens *apitoken.Store
-	issuer string
-	log    *slog.Logger
+	codes   *CodeStore
+	tokens  *apitoken.Store
+	issuer  string
+	session SessionAuth
+	log     *slog.Logger
 }
 
 // NewHandlers creates Handlers. issuer must be https://<host>[:<port>].
-func NewHandlers(codes *CodeStore, tokens *apitoken.Store, issuer string) *Handlers {
-	return &Handlers{codes: codes, tokens: tokens, issuer: issuer, log: slog.Default()}
+// session gates POST /oauth/authorize; see SessionAuth.
+func NewHandlers(codes *CodeStore, tokens *apitoken.Store, issuer string, session SessionAuth) *Handlers {
+	return &Handlers{codes: codes, tokens: tokens, issuer: issuer, session: session, log: slog.Default()}
 }
 
 // Metadata returns the /.well-known/oauth-authorization-server handler (RFC 8414).
@@ -113,6 +125,27 @@ func (h *Handlers) authorizeGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) authorizePost(w http.ResponseWriter, r *http.Request) {
+	// Consent must come from an authenticated browser (tether#117 A1).
+	//
+	// This handler is the mint: it turns a req_id into an authorization code,
+	// and /oauth/token turns that code into a 24h Bearer token in the same
+	// api-tokens store a hand-issued token lives in. It used to do so for
+	// anyone — the auth middleware exempted /oauth/authorize for every method,
+	// nothing here looked at a cookie or a client identity, and on a
+	// --acme-domain deployment the listener is on the public internet by
+	// construction (TLS-ALPN-01 needs :443 reachable from Let's Encrypt). Three
+	// curl requests, no credentials.
+	//
+	// The middleware now exempts GET only, so this is the second lock rather
+	// than the only one: a future mux rewiring cannot re-open the mint.
+	//
+	// BEFORE ConsumePending, deliberately: a rejected caller must not be able to
+	// burn the req_id of a consent page the owner is looking at.
+	if h.session == nil || !h.session(r) {
+		h.log.Warn("oauth.authorize.unauthenticated", "remote_ip", remoteIP(r))
+		http.Error(w, "unauthorized: sign in to tether before approving an app", http.StatusUnauthorized)
+		return
+	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return

@@ -16,6 +16,7 @@ import (
 
 	"github.com/piaobeizu/tether/internal/agent"
 	"github.com/piaobeizu/tether/internal/auth"
+	"github.com/piaobeizu/tether/internal/permission/cchook"
 	"github.com/piaobeizu/tether/internal/session"
 )
 
@@ -55,7 +56,7 @@ func handleWTShell(reg *session.Registry, wts *webtransport.Server, authState *a
 		// workspace parameter of its own, and giving it one would let the two
 		// disagree.
 		cmd := buildPTYCommand(ctx, ResolveClaudePath(), sid, reg.WorkdirForSession(sid))
-		cmd.Env = buildPTYEnv(reg.PermEndpoint)
+		cmd.Env = buildPTYEnv(reg.PermGate)
 
 		// Start the PTY at the size the browser already knows it will render
 		// at, rather than at the kernel default. Waiting for the first resize
@@ -236,15 +237,24 @@ func buildPTYCommand(ctx context.Context, ccPath, sid, workdir string) *exec.Cmd
 
 // buildPTYEnv constructs the env for the PTY shell subprocess.
 // IS_SANDBOX=1 injected for root (D-05a §2 fact 5). TERM set for full TUI.
-// permEndpoint is injected when non-empty so the PreToolUse hook can reach the daemon.
-func buildPTYEnv(permEndpoint string) []string {
+//
+// gate carries BOTH the permission callback endpoint and the
+// TETHER_DAEMON_MANAGED mark, and it is appended whole rather than unpacked
+// here. This is the shell half of tether#149: the chat half
+// (session.Registry.spawnEntry) builds a different environment from the SAME
+// cchook.Gate, and the entries the two produce must agree exactly. Until
+// tether#149 this function took a bare endpoint string, so a mark added on the
+// chat path would have left every PTY shell unmarked — and an unmarked child is
+// one the hook lets through by design, since it reads "unmarked" as "not a cc
+// the daemon spawned". Nothing inside this package could have noticed.
+func buildPTYEnv(gate cchook.Gate) []string {
 	env := os.Environ()
 	env = append(env, "TERM=xterm-256color")
 	if os.Geteuid() == 0 {
 		env = append(env, "IS_SANDBOX=1")
 	}
-	if permEndpoint != "" {
-		env = append(env, "TETHER_DAEMON_PERM_ENDPOINT="+permEndpoint)
-	}
-	return env
+	// Appended last so these win: os.Environ() above may already carry a stale
+	// TETHER_DAEMON_* from the daemon's own parent, and exec.Cmd keeps the LAST
+	// value for a duplicated key.
+	return append(env, gate.Env()...)
 }

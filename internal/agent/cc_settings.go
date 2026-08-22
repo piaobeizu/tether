@@ -11,9 +11,19 @@ import (
 const TetherManagedKey = "_tether_managed"
 
 // InjectPermHook merges the tether-managed PreToolUse hook entry into
-// ~/.config/claude/settings.json, preserving any existing user hooks.
+// ~/.claude/settings.json, preserving any existing user hooks.
 // Uses atomic rename to avoid partial writes (D-05b §5.1, §10 row 1).
-func InjectPermHook(hookBinPath, daemonEndpoint string) error {
+//
+// It takes the hook path and NOTHING ELSE, deliberately. It used to also accept
+// a daemonEndpoint that no line of the body ever read, and that dead parameter
+// was actively misleading: it made settings.json look like the channel the
+// permission endpoint travels on. It is not — the endpoint and the
+// TETHER_DAEMON_MANAGED mark both reach the hook through the ENVIRONMENT of the
+// cc subprocess, built by cchook.Gate.Env() at each spawn path. Reading the
+// old signature as the truth is how "the shell pane cannot see the endpoint"
+// became a believable diagnosis of a hole that was somewhere else entirely
+// (tether#149).
+func InjectPermHook(hookBinPath string) error {
 	path, err := ccSettingsPath()
 	if err != nil {
 		return err

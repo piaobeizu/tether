@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/piaobeizu/tether/internal/agent"
+	"github.com/piaobeizu/tether/internal/permission/cchook"
 	"github.com/piaobeizu/tether/internal/wire"
 )
 
@@ -2585,5 +2586,114 @@ func TestInterruptedTurn_MarkIsIdempotentAndIgnoresAnEmptySid(t *testing.T) {
 	}
 	if reg.takeTurnInterrupted("") {
 		t.Fatal(`an empty sid matched`)
+	}
+}
+
+// The tests below cover the CHAT half of the permission-gate wiring
+// (tether#149): what spawnEntry puts into agent.SpawnConfig.Env, which both
+// providers append to os.Environ() before exec.
+//
+// They are deliberately narrow. Nothing in this package can see the shell path
+// (internal/server/wt_shell.go builds a second cc environment from the same
+// cchook.Gate), and a gate entry present here and missing there fails OPEN on
+// the shell path with this file still green. The test that spans both is
+// TestBothCCSpawnPathsCarryTheGate in internal/server.
+
+// permGateEnv runs one fresh spawn with the given gate and returns the Env the
+// chat path handed the provider.
+func permGateEnv(t *testing.T, gate cchook.Gate) []string {
+	t.Helper()
+	fp := &fakeProvider{sess: &fakeSession{sid: "gate-sid", events: make(chan agent.Event, 8)}}
+	reg := NewRegistry(fp)
+	reg.PermGate = gate
+	if _, err := reg.GetOrSpawnEntry(context.Background(), "", "fake"); err != nil {
+		t.Fatalf("GetOrSpawnEntry: %v", err)
+	}
+	return fp.lastCfg.Env
+}
+
+// TestSpawnEntry_ChatChildCarriesTheWholeGate — an armed gate must reach the cc
+// subprocess as BOTH of its entries.
+//
+// Before tether#149 this path injected the endpoint and nothing else, so every
+// cc the daemon spawned for chat arrived unmarked. Unmarked is not a neutral
+// state: it is the exact input for which the hook exits 0 on purpose, to avoid
+// breaking the owner's own standalone cc. A daemon-spawned cc that lost its
+// endpoint was therefore indistinguishable from one the daemon never spawned,
+// and the gate resolved as allow (tether#117 A4b).
+func TestSpawnEntry_ChatChildCarriesTheWholeGate(t *testing.T) {
+	const ep = "https://127.0.0.1:8443/api/v1/permission/request"
+	gate := cchook.Gate{Managed: true, Endpoint: ep}
+
+	got := permGateEnv(t, gate)
+	want := gate.Env()
+	if len(got) != len(want) {
+		t.Fatalf("SpawnConfig.Env = %v, want exactly the gate's %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("SpawnConfig.Env[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestSpawnEntry_ChatChildIsMarkedEvenWithNoEndpoint — the mark does NOT depend
+// on there being an endpoint, and that is the whole difference between the two
+// states the hook has to tell apart. A gate that only injected something when it
+// had an endpoint would leave "daemon-spawned, endpoint missing" looking exactly
+// like "not daemon-spawned", which is the fail-open shape again with a new
+// variable in it.
+func TestSpawnEntry_ChatChildIsMarkedEvenWithNoEndpoint(t *testing.T) {
+	got := permGateEnv(t, cchook.Gate{Managed: true})
+	if len(got) != 1 || got[0] != cchook.EnvManaged+"="+cchook.ManagedValue {
+		t.Errorf("SpawnConfig.Env = %v, want just the %s mark", got, cchook.EnvManaged)
+	}
+}
+
+// TestSpawnEntry_UnmanagedGateInjectsNothing — a Registry built outside the
+// daemon, or a daemon started with TETHER_NO_PERMISSION_HOOK=1, must leave its
+// children completely unmarked. Marking them would turn a hook entry surviving
+// in ~/.claude/settings.json from a harmless leftover into a deny on every tool
+// call. The stray-endpoint row is there because Managed is the decision, not
+// "an endpoint happens to be set".
+func TestSpawnEntry_UnmanagedGateInjectsNothing(t *testing.T) {
+	for _, gate := range []cchook.Gate{
+		{},
+		{Endpoint: "https://127.0.0.1:8443/api/v1/permission/request"},
+	} {
+		if got := permGateEnv(t, gate); len(got) != 0 {
+			t.Errorf("gate %+v: SpawnConfig.Env = %v, want nothing injected", gate, got)
+		}
+	}
+}
+
+// TestSpawnEntry_DoesNotAppendIntoTheCallersEnvArray — cfg arrives by value but
+// its Env slice still shares a backing array with the caller's, so appending the
+// gate's entries in place would write into a slice spawnEntry does not own. No
+// caller passes a non-nil Env today, which is exactly why this would be found
+// the hard way; the sentinel below is what the caller would silently lose.
+func TestSpawnEntry_DoesNotAppendIntoTheCallersEnvArray(t *testing.T) {
+	backing := make([]string, 2, 8)
+	backing[0] = "CALLER_SUPPLIED=1"
+	backing[1] = "MUST_SURVIVE=yes"
+
+	fp := &fakeProvider{sess: &fakeSession{sid: "alias-sid", events: make(chan agent.Event, 8)}}
+	reg := NewRegistry(fp)
+	reg.PermGate = cchook.Gate{Managed: true, Endpoint: "https://127.0.0.1:8443/x"}
+
+	// Hand over only the first element, leaving spare capacity that still holds
+	// the second — the shape an append-in-place would overwrite.
+	_, _, err := reg.spawnEntry(context.Background(), "fake",
+		agent.SpawnConfig{Env: backing[:1]}, WorkspaceBinding{}, spawnIfAbsent)
+	if err != nil {
+		t.Fatalf("spawnEntry: %v", err)
+	}
+	if backing[1] != "MUST_SURVIVE=yes" {
+		t.Errorf("caller's env backing array element 1 = %q, want %q — spawnEntry appended in place",
+			backing[1], "MUST_SURVIVE=yes")
+	}
+	if n := len(fp.lastCfg.Env); n != 3 {
+		t.Errorf("SpawnConfig.Env has %d entries (%v), want the caller's 1 plus the gate's 2",
+			n, fp.lastCfg.Env)
 	}
 }

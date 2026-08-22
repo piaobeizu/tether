@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 
 	"github.com/piaobeizu/tether/internal/agent"
+	"github.com/piaobeizu/tether/internal/permission/cchook"
 	"github.com/piaobeizu/tether/internal/wire"
 )
 
@@ -109,8 +110,25 @@ type Registry struct {
 	// session's fanOut goroutine, the other inside Entry.Subscribe.
 	interruptedTurns   []string
 	interruptedTurnsMu sync.Mutex
-	PermEndpoint       string        // injected into cc subprocess env if non-empty
-	History            *HistoryStore // nil = history disabled
+	// PermGate is how a cc subprocess spawned on the CHAT path is wired to the
+	// PreToolUse permission gate. Decided once at startup by server.setupPermGate
+	// and handed here whole (internal/server/lifecycle.go step 3); spawnEntry
+	// appends PermGate.Env() to the child's environment and derives nothing of its
+	// own from it.
+	//
+	// The zero value injects nothing, which is the correct behaviour for a
+	// Registry built outside the daemon (tests, an embedder) and for
+	// TETHER_NO_PERMISSION_HOOK=1: an unmarked child makes the hook take its
+	// deliberate "not a cc tether spawned" exit-0 branch.
+	//
+	// It is the whole cchook.Gate rather than the endpoint string it used to be
+	// because the SHELL path (internal/server/wt_shell.go) builds a second
+	// environment from this same Registry field. Two paths deriving their own
+	// answer from a bare string is how the TETHER_DAEMON_MANAGED mark could be
+	// added to one and forgotten in the other — which fails OPEN on the forgotten
+	// path, in exactly the branch the mark exists to close (tether#149).
+	PermGate cchook.Gate
+	History  *HistoryStore // nil = history disabled
 	// Workdir is the DEFAULT agent subprocess cwd — the resolved
 	// --workspace-root; "" = daemon cwd. Wired by internal/server/lifecycle.go
 	// Step 3b once the workspace root is resolved (tether#51) — Step 1 builds the
@@ -186,7 +204,7 @@ type Registry struct {
 	// request may well have been answered from another tab since, and replaying it
 	// would put a card on screen for a tool call that is already running.
 	//
-	// A plain field written once at startup, like PermEndpoint / History / Workdir
+	// A plain field written once at startup, like PermGate / History / Workdir
 	// above: buildMux sets it before the listener accepts anything, so no session
 	// exists to read it concurrently.
 	PendingBackfill func() []wire.Envelope
@@ -1199,14 +1217,20 @@ func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agen
 		return nil, spawnNoEntry, refuse(wire.ErrCodeUnknownProvider, "unknown provider: %s", providerName)
 	}
 
-	if r.PermEndpoint != "" {
+	// One of the TWO places in the daemon that build a cc child's environment
+	// (server.buildPTYEnv is the other), and both must ask the same Gate. Deriving
+	// the entries here instead — an endpoint variable and nothing else, which is
+	// what this did before tether#149 — leaves the child unmarked, and an unmarked
+	// child is one the hook deliberately lets through: it cannot tell "tether
+	// spawned this and lost the endpoint" from "this is the owner's own cc".
+	if gateEnv := r.PermGate.Env(); len(gateEnv) > 0 {
 		// Copy rather than append in place: cfg arrives by value but its Env slice
 		// still shares a backing array with the caller's, so appending into spare
 		// capacity would mutate a slice we do not own. No current caller passes a
 		// non-nil Env, which is exactly why this would be found the hard way.
-		env := make([]string, 0, len(cfg.Env)+1)
+		env := make([]string, 0, len(cfg.Env)+len(gateEnv))
 		env = append(env, cfg.Env...)
-		cfg.Env = append(env, "TETHER_DAEMON_PERM_ENDPOINT="+r.PermEndpoint)
+		cfg.Env = append(env, gateEnv...)
 	}
 	cfg.Workdir = r.workdirFor(ws)
 	if cfg.ResumeSessionID == "" && cfg.SessionID == "" {

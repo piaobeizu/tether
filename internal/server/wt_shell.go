@@ -74,7 +74,7 @@ func handleWTShell(reg *session.Registry, wts *webtransport.Server, authState *a
 			return
 		}
 
-		defer attachShellResize(reg, req.sid, req.shellID, ptmx)()
+		defer attachShellResize(reg, req, ptmx)()
 
 		pumpShell(ctx, stream, ptmx, cmd.Wait, func() { _ = wtSess.CloseWithError(0, "") })
 	}
@@ -176,17 +176,29 @@ func pumpShell(ctx context.Context, stream io.ReadWriteCloser, ptmx io.ReadWrite
 // Registry: registrations are per shell now, and the detach this returns is the
 // one that Registry minted for THIS shell, so it cannot remove another's.
 //
-// shellID is what the client called this shell (wire.ShellQueryParam on the
+// req.shellID is what the client called this shell (wire.ShellQueryParam on the
 // /wt/shell URL, echoed as ClientFrame.ShellID on every resize). Empty means the
 // client named nothing, and its resizes fall back to "this session's newest
 // shell" — see Registry.ResizeShell.
+//
+// # Why this takes the whole shellRequest and not req.sid, req.shellID
+//
+// Because handleWTShell cannot be tested (it takes a concrete
+// *webtransport.Session), and taking two strings left a one-character edit at
+// the call site — `req.shellID` → `""` — that silently restores the entire
+// pre-tether#150 behaviour with every test still green. Passing the parsed value
+// itself removes that edit from the language: the two fields cannot come from
+// different places, because there is only one place they can come from. The
+// defect is still constructible in this package (`shellRequest{sid: req.sid}`),
+// which is not worth an opaque type to prevent — but it is now something a
+// reader sees rather than something a reader has to notice.
 //
 // Extracted from handleWTShell (rather than inlined there) so the whole path
 // from a control frame to the kernel's winsize is reachable from a test: the
 // handler itself needs a live WebTransport session, and an untested seam here
 // is exactly the kind that keeps compiling while doing nothing.
-func attachShellResize(reg *session.Registry, sid, shellID string, ptmx *os.File) func() {
-	return reg.RegisterShellResize(sid, shellID, func(cols, rows uint16) error {
+func attachShellResize(reg *session.Registry, req shellRequest, ptmx *os.File) func() {
+	return reg.RegisterShellResize(req.sid, req.shellID, func(cols, rows uint16) error {
 		return pty.Setsize(ptmx, &pty.Winsize{Rows: rows, Cols: cols})
 	})
 }
@@ -213,8 +225,15 @@ type shellRequest struct {
 // a starting size: a wrong one degraded visibly. It is not survivable for the
 // shell id, whose absence is INVISIBLE — it silently selects the fallback in
 // Registry.ResizeShell, which is the pre-tether#150 behaviour the id exists to
-// replace. Reading the keys here puts them under TestParseShellRequest; what
-// remains uncovered is the single `parseShellRequest(r.URL.Query())` call.
+// replace. Reading the keys here puts them under TestParseShellRequest, and
+// attachShellResize takes this value whole so no caller can substitute one of
+// its fields; what remains uncovered is the single
+// `parseShellRequest(r.URL.Query())` call.
+//
+// Called before wts.Upgrade, which is where the sid read it replaced already
+// sat. Whether *http.Request stays usable after Upgrade hijacks the CONNECT
+// stream has not been established here, so the position is kept rather than
+// moved.
 func parseShellRequest(q url.Values) shellRequest {
 	return shellRequest{
 		sid: q.Get("sid"),

@@ -226,7 +226,7 @@ func TestShellResize_QueryStringNamesTheShellAFrameThenFinds(t *testing.T) {
 		t.Fatalf("startPTY: %v", err)
 	}
 	defer func() { _ = ptmx.Close(); _ = cmd.Process.Kill(); _ = cmd.Wait() }()
-	defer attachShellResize(reg, req.sid, req.shellID, ptmx)()
+	defer attachShellResize(reg, req, ptmx)()
 
 	// The neighbour. Its presence is the point: with one shell on the session the
 	// fallback would answer this frame no matter what the ids said.
@@ -291,7 +291,7 @@ func TestShellResize_FrameReachesTheKernel(t *testing.T) {
 	}
 	defer func() { _ = ptmx.Close(); _ = cmd.Process.Kill(); _ = cmd.Wait() }()
 
-	detach := attachShellResize(reg, "sid-e2e", "shell-e2e", ptmx)
+	detach := attachShellResize(reg, shellRequest{sid: "sid-e2e", shellID: "shell-e2e"}, ptmx)
 
 	routeClientFrame(reg, wire.ClientFrame{
 		Kind: wire.ClientFrameResize, SessionID: "sid-e2e", ShellID: "shell-e2e", Cols: 176, Rows: 48,
@@ -360,7 +360,7 @@ func openLiveShell(t *testing.T, reg *session.Registry, sid, shellID string, col
 		t.Fatalf("startPTY for %q: %v", shellID, err)
 	}
 	sh := &liveShell{shellID: shellID, ptmx: ptmx}
-	sh.release = attachShellResize(reg, sid, shellID, ptmx)
+	sh.release = attachShellResize(reg, shellRequest{sid: sid, shellID: shellID}, ptmx)
 	t.Cleanup(func() {
 		sh.release()
 		_ = ptmx.Close()

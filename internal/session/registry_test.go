@@ -1782,6 +1782,274 @@ func TestBroadcast_NoticeGoesOnlyToTheSubscriberThatLost(t *testing.T) {
 	}
 }
 
+// ─── tether#167: a turn-ender is not a token delta ───────────────────────────
+
+// wedge fills a fresh subscriber's channel and returns it, plus a recorder of
+// everything the "browser" reads off it once it starts catching up.
+//
+// The catch-up is deliberately DELAYED rather than immediate: what is under test
+// is a send that meets a channel with no room in it, and a drain that started
+// first could hand that send an empty slot and assert nothing. The delay is not
+// a synchronisation point for any assertion — every assertion below waits on the
+// recorder or on a done channel with its own deadline — so it costs one fixed
+// beat and cannot make a test pass by being long enough.
+func wedge(t *testing.T, reg *Registry, e *Entry, catchUpAfter time.Duration) (ch chan wire.Envelope, got <-chan wire.Envelope) {
+	t.Helper()
+	ch, _ = lossySubscriber(t, reg, e)
+	reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "tok-1"})
+	reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "tok-2"})
+
+	out := make(chan wire.Envelope, 16)
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+	go func() {
+		select {
+		case <-time.After(catchUpAfter):
+		case <-stop:
+			return
+		}
+		for {
+			select {
+			case env := <-ch:
+				select {
+				case out <- env:
+				case <-stop:
+					return
+				}
+			case <-stop:
+				return
+			}
+		}
+	}()
+	return ch, out
+}
+
+// TestBroadcast_TurnEnderWaitsForRoomInsteadOfBeingDropped is tether#167's gate.
+//
+// # The defect
+//
+// There are two hops between the agent and the browser, and until this change
+// only the FIRST one exempted the envelopes that close a turn.
+// internal/agent/claude_provider.go's ccSession.emit blocks — with the spawn ctx
+// as its escape — for agent.EventResult and agent.EventError, because a lost one
+// "leaves the consumer's turn open forever" (tether#14, and its doc says exactly
+// that). The second hop, this one, did not: Registry.broadcast → Entry.deliverTurn
+// → trySend was non-blocking for every kind alike, so a wire.KindResult that met
+// a full connection channel vanished like a text delta. The tab is then never
+// told the turn ended and its spinner runs forever — the tether#14 symptom
+// re-entering one hop downstream, where the first hop's fix cannot see it.
+//
+// # What makes this the gate rather than a restatement
+//
+// It fails on the pre-fix build, which was run rather than assumed: the
+// turn-ender never arrives and the assertion below is the one that reports it.
+// Its control arm is a separate test, and the pair is the point — see
+// TestBroadcast_ATokenDeltaIsStillDroppedWhenThereIsNoRoom for why a treatment
+// arm on its own would be satisfied by a change that is worse than the bug.
+func TestBroadcast_TurnEnderWaitsForRoomInsteadOfBeingDropped(t *testing.T) {
+	// Both kinds, because they reach this hop by different roads and a fix that
+	// covered only the one with a literal in registry.go would look complete:
+	// KindResult is built inline by fanOut (the turn's own result, and tether#59's
+	// synthetic ender after the stream has closed), while KindError arrives
+	// through translateEvent's agent.EventError branch via wire.NewErrorEnvelope
+	// — and for one of the two providers the error is the ONLY turn-closer that
+	// is ever emitted (see fanOut's EventError arm).
+	for _, tc := range []struct {
+		name string
+		kind wire.EnvelopeKind
+	}{
+		{"result", wire.KindResult},
+		{"error", wire.KindError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := &Registry{}
+			e := &Entry{subs: make(map[chan wire.Envelope]struct{})}
+			_, got := wedge(t, reg, e, 50*time.Millisecond)
+
+			// In a goroutine so that a wait which never ends is a FAILURE and not a
+			// ten-minute hang: "the turn-ender is delivered" and "broadcast comes
+			// back" are two properties and this test owes both an answer.
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				reg.broadcast(e, wire.Envelope{Kind: tc.kind, Payload: "the turn is over"})
+			}()
+
+			deadline := time.After(5 * time.Second)
+			for delivered := false; !delivered; {
+				select {
+				case env := <-got:
+					delivered = env.Kind == tc.kind
+				case <-deadline:
+					t.Fatalf("the %q envelope that ends the turn never reached the subscriber. "+
+						"It was dropped into a full channel like a token delta, so the browser is "+
+						"left on \"thinking…\" with nothing coming (tether#167)", tc.kind)
+				}
+			}
+
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("the %q envelope was delivered but broadcast never returned; "+
+					"fanOut is wedged behind a subscriber that has already been served", tc.kind)
+			}
+		})
+	}
+}
+
+// TestBroadcast_ATokenDeltaIsStillDroppedWhenThereIsNoRoom is the control arm,
+// and it is load-bearing in the opposite direction.
+//
+// "Block until it fits" applied to EVERY kind would pass the treatment arm above
+// and be a worse bug than the one it fixed: broadcast runs on the session's own
+// fanOut goroutine, so waiting on one slow browser for every token increment
+// (cc runs with --include-partial-messages) stops the whole session — which is
+// the reason trySend exists and the reason its doc gives. This is what pins the
+// exemption to the two kinds that need it.
+//
+// It passes BEFORE and AFTER the tether#167 change, deliberately. It is the
+// invariant, not the gate; the gate is the test above. Stated here because a
+// reader who finds a green test next to a bug fix should not have to work out
+// which of the two it was.
+func TestBroadcast_ATokenDeltaIsStillDroppedWhenThereIsNoRoom(t *testing.T) {
+	reg := &Registry{}
+	e := &Entry{subs: make(map[chan wire.Envelope]struct{})}
+	ch, drain := lossySubscriber(t, reg, e)
+
+	reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "tok-1"})
+	reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "tok-2"})
+
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "tok-3"})
+	}()
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a token delta blocked on a full channel. The turn-ender exemption has " +
+			"leaked to every kind, so one wedged browser now holds up the whole session's fanOut")
+	}
+
+	// Dropped, and ACCOUNTED as a gap rather than silently swallowed — the drop
+	// path the exemption must leave untouched, counter and notice and all.
+	drain(2)
+	reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "tok-4"})
+	select {
+	case env := <-ch:
+		if _, ok := gapNoticeTextOf(env); !ok {
+			t.Fatalf("first envelope after the dropped delta = %q/%#v; want the gap notice, "+
+				"so the drop accounting still runs for non-terminal kinds", env.Kind, env.Payload)
+		}
+	default:
+		t.Fatal("nothing queued after the subscriber caught up")
+	}
+}
+
+// TestBroadcast_AWedgedTabDoesNotHoldTheTurnEnderBackFromAHealthyOne pins the
+// ORDER the turn-ender goes out in, which is a choice and not a consequence.
+//
+// A session can have several subscribers (the same human on a phone and a
+// laptop). The fix offers the envelope to every one of them first and only then
+// waits on the ones that had no room, so a wedged tab costs the healthy tab
+// nothing. Delivering in map order and waiting inline would make a healthy tab's
+// turn-ender arrive behind a stalled sibling's — a spinner that keeps turning
+// for a reason on the OTHER device, which is the hardest kind of report to act
+// on.
+//
+// Note what this is not: it passes on the pre-fix build too (where nothing waits
+// at all), so it is not a gate for tether#167. It is a gate against a narrower
+// fix of tether#167, and it is written down as such so nobody counts it twice.
+func TestBroadcast_AWedgedTabDoesNotHoldTheTurnEnderBackFromAHealthyOne(t *testing.T) {
+	reg := &Registry{}
+	e := &Entry{subs: make(map[chan wire.Envelope]struct{})}
+	// Never drained: this tab stays wedged for the whole of the assertion.
+	slow, _ := lossySubscriber(t, reg, e)
+	fast := make(chan wire.Envelope, 64)
+	e.Subscribe(fast)
+
+	reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "tok-1"})
+	reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "tok-2"})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		reg.broadcast(e, wire.Envelope{Kind: wire.KindResult, Payload: "over"})
+	}()
+
+	deadline := time.After(5 * time.Second)
+	for delivered := false; !delivered; {
+		select {
+		case env := <-fast:
+			delivered = env.Kind == wire.KindResult
+		case <-deadline:
+			t.Fatal("the healthy subscriber is still waiting for the turn-ender while a " +
+				"SIBLING tab is the one that is wedged; its spinner turns for someone else's stall")
+		}
+	}
+
+	// Release the wedged one so the waiting broadcast can finish and this test
+	// does not leave a goroutine parked for the rest of the package's run.
+	<-slow
+	<-slow
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("broadcast never returned after the wedged subscriber drained")
+	}
+}
+
+// TestBroadcast_TheTurnEnderWaitEndsWithTheSession pins the ESCAPE, which is the
+// half of a blocking send that decides whether it is a fix or a new hang.
+//
+// The wait is bounded by e.ctx — the ctx the agent was spawned under, which the
+// chat connection cancels on its way out and which exec.CommandContext watches.
+// Without an escape, a tab that stalls and never drains again would park the
+// session's fanOut goroutine for the life of the daemon; the drop this wi is
+// about would have been traded for a leak, on the same trigger.
+//
+// A guard rather than a gate: it cannot fail on the pre-fix build because
+// nothing there waits, and it does not compile there either (Entry has no ctx
+// until this change). It earns its place by failing on the plausible WRONG
+// version of the fix — one that blocks with no ctx in the select at all.
+func TestBroadcast_TheTurnEnderWaitEndsWithTheSession(t *testing.T) {
+	logs := captureWarnings(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	reg := &Registry{}
+	e := &Entry{subs: make(map[chan wire.Envelope]struct{}), ctx: ctx}
+	ch, _ := lossySubscriber(t, reg, e)
+
+	reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "tok-1"})
+	reg.broadcast(e, wire.Envelope{Kind: wire.KindMessage, Payload: "tok-2"})
+
+	// The agent goes away while the tab is still wedged — the client disconnected,
+	// which is the case that cancels this ctx AND kills the subprocess.
+	cancel()
+
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		reg.broadcast(e, wire.Envelope{Kind: wire.KindResult, Payload: "over"})
+	}()
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the turn-ender is still waiting on a subscriber whose session has ended. " +
+			"fanOut is parked for the life of the daemon, which is a worse failure than " +
+			"the drop tether#167 set out to fix")
+	}
+
+	// Giving up is an ordinary drop and leaves the ordinary trace: the operator
+	// gets the log, and the subscriber gets the notice if it ever catches up.
+	if got := logs.String(); !strings.Contains(got, "envelope dropped") {
+		t.Fatalf("the abandoned turn-ender left no trace; captured warnings were %q", got)
+	}
+	if len(ch) != 2 {
+		t.Fatalf("subscriber channel holds %d envelopes, want the 2 it was already "+
+			"wedged on — the abandoned send must not have displaced anything", len(ch))
+	}
+}
+
 // captureWarnings redirects slog to a buffer for the duration of one test and
 // returns a reader for what was logged.
 //

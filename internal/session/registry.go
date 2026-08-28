@@ -13,6 +13,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/piaobeizu/tether/internal/agent"
 	"github.com/piaobeizu/tether/internal/permission/cchook"
@@ -436,6 +437,33 @@ type Entry struct {
 	// reading, and the lock ordering (r.mu outside e.subsMu everywhere today) is
 	// not enforced by anything but convention.
 	reg *Registry
+	// ctx is the context this entry's agent was spawned under — the one
+	// provider.Spawn received and exec.CommandContext watches — so it is cancelled
+	// exactly when that agent is going away. Closing the chat connection cancels
+	// it and that KILLS the subprocess; the subCh declaration in
+	// internal/server/wt_chat.go is where that was measured rather than assumed.
+	//
+	// Here for one thing (tether#167): it is ONE of awaitTurnEnderRoom's ways out of
+	// a blocking send, for the plain reason that a session which has ended has
+	// nothing more to deliver.
+	//
+	// # What it is NOT
+	//
+	// It is not the escape for "the subscriber being waited on has gone" — that is
+	// Entry.gone, and the difference cost a review. ccSession.emit one hop upstream
+	// uses its own spawn ctx and is right to, because its consumer is Registry.fanOut:
+	// an in-process goroutine that lives exactly as long as the session. This hop's
+	// consumer is a browser's channel, and there can be several of them with
+	// lifetimes of their own — a second tab reaching a live session through Attach's
+	// reuse branch never becomes this ctx's owner. So "the same escape as the hop
+	// upstream" was a false equivalence: an exemption that is correct on hop 1 does
+	// not transfer to hop 2 when the consumer changes from a daemon goroutine to a
+	// remote peer.
+	//
+	// nil for the Entry literals this package's own tests build, exactly like reg,
+	// and read only behind a nil check for the same reason. spawnEntry is the only
+	// constructor in the daemon, so nil never reaches production.
+	ctx context.Context
 	// lost counts, per subscriber channel, the envelopes deliver could not fit
 	// into it and had to drop — reset each time the subscriber is TOLD about them
 	// (see deliver and gapNotice). Every channel in subs has an entry here and
@@ -455,7 +483,40 @@ type Entry struct {
 	// the one this lives in. The cost is the invariant above having to be
 	// maintained by hand in two methods instead of by construction; it is stated
 	// here and pinned by a test rather than left to be noticed.
-	lost   map[chan wire.Envelope]*atomic.Int64
+	lost map[chan wire.Envelope]*atomic.Int64
+	// gone holds, per subscriber channel, a channel that is CLOSED when that
+	// subscription ends — the escape awaitTurnEnderRoom needs, and the whole of
+	// what the first attempt at tether#167 got wrong.
+	//
+	// # Why the subscription and not the session
+	//
+	// That attempt bounded the wait with Entry.ctx. But ctx is the SPAWN ctx — the
+	// ctx of the connection that created this Entry — while the channel the wait
+	// blocks on belongs to whichever subscriber had no room, and the two are not
+	// the same subscriber: Attach's reuse branch hands a second tab a live Entry
+	// and returns before spawnEntry, so a second tab never becomes the ctx owner.
+	// Nothing in this package closes a subscriber channel, and
+	// internal/server/wt_chat.go's serveChat unsubscribes on its way out WITHOUT
+	// closing subCh — so a second tab that wedged and then disconnected left a
+	// permanently full channel with no escape at all, parking the session's fanOut
+	// (and its deferred teardown, hence the agent process) for the life of the
+	// daemon. The escape has to be scoped to the thing that can vanish, and what
+	// vanishes is the SUBSCRIPTION.
+	//
+	// # Closed exactly once
+	//
+	// Unsubscribe closes and deletes in the same critical section under the write
+	// lock, so the close is a property of removing the map entry rather than of
+	// remembering what has already been closed — the same argument observerSet's
+	// `retired` makes for its own shared signal. Subscribe is idempotent for a
+	// channel already here, exactly as it is for lost, so re-subscribing does not
+	// swap a live signal out from under a wait.
+	//
+	// A third parallel map for the reason lost gives for being the second one: the
+	// Entry literals this package's tests build name `subs` and nothing else, so
+	// widening that map's value type is a change to other files. Same invariant,
+	// maintained by the same two methods, pinned by the same test.
+	gone   map[chan wire.Envelope]chan struct{}
 	subsMu sync.RWMutex
 
 	ownerClientID string
@@ -678,6 +739,16 @@ func (e *Entry) Subscribe(ch chan wire.Envelope) {
 	}
 	if _, ok := e.lost[ch]; !ok {
 		e.lost[ch] = new(atomic.Int64)
+	}
+	// Same lazy construction and the same idempotence as lost, and the idempotence
+	// matters more here: handing a re-subscribing channel a FRESH signal would
+	// leave a turn-ender already waiting on the old one, which nothing would ever
+	// close. See Entry.gone.
+	if e.gone == nil {
+		e.gone = make(map[chan wire.Envelope]chan struct{}, 1)
+	}
+	if _, ok := e.gone[ch]; !ok {
+		e.gone[ch] = make(chan struct{})
 	}
 	e.subsMu.Unlock()
 	e.backfill(ch)
@@ -925,10 +996,22 @@ func (r *Registry) reportInterruptedTurn(e *Entry, ch chan wire.Envelope) {
 
 // Unsubscribe removes ch from the subscriber set, and with it the drop
 // accounting — see Entry.lost for why the two must move together.
+//
+// It also RELEASES anything waiting to hand ch a turn-ender. That is not
+// bookkeeping: this is the only signal a wedged subscriber's disappearance ever
+// gives, because the channel is not closed here and is not closed anywhere else
+// in this package (serveChat's deferred att.Unsubscribe is the production caller,
+// and it leaves subCh open). Without it a turn-ender waiting on a channel whose
+// reader has already gone waits forever, and takes the session's fanOut with it.
+// See Entry.gone.
 func (e *Entry) Unsubscribe(ch chan wire.Envelope) {
 	e.subsMu.Lock()
 	delete(e.subs, ch)
 	delete(e.lost, ch)
+	if done, ok := e.gone[ch]; ok {
+		close(done)
+		delete(e.gone, ch)
+	}
 	e.subsMu.Unlock()
 }
 
@@ -1355,7 +1438,10 @@ func (r *Registry) spawnEntry(ctx context.Context, providerName string, cfg agen
 	}
 
 	e := &Entry{
-		sess:        sess,
+		sess: sess,
+		// The SPAWN ctx, i.e. the one the line above just handed the provider — see
+		// Entry.ctx for what it is used for and why it is the right lifetime.
+		ctx:         ctx,
 		subs:        make(map[chan wire.Envelope]struct{}),
 		reg:         r,
 		fenceParser: NewFenceParser(),
@@ -2813,13 +2899,33 @@ func (r *Registry) fanOut(e *Entry) {
 
 // broadcast sends env to every current subscriber of e, dropping (with a
 // warning) on any subscriber whose channel is full rather than blocking
-// the whole session's fanOut loop.
+// the whole session's fanOut loop — EXCEPT for the envelopes that end a turn,
+// which are waited for instead. See isTurnEnder for which those are and
+// offerTurnEnderToAll for the whole of why.
 //
 // Two audiences, and they are reached differently on purpose: the chat clients
 // bound to THIS Entry, and (since tether#75) the read-only observers of the sid
 // it is registered under. See deliverObservers for the one question that
 // separates them.
+//
+// # Why the turn-ender path is three steps and not one
+//
+// The wait must be the LAST thing that happens, because every audience that is
+// not waiting has already been served by then. "A wedged tab costs a healthy one
+// nothing" is the property offerTurnEnderToAll's offer round buys for chat
+// subscribers, and it has to hold for observers too: they are different
+// connections with their own channels, and observerSet.send is non-blocking, so
+// leaving deliverObservers behind the wait starved a healthy observer for no gain
+// at all. That was the shape of the first attempt at tether#167 and it is the
+// reason the turn-ender path is three calls rather than one.
 func (r *Registry) broadcast(e *Entry, env wire.Envelope) {
+	if isTurnEnder(env.Kind) {
+		wedged := e.offerTurnEnderToAll(env)
+		r.deliverObservers(e, env)
+		e.awaitTurnEnderRoom(wedged, env)
+		return
+	}
+
 	e.subsMu.RLock()
 	slog.Debug("fanOut: broadcasting", "wire_kind", env.Kind, "nsub", len(e.subs))
 	for ch := range e.subs {
@@ -2828,6 +2934,30 @@ func (r *Registry) broadcast(e *Entry, env wire.Envelope) {
 	e.subsMu.RUnlock()
 
 	r.deliverObservers(e, env)
+}
+
+// isTurnEnder reports whether k is an envelope kind that CLOSES a turn, and so
+// must reach the browser rather than being dropped under backpressure. It is
+// this package's copy of the question internal/agent's isTerminal answers about
+// events, one hop downstream and in the wire vocabulary.
+//
+// The frontend clears its "thinking…" indicator on both of these and on nothing
+// else (tether#14, web/src/lib/store.ts), so losing either leaves a spinner
+// running with nothing coming to stop it. KindError is not a lesser case: for
+// one of the two providers it is the ONLY turn-closer ever emitted on several
+// failure paths (see the EventError arm in fanOut), and it reaches this hop by a
+// different road from KindResult — wire.NewErrorEnvelope out of translateEvent,
+// rather than a literal built in fanOut.
+//
+// # Not called "terminal", deliberately
+//
+// internal/wire already uses that word for something else: ErrorPayload.Terminal
+// says whether an error CODE is worth retrying, which is a different question
+// with a different answer (a KindError can be both a turn-ender and retryable —
+// ErrCodeAgent, the one translateEvent produces, is exactly that). Two meanings
+// of "terminal" one package apart would be read as one.
+func isTurnEnder(k wire.EnvelopeKind) bool {
+	return k == wire.KindResult || k == wire.KindError
 }
 
 // gapNoticeText is what a chat client is told after deliver has had to drop
@@ -2896,6 +3026,12 @@ func gapNotice() wire.Envelope {
 // trySend offers env to ch without blocking, reporting whether it fitted. The
 // non-blocking send is the point: broadcast runs on the session's own fanOut
 // goroutine, so waiting for one slow browser would stop the session.
+//
+// That argument is about VOLUME — cc streams with --include-partial-messages, so
+// this is on the hot path of every token increment — and it does not extend to
+// the one or two envelopes that end a turn. Since tether#167 those are waited for
+// instead, once, in awaitTurnEnderRoom; every other kind, and every other send onto
+// a subscriber channel in this file, still comes through here.
 func trySend(ch chan wire.Envelope, env wire.Envelope) bool {
 	select {
 	case ch <- env:
@@ -2905,12 +3041,115 @@ func trySend(ch chan wire.Envelope, env wire.Envelope) bool {
 	}
 }
 
+// subscriber is one chat client's channel together with its drop counter and its
+// end-of-subscription signal.
+//
+// They are paired up because they live in three maps that are read under the
+// same lock, and the turn-ender path has to carry all of them PAST the end of that
+// lock's scope — see offerTurnEnderToAll, where the snapshot is taken and why the
+// wait cannot happen inside it. Entry.lost's doc carries the invariant that makes
+// the pairing sound: every channel in subs has a counter there and nothing else
+// does, maintained by Subscribe and Unsubscribe together.
+type subscriber struct {
+	ch chan wire.Envelope
+	// lost may be nil, for an Entry whose subs map was populated without going
+	// through Subscribe — see deliverTurn, which is where that case is argued.
+	lost *atomic.Int64
+	// gone is closed when this subscription ends, and is awaitTurnEnderRoom's
+	// escape for "the reader of this channel has left" — see Entry.gone.
+	//
+	// Populated only on the turn-ender path. deliverTurn leaves it nil because it
+	// never waits, and looking it up there would cost a map read per subscriber per
+	// token increment for a field nothing reads. A nil channel in a select is never
+	// ready, which is also the correct reading of "no subscription to lose" for the
+	// hand-built Entry literals in this package's tests.
+	gone <-chan struct{}
+}
+
+// payGapNotice tells s about envelopes it has already lost, if it is owed a notice
+// and there is room for one. A notice that does not fit is not a failure: it stays
+// owed, and the next call that finds room sends it (see gapNoticeText).
+func (s subscriber) payGapNotice() {
+	if s.lost == nil {
+		return
+	}
+	// Subtract what was reported rather than storing 0: a drop racing in from
+	// another producer is still owed a notice of its own.
+	if n := s.lost.Load(); n > 0 && trySend(s.ch, gapNotice()) {
+		s.lost.Add(-n)
+	}
+}
+
+// offer gives s the envelope if there is room, having first paid off any gap
+// notice s is owed, and reports whether the envelope ITSELF fitted.
+//
+// The notice goes FIRST here because this is the best-effort path: more envelopes
+// are coming behind it, and putting the notice immediately ahead of the next one
+// that fits is what lands it at the position of the gap. offerTurnEnder reverses
+// that, and its doc is where the difference is argued.
+func (s subscriber) offer(env wire.Envelope) bool {
+	s.payGapNotice()
+	return trySend(s.ch, env)
+}
+
+// offerTurnEnder gives s an envelope that closes a turn if there is room, and pays
+// off the gap notice s is owed only AFTERWARDS — the reverse of offer's order,
+// deliberately.
+//
+// A free slot belongs to the turn-ender, not to the announcement of a loss. Paying
+// the notice first spends the last slot on the notice and then pushes the one
+// envelope that must not be lost into a blocking wait it did not need — and it
+// widens the trigger for that wait from "the channel is full" to "the channel has
+// one slot free and a notice is owed", which is a strictly larger set of
+// subscribers. awaitTurnEnderRoom's escape branch has always stated this rule for
+// itself; this is the same rule at the other end of the same path, where before
+// the two disagreed.
+//
+// The notice is deferred, not dropped: offer subtracts only what it managed to
+// report, so the debt survives and rides the next envelope that finds room. Its
+// position relative to the turn-ender is not load-bearing, and deliverTurn's doc
+// is where that is argued — sendEnvelope opens a fresh unidirectional stream per
+// envelope so send order is not delivery order, and the frontend keeps notices in
+// a list ordered by its own timestamps.
+func (s subscriber) offerTurnEnder(env wire.Envelope) bool {
+	if !trySend(s.ch, env) {
+		return false
+	}
+	s.payGapNotice()
+	return true
+}
+
+// recordDrop accounts for an envelope s will never see, and is the whole of what
+// a drop leaves behind on this path. extra carries any additional log keys the
+// caller can say more with; the drop path deliverTurn uses passes none, so its
+// line is unchanged.
+func (s subscriber) recordDrop(env wire.Envelope, extra ...any) {
+	// The count is per subscriber and per gap, which is what makes this log usable
+	// as a measurement: "one connection lost 400 increments" and "400 connections
+	// lost one each" used to print identically.
+	n := int64(1)
+	if s.lost != nil {
+		n = s.lost.Add(1)
+	}
+	args := []any{"site", "fanOut", "kind", env.Kind,
+		"lost_this_gap", n, "repairable_by_reload", true}
+	slog.Warn("slow subscriber, envelope dropped", append(args, extra...)...)
+}
+
 // deliverTurn hands one subscriber an envelope from the SESSION's event stream
 // (Registry.broadcast, i.e. fanOut), telling that subscriber first about any such
 // envelopes it has already lost.
 //
+// This is the BEST-EFFORT half of that stream and since tether#167 it is no
+// longer all of it: the envelopes that close a turn go through offerTurnEnderToAll
+// and awaitTurnEnderRoom instead, which wait rather than dropping. Everything below is about the kinds
+// that are still allowed to be lost — the token deltas, tool rows and usage lines
+// a reload can reconstruct.
+//
 // The caller holds subsMu for reading — which is all the synchronisation the
-// counter needs, being an atomic; see Entry.lost.
+// counter needs, being an atomic; see Entry.lost. (awaitTurnEnderRoom deliberately
+// does NOT hold it while it waits, and offerTurnEnderToAll's doc is where that is
+// argued.)
 //
 // # Why the notice is on this path and not on the other one
 //
@@ -2943,32 +3182,248 @@ func trySend(ch chan wire.Envelope, env wire.Envelope) bool {
 // A run of drops is ONE notice: the counter is reported and cleared, so what the
 // reader is told is "there is a gap here", not one line per lost token increment.
 func (e *Entry) deliverTurn(ch chan wire.Envelope, env wire.Envelope) {
-	// The nil checks here and below are reachable only for an Entry whose subs map
-	// was populated without going through Subscribe, which nothing does today.
-	// Kept because the alternative is a nil dereference inside fanOut — a panic
-	// that takes the session down — as the penalty for a bookkeeping miss, and the
-	// accounting is not worth a crash.
-	lost := e.lost[ch]
-	if lost != nil {
-		// Subtract what was reported rather than storing 0: a drop racing in from
-		// another producer is still owed a notice of its own. A notice that does
-		// not fit stays owed, and the next call that finds room sends it.
-		if n := lost.Load(); n > 0 && trySend(ch, gapNotice()) {
-			lost.Add(-n)
-		}
-	}
-	if trySend(ch, env) {
+	// The nil counter this tolerates (see subscriber.lost) is reachable only for an
+	// Entry whose subs map was populated without going through Subscribe, which
+	// nothing does today. Tolerated because the alternative is a nil dereference
+	// inside fanOut — a panic that takes the session down — as the penalty for a
+	// bookkeeping miss, and the accounting is not worth a crash.
+	sub := subscriber{ch: ch, lost: e.lost[ch]}
+	if sub.offer(env) {
 		return
 	}
-	// Dropped. The count is per subscriber and per gap, which is what makes this
-	// log usable as a measurement: "one connection lost 400 increments" and "400
-	// connections lost one each" used to print identically.
-	n := int64(1)
-	if lost != nil {
-		n = lost.Add(1)
+	sub.recordDrop(env)
+}
+
+// turnEnderWaitBudget is the longest a turn-ender may hold up a session waiting
+// for a subscriber to make room — the backstop for the one case
+// awaitTurnEnderRoom's per-subscription escape cannot see.
+//
+// # What it is for, which is narrower than it looks
+//
+// Two of the three ways a wait can end need no budget. A subscriber that
+// DISCONNECTS closes its Entry.gone signal through Unsubscribe, and a session that
+// ENDS cancels Entry.ctx; both are immediate and exact. What neither sees is a
+// client that stays connected and stays subscribed and simply stops reading its own
+// channel — a browser wedged hard enough that its drain loop never runs again while
+// its QUIC connection stays up. There is no signal for that, so it needs a clock.
+//
+// # Why this number
+//
+// It is deliberately NOT tuned to a measurement, because it is not a threshold
+// between two behaviours that both matter. The thing that must not trip it — a
+// browser that is merely behind and catching up — is covered by the wait ending
+// the moment room appears, and the thing it exists for has no legitimate duration
+// at all: a subscriber that has not read one envelope in ten seconds while its
+// connection is still up is broken, not slow. So the budget only has to be long
+// enough that no ordinary catch-up reaches it and short enough that the collateral
+// is a hiccup rather than an outage:
+//
+//   - The floor: a wedged tab holds 32 queued envelopes (the subCh capacity in
+//     internal/server/wt_chat.go), each of which serveChat forwards on a fresh
+//     unidirectional stream. Ten seconds is orders of magnitude more than that
+//     costs on any link this has been run over.
+//   - The ceiling: what a spent budget costs is a HEALTHY subscriber's latency —
+//     the session's fanOut is stalled for the duration, so a sibling tab's stream
+//     freezes for up to this long, once per turn-ender, and then continues. Ten
+//     seconds is a visible stutter; a minute would be indistinguishable from the
+//     hang this replaced.
+//
+// What is NOT known: nobody has measured real-browser catch-up latency for a full
+// 32-slot backlog on a slow mobile link. If that is ever measured and its tail
+// reaches seconds, this is the constant to revisit — and it is one named var, read
+// in one place, for exactly that reason. It is a var rather than a const only so
+// the test that pins the backstop does not have to spend it in real time.
+//
+// # What a spent budget degrades to
+//
+// Exactly the pre-tether#167 behaviour for that one subscriber, and no worse: a
+// last look for room, then a counted, logged drop and the gap notice it earns.
+// That means a tab which stops reading altogether still ends up with the forever
+// spinner this wi is about — stated plainly rather than glossed, because it is the
+// deliberate trade. The alternative is the unbounded version, where the same tab
+// takes the session, every healthy sibling, and the agent process down with it.
+// Nothing in-band can help a subscriber that is not reading; what repairs it is
+// its connection dying, and that is instant through Entry.gone.
+var turnEnderWaitBudget = 10 * time.Second
+
+// offerTurnEnderToAll offers an envelope that CLOSES a turn to every current
+// subscriber without blocking, and returns the ones that had no room for it — the
+// non-blocking half of the turn-ender path. Registry.broadcast pairs it with
+// awaitTurnEnderRoom, and its doc says what goes between them and why.
+//
+// # What this repairs (tether#167)
+//
+// There are two hops between the agent and the browser, and until this existed
+// only the first one exempted the envelopes that end a turn.
+// internal/agent/claude_provider.go's ccSession.emit blocks on agent.EventResult
+// and agent.EventError until the event is taken or its spawn ctx ends, because
+// "a lost EventResult/EventError leaves the consumer's turn open forever"
+// (tether#14, and that doc says exactly this). This hop did not: broadcast →
+// deliverTurn → trySend treated a wire.KindResult like a token delta, so a tab
+// that had stalled long enough to fill its 32 slots lost the turn-ender and its
+// spinner ran forever. The first hop's guarantee simply stopped at the registry.
+//
+// The one trace it left was the gap notice, and that made it WORSE than silent:
+// the notice says to reload, and reloading the only open tab kills the agent
+// (Entry.backfill has the measurement). So a user who followed the advice
+// destroyed the session that was still, on the daemon's side, perfectly fine.
+//
+// Only the two kinds isTurnEnder names. Everything else keeps the drop for the
+// reason trySend's doc gives, and
+// TestBroadcast_ATokenDeltaIsStillDroppedWhenThereIsNoRoom is the arm that holds
+// that half in place — a "block on everything" version of this would pass the
+// test that motivated it and stop a session dead on the first slow browser.
+//
+// # The wait is OUTSIDE subsMu, which is not a detail
+//
+// broadcast's ordinary path holds subsMu for reading while it delivers. That is
+// free while every send is non-blocking and a daemon-wide stall as soon as one
+// is not:
+//
+//   - Registry.BroadcastAll takes each entry's subsMu in turn, so one wedged tab
+//     on THIS session would hold up a permission request bound for every OTHER
+//     session — an un-answerable prompt on sessions that are not even slow.
+//   - Subscribe / Unsubscribe / setOwner take the WRITE lock, and a parked writer
+//     parks every reader queued behind it too (Go's RWMutex), which is the
+//     session-list path through owner / IsOwner / OwnedByOther. Worse, the
+//     Unsubscribe being blocked is very often the wedged tab's own — the daemon
+//     would be holding the lock against the one call that would free it.
+//
+// Entry.backfill's doc reaches this same fork and takes the other branch — it
+// drops, because a backfill is repairable by the next attach and a turn-ender is
+// repairable by nothing. So here the subscribers are SNAPSHOT under the lock and
+// served after it is released.
+//
+// What the snapshot can be stale about is a channel unsubscribed in between, and
+// that case is NOT cheap — the first attempt at tether#167 recorded it here as
+// costing "that envelope and nothing else", and that was measurably wrong. Nothing
+// in this package closes a subscriber channel, so an unsubscribed channel that was
+// already full stays full for good; a wait on it therefore had no end at all, and
+// what it cost was the session. It is now carried by the per-subscription signal
+// Entry.gone, which Unsubscribe closes, and awaitTurnEnderRoom is where that is
+// spelled out.
+//
+// # Offered to everyone first, waited on second
+//
+// A wedged tab must not hold the turn-ender back from a healthy one, which is
+// what delivering in map order and waiting inline would do about half the time —
+// a spinner turning on the laptop because the phone stalled, which is the
+// hardest kind of report to act on. So every subscriber is OFFERED the envelope
+// first and only the ones with no room are waited for. The read-only observers of
+// this sid are in the same position and are served in the same gap; see
+// Registry.broadcast, which is where the three steps are ordered.
+func (e *Entry) offerTurnEnderToAll(env wire.Envelope) []subscriber {
+	e.subsMu.RLock()
+	slog.Debug("fanOut: broadcasting", "wire_kind", env.Kind, "nsub", len(e.subs))
+	subs := make([]subscriber, 0, len(e.subs))
+	for ch := range e.subs {
+		subs = append(subs, subscriber{ch: ch, lost: e.lost[ch], gone: e.gone[ch]})
 	}
-	slog.Warn("slow subscriber, envelope dropped", "site", "fanOut", "kind", env.Kind,
-		"lost_this_gap", n, "repairable_by_reload", true)
+	e.subsMu.RUnlock()
+
+	var wedged []subscriber
+	for _, sub := range subs {
+		if !sub.offerTurnEnder(env) {
+			wedged = append(wedged, sub)
+		}
+	}
+	return wedged
+}
+
+// awaitTurnEnderRoom waits for each wedged subscriber to make room for an envelope
+// that closes a turn, and delivers it when they do — the blocking half of the
+// turn-ender path. See offerTurnEnderToAll for which subscribers get here and why
+// the wait is outside subsMu.
+//
+// # The escape is the SUBSCRIBER's lifetime, not the session's
+//
+// This is the whole of what the first attempt at tether#167 got wrong, and the
+// correction is worth stating as a rule: the escape from a blocking send must be
+// scoped to the thing whose disappearance makes the send unsatisfiable. That is the
+// subscription. e.ctx is the ctx of the connection that SPAWNED this Entry, and a
+// second tab reaching a live session through Attach's reuse branch never becomes
+// its owner — so bounding the wait with e.ctx bounded it by the lifetime of a
+// DIFFERENT client than the one being waited on. Entry.gone carries the right one:
+// it is closed by Unsubscribe, which serveChat runs on its way out, and it is the
+// only notice this code ever gets that a channel's reader has left (subCh is not
+// closed there, and nothing in this package closes a subscriber channel).
+//
+// Three ways out, and every one of them ends in the same behaviour, because there
+// is only one honest thing to do with a turn-ender nobody will take:
+//
+//   - the subscription ends (Entry.gone) — nothing to deliver and nothing to
+//     account; see the branch.
+//   - the session ends (e.ctx) — the agent is already going away.
+//   - the budget is spent (turnEnderWaitBudget) — the case neither signal can see:
+//     a client still connected, still subscribed, and no longer reading.
+//
+// # One budget for the whole wedged set
+//
+// Not one each. What is being bounded is "how long a turn-ender can hold up THIS
+// SESSION", and that quantity does not grow with the size of the audience — a
+// per-subscriber timer would multiply the worst-case stall by the number of stalled
+// tabs, so a healthy sibling's guarantee would degrade as more siblings broke. A
+// tab that inherits little of the budget because an earlier one spent it still gets
+// the last look for room that every other exit gets. Derived from e.ctx so a single
+// channel covers both the deadline and the session, which also keeps it correct
+// across iterations: a context's Done stays closed, where a Timer's channel fires
+// once and would leave every subscriber after the first with no clock at all.
+func (e *Entry) awaitTurnEnderRoom(wedged []subscriber, env wire.Envelope) {
+	if len(wedged) == 0 {
+		return
+	}
+
+	// A nil ctx is the hand-built Entry literals in this package's tests; every
+	// entry the daemon makes has one, spawnEntry being the only constructor. Those
+	// still get the budget, which is the point of deriving rather than branching.
+	base := context.Background()
+	if e.ctx != nil {
+		base = e.ctx
+	}
+	waitCtx, cancelWait := context.WithTimeout(base, turnEnderWaitBudget)
+	defer cancelWait()
+
+	for _, sub := range wedged {
+		select {
+		case sub.ch <- env:
+			// The turn-ender is in; only now is there anything to spare for the notice
+			// that reports what this subscriber lost earlier. Behind the turn-ender,
+			// never in front of it — see offerTurnEnder.
+			sub.payGapNotice()
+
+		case <-sub.gone:
+			// The reader has left. Nothing is delivered and nothing is COUNTED, and the
+			// second half is the point: Unsubscribe took this subscriber's counter with
+			// it, so an increment here would land on an orphan that no gap notice can
+			// ever report, addressed to a drain loop that has already returned
+			// (serveChat unsubscribes after its loop, not before). The log line is the
+			// whole record, and it says repairable_by_reload=false because there is no
+			// longer anyone to reload.
+			slog.Warn("slow subscriber, envelope dropped", "site", "fanOut", "kind", env.Kind,
+				"reason", "unsubscribed while waiting for room", "repairable_by_reload", false)
+
+		case <-waitCtx.Done():
+			// Room appearing and the wait ending can become ready in the same instant,
+			// and select picks between ready cases at random. Look once more before
+			// giving up, so a turn-ender is never dropped by a coin toss.
+			//
+			// trySend and not offerTurnEnder: this is the last envelope this subscriber
+			// will be offered, so there is no later one for a gap notice to ride, and
+			// paying the notice here could only displace the thing being rescued.
+			if trySend(sub.ch, env) {
+				continue
+			}
+			// Which of the two ended it is a materially different operational fact —
+			// "the session finished while a tab was behind" is routine, "a connected
+			// client stopped reading for ten seconds" is a client defect — and they
+			// are indistinguishable in the log otherwise.
+			reason := "the subscriber did not make room within turnEnderWaitBudget"
+			if e.ctx != nil && e.ctx.Err() != nil {
+				reason = "the session ended while the subscriber was still wedged"
+			}
+			sub.recordDrop(env, "reason", reason)
+		}
+	}
 }
 
 // deliverOutOfBand hands one subscriber a DAEMON-WIDE envelope (BroadcastAll),

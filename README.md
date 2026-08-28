@@ -108,6 +108,39 @@ next tool call transparently revives them.
 
 ---
 
+## Third-party code
+
+tether's UI design tokens, and its UI primitive layer as that lands, come from
+**CloudCLI UI (https://github.com/siteboon/claudecodeui)**, which is licensed
+under the GNU Affero General Public License v3.0 or later, with additional terms
+under Section 7 of that licence.
+
+Those files are carried unmodified in `web/src/vendor/cloudcli/`.
+`web/src/vendor/cloudcli.MANIFEST.json` is the authoritative list of exactly
+which files are present at any given commit, and records for each one the
+upstream path, tag and commit it was taken from and whether it is `pristine` or
+`detached` — that is, whether this project has modified it. Source files repeat
+that record in a header inside the file itself; `LICENSE` and `NOTICE` carry no
+header, so as not to alter documents that must be conveyed unchanged. CI checks
+the manifest against the files on every pull request, in both directions, so it
+cannot quietly fall out of date.
+
+This section deliberately does not list the files. A list here would be a second,
+hand-maintained copy of the manifest, kept in prose, with nothing comparing the
+two — and the copy that nothing checks is the one that goes wrong. Run
+`jq -r '(.vendored + .verbatim)[].path' web/src/vendor/cloudcli.MANIFEST.json`
+for the current set.
+
+tether's own differences in behaviour and appearance are implemented separately,
+in `web/src/ui/`, and are not modifications of upstream's files.
+
+- Licence text: [`web/src/vendor/cloudcli/LICENSE`](web/src/vendor/cloudcli/LICENSE)
+- Upstream's attribution and relicensing notice: [`web/src/vendor/cloudcli/NOTICE`](web/src/vendor/cloudcli/NOTICE)
+- How a newer upstream tag is absorbed: [`docs/vendoring-cloudcli.md`](docs/vendoring-cloudcli.md)
+
+CloudCLI UI is a product of Siteboon AI B.V. This project is not affiliated with,
+sponsored by, or endorsed by Siteboon AI B.V.
+
 ## Troubleshooting
 
 ### K.8.1 — VPN / corporate firewall breaks the shell and chat channels

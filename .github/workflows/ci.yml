@@ -3,14 +3,23 @@ name: CI
 on:
   push:
     branches: [main, "pf2.*"]
+  # No `branches:` filter on purpose. It used to be `[main]`, which reads like
+  # "PRs into main" and behaves like "PRs into anything else run zero checks":
+  # a stacked PR — B onto A, A onto main — got no CI at all, so B's checks were
+  # first attempted only after A merged and B was retargeted. A gate that skips
+  # the review it is supposed to gate is not a narrower gate, it is absent.
   pull_request:
-    branches: [main]
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The vendor-provenance diff gate below reads the manifest as of the
+          # PR base, so the base commit has to be in the local object store. The
+          # default depth-1 fetch gives only the merge ref.
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -37,6 +46,52 @@ jobs:
       # Runs before the web build because it reads the git index, not the tree.
       - name: Check no generated artifacts committed
         run: bash scripts/check-artifacts-uncommitted.sh
+
+      # ── vendored-upstream provenance gate (tether#171) ──────────────────────
+      # web/src/vendor/cloudcli/ is CloudCLI UI's source, copied byte-for-byte at
+      # a pinned tag. Keeping it byte-identical is what makes
+      # `git diff <old-sha>..<new-sha>` still applicable when we absorb a later
+      # tag; one in-place edit ends that permanently, and nothing about an edited
+      # file looks wrong from the outside.
+      #
+      # Derives the file set from `find` over the vendor root unioned with the
+      # git index — not from the manifest — and requires the two to agree in both
+      # directions, so an undeclared vendored file is red rather than invisible.
+      # That direction is the whole point: the manifest-iterating version of this
+      # check passes forever while blind, which is the defect WIRE-8 already has
+      # in web/test/wire-contract.spec.ts. `find` and not `git ls-files --others
+      # --exclude-standard`, because the latter honours .gitignore and tether's
+      # .gitignore has un-anchored entries — a gitignored `.env` dropped into the
+      # vendor root was measured passing the first version of this check.
+      #
+      # Offline and dependency-free (bash + jq + git), hence its position up here
+      # beside the artifact gate rather than after the builds. The network half —
+      # "are the recorded hashes what upstream really published" — is
+      # `verify-upstream`, which an absorption runs by hand; see step 5 of
+      # docs/vendoring-cloudcli.md for why it is not a per-PR gate.
+      - name: Check vendored upstream provenance
+        run: bash scripts/check-vendor-provenance.sh check
+
+      # The half `check` structurally cannot do. `check` compares the tree
+      # against the manifest, and both sides are writable in the same commit, so
+      # an in-place edit plus `rehash` leaves consistent state and passes. Reading
+      # the *change* closes it: upstream's bytes at a fixed sha never change, so a
+      # content hash that moves while the entry's tag/sha/status stay put is an
+      # in-place edit by definition. Offline and deterministic, so unlike
+      # verify-upstream it belongs on every PR.
+      #
+      # This replaces a sentence in docs/vendoring-cloudcli.md asking reviewers to
+      # paste verify-upstream output into any PR that touches a hash — a request
+      # addressed to people, enforced by nobody, on the one path where the whole
+      # arrangement fails silently.
+      #
+      # PR-only because it needs two endpoints. On a push there is no reliable
+      # base: `github.event.before` is all-zeros for a new branch and points at a
+      # discarded commit after a force-push. PRs are where the diff is reviewed
+      # anyway, and `pull_request` now fires for every base branch (see `on:`).
+      - name: Check vendored provenance diff against PR base
+        if: github.event_name == 'pull_request'
+        run: bash scripts/check-vendor-provenance.sh check-diff "@${{ github.event.pull_request.base.sha }}"
 
       # ── codegen drift gate (D-22 §2.6, K.7.1) ──────────────────────────────
       - name: Run codegen

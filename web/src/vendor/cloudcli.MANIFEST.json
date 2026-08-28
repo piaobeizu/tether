@@ -1,0 +1,85 @@
+{
+  "manifest_version": 1,
+  "README": "Machine-readable provenance for everything under vendor_root. Held to the files themselves by scripts/check-vendor-provenance.sh; the procedure for absorbing a newer upstream tag is docs/vendoring-cloudcli.md. Do not hand-edit the *_sha256 fields — `scripts/check-vendor-provenance.sh rehash` computes them.",
+  "upstream": {
+    "name": "CloudCLI UI",
+    "repo": "https://github.com/siteboon/claudecodeui",
+    "npm": "@cloudcli-ai/cloudcli",
+    "license": "AGPL-3.0-or-later",
+    "license_notes": "Section 7 additional terms apply (attribution, marking of modifications, publicity, trademarks). Full text in vendor_root/LICENSE; upstream's own attribution in vendor_root/NOTICE."
+  },
+  "vendor_root": "web/src/vendor/cloudcli",
+  "wrap_root": "web/src/ui",
+  "procedure": "docs/vendoring-cloudcli.md",
+  "pins": {
+    "v1.37.2": "677b7ba43695d5624d1a981c62f87fa086187991"
+  },
+  "current_baseline": "v1.37.2",
+  "notes": [
+    "File mode is normalised to 0644. Upstream ships LICENSE, tailwind.config.js and postcss.config.js as 0755; mode is not content, is not part of any diff we intend to apply, and is not part of the pristine claim. Only the bytes are.",
+    "A vendored file's local `path` mirrors its `upstream_path` exactly, so vendor_root is a subset of upstream's tree with the same shape. Nothing enforces that (the checker only requires the two to be declared and to agree with the file's header), but keeping it means an upstream path is always locatable here without consulting a mapping table.",
+    "body_sha256 covers the bytes strictly below the ' * @tether-vendored-end */' line — i.e. upstream's bytes, without the provenance header this repo prepends. That is what makes it comparable to the upstream blob.",
+    "header_sha256 covers lines 1..terminator inclusive — the provenance header itself, i.e. exactly the bytes body_sha256 excludes. Together the two cover every byte of the file. It exists because the header region is *trusted* (body_sha256 starts below it) and a trusted region that nothing hashes is a hole: the first version of this setup parsed six fields out of that region and left every other byte unexamined, so a header that closed the comment early, ran code and reopened it passed both `check` and `verify-upstream`. The checker now also requires the region to be a single self-contained block comment, which is what makes it inert; header_sha256 is what makes any edit to it visible.",
+    "file_sha256 covers the whole file. Only 'verbatim' entries use it, because they carry no header."
+  ],
+  "vendored": [
+    {
+      "path": "src/index.css",
+      "upstream_path": "src/index.css",
+      "tag": "v1.37.2",
+      "sha": "677b7ba43695d5624d1a981c62f87fa086187991",
+      "fetched": "2026-08-27",
+      "status": "pristine",
+      "body_sha256": "da351af790265e4997665fe11ff192400417907f2feccb488608ffa3de9e6968",
+      "header_sha256": "58de1900938a2f1190c5db126094c2779f591c1a933d99c3038ec0c1450b8a05",
+      "layer": "1-design-tokens",
+      "note": "This is where the design tokens actually are: the :root and .dark custom-property definitions that every hsl(var(--x)) entry in tailwind.config.js resolves against. Carrying the config without this file would have pinned the references and not the values. Whole file, not an extract: a partially vendored file cannot be diffed against a future tag, which is the entire purpose of this arrangement, so it is whole-file or not at all. Not yet imported by web/'s build (tether has no tailwind dependency at this pin); phase 1 of the UI rewrite is what consumes it, from web/src/ui/."
+    },
+    {
+      "path": "tailwind.config.js",
+      "upstream_path": "tailwind.config.js",
+      "tag": "v1.37.2",
+      "sha": "677b7ba43695d5624d1a981c62f87fa086187991",
+      "fetched": "2026-08-27",
+      "status": "pristine",
+      "body_sha256": "ede94a5f69d45a6251ad4d8345d935259d945f09e90d49be81a2910097c47929",
+      "header_sha256": "175a3bc11f1828e7828cfa2db347aaef41c05ca436f3d4e4b76d4dc8d35e7d2f",
+      "layer": "1-design-tokens",
+      "note": "Not yet wired into web/'s build — tether has no tailwind dependency at this pin. Vendored so that the token *references* have a pinned origin; the token *values* they resolve against are in src/index.css, which is why that file is vendored alongside it. Uses require() inside an ESM module and pulls @tailwindcss/typography; both are upstream's problem to solve at adoption time, in web/src/ui/, not here."
+    },
+    {
+      "path": "postcss.config.js",
+      "upstream_path": "postcss.config.js",
+      "tag": "v1.37.2",
+      "sha": "677b7ba43695d5624d1a981c62f87fa086187991",
+      "fetched": "2026-08-27",
+      "status": "pristine",
+      "body_sha256": "010e8774c76996e28b1f2290d690b3b64f56f2fbe26c747b4419ee0110d0a002",
+      "header_sha256": "9d5e26ce2f264632964bada68f65e2877e7428f77dcfdb463027e416a6643942",
+      "layer": "1-design-tokens"
+    }
+  ],
+  "verbatim": [
+    {
+      "path": "LICENSE",
+      "upstream_path": "LICENSE",
+      "tag": "v1.37.2",
+      "sha": "677b7ba43695d5624d1a981c62f87fa086187991",
+      "fetched": "2026-08-27",
+      "status": "pristine",
+      "file_sha256": "6d909143fd48a74595f4381a9118aa07b13690a6e3d0b85427c81fda67a3d7c4",
+      "no_header_reason": "Inserting a provenance header into a license document would modify the license text. AGPL-3.0 requires it be conveyed unaltered."
+    },
+    {
+      "path": "NOTICE",
+      "upstream_path": "NOTICE",
+      "tag": "v1.37.2",
+      "sha": "677b7ba43695d5624d1a981c62f87fa086187991",
+      "fetched": "2026-08-27",
+      "status": "pristine",
+      "file_sha256": "9f2b4a42d603737f0b7f2c9e21ee426cbb6fb88ce0e9d1c4b9c950b9d5499111",
+      "no_header_reason": "Upstream's own attribution and relicensing notice. Section 7(b) requires it be preserved as-is."
+    }
+  ],
+  "rejected_upstream_changes": []
+}

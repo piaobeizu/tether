@@ -29,6 +29,19 @@
 
 按 spec §10.C.1：根目录新建 `cmd/tether/`、`internal/{server,wire,agent,session,workspace,skill,crypto,pair}/`、`web/`、`scripts/`、`Makefile`、`tygo.yaml`、新 `go.mod` (module path 沿用 `github.com/piaobeizu/tether`)。
 
+## 第三方代码只能落在 vendor 树里
+
+上游（CloudCLI UI）的代码一律放 `web/src/vendor/cloudcli/`，**逐字节原样**，并在
+`web/src/vendor/cloudcli.MANIFEST.json` 声明；tether 自己的差异写在 `web/src/ui/`。
+
+- **不要就地改** `web/src/vendor/cloudcli/` 下任何文件，包括文件头的 provenance
+  注释块 —— 头部和正文各有一个 sha256，CI 两个方向都比。
+- 复制上游文件进来 = 同一个 commit 里加 manifest 条目，否则 `make check-vendor` 红。
+- 想改上游行为 → 包一层放 `web/src/ui/`；真包不动 → 走
+  `docs/vendoring-cloudcli.md` 的 step 6 显式 detach，不要偷偷改。
+
+完整规程（含吸收新 tag、AGPL §7 义务）：`docs/vendoring-cloudcli.md`。
+
 ## Commits
 
 走 `/pf2-commit msg="..."`，不要裸 `git commit`（polyforge 管理多仓 commit）。

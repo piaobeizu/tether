@@ -1,4 +1,5 @@
-.PHONY: all build codegen test go-test web-test check-artifacts ci release clean
+.PHONY: all build codegen test go-test web-test check-artifacts check-vendor \
+        check-vendor-diff verify-vendor-upstream ci release clean
 
 BINARY  := bin/tether
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
@@ -20,7 +21,10 @@ build:
 codegen:
 	bash scripts/codegen.sh
 
-test: go-test web-test
+# check-vendor is in here and not only in `ci` because `make test` is what anyone
+# actually runs before pushing, and a gate that only exists in CI is a gate you
+# meet after the fact. It needs neither Go nor node, so it costs nothing here.
+test: check-vendor go-test web-test
 
 go-test:
 	$(GOTEST) ./...
@@ -39,9 +43,41 @@ web-test:
 check-artifacts:
 	bash scripts/check-artifacts-uncommitted.sh
 
+# Asserts every file under web/src/vendor/cloudcli is still byte-identical to the
+# upstream tag its provenance header names (tether#171). Offline. See
+# docs/vendoring-cloudcli.md.
+check-vendor:
+	bash scripts/check-vendor-provenance.sh check
+
+# The other half of the offline gate, and the half that reads the *change* rather
+# than the state: a content hash that moved while its tag/sha/status did not is an
+# in-place edit that was rehashed, which `check` is structurally unable to see
+# (after the rehash the state is consistent). CI runs this per PR against the PR
+# base; locally, BASE is whatever you are stacked on.
+#
+#   make check-vendor-diff BASE=@origin/main
+#
+# BASE and HEAD take '@<git-ref>' or a path to a manifest file.
+BASE ?= @origin/main
+check-vendor-diff:
+	bash scripts/check-vendor-provenance.sh check-diff "$(BASE)" $(HEAD)
+
+# The network half — "are the recorded hashes what upstream actually published at
+# the recorded sha". Step 5 of an absorption; not a per-PR gate, because a gate
+# that reddens when github.com has a bad afternoon is one people rerun past.
+#
+#   make verify-vendor-upstream CLONE=/tmp/ccui
+verify-vendor-upstream:
+	@test -n "$(CLONE)" || { echo "usage: make verify-vendor-upstream CLONE=<upstream-clone>"; exit 2; }
+	bash scripts/check-vendor-provenance.sh verify-upstream "$(CLONE)"
+
 # scripts/build.sh stamps web/dist and then verifies the binary against it
 # (scripts/spa-bundle.sh), so the embed hop is covered here without a separate line.
-ci: codegen check-artifacts
+#
+# check-vendor needs neither Go nor node, so it sits with check-artifacts ahead of
+# the builds: a broken vendor pin should be reported in seconds, not after a web
+# build.
+ci: codegen check-artifacts check-vendor
 	git diff --exit-code web/src/lib/wire.gen.ts
 	bash scripts/build.sh
 	$(GOTEST) ./...

@@ -9,10 +9,14 @@
 //
 // 🔴 Ported back onto the phase-1 branch by tether#187, after tether#174 deleted
 // the old SPA. It survives the rewrite because the rule below is a DAEMON
-// contract, not a property of the old shell: internal/session/workspace.go:28
-// and internal/session/workspace_test.go:257 both name `web/src/lib/chatUrl.ts`
-// in prose as the client half of it, so the Go side already says it depends on
-// this file. What came back is this function and its test, unchanged.
+// contract, not a property of the old shell: internal/session/workspace.go and
+// internal/session/workspace_test.go both name `web/src/lib/chatUrl.ts` in
+// prose as the client half of it, so the Go side already says it depends on
+// this path. (Named without line numbers on purpose — a line number is a
+// pointer that rots silently, and those files are not in this wi's scope, so
+// nothing keeps such a number honest. `git grep -n chatUrl.ts -- '*.go'` finds
+// both.) The function body and its test came back unchanged; only this comment
+// differs from the origin/main copy.
 //
 // Every pointer this doc comment used to make into the old shell — `store.ts`,
 // `ChatPane`, `panes/chat/index.tsx` — has been rewritten below, because all of
@@ -52,10 +56,10 @@
  * (tether#47) — tracks what the user is currently BROWSING: a read with no
  * relationship to which workspace the LIVE session actually runs in, and one
  * that keeps changing as the user clicks around while chatting. If every
- * reconnect resent it, an
- * ordinary network blip — a WebTransport drop, a laptop sleep, a flaky UDP
- * path — that happened to land after the user had merely clicked a different
- * workspace in the sidebar would present the daemon with exactly the signal
+ * reconnect resent it, an ordinary network blip — a WebTransport drop, a
+ * laptop sleep, a flaky UDP path — that happened to land after the user had
+ * merely clicked a different workspace in the sidebar would present the daemon
+ * with exactly the signal
  * it's told to treat as "abandon and start over": existing sid, disagreeing
  * ws. The live session — mid-turn, with real state — would be silently
  * dropped for a fresh empty one. No error, no user action, just bad timing.

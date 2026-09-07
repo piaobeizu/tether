@@ -1,0 +1,52 @@
+# Every test file `pnpm exec vitest list --filesOnly` must still execute, one
+# web-relative path per line. Read by the step "Check typecheck covers every test
+# file" in .github/workflows/ci.yml, which fails when a path recorded here is no
+# longer in vitest's list. Order does not matter — the step sorts both sides — so
+# add a line wherever you like; `#` comments and blank lines are ignored.
+#
+# A RATCHET, and one-sided: it asserts recorded is a subset of executed, so
+# ADDING a test never reds CI and never requires touching this file. It is not
+# the "count that goes red every time someone adds a file" the step's own comment
+# rejects. What it makes impossible is a test file quietly LEAVING the suite.
+#
+# Nothing else in that step can see that. Rename `foo.test.ts` to `foo.ts` and it
+# disappears from vitest's list AND from the git-index glob at the same time, so
+# both sides of the subset assertion shrink together and it still passes — while
+# the file stays inside the typecheck set, keeps compiling, and never runs again.
+# Adding members to the coverage union cannot help: the file was never outside
+# the coverage. Measured before this file existed, by renaming one spec in the
+# index: the step printed `OK: all 14 test file(s) are inside the typecheck
+# coverage set` and exited 0, its own reported number having just gone down.
+#
+# Paths and not a count, which was the first attempt at this. A count admits a
+# compensating addition — rename one spec out of the suite and add an unrelated
+# one in the same commit, and the total is unchanged and the removal is hidden
+# (measured: green). A count also drifts, because nothing forces it upward: as
+# this branch refills web/, a number recorded today sits further and further
+# below the real one and stops detecting anything short of a mass deletion. A
+# recorded path has neither property; it can only go away deliberately.
+#
+# Deliberately NOT derived from the tree, and that is not the WIRE-8 defect ("an
+# assertion built from a copy of the thing under test"). The question this
+# answers is "did something LEAVE", and no measurement of the current tree can
+# answer it at any price — the tree only knows what is there now. That has to be
+# written down to exist at all.
+#
+# Add a line whenever the step reports an executed file that is not recorded.
+# Delete a line only in the same commit that removes the test, and name it and
+# the reason in that commit message.
+src/AuthPage.test.tsx
+src/lib/auth.test.ts
+src/lib/chatUrl.test.ts
+src/lib/httpError.test.ts
+src/lib/oauthSignInRedirect.test.ts
+src/lib/safeRedirectTarget.test.ts
+src/lib/timefmt.test.ts
+src/lib/version.test.ts
+src/main.test.tsx
+src/wireContract.smoke.test.ts
+test/latency.spec.ts
+test/scaffold.spec.ts
+test/ui-primitives.spec.tsx
+test/wire-contract.spec.ts
+test/workspace-tree.spec.ts

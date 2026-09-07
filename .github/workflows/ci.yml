@@ -255,10 +255,25 @@ jobs:
       # into web/test/. Reading the glob is exactly how the 0 stayed invisible, so
       # this checks the file set tsc reports.
       #
-      # The invariant is a SUBSET, not a count: every test file in the repo is inside
-      # the set `pnpm typecheck` reads. A count would go red every time someone adds
-      # a file, which makes it a gate people edit rather than obey; the subset check
-      # only fires when a test file is genuinely uncovered.
+      # The coverage invariant is a SUBSET, not a count: every test file in the repo
+      # is inside the set `pnpm typecheck` reads. An equality count would go red every
+      # time someone adds a file, which makes it a gate people edit rather than obey;
+      # the subset check only fires when a test file is genuinely uncovered.
+      #
+      # 🔴 There is a SECOND invariant below it, and the sentence above is exactly why
+      # it had to be added separately (tether#184). The subset says nothing about a
+      # test file that stops being a test file. Rename `foo.test.ts` to `foo.ts` and it
+      # leaves vitest's list and the git-index glob at the same time, so BOTH sides of
+      # the subset shrink together and it still passes — while the file stays inside
+      # the typecheck set, keeps compiling, and never runs again. Widening the union
+      # cannot see it, because the file was never outside the coverage; the file set
+      # this step compares is not where the loss shows up. The executed SET is.
+      #
+      # So the paths vitest executes are held against the set recorded in
+      # web/test/EXECUTED_TEST_FILES. One-sided — recorded must be a subset of
+      # executed — so it keeps the property the paragraph above is protecting: adding
+      # tests never reds CI and never touches that file. Only a removal does, and a
+      # removal then has to be written down in a diff a reviewer sees.
       #
       # `tsc -b --listFiles` and not per-project `tsc -p`: `-b` is what `pnpm
       # typecheck` actually runs, so this measures the real invocation and not a
@@ -280,7 +295,7 @@ jobs:
       #                              unexecuted is a separate problem, but it is
       #                              not an excuse to stop type-checking it.
       #
-      # 🔴 The two emptiness guards are not defensive padding. A subset assertion
+      # 🔴 The emptiness guards are not defensive padding. A subset assertion
       # over an empty left side passes vacuously, so "there are no test files" and
       # "every test file is covered" would be the same green — the precise defect
       # this gate exists to prevent, rebuilt inside the gate. It has already fired
@@ -296,21 +311,37 @@ jobs:
           # Both sides have to agree, and only the byte order is guaranteed to.
           export LC_ALL=C
 
+          # Scratch sets go in a directory this process owns (tether#184). They
+          # used to be fixed /tmp/tc-*.txt paths, and a literal path in a step body
+          # that is ALSO extracted and run verbatim by hand — which is how the
+          # tether#174 measurements quoted above this step were taken — is a shared
+          # global name. Two runs at once cross-write each other's intermediates,
+          # and then `comm` compares one run's test set against another run's
+          # coverage set: a verdict about a tree that never existed, delivered with
+          # total confidence, in either direction. Measured with a genuinely
+          # uncovered spec staged, which the old body correctly failed when run
+          # alone: with a second process writing those same names it reported `OK:`
+          # and exited 0. mktemp -d makes the name unique per process. It still
+          # lands under /tmp; /tmp was never the problem, the fixed names were.
+          tc=$(mktemp -d)
+          trap 'rm -rf "$tc"' EXIT
+
           # What tsc really reads, as web-relative paths.
           pnpm exec tsc -b --listFiles \
             | sed "s#^${PWD}/##" \
-            | sort -u > /tmp/tc-covered.txt
+            | sort -u > "$tc/covered.txt"
 
           # What has to be covered (see the comment above for why this is a union).
-          pnpm exec vitest list --filesOnly > /tmp/tc-vitest.txt
+          pnpm exec vitest list --filesOnly > "$tc/vitest.txt"
           git ls-files -- '*.test.ts' '*.test.tsx' '*.spec.ts' '*.spec.tsx' \
-            > /tmp/tc-indexed.txt
-          sort -u /tmp/tc-vitest.txt /tmp/tc-indexed.txt > /tmp/tc-tests.txt
+            > "$tc/indexed.txt"
+          sort -u "$tc/vitest.txt" "$tc/indexed.txt" > "$tc/tests.txt"
 
-          n_cov=$(grep -cv '^node_modules/' /tmp/tc-covered.txt || true)
-          n_tests=$(wc -l < /tmp/tc-tests.txt)
+          n_cov=$(grep -cv '^node_modules/' "$tc/covered.txt" || true)
+          n_tests=$(wc -l < "$tc/tests.txt")
+          n_vitest=$(wc -l < "$tc/vitest.txt")
           echo "typecheck reads ${n_cov} project file(s) under web/"
-          echo "test files to cover: ${n_tests} (union of $(wc -l < /tmp/tc-vitest.txt) from vitest and $(wc -l < /tmp/tc-indexed.txt) from the git index)"
+          echo "test files to cover: ${n_tests} (union of ${n_vitest} from vitest and $(wc -l < "$tc/indexed.txt") from the git index)"
 
           if [[ "$n_tests" -eq 0 ]]; then
             echo "FAIL: no test files found under web/." >&2
@@ -325,7 +356,77 @@ jobs:
             exit 1
           fi
 
-          uncovered=$(comm -23 /tmp/tc-tests.txt /tmp/tc-covered.txt)
+          # ── the executed-set ratchet (tether#184) ────────────────────────────
+          # Held apart from the subset check because it answers a different
+          # question: not "is every test file type-checked" but "is every test
+          # file still a test file". The comment above this step has the case that
+          # motivates it and why widening the coverage union cannot substitute.
+          #
+          # Recorded PATHS, not a recorded count. The first version of this was a
+          # count with a floor under it, and a count has defects a set does
+          # not: a removal can be masked by an unrelated addition in the same
+          # commit (measured green), and nothing forces the number upward, so it
+          # drifts below the real one and quietly stops discriminating. It also
+          # needed an integer parser, and that parser had a state — a value with a
+          # leading zero — where bash arithmetic errors, `if ((...))` swallows the
+          # error as false, BOTH comparisons fall through and the step exits 0
+          # with a test missing. Comparing sorted lines needs no parser at all.
+          recorded_file=test/EXECUTED_TEST_FILES
+          if [[ ! -f "$recorded_file" ]]; then
+            echo "FAIL: web/${recorded_file} is missing." >&2
+            echo "      It is the only record of which tests used to run, so without" >&2
+            echo "      it the comparison below has nothing to fail against. A gate" >&2
+            echo "      whose reference can be deleted into a green is not a gate;" >&2
+            echo "      refusing rather than skipping is the whole point." >&2
+            exit 1
+          fi
+          # `|| true` on both greps: grep exits 1 when it matches nothing, and
+          # under this step's `pipefail` an empty or all-comment record would then
+          # abort here with no diagnosis — killing the very message written to
+          # explain that case. Emptiness is decided below, deliberately.
+          { grep -v '^[[:space:]]*#' "$recorded_file" || true; } \
+            | { grep -v '^[[:space:]]*$' || true; } \
+            | sort -u > "$tc/recorded.txt"
+          sort -u "$tc/vitest.txt" > "$tc/executed.txt"
+
+          if [[ ! -s "$tc/recorded.txt" ]]; then
+            echo "FAIL: web/${recorded_file} records no test files." >&2
+            echo "      A subset assertion over an empty recorded set holds for any" >&2
+            echo "      suite at all, including none — the vacuous pass this whole" >&2
+            echo "      step exists to refuse." >&2
+            exit 1
+          fi
+
+          gone=$(comm -23 "$tc/recorded.txt" "$tc/executed.txt")
+          if [[ -n "$gone" ]]; then
+            echo "FAIL: recorded test files that vitest no longer executes:" >&2
+            sed 's/^/  /' <<<"$gone" >&2
+            echo >&2
+            echo "      They left the suite. The usual way that happens is a rename" >&2
+            echo "      out of the *.test.ts / *.spec.ts patterns, which every other" >&2
+            echo "      assertion in this step is blind to: such a file keeps" >&2
+            echo "      type-checking and simply never runs again." >&2
+            echo "      If the removal is deliberate, delete those lines from" >&2
+            echo "      web/${recorded_file} in the same commit and say why there." >&2
+            exit 1
+          fi
+
+          # Said on the way past, because the pre-#184 body's green line is
+          # byte-identical to this step's, so without this a passing log cannot be
+          # told apart from one where the ratchet is not there at all. A green that
+          # names what it checked is the difference between evidence and a mood.
+          echo "OK: all $(wc -l < "$tc/recorded.txt") recorded test file(s) are still executed by vitest"
+
+          added=$(comm -13 "$tc/recorded.txt" "$tc/executed.txt")
+          if [[ -n "$added" ]]; then
+            echo "::warning file=web/${recorded_file}::vitest executes test files this record does not list; add them, or their later removal goes unnoticed"
+            echo "NOTE: executed but not recorded in web/${recorded_file}:"
+            sed 's/^/  /' <<<"$added"
+            echo "      Add them so that removing one later is caught. Until then"
+            echo "      those files have no ratchet under them."
+          fi
+
+          uncovered=$(comm -23 "$tc/tests.txt" "$tc/covered.txt")
           if [[ -n "$uncovered" ]]; then
             echo "FAIL: these test files are OUTSIDE the typecheck's coverage:" >&2
             sed 's/^/  /' <<<"$uncovered" >&2

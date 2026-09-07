@@ -81,9 +81,13 @@ func TestMakeTargetsStayHermeticAgainstAnEnclosingGoWork(t *testing.T) {
 	// would get a pass, which is the failure mode this gate exists to prevent.
 	copyTrackedTree(t, root, mod)
 
-	// An enclosing workspace that does not `use` the copy. A go.work needs at
-	// least one usable module, so a decoy stands in for "somebody else's
-	// modules" — the role gmi-ws/go.work's other repos play in reality.
+	// An enclosing workspace that does not `use` the copy. The decoy is fidelity
+	// rather than necessity — measured, a go.work with no `use` at all is accepted
+	// by go and puts the copy in the same hazard, and removing the decoy's go.mod
+	// does not change this gate's verdict in either direction. It is here because
+	// it stands in for "somebody else's modules", the role gmi-ws/go.work's other
+	// repos play in reality, and a synthetic workspace shaped like the real one is
+	// the thing worth reproducing.
 	mustWriteFile(t, filepath.Join(decoy, "go.mod"),
 		fmt.Sprintf("module decoy\n\ngo %s\n", goVersion))
 	mustWriteFile(t, filepath.Join(base, "go.work"),

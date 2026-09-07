@@ -1,0 +1,73 @@
+// Invariant IDs are docs/tether-ui-invariants.md §3.9; the governing rule is §2 R10.
+//
+// These assertions land on RENDERED TEXT rather than on the return value of
+// historyStart(), because owner ruling ④ is about what the reader is told. The
+// pure function having the right variant and the screen saying the wrong sentence
+// is the exact gap docs/tether-ui-invariants.md §2 R9 records as "the acceptance
+// must walk to the eyes".
+
+import { afterEach, describe, expect, it } from 'vitest'
+import { cleanup, render, screen } from '@testing-library/react'
+import { HistoryStartMarker } from './HistoryStartMarker'
+
+afterEach(cleanup)
+
+describe('HistoryStartMarker', () => {
+  it('SCROLL-1: renders nothing at all in the none state', () => {
+    const { container } = render(<HistoryStartMarker state={{ kind: 'none' }} />)
+    expect(container.innerHTML).toBe('')
+  })
+
+  it('SCROLL-1: offers a way to load an earlier page, and claims nothing else', () => {
+    render(<HistoryStartMarker state={{ kind: 'more' }} />)
+    expect(screen.getByRole('button', { name: /load earlier/i })).toBeTruthy()
+  })
+
+  it('SCROLL-1: says plainly that there is no more history at the beginning', () => {
+    render(<HistoryStartMarker state={{ kind: 'start' }} />)
+    const text = document.body.textContent ?? ''
+    expect(text).toMatch(/no more history/i)
+    expect(text).toMatch(/beginning/i)
+  })
+
+  it('SCROLL-1: names the other store, so "no more here" is not read as "no more anywhere"', () => {
+    render(<HistoryStartMarker state={{ kind: 'startOf', otherStore: 'cc' }} />)
+    const text = document.body.textContent ?? ''
+    expect(text).toMatch(/no more history in this record/i)
+    expect(text).toMatch(/claude code session log/i)
+  })
+
+  it('SCROLL-1: falls back to the raw store name rather than dropping it', () => {
+    render(<HistoryStartMarker state={{ kind: 'startOf', otherStore: 'archive' }} />)
+    expect(document.body.textContent).toContain('archive')
+  })
+
+  // R10, at the surface. The two failure directions are asserted separately
+  // because they are different mistakes: claiming an end we have not established,
+  // and claiming a continuation we have not established.
+  it('R10: the unknown state says it cannot tell, and does NOT say there is no more history', () => {
+    render(<HistoryStartMarker state={{ kind: 'unknown' }} />)
+    const text = document.body.textContent ?? ''
+    expect(text).toMatch(/cannot tell/i)
+    expect(text).not.toMatch(/no more history/i)
+    expect(text).not.toMatch(/beginning/i)
+  })
+
+  it('R10: the unknown state offers no load control — there is nothing known to load', () => {
+    render(<HistoryStartMarker state={{ kind: 'unknown' }} />)
+    expect(screen.queryByRole('button')).toBeNull()
+  })
+
+  // Ruling ④'s actual complaint, stated as an assertion: the tether-source case
+  // must not render as an in-progress load. No spinner, no disabled control, no
+  // "loading" wording — a UI element that implies arrival is the thing the ruling
+  // says is dishonest, because on that store nothing can arrive.
+  it('ruling ④: the end-of-history states offer no control that implies a page is coming', () => {
+    for (const state of [{ kind: 'start' } as const, { kind: 'startOf', otherStore: 'cc' } as const]) {
+      cleanup()
+      render(<HistoryStartMarker state={state} />)
+      expect(screen.queryByRole('button')).toBeNull()
+      expect(document.body.textContent ?? '').not.toMatch(/loading|loading…/i)
+    }
+  })
+})

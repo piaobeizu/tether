@@ -1,0 +1,239 @@
+/* The phase-1 shell's layout (tether#195).
+ *
+ * Mobile-first is tether#173 decision 5 and it is meant literally here, so two
+ * rules hold throughout this file and shell/mobileFirst.spec.ts enforces them
+ * over the whole directory:
+ *
+ *   · `100dvh`, never `100vh`. On iOS Safari `100vh` is the viewport with the
+ *     browser chrome EXPANDED, so a `100vh` root is taller than the screen
+ *     whenever the chrome is collapsed and the bottom of the app — the composer
+ *     — sits under it. `dvh` tracks the chrome and the software keyboard.
+ *   · no fixed `min-width`. A floor wider than the narrowest phone turns the
+ *     whole page into a horizontal scroller, which is the failure mode that
+ *     makes a "responsive" app unusable rather than merely ugly.
+ *
+ * 🔴 There is NO width media query in this file, and adding one would be a
+ * regression. The shell's breakpoint lives in exactly one place — LG_MIN_WIDTH in
+ * web/src/shell/breakpoint.ts — and reaches the DOM as `data-wide` on `.sh-body`.
+ *
+ * The reason is not tidiness. The wide and narrow forms are DIFFERENT TREES, not
+ * one tree styled two ways: the narrow form renders a single `.sh-column` and no
+ * activity bar at all, and LAY-14's mount/unmount rule cannot be expressed in
+ * `display`. A media query here would therefore be a second copy of a number the
+ * JavaScript already branches on, free to disagree with it — the layout switching
+ * at one width while the MOUNTING switched at another. Selecting on the attribute
+ * the shell publishes means there is one decision and the stylesheet follows it.
+ * breakpoint.test.ts reads this file and fails if a width query appears in it.
+ *
+ * Mobile-first falls out of that rather than being asserted alongside it: every
+ * rule outside the attribute selector is the narrow layout, and that is what a
+ * browser renders before any JavaScript has run.
+ *
+ * Colours come from the vendored design tokens (web/src/ui/index.css imports
+ * upstream's :root/.dark custom properties). Nothing here invents a palette.
+ */
+
+/* ── root ─────────────────────────────────────────────────────────────────── */
+
+.sh-root {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  min-height: 0;
+  overflow: hidden;
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+}
+
+/* ── header: the narrow form's only chrome ────────────────────────────────── */
+
+.sh-header {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid hsl(var(--border));
+}
+
+.sh-nav-toggle {
+  flex: 0 0 auto;
+  padding: 0.25rem 0.5rem;
+  background: none;
+  border: 1px solid hsl(var(--border));
+  border-radius: var(--radius);
+  color: inherit;
+  cursor: pointer;
+}
+
+.sh-crumb {
+  font-size: 0.875rem;
+  color: hsl(var(--muted-foreground));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── body ─────────────────────────────────────────────────────────────────── */
+
+.sh-body {
+  flex: 1 1 0;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  overflow: hidden;
+}
+
+.sh-column {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* The narrow form: the focused column is the whole body. */
+.sh-column {
+  flex: 1 1 0;
+}
+
+.sh-pane {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* A mounted-but-not-showing pane (LAY-14). `display:none` rather than removal is
+ * the point of the invariant: unmounting loses scroll position and every piece of
+ * local component state the pane had. */
+.sh-pane[data-showing='false'] {
+  display: none;
+}
+
+/* The activity bar and the tab strip are wide-form chrome; the drawer replaces
+ * both below lg. */
+.sh-activity,
+.sh-tabstrip,
+.sh-resizer {
+  display: none;
+}
+
+/* ── drawer (narrow navigation) ───────────────────────────────────────────── */
+
+.sh-drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  background: hsl(var(--foreground) / 0.4);
+  display: flex;
+  z-index: 40;
+}
+
+.sh-drawer-panel {
+  width: 17rem;
+  max-width: 85%;
+  background: hsl(var(--background));
+  border-right: 1px solid hsl(var(--border));
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+  transform: translateX(0);
+  transition: transform 160ms ease-out;
+}
+
+/* The old SPA's only non-size media queries were prefers-reduced-motion, and
+ * tether#173 §7 says new transitions must not go around them. */
+@media (prefers-reduced-motion: reduce) {
+  .sh-drawer-panel {
+    transition: none;
+  }
+}
+
+.sh-drawer-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 0.625rem 0.875rem;
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+}
+
+.sh-drawer-item[aria-current='page'] {
+  color: hsl(var(--primary));
+}
+
+/* ── wide form ────────────────────────────────────────────────────────────── */
+
+[data-wide='true'] {
+  /* The drawer's entry point has no job when every column is on screen. */
+  .sh-nav-toggle {
+    display: none;
+  }
+
+  .sh-activity {
+    display: flex;
+    flex-direction: column;
+    /* 48px mirrors ACTIVITY_W in web/src/lib/layout.ts, which is not exported and
+     * cannot be imported. columns.test.ts solves for the width layout.ts really
+     * charges and compares it with this number, so the pairing that layout.ts's
+     * own comment calls "still a convention" is checked here. */
+    flex: 0 0 48px;
+    border-right: 1px solid hsl(var(--border));
+  }
+
+  .sh-activity-btn {
+    padding: 0.75rem 0;
+    background: none;
+    border: none;
+    color: hsl(var(--muted-foreground));
+    cursor: pointer;
+  }
+
+  .sh-activity-btn[aria-current='page'] {
+    color: hsl(var(--primary));
+  }
+
+  .sh-tabstrip {
+    display: flex;
+    flex: 0 0 auto;
+    border-bottom: 1px solid hsl(var(--border));
+  }
+
+  .sh-tab {
+    padding: 0.5rem 0.875rem;
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: hsl(var(--muted-foreground));
+    cursor: pointer;
+  }
+
+  .sh-tab[aria-current='page'] {
+    color: hsl(var(--foreground));
+    border-bottom-color: hsl(var(--primary));
+  }
+
+  /* Widths are inline styles driven by lib/layout.ts; only the flex behaviour is
+   * here. `flex-basis: auto` so the inline width wins. */
+  .sh-column[data-column='left'],
+  .sh-column[data-column='right'] {
+    flex: 0 0 auto;
+  }
+
+  .sh-column[data-column='middle'] {
+    flex: 1 1 0;
+  }
+
+  .sh-resizer {
+    display: block;
+    flex: 0 0 4px;
+    cursor: col-resize;
+    background: hsl(var(--border));
+  }
+
+  .sh-resizer:hover {
+    background: hsl(var(--primary));
+  }
+}

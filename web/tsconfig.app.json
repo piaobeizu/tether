@@ -1,3 +1,33 @@
+// 🔴 DO NOT ADD `"composite": true` TO THIS PROJECT. Measured, tether#165 /
+// tether#174, TypeScript 5.8.3.
+//
+// While no referenced project is composite, `tsc -b`'s up-to-date check looks for
+// expected `.js` outputs that `noEmit: true` guarantees can never exist, so every
+// run is unconditionally "out of date" and does a FULL recheck. Its own words:
+//
+//     Project 'tsconfig.app.json' is out of date because output file
+//     'src/main.js' does not exist
+//
+// That is the ONLY reason the arrangement below is safe. Make this project
+// composite and the up-to-date check switches to the timestamp path, the
+// tsbuildinfo becomes load-bearing, and a `--noEmit` run and an emitting run then
+// share one buildinfo and POISON EACH OTHER: measured on a scratch composite
+// project, `tsc -b --noEmit` followed by a plain `tsc -b` exits 0 and emits
+// NOTHING, reporting "is up to date because newest input is older than output
+// tsconfig.lib.tsbuildinfo". Emit silently skipped, exit code 0.
+//
+// This is not hypothetical here, and that is why the warning is in this file
+// rather than in a commit message. .github/workflows/ci.yml runs
+// `pnpm typecheck` (`tsc -b --noEmit`) IMMEDIATELY BEFORE `pnpm build`
+// (`tsc -b && vite build`) — exactly that pair, in exactly that order, on one
+// buildinfo. Verified as it stands: typecheck leaves web/dist absent, the build
+// then produces it. Add composite and that verification silently stops holding,
+// with a green CI and a binary carrying whatever dist/ was lying around.
+//
+// The concrete hazard is a Vite scaffold: current templates DO set
+// `composite: true` plus a `tsBuildInfoFile` under node_modules/.tmp/. tether#174
+// deliberately did not scaffold from one for this reason. If you are regenerating
+// these configs from a template, strip composite rather than keeping it.
 {
   "compilerOptions": {
     "target": "ES2022",

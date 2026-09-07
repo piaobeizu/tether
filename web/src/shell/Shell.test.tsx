@@ -8,6 +8,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { Shell, type ColumnLayout } from './Shell'
+import { PanePlaceholder } from './PanePlaceholder'
 import { PANE_LABEL, panesInColumn, type PaneId } from './panes'
 import { STORAGE_KEY_FOCUS, STORAGE_KEY_PANE, type SelectionStore } from './selection'
 import type { WideSubscription } from './breakpoint'
@@ -18,6 +19,12 @@ function store(seed: Record<string, string> = {}): SelectionStore {
   const map = new Map(Object.entries(seed))
   return { getItem: k => map.get(k) ?? null, setItem: (k, v) => void map.set(k, v) }
 }
+
+// The shell's own default renderer mounts the real WorkspacePane, which fetches.
+// These tests are about the shell, so they render placeholders in every pane and
+// leave the WorkspacePane to WorkspacePane.test.tsx; renderPane.test.tsx is what
+// pins the default wiring.
+const placeholders = (pane: PaneId) => <PanePlaceholder pane={pane} />
 
 function widthSub(initial: boolean) {
   let wide = initial
@@ -60,7 +67,7 @@ describe('Shell — wide form', () => {
   const wide = () => widthSub(true).sub
 
   it('LAY-11: the activity bar has one named item per middle-column pane', () => {
-    render(<Shell wide={wide()} store={store()} />)
+    render(<Shell wide={wide()} store={store()} renderPane={placeholders} />)
     const bar = screen.getByRole('navigation', { name: 'Main views' })
     const names = within(bar)
       .getAllByRole('button')
@@ -72,7 +79,7 @@ describe('Shell — wide form', () => {
   })
 
   it('LAY-11: the selected marker moves with the selection', () => {
-    render(<Shell wide={wide()} store={store()} />)
+    render(<Shell wide={wide()} store={store()} renderPane={placeholders} />)
     const bar = screen.getByRole('navigation', { name: 'Main views' })
     const marked = () =>
       within(bar)
@@ -86,7 +93,7 @@ describe('Shell — wide form', () => {
   })
 
   it('LAY-12: selecting Work does not take Chat off the right column', () => {
-    render(<Shell wide={wide()} store={store()} />)
+    render(<Shell wide={wide()} store={store()} renderPane={placeholders} />)
     expect(showing('right')?.getAttribute('data-pane')).toBe('chat')
 
     fireEvent.click(activityBtn(PANE_LABEL.work))
@@ -96,7 +103,7 @@ describe('Shell — wide form', () => {
   })
 
   it('LAY-13: the active pane of every column is published for responsive rules', () => {
-    const { container } = render(<Shell wide={wide()} store={store()} />)
+    const { container } = render(<Shell wide={wide()} store={store()} renderPane={placeholders} />)
     const body = container.querySelector('.sh-body')!
     expect(body.getAttribute('data-active-middle')).toBe('canvas')
 
@@ -106,7 +113,7 @@ describe('Shell — wide form', () => {
   })
 
   it('LAY-14: a visited pane stays mounted and hidden; a never-visited one is not mounted', () => {
-    render(<Shell wide={wide()} store={store()} />)
+    render(<Shell wide={wide()} store={store()} renderPane={placeholders} />)
     // Fresh browser: canvas / chat / workspace are the columns' restored panes.
     expect(mounted('canvas')).not.toBeNull()
     expect(mounted('work')).toBeNull()
@@ -121,7 +128,7 @@ describe('Shell — wide form', () => {
   })
 
   it('LAY-14: a pane in another column that was never selected is not mounted either', () => {
-    render(<Shell wide={wide()} store={store()} />)
+    render(<Shell wide={wide()} store={store()} renderPane={placeholders} />)
     expect(mounted('skill')).toBeNull()
     fireEvent.click(screen.getByRole('tab', { name: PANE_LABEL.skill }))
     expect(mounted('skill')).not.toBeNull()
@@ -131,7 +138,7 @@ describe('Shell — wide form', () => {
   // read out of the DOM — rather than with a second copy of the label table. A
   // crumb agreeing with a copy of itself is the WIRE-8 defect.
   it('LAY-15: the breadcrumb names the pane that is actually showing', () => {
-    render(<Shell wide={wide()} store={store()} />)
+    render(<Shell wide={wide()} store={store()} renderPane={placeholders} />)
     const crumb = () => screen.getByTestId('sh-crumb').textContent
     const focused = () => document.querySelector('[data-focus]')!.getAttribute('data-focus')!
 
@@ -145,7 +152,7 @@ describe('Shell — wide form', () => {
   })
 
   it('LAY-19: the right tab strip is exactly the right column, and has no Work tab', () => {
-    render(<Shell wide={wide()} store={store()} />)
+    render(<Shell wide={wide()} store={store()} renderPane={placeholders} />)
     const rendered = screen.getAllByRole('tab').map(t => t.textContent)
     expect(rendered).toEqual(panesInColumn('right').map(p => PANE_LABEL[p]))
     expect(rendered).not.toContain(PANE_LABEL.work)
@@ -154,19 +161,19 @@ describe('Shell — wide form', () => {
   it('LAY-20: exactly one tab is selected, for every value a browser could hold', () => {
     for (const stored of ['work', 'chat', 'skill', 'shell', 'canvas', 'garbage', '']) {
       cleanup()
-      render(<Shell wide={wide()} store={store({ [STORAGE_KEY_PANE.right]: stored })} />)
+      render(<Shell wide={wide()} store={store({ [STORAGE_KEY_PANE.right]: stored })} renderPane={placeholders} />)
       const selected = screen.getAllByRole('tab').filter(t => t.getAttribute('aria-selected') === 'true')
       expect(selected.length, `stored=${stored}`).toBe(1)
     }
   })
 
   it('LAY-20: the legacy "work" right-tab value mounts to Chat', () => {
-    render(<Shell wide={wide()} store={store({ [STORAGE_KEY_PANE.right]: 'work' })} />)
+    render(<Shell wide={wide()} store={store({ [STORAGE_KEY_PANE.right]: 'work' })} renderPane={placeholders} />)
     expect(showing('right')?.getAttribute('data-pane')).toBe('chat')
   })
 
   it('LAY-21: tether:select-tab routes by surface name, across columns', () => {
-    render(<Shell wide={wide()} store={store()} />)
+    render(<Shell wide={wide()} store={store()} renderPane={placeholders} />)
     act(() => {
       window.dispatchEvent(new CustomEvent('tether:select-tab', { detail: 'work' }))
     })
@@ -179,7 +186,7 @@ describe('Shell — wide form', () => {
   })
 
   it('LAY-21: a name matching no surface is ignored and does not blank the panel', () => {
-    render(<Shell wide={wide()} store={store()} />)
+    render(<Shell wide={wide()} store={store()} renderPane={placeholders} />)
     const before = showing('right')?.getAttribute('data-pane')
     act(() => {
       window.dispatchEvent(new CustomEvent('tether:select-tab', { detail: 'settings' }))
@@ -192,13 +199,13 @@ describe('Shell — wide form', () => {
   // no implementation injected there is no rule to clamp against, so the divider
   // is absent rather than present and inert.
   it('R10: no resizer is rendered when no column-layout rule is available', () => {
-    render(<Shell wide={wide()} store={store()} />)
+    render(<Shell wide={wide()} store={store()} renderPane={placeholders} />)
     expect(screen.queryAllByRole('separator')).toHaveLength(0)
   })
 
   it('renders a resizer per fixed column once a layout rule is supplied', () => {
     const columns: ColumnLayout = { width: () => 240, resize: vi.fn() }
-    render(<Shell wide={wide()} store={store()} columns={columns} />)
+    render(<Shell wide={wide()} store={store()} columns={columns} renderPane={placeholders} />)
     const separators = screen.getAllByRole('separator')
     expect(separators.map(s => s.getAttribute('data-resizer'))).toEqual(['left', 'right'])
   })
@@ -206,7 +213,7 @@ describe('Shell — wide form', () => {
   it('hands a divider drag to the layout rule without clamping it here', () => {
     const resize = vi.fn()
     const columns: ColumnLayout = { width: () => 240, resize }
-    render(<Shell wide={wide()} store={store()} columns={columns} />)
+    render(<Shell wide={wide()} store={store()} columns={columns} renderPane={placeholders} />)
     const left = screen.getAllByRole('separator')[0]!
     // jsdom has no PointerEvent capture API on elements by default.
     left.setPointerCapture = () => {}
@@ -219,13 +226,13 @@ describe('Shell — wide form', () => {
 
 describe('Shell — narrow form', () => {
   it('ruling ①: a fresh narrow browser opens on Chat', () => {
-    render(<Shell wide={widthSub(false).sub} store={store()} />)
+    render(<Shell wide={widthSub(false).sub} store={store()} renderPane={placeholders} />)
     expect(screen.getByTestId('sh-crumb').textContent).toBe(PANE_LABEL.chat)
     expect(document.querySelector('[data-showing="true"]')?.getAttribute('data-pane')).toBe('chat')
   })
 
   it('renders exactly one pane, and no wide-form chrome', () => {
-    render(<Shell wide={widthSub(false).sub} store={store()} />)
+    render(<Shell wide={widthSub(false).sub} store={store()} renderPane={placeholders} />)
     expect(document.querySelectorAll('[data-showing="true"]')).toHaveLength(1)
     expect(document.querySelectorAll('.sh-column')).toHaveLength(1)
     expect(screen.queryByRole('navigation', { name: 'Main views' })).toBeNull()
@@ -237,13 +244,14 @@ describe('Shell — narrow form', () => {
       <Shell
         wide={widthSub(false).sub}
         store={store({ [STORAGE_KEY_PANE.middle]: 'work', [STORAGE_KEY_FOCUS]: 'middle' })}
+        renderPane={placeholders}
       />,
     )
     expect(document.querySelector('[data-showing="true"]')?.getAttribute('data-pane')).toBe('work')
   })
 
   it('reaches the five non-Chat panes through the drawer', () => {
-    render(<Shell wide={widthSub(false).sub} store={store()} />)
+    render(<Shell wide={widthSub(false).sub} store={store()} renderPane={placeholders} />)
     fireEvent.click(screen.getByRole('button', { name: 'Panes' }))
     const dialog = screen.getByRole('dialog', { name: 'Panes' })
     for (const pane of ['canvas', 'shell', 'skill', 'work', 'workspace'] as PaneId[]) {
@@ -252,7 +260,7 @@ describe('Shell — narrow form', () => {
   })
 
   it('selecting from the drawer switches the pane and closes the drawer', () => {
-    render(<Shell wide={widthSub(false).sub} store={store()} />)
+    render(<Shell wide={widthSub(false).sub} store={store()} renderPane={placeholders} />)
     fireEvent.click(screen.getByRole('button', { name: 'Panes' }))
     fireEvent.click(
       within(screen.getByRole('dialog', { name: 'Panes' })).getByRole('button', {
@@ -272,7 +280,7 @@ describe('Shell — crossing the breakpoint', () => {
   // selection.ts actually bought that.
   it('keeps the selection when the viewport crosses the breakpoint in either direction', () => {
     const w = widthSub(false)
-    render(<Shell wide={w.sub} store={store()} />)
+    render(<Shell wide={w.sub} store={store()} renderPane={placeholders} />)
     fireEvent.click(screen.getByRole('button', { name: 'Panes' }))
     fireEvent.click(
       within(screen.getByRole('dialog', { name: 'Panes' })).getByRole('button', {

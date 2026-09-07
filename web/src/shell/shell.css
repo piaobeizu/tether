@@ -1,7 +1,7 @@
 /* The phase-1 shell's layout (tether#195).
  *
  * Mobile-first is tether#173 decision 5 and it is meant literally here, so two
- * rules hold throughout this file and shell/mobileFirst.spec.ts enforces them
+ * rules hold throughout this file and shell/mobileFirst.test.ts enforces them
  * over the whole directory:
  *
  *   · `100dvh`, never `100vh`. On iOS Safari `100vh` is the viewport with the
@@ -32,6 +32,35 @@
  * Colours come from the vendored design tokens (web/src/ui/index.css imports
  * upstream's :root/.dark custom properties). Nothing here invents a palette.
  */
+
+/* ── the vendored stylesheet's static-vh rules, overridden ────────────────── */
+
+/* 🔴 Found by inspecting web/dist after the first green build, NOT by reading the
+ * source: `.sh-root` was already `100dvh` and the built CSS still carried one
+ * `100vh` — `#root { min-height: 100vh }` from
+ * web/src/vendor/cloudcli/src/index.css. So the shell's own root was correct and
+ * its PARENT was taller than the visual viewport, which is the same defect one
+ * level up: with the iOS chrome collapsed the page scrolls and the bottom of the
+ * app goes under it.
+ *
+ * That file is upstream's and may not be edited (its body and header are hashed
+ * separately, both directions — scripts/check-vendor-provenance.sh), so the fix is
+ * a wrap-layer override, which is what web/src/ui/ is for. It works because
+ * web/src/ui/index.css imports the vendored sheet FIRST and this file second: same
+ * selector, same specificity, later declaration wins. mobileFirst.test.ts derives
+ * the list of selectors to override from the vendored file itself, so an upstream
+ * pin this file does not answer for turns red rather than shipping.
+ *
+ * `body.pwa-mode #root` is overridden at the same specificity for the same reason;
+ * nothing in tether adds that class today, and an override that only applies once
+ * something does is cheaper than discovering this again from a phone. */
+#root {
+  min-height: 100dvh;
+}
+
+body.pwa-mode #root {
+  height: 100dvh;
+}
 
 /* ── root ─────────────────────────────────────────────────────────────────── */
 

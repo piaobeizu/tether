@@ -1,5 +1,24 @@
 // Renders what historyStart() decided (tether#195, owner ruling ④).
 //
+// 🔴 NOTHING RENDERS THIS YET, and that is a scope boundary rather than an
+// oversight — but do not read this file as evidence that a user is being told
+// anything today.
+//
+// Ruling ④'s landing point is the top of the transcript, and the transcript lives
+// in the Chat panel, which tether#195 explicitly does not rewrite (it is
+// web/src/panes/chat/index.tsx on `main`, a single 3,241-line file, and
+// tether#173 §2 lists it as a parallel scope line with its own wi). So this wi
+// builds and pins the surface; the wi that rewrites the Chat panel mounts it, and
+// until then a tether-source session still shows whatever the old UI on `main`
+// shows.
+//
+// The gap is written down here on purpose. web/src/lib/fileTreeCache.ts did the
+// same thing for its refusal wording — "there is currently NO renderer … an open
+// tether#173 AC-R9 gap, owed by the wi that next renders a file tree" — and that
+// note is the only reason this wi knew it had inherited that debt. This is the
+// same note for the same kind of debt: OWED BY THE WI THAT NEXT RENDERS A
+// TRANSCRIPT.
+//
 // SCROLL-10 pins the marker at "exactly one grid cell with exactly one visible
 // child, in both states". That is a layout property of the transcript viewport,
 // which belongs to the Chat-panel rewrite, so this component does not claim

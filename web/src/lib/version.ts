@@ -14,11 +14,15 @@
 // version.test.ts imports.
 //
 // The React hook that used to close this file, `useAppVersion`, did NOT come
-// back, for three reasons that hold independently:
-//   - it had zero test coverage, so porting it would have moved untested code
-//     into the new tree under the label of a ported A-grade module;
-//   - both of its consumers (App.tsx, Settings.tsx) were deleted with the
-//     shell, so it would have arrived with no call site at all; and
+// back, for three reasons that hold independently. All three are measured on
+// origin/main, which still carries the old SPA as tether#173's control:
+//   - it had zero test coverage, and the sharp form of that is not "no test
+//     imported it" but that the ONE test which named it replaced it:
+//     App.test.tsx did `vi.mock('./lib/version', () => ({ useAppVersion: () =>
+//     'v-test' }))`. Porting it would have moved never-executed code into the
+//     new tree wearing the label of a ported A-grade module;
+//   - its only two consumers, App.tsx and Settings.tsx, were both deleted by
+//     tether#174, so it would have arrived with no call site at all; and
 //   - whether the new shell reads this through a React hook is a SHELL
 //     decision, and a port must not pre-empt it by shipping the answer.
 // Same call web/src/lib/sessionActivity.ts already made on this branch:
@@ -40,10 +44,18 @@ import type { VersionResponse } from './wire.gen'
 export const UNKNOWN_VERSION = '—'
 
 // One request per page load, shared by every caller: no call site should cost a
-// round trip of its own. The old shell rendered this string in four places,
-// which is where the requirement came from; the new shell has none yet, which
-// is precisely why the sharing lives in this module rather than in a caller —
-// nothing that gets rewritten can lose it.
+// round trip of its own.
+//
+// 🔴 The line this replaced said "four call sites render this string", and that
+// number is wrong — it was carried forward through the deletion by whoever last
+// touched the comment, this port included, without anyone re-deriving it.
+// Measured on origin/main: `useAppVersion` had exactly TWO call sites (App.tsx,
+// Settings.tsx) and `fetchAppVersion`/`UNKNOWN_VERSION` were imported by
+// version.test.ts and nothing else. The count is dropped rather than corrected
+// to 2, because the new shell has zero call sites and any number written here
+// is stale the moment the shell lands. What is NOT stale is the reason the
+// sharing lives in this module instead of in a caller: nothing that gets
+// rewritten can lose it.
 let inflight: Promise<string> | null = null
 
 /** fetchAppVersion resolves to the daemon's version, or '' if unavailable. */

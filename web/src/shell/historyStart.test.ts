@@ -39,6 +39,11 @@ describe('historyStart', () => {
     expect(historyStart(withOther('cc'), nonEmpty)).toEqual({ kind: 'startOf', otherStore: 'cc' })
   })
 
+  // ⚠️ Defensive, not observed: `MessagePage` sets `OtherRecord` only on the
+  // tether branch, where `HasEarlier` is always false, so the daemon cannot send
+  // both headers today (measured on internal/session/sessionlist.go). The
+  // precedence still has to be one of the two orders, and this is the one that
+  // cannot strand a reader — see historyStart.ts.
   it('SCROLL-1: a cursor wins over the other-store header — there is still a page to fetch', () => {
     const h = withEarlier('12')
     h.set(TRANSCRIPT_OTHER_RECORD_HEADER, 'cc')

@@ -7,7 +7,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
-import { RESIZE_STEP, Shell, type ColumnLayout } from './Shell'
+import { Shell, type ColumnLayout } from './Shell'
 import { PanePlaceholder } from './PanePlaceholder'
 import { PANE_LABEL, panesInColumn, type PaneId } from './panes'
 import { STORAGE_KEY_FOCUS, STORAGE_KEY_PANE, type SelectionStore } from './selection'
@@ -295,36 +295,58 @@ describe('Shell — wide form', () => {
   })
 
   // 🔴 `role="separator"` has two forms in ARIA and they are distinguished by
-  // exactly one thing: focusability. A non-focusable separator is structural and
-  // promises no keys; a focusable one is a WIDGET and promises that the arrow keys
-  // move it. The divider was `role="separator"` + `aria-orientation="vertical"`
-  // with pointer-only handling and no `tabIndex`, so resizing was a capability
-  // only pointer users had.
+  // exactly one thing: focusability. A non-focusable separator is a boundary and
+  // promises no keys; a focusable one is a WIDGET, and its contract is BOTH that
+  // the arrow keys move it and that it publishes its position in `aria-valuenow`,
+  // updated as the position changes.
   //
-  // The contract is implemented rather than the announcement narrowed, because the
-  // delta an arrow key produces is the same delta the drag path produces — one
-  // resize path, not two — and because clamping still belongs to
-  // web/src/lib/layout.ts. That is what the last assertion is about: this file
-  // hands over a raw step and does not decide whether it is allowed.
-  it('lets the keyboard move a divider, which is what a focusable separator promises', () => {
+  // This branch had the widget form — `tabIndex={0}` plus arrow keys, and no value
+  // state at all — and took it back out. Shell.tsx's `Resizer` docblock has the
+  // reasoning; the short version is that the range `aria-valuenow` would sit in is
+  // not on `ColumnLayout` (and writing it as a literal here is the tether#102
+  // bug), and that `ColumnLayout` has no change notification, so a value published
+  // from Shell.tsx would be frozen rather than tracking the divider.
+  //
+  // 🔴 So this case asserts the ABSENCE of a capability, on purpose, and it is
+  // written to be the thing that has to be edited when the capability arrives —
+  // the same shape as WorkspacePane.test.tsx's "claims no role whose keyboard
+  // contract is unimplemented". The two halves move together: whoever adds the
+  // `tabIndex` back owes the value state in the same change, and this goes red if
+  // they add only the first.
+  //
+  // Check, both directions: add `tabIndex={0}` back to `Resizer` in Shell.tsx and
+  // the first assertion fails; add an `onKeyDown` that calls `e.preventDefault()`
+  // and the cancellation loop fails.
+  it('R10: the separator stays STRUCTURAL, because its position cannot be published here', () => {
     const resize = vi.fn()
     const columns: ColumnLayout = { width: () => 240, resize }
     render(<Shell wide={wide()} store={store()} columns={columns} renderPane={placeholders} />)
-    const left = screen.getAllByRole('separator')[0]!
-    expect(left.tabIndex, 'a separator that is not a tab stop is unreachable').toBe(0)
+    const separators = screen.getAllByRole('separator')
+    expect(separators).toHaveLength(2)
 
-    fireEvent.keyDown(left, { key: 'ArrowRight' })
-    fireEvent.keyDown(left, { key: 'ArrowLeft' })
-    expect(resize.mock.calls).toEqual([
-      ['left', RESIZE_STEP],
-      ['left', -RESIZE_STEP],
-    ])
+    for (const s of separators) {
+      const which = s.getAttribute('data-resizer')
+      // `.tabIndex` rather than the attribute: a `<div>` with no tabindex reads
+      // -1 and cannot become `activeElement`, which is what "structural" means
+      // operationally. Measured in jsdom: `.focus()` on such a div is a no-op.
+      expect(s.tabIndex, `the ${which} separator is a tab stop`).toBeLessThan(0)
+      // The widget state, which a structural separator must not carry either —
+      // announcing a position without being operable is the mirror defect.
+      for (const attr of ['aria-valuenow', 'aria-valuemin', 'aria-valuemax']) {
+        expect(s.hasAttribute(attr), `the ${which} separator publishes ${attr}`).toBe(false)
+      }
+    }
 
-    // Every other key falls through: a separator that swallowed Tab would trap the
-    // keyboard on a divider, which is worse than not being reachable.
-    resize.mockClear()
-    for (const key of ['Tab', 'Enter', ' ', 'ArrowUp', 'Home']) {
-      fireEvent.keyDown(left, { key })
+    // …and it swallows no key, which is the other half of what the widget form
+    // would have promised. 🔴 Read off CANCELLATION and not off `resize`: the
+    // previous version of this case asserted only `expect(resize).not
+    // .toHaveBeenCalled()`, and a divider that called `preventDefault()` on every
+    // key and resized on none satisfied that while trapping the keyboard on a
+    // divider — measured, whole-suite green. `fireEvent` returns `dispatchEvent`'s
+    // value, which is false exactly when a cancelable event was prevented.
+    for (const key of ['ArrowLeft', 'ArrowRight', 'Tab', 'Enter', ' ', 'Home']) {
+      const notCancelled = fireEvent.keyDown(separators[0]!, { key })
+      expect(notCancelled, `the separator cancelled ${JSON.stringify(key)}`).toBe(true)
     }
     expect(resize).not.toHaveBeenCalled()
   })

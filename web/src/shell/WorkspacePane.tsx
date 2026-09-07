@@ -50,14 +50,22 @@
 // in natural tab order. `aria-expanded` made the announcement MORE specific, not
 // less, because it named a widget that answers to arrow keys.
 //
-//     grep -nE 'onKeyDown|onKeyUp|tabIndex|roving' web/src/shell/WorkspacePane.tsx
+// The check is in WorkspacePane.test.tsx — "R10 in the accessibility tree: claims
+// no role whose keyboard contract is unimplemented" — which renders the pane and
+// asserts `document.querySelectorAll('[role="tree"]')` (and `treeitem`, `group`,
+// and any `[tabindex]`) is empty. So re-adding a role without the behaviour turns
+// red rather than shipping.
 //
-// returns nothing, which is the check: the day someone implements the contract,
-// that command stops being empty and the roles become true. Until then a
-// `<ul>`/`<li>` with an accessible name is a complete and honest pattern, and
-// `aria-expanded` sits on the element it is actually true of — the button that
-// toggles the subtree. WorkspacePane.test.tsx pins the absence of the roles, so
-// re-adding them without the behaviour turns red rather than shipping.
+// 🔴 This paragraph used to print a `grep` for those constructs and call the
+// command itself the check — "returns nothing, which is the check". It does not
+// return nothing: it matches the tombstone sentence above and the line the grep
+// was written on, and it would go on matching them however the code changed. A
+// codebase that documents what it removed cannot use a source-text grep as the
+// gate for the removal, because writing the gate down is enough to satisfy it. A
+// DOM assertion cannot match its own documentation, which is why that is the one
+// named here. Until the contract exists, a `<ul>`/`<li>` with an accessible name
+// is a complete and honest pattern, and `aria-expanded` sits on the element it is
+// actually true of — the button that toggles the subtree.
 //
 // This is R10 applied to the accessibility tree instead of to a sentence, and it
 // is the standard the rest of this branch is held to.

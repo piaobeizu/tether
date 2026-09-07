@@ -18,6 +18,15 @@
  *
  *     grep -n 'data-wide' web/src/shell/Shell.tsx
  *
+ * ⚠️ The rule is about WIDTH queries, and CAPABILITY queries are a different
+ * thing. This file uses them — `prefers-reduced-motion` below, and
+ * `(hover: hover)` around the tree's hide control — and none is a second copy of
+ * the breakpoint, because none asks about width. They ask the device questions
+ * `data-wide` cannot answer: width and pointer type are independent axes, and
+ * conflating them is how a touch laptop (wide, no hover) or a landscape phone
+ * (neither) gets the wrong form. breakpoint.test.ts's rule is scoped to
+ * `(min-width|max-width)` for exactly that reason.
+ *
  * ⚠️ `.sh-root`, not `.sh-body`, and the difference is load-bearing rather than
  * pedantic. `[data-wide='true'] { .sh-nav-toggle { … } }` below compiles to the
  * DESCENDANT selector `[data-wide=true] .sh-nav-toggle`, and `.sh-nav-toggle`
@@ -352,22 +361,59 @@ body.pwa-mode #root {
   color: hsl(var(--primary));
 }
 
-/* The hide control is present only when a hide policy is wired (R10), and it is
- * revealed on hover or focus so that a tree of many rows is not a wall of
- * buttons. `focus-visible` is what keeps it reachable by keyboard: opacity 0 is
- * still focusable, and a control you can focus but cannot see is worse than one
- * that is always visible. */
+/* The hide control is present only when a hide policy is wired (R10).
+ *
+ * 🔴 The hover-reveal is INSIDE `@media (hover: hover)`, and that is not tidiness
+ * — the version without it made the one real control in the one real pane
+ * invisible on the form this phase is primarily for. A touch device has no hover
+ * and no `:focus-visible` before the tap, so `opacity: 0` plus a `:hover` rule to
+ * undo it left a fully transparent target: present in the DOM, tappable if you
+ * guessed where it was, and invisible. That defeats owner ruling ③ directly —
+ * that ruling made the tree real *because acceptance is judged by the owner's
+ * eyes*.
+ *
+ * So the base cascade — what a touch device, and a browser before any JavaScript,
+ * applies — is the VISIBLE form, and the compaction is what hover buys:
+ *
+ *   no hover     always visible, at the `Button size="icon"` target the vendored
+ *                primitive already defines (`h-10 w-10`, 40px). The base rule
+ *                sets NO width or height, deliberately: shell.css is imported
+ *                after the vendored sheet, so a `width` here beats Tailwind's
+ *                utilities at equal specificity by order alone — which is how the
+ *                old unconditional `1.5rem` silently shrank a 40px touch target
+ *                to 24px. Verified in web/dist, not inferred: `.w-10{width:2.5rem}`
+ *                precedes both `.sh-tree-hide` rules in the built asset.
+ *   hover        24px and revealed on hover or focus, so a tree of many rows is
+ *                not a wall of buttons. `focus-visible` is what keeps it
+ *                reachable by keyboard: opacity 0 is still focusable, and a
+ *                control you can focus but cannot see is worse than one that is
+ *                always visible.
+ *
+ * A CAPABILITY query, not a width one. The rule this file states in its header —
+ * and breakpoint.test.ts enforces — is that no `(min-width|max-width)` query may
+ * appear, because the breakpoint exists once, in TypeScript. `(hover: hover)`
+ * duplicates no constant: it asks the device a question `data-wide` cannot answer,
+ * since viewport width and pointer type are independent (a touch laptop is wide
+ * and hoverless; a phone in landscape is neither).
+ *
+ * Gated by mobileFirst.test.ts: no rule outside a `(hover: hover)` block may set
+ * `opacity: 0`, and no `:hover` selector outside one may touch visibility at all. */
 .sh-tree-hide {
   flex: 0 0 auto;
-  width: 1.5rem;
-  height: 1.5rem;
-  opacity: 0;
   color: hsl(var(--muted-foreground));
 }
 
-.sh-tree-line:hover .sh-tree-hide,
-.sh-tree-hide:focus-visible {
-  opacity: 1;
+@media (hover: hover) {
+  .sh-tree-hide {
+    width: 1.5rem;
+    height: 1.5rem;
+    opacity: 0;
+  }
+
+  .sh-tree-line:hover .sh-tree-hide,
+  .sh-tree-hide:focus-visible {
+    opacity: 1;
+  }
 }
 
 .sh-tree-hidden-row {

@@ -15,6 +15,48 @@ afterEach(cleanup)
 
 const noop = () => {}
 
+const outsiders: HTMLButtonElement[] = []
+afterEach(() => {
+  for (const el of outsiders.splice(0)) el.remove()
+})
+
+/**
+ * A real focusable element OUTSIDE the panel.
+ *
+ * 🔴 This used to be `document.body.focus()`, and that call is a NO-OP in jsdom:
+ * `document.body.tabIndex` is -1, so it leaves `document.activeElement` exactly
+ * where the previous line put it — inside the panel. The "focus is already
+ * outside" case therefore never ran: the handler took its `inside` branch, changed
+ * nothing, and the assertion passed because focus had not moved. Measured on the
+ * commit that introduced it, both directions: deleting `!inside ||` from EITHER
+ * branch of NavDrawer.tsx's Tab handler left the whole suite green.
+ *
+ * A `<button>` appended to `document.body` is a sibling of testing-library's
+ * container, so `panel.contains(document.activeElement)` is genuinely false — and
+ * the cases below assert that it took focus BEFORE firing the key, because an
+ * assertion built on a focus primitive that silently does nothing is the whole
+ * defect being fixed here.
+ */
+function outsideStop(): HTMLButtonElement {
+  const el = document.createElement('button')
+  el.textContent = 'outside the drawer'
+  document.body.appendChild(el)
+  outsiders.push(el)
+  return el
+}
+
+/**
+ * Fires a key on `document` and reports whether the handler cancelled it.
+ *
+ * `fireEvent` returns `dispatchEvent`'s value, which is false exactly when
+ * `preventDefault()` was called on a cancelable event. Cancellation is half of
+ * what the trap has to do: without it the browser performs its own focus move as
+ * well, so focus lands two stops on rather than where the trap put it.
+ */
+function tabWasCancelled(shiftKey = false): boolean {
+  return !fireEvent.keyDown(document, { key: 'Tab', shiftKey })
+}
+
 describe('NavDrawer', () => {
   it('renders nothing while closed', () => {
     const { container } = render(
@@ -99,12 +141,23 @@ describe('NavDrawer', () => {
   // from the pane strip's `role="tablist"`, and the PR body had already recorded
   // "no focus trap" as accepted without connecting it to the attribute.
   //
-  //     grep -rnE 'inert|aria-hidden|FocusTrap' web/src/shell/
+  //     git grep -nE 'inert|aria-hidden|FocusTrap' c96a069 -- web/src/shell/
   //
-  // used to return no production hit at all. What is asserted here is the
-  // AUTHOR-SIDE behaviour the attribute presupposes; what a screen reader does
-  // with `aria-modal` itself is not observable from jsdom and is not claimed.
+  // matched no production CODE before this trap existed. That command — pinned to
+  // the commit, so its output cannot drift — does return lines, two of them in
+  // production files, and every one is prose using "inert" as an adjective rather
+  // than the attribute. The distinction is the point rather than a quibble: this
+  // sentence used to read "no production hit at all", and running the command it
+  // prints is what falsifies that.
+  //
+  // What is asserted below is the AUTHOR-SIDE behaviour the attribute
+  // presupposes; what a screen reader does with `aria-modal` itself is not
+  // observable from jsdom and is not claimed.
+  //
+  // Check, both branches: delete `!inside ||` from either arm of NavDrawer.tsx's
+  // Tab handler and one of the two cases below fails.
   it('aria-modal: the panel really is modal to the keyboard, forwards', () => {
+    const outside = outsideStop()
     render(<NavDrawer open current="chat" onSelect={noop} onClose={noop} />)
     const panel = screen.getByRole('dialog', { name: 'Panes' })
     expect(panel.getAttribute('aria-modal')).toBe('true')
@@ -114,18 +167,25 @@ describe('NavDrawer', () => {
 
     // Tab from the last stop wraps to the first instead of leaving the dialog.
     last.focus()
-    fireEvent.keyDown(document, { key: 'Tab' })
+    expect(tabWasCancelled()).toBe(true)
     expect(document.activeElement).toBe(first)
 
     // Tab from OUTSIDE the panel is pulled back in. This is the case that fires
     // when the browser has already moved focus past the panel — without it the
     // trap only works while focus happens to still be inside.
-    document.body.focus()
-    fireEvent.keyDown(document, { key: 'Tab' })
+    outside.focus()
+    // 🔴 The precondition, asserted rather than assumed: the previous version of
+    // this case used `document.body.focus()`, which moves nothing, so the lines
+    // below ran with focus still on `first` and passed without exercising the
+    // branch they name.
+    expect(document.activeElement).toBe(outside)
+    expect(panel.contains(document.activeElement)).toBe(false)
+    expect(tabWasCancelled()).toBe(true)
     expect(document.activeElement).toBe(first)
   })
 
   it('aria-modal: and backwards, including from the panel itself', () => {
+    const outside = outsideStop()
     render(<NavDrawer open current="chat" onSelect={noop} onClose={noop} />)
     const panel = screen.getByRole('dialog', { name: 'Panes' })
     const items = within(panel).getAllByRole('button')
@@ -136,11 +196,20 @@ describe('NavDrawer', () => {
     // "is focus inside" test passes and the browser's default would then move
     // focus BACKWARDS out of the dialog. Its own case, asserted first.
     expect(document.activeElement).toBe(panel)
-    fireEvent.keyDown(document, { key: 'Tab', shiftKey: true })
+    expect(tabWasCancelled(true)).toBe(true)
     expect(document.activeElement).toBe(last)
 
     first.focus()
-    fireEvent.keyDown(document, { key: 'Tab', shiftKey: true })
+    expect(tabWasCancelled(true)).toBe(true)
+    expect(document.activeElement).toBe(last)
+
+    // And Shift+Tab from outside, the mirror of the forward case above. This is
+    // the `!inside` half of the BACKWARDS branch, and it was the other one that
+    // nothing pinned.
+    outside.focus()
+    expect(document.activeElement).toBe(outside)
+    expect(panel.contains(document.activeElement)).toBe(false)
+    expect(tabWasCancelled(true)).toBe(true)
     expect(document.activeElement).toBe(last)
   })
 

@@ -6,11 +6,15 @@
 //
 // Ruling ④'s landing point is the top of the transcript, and the transcript lives
 // in the Chat panel, which tether#195 explicitly does not rewrite (it is
-// web/src/panes/chat/index.tsx on `main`, a single 3,241-line file, and
-// tether#173 §2 lists it as a parallel scope line with its own wi). So this wi
-// builds and pins the surface; the wi that rewrites the Chat panel mounts it, and
-// until then a tether-source session still shows whatever the old UI on `main`
-// shows.
+// web/src/panes/chat/index.tsx on `main`, one file and large enough to be its own
+// wi, which tether#173 §2 lists as a parallel scope line). So this wi builds and
+// pins the surface; the wi that rewrites the Chat panel mounts it, and until then
+// a tether-source session still shows whatever the old UI on `main` shows.
+//
+// 🔴 Deliberately no line count for that file, here or in Shell.tsx. It is on
+// ANOTHER BRANCH, so a measurement of it is a sentence nothing in this repo can
+// redden on — exact when written, and silently wrong from the next commit to
+// `main` onwards.
 //
 // The gap is written down here on purpose. web/src/lib/fileTreeCache.ts did the
 // same thing for its refusal wording — "there is currently NO renderer … an open

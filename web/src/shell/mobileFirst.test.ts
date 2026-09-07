@@ -51,6 +51,58 @@ function ruleFor(css: string, selector: string): string | null {
   return m === null ? null : m[1]!
 }
 
+// Every stylesheet TETHER writes, by WILDCARD rather than by filename — so a file
+// added to either directory next month inherits the rule below instead of having
+// to be added to a list, which is this file's own stated difference between a gate
+// and a checklist. Same glob shape as breakpoint.test.ts's, for the same reason
+// its header records: scoped to `./*.css` alone, its width rule was green and
+// blind to web/src/ui/index.css, the file that PR was editing.
+//
+// Deliberately NOT `cssLayers` above: that one names `../ui/index.css` exactly, so
+// a second wrap stylesheet would escape it. It is left as it is because its two
+// callers want that one file and nothing else.
+//
+// The vendored sheet is out of the set on purpose. It is upstream's, may not be
+// edited, and it carries hover rules of its own — two `(hover: none) and
+// (pointer: coarse)` blocks at this pin — so gating it would assert something
+// about upstream that tether cannot act on.
+const tetherStylesheets = import.meta.glob(['./*.css', '../ui/*.css'], {
+  query: '?raw',
+  import: 'default',
+  eager: true,
+}) as Record<string, string>
+
+/** A `@media` prelude asking for a real hover capability. */
+const HOVER_QUERY = /@media[^{]*\(\s*hover\s*:\s*hover\s*\)/
+
+/**
+ * The stylesheet with every `@media (hover: hover)` block removed — which is
+ * exactly what a device with NO hover applies.
+ *
+ * Brace-MATCHED rather than regex-delimited, because a media block contains rule
+ * blocks: the obvious `/@media[^{]*\{[^}]*\}/` stops at the first INNER `}` and
+ * leaves the rest of the block's declarations behind, so the rules below would
+ * read declarations a touch device never applies and fail on a correct file.
+ * Guarded by its own case at the bottom of this file, for the reason the comment
+ * stripper is: a stripper that ate too much turns every rule built on it green.
+ */
+function stripHoverQueries(css: string): string {
+  let out = css
+  for (;;) {
+    const at = out.search(HOVER_QUERY)
+    if (at < 0) return out
+    const open = out.indexOf('{', at)
+    if (open < 0) return out
+    let depth = 0
+    let end = open
+    for (; end < out.length; end++) {
+      if (out[end] === '{') depth++
+      else if (out[end] === '}' && --depth === 0) break
+    }
+    out = out.slice(0, at) + out.slice(end + 1)
+  }
+}
+
 /** Test files describe the rules; the rules are about what ships. */
 function production(): [string, string][] {
   return Object.entries(shellSources)
@@ -152,6 +204,78 @@ describe('mobile-first', () => {
     }
   })
 
+  // 🔴 A touch device has no hover, and no `:focus-visible` before the tap. So a
+  // control that is `opacity: 0` until `:hover` is, on the form this phase is
+  // primarily for, a fully transparent target — present in the DOM, invisible on
+  // screen. That is what `.sh-tree-hide` was: the one real control in the one real
+  // pane, at 24px and opacity 0, on a workspace whose root is dominated by
+  // generated sibling directories. It defeats owner ruling ③ directly, since that
+  // ruling made the tree real *because acceptance is judged by the owner's eyes*.
+  //
+  // Two rules, both read off the whole stylesheet rather than off one selector, so
+  // the next hover-revealed control inherits them:
+  //
+  //   1. nothing outside a `(hover: hover)` block may be `opacity: 0`
+  //   2. no `:hover` selector outside one may touch visibility
+  //
+  // Rule 2 is what stops the obvious way around rule 1 — leaving the base rule
+  // visible and hiding it from a `:hover` rule instead. `:hover` changing a
+  // BACKGROUND outside the query is fine and is used throughout (`.sh-ws-row`,
+  // `.sh-tree-line`, `.sh-resizer`): a device with no hover simply never gets the
+  // highlight, which costs nothing.
+  //
+  // Both are stated as prohibitions rather than as "the reveal exists inside the
+  // query", deliberately: deleting the hover-reveal outright and leaving the
+  // control always visible is a perfectly good answer, and a gate that forbade it
+  // would be pinning the decoration instead of the reachability.
+  //
+  // Check, all three run: (a) move `opacity: 0` out of the `@media (hover: hover)`
+  // block in shell.css and into the base `.sh-tree-hide` rule — rule 1 fails; (b)
+  // move the `:hover` reveal rule out of the block and leave `opacity: 0` inside —
+  // rule 1 still passes and rule 2 fails; (c) put either violation in
+  // web/src/ui/index.css instead — it fails there too, which is what the widened
+  // glob buys.
+  it('never hides a control behind hover alone — a touch device has no hover', () => {
+    const sheets = Object.entries(tetherStylesheets)
+    // Both halves of the glob have to have resolved. One guard over the union
+    // would be satisfied by shell.css alone, which is the exact state
+    // breakpoint.test.ts's width rule was in: green, and blind to the wrap layer.
+    expect(
+      sheets.filter(([p]) => p.startsWith('./')).length,
+      'the shell glob resolved to nothing',
+    ).toBeGreaterThan(0)
+    expect(
+      sheets.filter(([p]) => p.includes('/ui/')).length,
+      'the wrap-layer glob resolved to nothing',
+    ).toBeGreaterThan(0)
+
+    for (const [path, raw] of sheets) {
+      // Non-empty on the RAW text: the import is stubbed to '' unless
+      // vite.config.ts sets `test.css`, and a stripped '' is also '' — so
+      // checking after the strip could not tell "nothing was read" from
+      // "everything was a comment". Same phrasing as breakpoint.test.ts's.
+      expect(raw.length, `${path} read back empty — the raw import is stubbed`).toBeGreaterThan(0)
+
+      // Everything a browser with NO hover applies: the sheet with its comments
+      // gone (this file's header quotes the patterns below in prose) and every
+      // `(hover: hover)` block removed, brace-matched from the query's own `{`.
+      const base = stripHoverQueries(stripComments(raw))
+
+      const transparent = [...base.matchAll(/opacity:\s*0(?![.\d])/g)].map(m => m[0])
+      expect(
+        transparent,
+        `${path} sets opacity: 0 outside a (hover: hover) query — invisible on touch`,
+      ).toEqual([])
+
+      for (const [, selector, body] of base.matchAll(/([^{}]*:hover[^{}]*)\{([^}]*)\}/g)) {
+        expect(
+          /(?:opacity|visibility|display)\s*:/.test(body!),
+          `${path}: \`${selector!.trim()}\` changes visibility outside a (hover: hover) query`,
+        ).toBe(false)
+      }
+    }
+  })
+
   // The override only wins because of import order, so the order is asserted
   // rather than assumed. Reversing the two imports would leave every rule above
   // green and the shipped page wrong.
@@ -187,5 +311,32 @@ describe('mobile-first', () => {
     expect(stripped).not.toContain('a comment mentioning')
     expect(stripped).not.toContain('trailing')
     expect(stripped).not.toContain('a line comment')
+  })
+
+  // Guards the OTHER stripper, for the same reason and against both directions of
+  // error. Too little and the hover rule fails on a correct file; too much and it
+  // passes on a violating one, which is the direction that ships.
+  it('the hover-query stripper removes the whole block and nothing outside it', () => {
+    const sample = [
+      '.a { opacity: 0 }',
+      '@media (hover: hover) {',
+      '  .b { opacity: 0 }',
+      '  .c:hover .b { opacity: 1 }',
+      '}',
+      '.d:hover { background: red }',
+    ].join('\n')
+    const base = stripHoverQueries(sample)
+
+    // The block goes, INCLUDING its nested rules. A regex delimited by the first
+    // `}` would leave `.c:hover .b { opacity: 1 }` standing, and the rule above
+    // would then fail on a stylesheet that is correct.
+    expect(base).not.toContain('.b {')
+    expect(base).not.toContain('.c:hover')
+    // …and nothing outside it moves. This half is the one that matters: a
+    // stripper that ate the file would turn the rule above green on exactly the
+    // stylesheet it was written to reject — `.a { opacity: 0 }` is that
+    // stylesheet, and it has to survive to be seen.
+    expect(base).toContain('.a { opacity: 0 }')
+    expect(base).toContain('.d:hover { background: red }')
   })
 })

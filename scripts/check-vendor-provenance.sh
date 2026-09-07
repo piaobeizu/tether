@@ -553,26 +553,101 @@ check-diff)
 	base_json=$(mktemp); head_json=$(mktemp)
 	trap 'rm -f "$base_json" "$head_json"' EXIT
 
-	load_manifest() { # <locator> <outfile>; returns 1 if there is no manifest there
-		local loc=$1 out=$2
+	# Returns 1 when the locator's container exists but holds no manifest, and
+	# exits hard when the container itself is missing. Those two used to share one
+	# `return 1` and therefore one `OK:` / exit 0 (tether#184), so:
+	#
+	#   ref resolves, no manifest at that path   what the commit that introduces
+	#                                            the vendor tree looks like.
+	#                                            Legitimate -> return 1, and the
+	#                                            caller passes, saying why.
+	#   ref does not resolve at all              nothing was read and nothing
+	#                                            could have been. Fatal -> exit 2.
+	#
+	# The second one was reachable in CI and printed green. `fetch-depth: 0` on
+	# the checkout step is what keeps every PR base sha in the local object store,
+	# and nothing asserted that — so switching the checkout to a shallow fetch for
+	# speed would have left this mode reporting `OK:` while comparing nothing at
+	# all, with the vendor boundary (tether#173 acceptance 7) unguarded behind it.
+	# The `rev-parse` below IS that assertion: shallow checkout -> unresolvable
+	# base -> red, naming the depth.
+	#
+	# Only the `@<ref>` form is hardened, because only it has a container that can
+	# be absent. A path locator's container is the filesystem, which is always
+	# there, so a file missing at a path the caller named says the same thing git
+	# says for a ref that resolves to a commit without that path in its tree:
+	# no manifest here. There is no third state to tell apart.
+	load_manifest() { # <locator> <outfile> <role>; returns 1 if there is no manifest there
+		local loc=$1 out=$2 role=$3 ref listing
 		case "$loc" in
-			@*) git show "${loc#@}:$MANIFEST" >"$out" 2>/dev/null || return 1 ;;
-			*)  [[ -f "$loc" ]] || return 1
+			@*) ref=${loc#@}
+			    git rev-parse --verify --quiet "${ref}^{commit}" >/dev/null || {
+			        echo "$role ref '$ref' does not resolve to a commit in this repository." >&2
+			        echo "  Nothing was compared, and nothing could have been. An unresolvable" >&2
+			        echo "  ref is a broken environment, not an empty comparison: reporting it" >&2
+			        echo "  green would be this gate passing without having read anything." >&2
+			        echo "  In CI this is usually a shallow checkout — this mode needs" >&2
+			        echo "  'fetch-depth: 0' so the commit is in the local object store." >&2
+			        exit 2; }
+			    # "That commit has no manifest" is decided POSITIVELY, from the
+			    # tree, rather than by reading any git failure as absence — sharing
+			    # one exit path between "absent" and "unreadable" is the exact
+			    # defect this mode was fixed for, and it is rebuildable one layer
+			    # down by any primitive that answers both with the same status.
+			    #
+			    # `git ls-tree` and NOT `git show` or `git rev-parse <ref>:<path>`,
+			    # both of which do exactly that: measured, with the tree object
+			    # containing the manifest deleted, `rev-parse --verify --quiet`
+			    # exits 1 with empty stderr — byte-for-byte indistinguishable from
+			    # a path that was never there, so a damaged object store lands back
+			    # on the green path. ls-tree separates the three states: exit 0
+			    # with the path printed (present), exit 0 with no output (absent),
+			    # non-zero (the tree itself could not be read).
+			    listing=$(git ls-tree --name-only "$ref" -- "$MANIFEST" 2>/dev/null) || {
+			        echo "$role ref '$ref' resolves, but its tree could not be read, so" >&2
+			        echo "  whether it carries $MANIFEST is unknown. That is a damaged or" >&2
+			        echo "  incomplete object store, not an absent manifest, and an unknown" >&2
+			        echo "  is not a green." >&2
+			        exit 2; }
+			    [[ -n "$listing" ]] || return 1
+			    git show "${ref}:${MANIFEST}" >"$out" 2>/dev/null || {
+			        echo "$role ref '$ref' has $MANIFEST in its tree, but its bytes could" >&2
+			        echo "  not be read. That is an incomplete or damaged object store, not" >&2
+			        echo "  an absent manifest, so it is fatal rather than green." >&2
+			        exit 2; }
+			    ;;
+			*)  # A file locator names a file the caller believes is there, so an
+			    # absent one is a broken invocation, not a base that legitimately
+			    # predates the manifest. Only `@<ref>` can express the latter, and
+			    # only when the ref resolves — which is what lets the green message
+			    # below say the base was really read. Leaving this on `return 1`
+			    # made `check-diff /tmp/typo.json` print "'/tmp/typo.json' exists
+			    # but carries no manifest" and exit 0, a green line asserting the
+			    # existence of a file that is not there. Reachable by hand through
+			    # `make check-vendor-diff BASE=<anything>`.
+			    [[ -f "$loc" ]] || {
+			        echo "$role manifest file '$loc' does not exist." >&2
+			        echo "  To compare against a commit that predates the manifest, name it" >&2
+			        echo "  as '@<ref>'; a path is only ever a file that should be there." >&2
+			        exit 2; }
 			    cat "$loc" >"$out" ;;
 		esac
 		jq empty "$out" 2>/dev/null || { echo "not valid JSON: $loc" >&2; exit 2; }
 	}
 
-	load_manifest "$head_loc" "$head_json" || { echo "no manifest at '$head_loc'" >&2; exit 2; }
-	if ! load_manifest "$base_loc" "$base_json"; then
+	load_manifest "$head_loc" "$head_json" head || { echo "no manifest at '$head_loc'" >&2; exit 2; }
+	if ! load_manifest "$base_loc" "$base_json" base; then
 		# The commit that introduces the vendor tree has no base manifest to
 		# compare against, and a new entry's hash is a new fact, not a moved one.
 		# Green — but say why, so a green here is not mistaken for a comparison
-		# that happened.
-		echo "OK: '$base_loc' carries no $MANIFEST, so there is no prior record to"
-		echo "    compare against — every entry at '$head_loc' is new. Nothing here"
-		echo "    can be a laundered hash; a new hash is what 'check' (against the"
-		echo "    files) and verify-upstream (against upstream) are for."
+		# that happened. Reachable only after load_manifest has established that
+		# the locator's container exists, so "carries no manifest" is now a
+		# statement about a base that was really read, not about one that was
+		# never found.
+		echo "OK: '$base_loc' exists but carries no $MANIFEST, so there is no prior"
+		echo "    record to compare against — every entry at '$head_loc' is new."
+		echo "    Nothing here can be a laundered hash; a new hash is what 'check'"
+		echo "    (against the files) and verify-upstream (against upstream) are for."
 		exit 0
 	fi
 

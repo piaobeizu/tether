@@ -70,6 +70,7 @@ jobs:
       # `verify-upstream`, which an absorption runs by hand; see step 5 of
       # docs/vendoring-cloudcli.md for why it is not a per-PR gate.
       - name: Check vendored upstream provenance
+        id: vendor_check
         run: bash scripts/check-vendor-provenance.sh check
 
       # The half `check` structurally cannot do. `check` compares the tree
@@ -89,9 +90,92 @@ jobs:
       # base: `github.event.before` is all-zeros for a new branch and points at a
       # discarded commit after a force-push. PRs are where the diff is reviewed
       # anyway, and `pull_request` now fires for every base branch (see `on:`).
+      #
+      # `fetch-depth: 0` above is what puts the base commit in the local object
+      # store, and that dependency is now asserted rather than assumed: since
+      # tether#184 the script refuses a base ref that does not resolve instead of
+      # printing `OK:` and exiting 0. A shallow checkout therefore turns this step
+      # red. It used to turn it into a no-op that still reported success — a gate
+      # guarding the vendor boundary (tether#173 acceptance 7) while reading
+      # nothing.
+      #
+      # 🔴 That same change is why neither obvious push base can simply be wired
+      # in here, and both were considered:
+      #   github.event.before   unresolvable after a force-push, because a
+      #                         discarded commit is reachable from no ref and
+      #                         `fetch-depth: 0` does not fetch it. That is now a
+      #                         hard red, so every rebase-push of a long-lived
+      #                         branch would fail CI for no defect.
+      #   origin/main           resolves always, but `.pins` is append-only: a pin
+      #                         main has absorbed and the branch has not yet
+      #                         rebased onto reads as a pin that was REMOVED going
+      #                         main -> branch, which the script fails as
+      #                         `pin-rewritten`. A red with no defect behind it,
+      #                         on the branch that is furthest behind.
+      # A base that is sound on push is a real design question, not an oversight;
+      # until it is answered the step below records the gap instead of hiding it.
+      #
+      # One residual, accepted: `pull_request.base.sha` shares that same failure
+      # mode when an OLD run is re-run after the base branch was force-pushed,
+      # because a re-run replays the original payload and that sha may no longer be
+      # reachable. Long-lived rebase-maintained branches are the exposed
+      # population. Failing loud is the right default for it — the alternative is
+      # the silent `OK:` this all came from — but the fix if it becomes a nuisance
+      # is to fetch the sha explicitly here, not to soften the script.
       - name: Check vendored provenance diff against PR base
         if: github.event_name == 'pull_request'
         run: bash scripts/check-vendor-provenance.sh check-diff "@${{ github.event.pull_request.base.sha }}"
+
+      # Two jobs, and they are deliberately in one step.
+      #
+      # It says out loud, on the events where it is true, that the gate above did
+      # not run — because a skipped step renders as a bare `-` in the step list,
+      # which reads to a human exactly like a check that passed. Measured on run
+      # 34105262140 (a push to main): `Check vendored provenance diff against PR
+      # base` is `-` there, sitting between two ticks.
+      #
+      # And it asserts that the OTHER half did run. It is NOT a second gate on the
+      # diff half and must not be mistaken for one. `check` is the only
+      # vendored-provenance coverage a push gets, so this fails when that step did
+      # not succeed, which is what makes it load-bearing rather than an echo:
+      # deleting `check`, dropping its `id:`, or putting an `if:` on it reds this.
+      #
+      # 🔴 The event test is INSIDE the body, not an `if:` on the step, and that is
+      # the difference between catching a regression and reporting it too late. As
+      # a step-level `if: github.event_name != 'pull_request'` the assertion did
+      # not run on pull_request at all — so a PR deleting `id: vendor_check` was
+      # green on the PR and only went red after it merged to main, i.e. the review
+      # that was supposed to stop it saw nothing. The narration is event-specific;
+      # the assertion is not, so only the narration is conditional.
+      #
+      # Deliberately no `always()`: without it this step is skipped whenever
+      # something earlier already failed, so an unrelated failure does not collect
+      # a second, confusing red. The cases it must catch — `check` removed, or made
+      # conditional — all leave every earlier step green, so all still reach it.
+      - name: Assert the vendor provenance 'check' half ran
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" != "pull_request" ]]; then
+            echo "event=${GITHUB_EVENT_NAME}: the manifest-DIFF half of the vendored"
+            echo "provenance gate did not run. It needs two manifests and a push has no"
+            echo "reliable second endpoint; the comment above this step has the two"
+            echo "candidates that were tried and why each is unsound."
+            echo
+            echo "So on this event tether#173 acceptance 7 is covered by 'check' alone:"
+            echo "the tree is held to the manifest, but a hash moved in place and"
+            echo "rehashed would not be seen here. That half is covered on the PR."
+          else
+            echo "event=pull_request: both halves of the vendored provenance gate ran."
+          fi
+          echo
+          if [[ "${{ steps.vendor_check.outcome }}" != "success" ]]; then
+            echo "FAIL: 'Check vendored upstream provenance' did not succeed" >&2
+            echo "      (outcome: '${{ steps.vendor_check.outcome }}'). That step is the" >&2
+            echo "      ONLY vendored-provenance coverage a push event has, so a run" >&2
+            echo "      where it is absent or skipped leaves push with none at all." >&2
+            exit 1
+          fi
+          echo "'check' ran and passed, so the half that does cover push is intact."
 
       # ── codegen drift gate (D-22 §2.6, K.7.1) ──────────────────────────────
       - name: Run codegen

@@ -200,24 +200,43 @@ jobs:
       # have turned nothing red.
       #
       # 🔴 Be precise about what this step buys, because overclaiming it is the same
-      # mistake one layer along: it makes the script's EXISTENCE load-bearing (delete
-      # the script and pnpm exits non-zero), and nothing more. Replace its body with
-      # `"typecheck": "true"` and this step is still green. The step below is the one
-      # that can go red on a weakened typecheck, and it is not redundant with this
-      # one.
+      # mistake one layer along. Measured in tether#174 by extracting these step
+      # bodies out of this file and running them verbatim:
       #
-      # Also not redundant with "Build web": `pnpm build` is `tsc -b && vite build`,
-      # so type errors are already gated. Running the named script is what keeps the
-      # script itself honest.
+      #   - Delete the `typecheck` key from web/package.json -> THIS STEP exits 254,
+      #     `Command "typecheck" not found`. The script's EXISTENCE is load-bearing.
+      #   - Replace its body with `"typecheck": "true"`      -> this step exits 0,
+      #     and so does everything else: the coverage step below still prints its
+      #     usual `OK: all 2 test file(s) are inside the typecheck coverage set`, and
+      #     "Build web" still builds. NOTHING in this workflow goes red. The step's
+      #     marginal value is the key's existence and nothing more.
+      #
+      # 🔴 Do NOT read the step below as a backstop for this one. An earlier version
+      # of this comment said it was ("the step below is the one that can go red on a
+      # weakened typecheck") and that is false: it runs `pnpm exec tsc -b
+      # --listFiles` itself and never invokes the script, so a no-op'd script body is
+      # structurally invisible to it. It does go red on a REAL type error (exit 2),
+      # but incidentally — its own `tsc -b` call is what fails, not a coverage
+      # change.
+      #
+      # What gates type errors is "Build web" (`pnpm build` = `tsc -b && vite
+      # build`), a step that predates this PR: with a type error injected AND the
+      # `typecheck` script no-op'd at the same time, "Build web" still exits 2 with
+      # `error TS2322`. So running the named script keeps the script honest; it is
+      # not what keeps the types honest.
       #
       # 🔴 This step and "Build web" below are a `tsc -b --noEmit` immediately
-      # followed by a `tsc -b` that must emit, sharing one tsbuildinfo. On a
-      # COMPOSITE project that pair poisons itself and the emitting run silently
-      # skips emit at exit 0 — measured, tether#165/#174. What makes the order safe
-      # is that neither referenced project sets `composite`, and the prohibition is
-      # recorded in web/tsconfig.app.json's header, i.e. in the file someone would
-      # have to edit to break it. Do not "fix" the redundancy by reordering these
-      # two: the order is not what protects it.
+      # followed by a `tsc -b`, sharing one tsbuildinfo — the adjacency that poisons
+      # itself on a COMPOSITE project, where the emitting run silently skips emit at
+      # exit 0 (measured on a scratch project, tether#165). It does not reproduce
+      # here and cannot today: BOTH referenced projects set `noEmit: true`, so the
+      # `tsc -b` in `pnpm build` emits nothing either — dist/ comes from `vite
+      # build`, which does not read tsbuildinfo. Adding `composite: true` and
+      # re-running these two step bodies leaves dist/ at its normal 6 files
+      # (measured, tether#174). What keeps that true is the `noEmit` premise, not
+      # this ordering, so do not "fix" the redundancy by reordering these two — and
+      # do not add `composite` either; web/tsconfig.app.json's header has the full
+      # measurement and the reason the prohibition outlives it.
       - name: Typecheck web
         run: cd web && pnpm typecheck
 

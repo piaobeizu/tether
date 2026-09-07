@@ -1,5 +1,12 @@
-// 🔴 DO NOT ADD `"composite": true` TO THIS PROJECT. Measured, tether#165 /
-// tether#174, TypeScript 5.8.3.
+// 🔴 DO NOT ADD `"composite": true` TO THIS PROJECT. tether#165 / tether#174,
+// TypeScript 5.8.3.
+//
+// Two things are recorded below and they are NOT the same strength. Keeping them
+// apart is the point of this header: (1) is a measured property of this tree,
+// (2) is a failure mode this tree currently CANNOT reach, and the prohibition
+// rests on (2) staying unreachable rather than on it being observed here.
+//
+// ── 1. Measured in this worktree, reproducible on demand ────────────────────
 //
 // While no referenced project is composite, `tsc -b`'s up-to-date check looks for
 // expected `.js` outputs that `noEmit: true` guarantees can never exist, so every
@@ -8,21 +15,52 @@
 //     Project 'tsconfig.app.json' is out of date because output file
 //     'src/main.js' does not exist
 //
-// That is the ONLY reason the arrangement below is safe. Make this project
-// composite and the up-to-date check switches to the timestamp path, the
-// tsbuildinfo becomes load-bearing, and a `--noEmit` run and an emitting run then
-// share one buildinfo and POISON EACH OTHER: measured on a scratch composite
-// project, `tsc -b --noEmit` followed by a plain `tsc -b` exits 0 and emits
-// NOTHING, reporting "is up to date because newest input is older than output
-// tsconfig.lib.tsbuildinfo". Emit silently skipped, exit code 0.
+// `pnpm exec tsc -b --verbose` prints that line on EVERY run, including
+// back-to-back runs with both .tsbuildinfo files already warm — there is no
+// incremental-skip path to land in. That is what the typecheck buys: a type error
+// injected into a file on a warm tree is still reported (`tsc -b` exit 2, TS2322)
+// instead of being skipped.
 //
-// This is not hypothetical here, and that is why the warning is in this file
-// rather than in a commit message. .github/workflows/ci.yml runs
-// `pnpm typecheck` (`tsc -b --noEmit`) IMMEDIATELY BEFORE `pnpm build`
-// (`tsc -b && vite build`) — exactly that pair, in exactly that order, on one
-// buildinfo. Verified as it stands: typecheck leaves web/dist absent, the build
-// then produces it. Add composite and that verification silently stops holding,
-// with a green CI and a binary carrying whatever dist/ was lying around.
+// ── 2. The composite poisoning: real elsewhere, UNREACHABLE here today ──────
+//
+// On a COMPOSITE project the up-to-date check switches to the timestamp path, the
+// tsbuildinfo becomes load-bearing, and a `--noEmit` run and an emitting run that
+// share one buildinfo can poison each other: measured on a scratch composite
+// project (tether#165), `tsc -b --noEmit` followed by a plain `tsc -b` exits 0 and
+// emits NOTHING, reporting "is up to date because newest input is older than
+// output tsconfig.lib.tsbuildinfo". Emit silently skipped, exit code 0.
+//
+// 🔴 That does NOT reproduce in THIS project, and an earlier version of this
+// header asserted that it did — with a "Measured" label it had not earned. It
+// cannot reproduce, because the pair it needs does not exist here. Measured,
+// tether#174:
+//
+//   - Both referenced projects set `noEmit: true` (`tsc -p <project>
+//     --showConfig` on tsconfig.app.json and on tsconfig.node.json). No `tsc`
+//     invocation in this project is an emitter: a bare `pnpm exec tsc -b` exits 0
+//     and produces zero new .js/.d.ts anywhere under src/ or test/, and no dist/
+//     at all.
+//   - web/dist comes from `vite build`, not from tsc, and its emit does not depend
+//     on buildinfo state: with both .tsbuildinfo files freshly written by `tsc -b
+//     --noEmit`, `pnpm exec vite build` ALONE still emits all 6 dist/ files.
+//     ("tsbuildinfo" also appears 0 times across node_modules/vite/dist and
+//     node_modules/rollup/dist.)
+//   - Adding `"composite": true` here and running CI's own two step bodies:
+//     `pnpm typecheck` exits 0 with dist/ absent, then `pnpm build` exits 0 with
+//     dist/ at 6 files — identical to the unmutated tree. Emit is NOT skipped.
+//
+// So the poisoning needs a tsc that emits, and this project has none. The
+// prohibition stays anyway, for the reason that survives that correction: the
+// premise carrying it is "no tsc here emits", and NOTHING enforces that premise.
+// The adjacency is already built — .github/workflows/ci.yml runs `pnpm typecheck`
+// (`tsc -b --noEmit`) IMMEDIATELY BEFORE `pnpm build` (`tsc -b && vite build`), on
+// one buildinfo — so the day a change makes tsc an emitter here (drops `noEmit`,
+// adds `declaration`/`outDir`, emits .d.ts for a package split), the scratch
+// measurement above becomes the applicable one and composite is what turns a
+// skipped emit into an exit 0. That last step is NOT re-measured in this tree and
+// cannot be: it needs the very premise this tree still holds. Banning composite
+// now is the cheap way to stop that future change from having to re-derive any of
+// this.
 //
 // The concrete hazard is a Vite scaffold: current templates DO set
 // `composite: true` plus a `tsBuildInfoFile` under node_modules/.tmp/. tether#174

@@ -287,21 +287,30 @@ function ColumnView({
         // LAY-19. The strip maps `panesInColumn('right')`. Work cannot appear here
         // because its column is 'middle' — there is no second list that could
         // disagree, which is what the old App.tsx's own comment asked for.
-        <div className="sh-tabstrip" role="tablist" aria-label="Right column">
+        //
+        // 🔴 Deliberately NOT `role="tablist"` / `role="tab"`, though it looks
+        // like a tab strip and the old SPA called it one. That role carries a
+        // keyboard contract — arrow keys move between tabs, Home/End jump to the
+        // ends, and the strip is one tab stop — and none of that is implemented
+        // here. Announcing the role without the behaviour tells assistive
+        // technology the widget works a way it does not, which is R10 aimed at an
+        // accessibility tree instead of at a sentence. A labelled nav of buttons
+        // with `aria-current` is a complete pattern at this size, and it is the
+        // same one the activity bar uses. Whoever implements the keyboard contract
+        // can add the roles then, and the roles will be true.
+        <nav className="sh-tabstrip" aria-label="Right column panes">
           {panesInColumn(column).map(pane => (
             <button
               key={pane}
               type="button"
-              role="tab"
               className="sh-tab"
-              aria-selected={active === pane}
               aria-current={active === pane ? 'page' : undefined}
               onClick={() => onChoose(pane)}
             >
               {PANE_LABEL[pane]}
             </button>
           ))}
-        </div>
+        </nav>
       )}
       {panesInColumn(column)
         .filter(pane => visited.includes(pane))

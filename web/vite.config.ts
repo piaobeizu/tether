@@ -10,8 +10,25 @@ import react from '@vitejs/plugin-react'
 // @types/node ever does arrive. vite.config.ts only ever runs under Node.
 declare const process: { env: Record<string, string | undefined> }
 
+// 🔴 There is deliberately no `css.postcss` key below, and adding one is how you
+// would break the stylesheet silently — tether#194.
+//
+// PostCSS config resolution is left to postcss-load-config, which searches from
+// `root` (web/) UPWARD and finds ./postcss.config.mjs. That file is a re-export
+// stub; the config tether actually builds with is src/ui/postcss.config.mjs, and
+// the reason for the indirection is in the stub's own comment.
+//
+// The obvious alternative — an inline `css: { postcss: { plugins: [...] } }` here,
+// importing src/ui/tailwind.config.mjs — does not work and does not fail loudly.
+// Vite bundles THIS file with esbuild into a temp file written beside it
+// (vite.config.ts.timestamp-*.mjs), inlining relative imports. The tailwind wrap
+// resolves the vendored config against its own `import.meta.url`, which would then
+// be the temp file's URL, one directory up: '../vendor/cloudcli/...' lands outside
+// web/ and resolves to nothing. Loading the wrap through postcss instead means
+// node `import()`s it from its real path, so `import.meta.url` is honest.
 export default defineConfig({
   plugins: [react()],
+
   build: {
     outDir: 'dist',
     emptyOutDir: true,

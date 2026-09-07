@@ -1,0 +1,17 @@
+/* tether's stylesheet. tether#194.
+ *
+ * The `@import` is the whole file on purpose. web/src/vendor/cloudcli/src/index.css
+ * is upstream's, unmodified and unmodifiable, and it is where the design tokens
+ * actually live: the `:root` / `.dark` custom properties that every
+ * `hsl(var(--x))` entry in the vendored tailwind config resolves against. It also
+ * carries the three `@tailwind` directives, which is what gives the tailwind
+ * PostCSS plugin somewhere to emit into.
+ *
+ * So this file is the pinned origin's consumer, not a copy of it. Overrides go
+ * BELOW the import when there are any; there are none yet, and inventing some
+ * here would be inventing design decisions that belong to the shell wi.
+ *
+ * `@import` has to come first in a CSS file (only `@charset` and `@layer` may
+ * precede it), which is why the comment above is a comment and not a rule.
+ */
+@import '../vendor/cloudcli/src/index.css';

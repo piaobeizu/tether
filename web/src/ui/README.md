@@ -30,7 +30,32 @@ tether#171.
   absorption chain deliberately — step 6 of `docs/vendoring-cloudcli.md` — not
   edited in place.
 
-Empty for now. tether#171 built the vendoring container, its check, and the
-layer-1 files upstream's tokens live in (`src/index.css`, `tailwind.config.js`,
-`postcss.config.js`); phase 1 of the UI rewrite is what brings in the layer-2
-primitives next door and what puts anything in here.
+## What is here
+
+tether#171 built the vendoring container, its check, and the layer-1 files
+upstream's tokens live in. tether#194 is what put the toolchain behind them and
+opened the `2-primitives` layer next door.
+
+| file | what it is |
+|---|---|
+| `tailwind.config.mjs` | the config the build uses: the vendored one, loaded and adjusted |
+| `postcss.config.mjs` | the plugin list; `../../postcss.config.mjs` re-exports it |
+| `index.css` | tether's stylesheet — `@import`s the vendored one for the tokens |
+| `primitives.ts` | the barrel application code imports primitives from |
+
+Each of those four files carries its own reasoning in a header comment, including
+the two upstream adoption blockers and the measurements behind how they are
+solved. Read the file, not this table — a table is a summary and summaries rot.
+
+## Two things that are easy to get wrong here
+
+**A green `pnpm build` does not mean the CSS pipeline works.** Tailwind
+misconfigured emits a stylesheet with no utility rules, or one built on its own
+defaults with none of the vendored tokens, and exits 0 either way. The check that
+can tell those apart reads `web/dist`, not the source:
+`scripts/check-tailwind-emitted.sh`, wired into CI after the web build.
+
+**jsdom cannot answer the same question.** vitest runs no PostCSS, so
+`getComputedStyle` in a test takes the same value whether the toolchain is wired
+correctly or absent entirely. Tests here assert primitive *behaviour*; appearance
+is the artifact check's business.

@@ -78,7 +78,42 @@ type ListState =
   | { readonly kind: 'refused'; readonly message: string }
 
 export function WorkspacePane({ fetchFn, storage, hide }: WorkspacePaneProps) {
-  const doFetch = fetchFn ?? ((...a: Parameters<typeof fetch>) => fetch(...a))
+  // 🔴 `useMemo`, and it is load-bearing: without it the tree drops its cache and
+  // re-requests every open directory on each re-render of an ANCESTOR.
+  //
+  // The default is a fresh arrow per render, so it is a new identity every time.
+  // `FileTree` memoises the tree cache on it and `Directory`'s effect depends on
+  // the cache, so a new identity means a new empty cache and a fresh listing.
+  //
+  // MEASURED, both arms, because the first version of this comment was wrong. It
+  // claimed an infinite loop — render → new cache → effect → setState → render —
+  // and that does not happen: `setEntries` lives in `Directory`, a descendant, so
+  // it re-renders `Directory` and not this component, and the identity is stable
+  // until something above re-renders. What the differential actually shows, over
+  // five re-renders of a parent:
+  //
+  //     with this useMemo      1 listing after mount, 1 after the re-renders
+  //     without it             1 listing after mount, 6 after the re-renders
+  //
+  // One per ancestor re-render. That matters here specifically because Shell
+  // re-renders on every pane switch and this pane is mounted in a column, so
+  // switching panes would re-read the visible tree each time.
+  //
+  // The suite could not have caught it: every other test in this file injects
+  // `fetchFn`, which is a stable identity, so the defect lives exactly in the
+  // production path the tests do not take. `WorkspacePane.test.tsx`'s
+  // "an ancestor re-render does not re-read the tree" case takes that path.
+  const doFetch = useMemo(
+    () => fetchFn ?? ((...a: Parameters<typeof fetch>) => fetch(...a)),
+    [fetchFn],
+  )
+  // One storage object, resolved once. The alternative — `storage?.setItem(...)`
+  // with a `localStorage` fallback beside it — is two paths through every read
+  // and write, which is the shape R9 is about even though this one is not a fetch.
+  const store = useMemo(
+    () => storage ?? (typeof localStorage !== 'undefined' ? localStorage : null),
+    [storage],
+  )
   const [list, setList] = useState<ListState>({ kind: 'loading' })
   const [selected, setSelected] = useState<string | null>(null)
 
@@ -98,9 +133,7 @@ export function WorkspacePane({ fetchFn, storage, hide }: WorkspacePaneProps) {
         const items = (await res.json()) as WorkspaceSummary[]
         if (!live) return
         setList({ kind: 'ready', items })
-        setSelected(prev =>
-          resolveSelection(items, prev, safeGet(storage, SELECTED_WORKSPACE_KEY)),
-        )
+        setSelected(prev => resolveSelection(items, prev, safeGet(store, SELECTED_WORKSPACE_KEY)))
       } catch (e) {
         // A transport failure has no response to extract a sentence from, so it
         // says what it knows and no more. R10: not "the daemon refused".
@@ -117,15 +150,12 @@ export function WorkspacePane({ fetchFn, storage, hide }: WorkspacePaneProps) {
     (id: string) => {
       setSelected(id)
       try {
-        storage?.setItem(SELECTED_WORKSPACE_KEY, id)
-        if (!storage && typeof localStorage !== 'undefined') {
-          localStorage.setItem(SELECTED_WORKSPACE_KEY, id)
-        }
+        store?.setItem(SELECTED_WORKSPACE_KEY, id)
       } catch {
-        /* private mode / quota */
+        /* private mode / quota — the session keeps working, it just will not persist */
       }
     },
-    [storage],
+    [store],
   )
 
   return (
@@ -336,13 +366,9 @@ function messageOf(e: unknown): string {
   return e instanceof Error && e.message !== '' ? e.message : 'Request failed.'
 }
 
-function safeGet(
-  storage: WorkspacePaneProps['storage'],
-  key: string,
-): string | null {
+function safeGet(store: WorkspacePaneProps['storage'] | null, key: string): string | null {
   try {
-    if (storage) return storage.getItem(key)
-    return typeof localStorage !== 'undefined' ? localStorage.getItem(key) : null
+    return store?.getItem(key) ?? null
   } catch {
     return null
   }

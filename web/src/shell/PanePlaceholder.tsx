@@ -3,8 +3,9 @@
 //
 // 🔴 The wording is a requirement, not filler. tether#195's scope allows pane
 // contents to be placeholders and forbids a placeholder from PRETENDING to have a
-// capability — which is docs/tether-ui-invariants.md §2 R10 ("say you don't know
-// when you don't know") applied to a UI surface rather than to a data value.
+// capability — which is <workspace>/docs/tether-ui-invariants.md §2 R10 ("say
+// you don't know when you don't know") applied to a UI surface rather than to a
+// data value.
 //
 // So this component renders a sentence and nothing else. Specifically it does NOT
 // render:

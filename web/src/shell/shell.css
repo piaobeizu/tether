@@ -396,8 +396,13 @@ body.pwa-mode #root {
  * since viewport width and pointer type are independent (a touch laptop is wide
  * and hoverless; a phone in landscape is neither).
  *
- * Gated by mobileFirst.test.ts: no rule outside a `(hover: hover)` block may set
- * `opacity: 0`, and no `:hover` selector outside one may touch visibility at all. */
+ * Gated by mobileFirst.test.ts, in three parts: the base cascade may not hide an
+ * element by opacity or visibility, no `:hover` selector outside a hover query
+ * may touch visibility, and a hover query may not REVEAL what the base cascade
+ * hid. The third is what covers `display`, which the first cannot forbid outright
+ * because hiding a pane with it is correct and this file does it below. The query
+ * is recognised by what it ASKS — `(pointer: fine)` and the `any-` forms count
+ * too — not by its spelling here. */
 .sh-tree-hide {
   flex: 0 0 auto;
   color: hsl(var(--muted-foreground));

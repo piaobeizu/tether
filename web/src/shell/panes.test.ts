@@ -1,4 +1,4 @@
-// Invariant IDs are docs/tether-ui-invariants.md §3.10.
+// Invariant IDs are <workspace>/docs/tether-ui-invariants.md §3.10.
 
 import { describe, expect, it } from 'vitest'
 import {

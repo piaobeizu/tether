@@ -1,4 +1,4 @@
-// Invariant IDs are docs/tether-ui-invariants.md §3.10.
+// Invariant IDs are <workspace>/docs/tether-ui-invariants.md §3.10.
 //
 // Every assertion here reads the RENDERED tree. The pure semantics are already
 // pinned in selection.test.ts; what this file adds is that the projection onto DOM

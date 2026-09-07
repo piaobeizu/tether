@@ -1,9 +1,9 @@
 // Which workspace the tree is showing (tether#195).
 //
 // Split from the component so the selection rule is exercised as arithmetic. The
-// rule itself is WS-4 in docs/tether-ui-invariants.md §3.11, extracted from the
-// old WorkspacePane.test.tsx — a C-grade file whose assertions were bound to a
-// store that no longer exists, but whose rule is not.
+// rule itself is WS-4 in <workspace>/docs/tether-ui-invariants.md §3.11,
+// extracted from the old WorkspacePane.test.tsx — a C-grade file whose
+// assertions were bound to a store that no longer exists, but whose rule is not.
 
 /** A workspace, as far as selecting one is concerned. `GET /api/v1/workspaces`. */
 export interface WorkspaceSummary {

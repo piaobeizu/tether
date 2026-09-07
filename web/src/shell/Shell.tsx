@@ -267,10 +267,10 @@ export function Shell({ renderPane, store, wide, columns }: ShellProps) {
           //
           // Not claimed for the narrow form anywhere — LAY-14's test is wide-form
           // and mutation-proven, and the invariant was extracted from a
-          // desktop-only suite (docs/tether-ui-invariants.md §3.10) — but silence
-          // is how a reader concludes it holds everywhere. It is written here
-          // rather than fixed because the fix is a design decision this wi does
-          // not own: keeping all three columns mounted on a phone means every
+          // desktop-only suite (<workspace>/docs/tether-ui-invariants.md §3.10)
+          // — but silence is how a reader concludes it holds everywhere. It is
+          // written here rather than fixed because the fix is a design decision this
+          // wi does not own: keeping all three columns mounted on a phone means every
           // visited pane's subscriptions and DOM stay live behind the one on
           // screen — a whole Chat transcript among them, with its own streaming
           // subscription. Whoever rewrites Chat measures that and decides.

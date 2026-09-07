@@ -30,9 +30,9 @@
 // no branching on height.
 //
 // The wording is the point of the component. R10's discipline in
-// docs/tether-ui-invariants.md §2 is not "show an error state", it is that a
-// sentence must not read as a fact the code does not have. Each case below says
-// only what its input supports:
+// <workspace>/docs/tether-ui-invariants.md §2 is not "show an error state", it
+// is that a sentence must not read as a fact the code does not have. Each case
+// below says only what its input supports:
 //
 //   more     no sentence at all — the affordance to load is the message, and a
 //            label saying "there is more" beside a button that loads more is one

@@ -2,7 +2,16 @@ name: CI
 
 on:
   push:
-    branches: [main, "pf2.*"]
+    # `ui-rewrite` is the long-lived branch for tether#173's phase-1 front-end
+    # rewrite. It is here because tether#174's first acceptance criterion is
+    # "GOWORK=off go build ./... passes on EVERY commit of the UI branch", and the
+    # only mechanism that can hold that is CI on every push to it. The `pull_request`
+    # trigger below already covers PRs *into* it, but the branch also takes direct
+    # commits (rebases onto main, in particular), and those are exactly the commits
+    # where web/dist stops matching web/src.
+    #
+    # It is deletable, not permanent: remove this entry when phase 1 merges to main.
+    branches: [main, "pf2.*", ui-rewrite]
   # No `branches:` filter on purpose. It used to be `[main]`, which reads like
   # "PRs into main" and behaves like "PRs into anything else run zero checks":
   # a stacked PR — B onto A, A onto main — got no CI at all, so B's checks were
@@ -97,12 +106,172 @@ jobs:
       - name: Run codegen
         run: bash scripts/codegen.sh
 
+      # This step used to be, in full:
+      #
+      #     run: git diff --exit-code web/src/lib/wire.gen.ts
+      #
+      # 🔴 Two independent ways that gate reports PASS while checking nothing.
+      # Both were measured, neither is reasoned, and the first one was about to
+      # fire: tether#174 deletes web/src, and tether#168 is adding a field to
+      # wire.Envelope at the same time.
+      #
+      # (1) THE PATH IS NOT TRACKED. `git diff --exit-code <untracked-but-present
+      #     path>` exits **0**. tygo's writer calls os.MkdirAll before
+      #     os.WriteFile (tygo generator.go:72 and :77 at v0.2.21 — the exact tag
+      #     the "Install tygo" step above pins), so the "Run codegen" step
+      #     RECREATES a deleted wire.gen.ts on disk as an untracked file, and the
+      #     diff above then finds nothing to compare. Verified in a scratch repo on
+      #     both branches: tracked -> deleted -> recreated-on-disk = exit 0; absent
+      #     from index AND worktree = exit 128. Only the second branch is safe, and
+      #     a generator that MkdirAll's never produces it. So the gate's failure
+      #     mode was indistinguishable from its success, forever, from the first
+      #     commit of any wi that untracks the file. Nothing else caught it:
+      #     check-artifacts-uncommitted.sh runs BEFORE codegen and its
+      #     INDEX_FORBIDDEN list never mentions wire.gen.ts.
+      #
+      # (2) THE GATE HELD ITS OWN COPY OF THE PATH. `web/src/lib/wire.gen.ts` was
+      #     written here and in tygo.yaml, and tygo.yaml is what DECIDES where
+      #     codegen writes. Move `output_path` and this step keeps diffing a file
+      #     nothing regenerates any more: still tracked, still unchanged, still
+      #     exit 0. Same failure class one level up, so fixing only (1) would have
+      #     left a gate that is green because the check is absent.
+      #
+      # Hence: read the path from tygo.yaml, assert the precondition `git diff`
+      # cannot express, and only then diff. The assertion is what makes this a
+      # gate rather than a path change — tether#174's own acceptance criterion is
+      # that a mutant (edit internal/wire/ without regenerating) turns this red,
+      # and that both untracking the file and moving output_path turn it red too.
       - name: Check codegen drift
-        run: git diff --exit-code web/src/lib/wire.gen.ts
+        run: |
+          set -euo pipefail
+
+          mapfile -t outs < <(sed -n 's/^[[:space:]]*output_path:[[:space:]]*//p' tygo.yaml)
+          if (( ${#outs[@]} != 1 )); then
+            echo "FAIL: expected exactly one 'output_path:' in tygo.yaml, found ${#outs[@]}." >&2
+            echo "      This gate reads the path from tygo.yaml on purpose (see the" >&2
+            echo "      comment above). If codegen now writes several files, this step" >&2
+            echo "      has to check all of them — it must not silently check one." >&2
+            exit 1
+          fi
+          gen="${outs[0]}"
+          echo "codegen target, per tygo.yaml: $gen"
+
+          if ! git ls-files --error-unmatch -- "$gen" >/dev/null 2>&1; then
+            echo "FAIL: '$gen' is not tracked in git." >&2
+            echo "      tygo recreates it on every run (MkdirAll + WriteFile), so" >&2
+            echo "      'git diff --exit-code' would exit 0 while comparing nothing." >&2
+            echo "      Commit the generated file, or move this gate to wherever the" >&2
+            echo "      wire contract now lives." >&2
+            exit 1
+          fi
+
+          if ! git diff --exit-code -- "$gen"; then
+            echo >&2
+            echo "FAIL: '$gen' is stale with respect to internal/wire/." >&2
+            echo "      Run 'make codegen' and commit the result." >&2
+            exit 1
+          fi
+          echo "OK: $gen is tracked and matches internal/wire/"
 
       # ── web build ───────────────────────────────────────────────────────────
       - name: Install web dependencies
         run: cd web && pnpm install --frozen-lockfile
+
+      # ── typecheck gates (tether#165, tether#174) ────────────────────────────
+      # web/package.json's `typecheck` script had NO automated consumer before this
+      # step: measured on baf7117, `typecheck` appears 0 times under .github/, 0
+      # times in the Makefile, 0 times under scripts/, and there is no .husky/. So
+      # tether#165 repaired a gate that nothing ran — anyone reverting its fix would
+      # have turned nothing red.
+      #
+      # 🔴 Be precise about what this step buys, because overclaiming it is the same
+      # mistake one layer along: it makes the script's EXISTENCE load-bearing (delete
+      # the script and pnpm exits non-zero), and nothing more. Replace its body with
+      # `"typecheck": "true"` and this step is still green. The step below is the one
+      # that can go red on a weakened typecheck, and it is not redundant with this
+      # one.
+      #
+      # Also not redundant with "Build web": `pnpm build` is `tsc -b && vite build`,
+      # so type errors are already gated. Running the named script is what keeps the
+      # script itself honest.
+      - name: Typecheck web
+        run: cd web && pnpm typecheck
+
+      # Asserts the typecheck's COVERAGE, measured, rather than its `include` globs.
+      #
+      # Measured on baf7117 with `tsc -p <project> --listFiles`:
+      #
+      #     tsconfig.app.json   include ["src"]            -> 82 files
+      #     tsconfig.node.json  include ["vite.config.ts"] ->  1 file
+      #     web/test/*.spec.ts  in NEITHER project         ->  0 files  (5 existed)
+      #
+      # So tether#165's acceptance — "typecheck must be shown red" — was fully
+      # satisfiable with a mutant inside src/, and was: the gate shipped real, five
+      # spec files stayed outside it, and the whole thing carried the label of a
+      # fixed gate. tether#173 §4 then ports 11 A-grade test files in, three of them
+      # into web/test/. Reading the glob is exactly how the 0 stayed invisible, so
+      # this checks the file set tsc reports.
+      #
+      # The invariant is a SUBSET, not a count: every test file in the repo is inside
+      # the set `pnpm typecheck` reads. A count would go red every time someone adds
+      # a file, which makes it a gate people edit rather than obey; the subset check
+      # only fires when a test file is genuinely uncovered.
+      #
+      # `tsc -b --listFiles` and not per-project `tsc -p`: `-b` is what `pnpm
+      # typecheck` actually runs, so this measures the real invocation and not a
+      # re-derivation of it that could drift. (Build mode does accept --listFiles;
+      # verified, exit 0, output spanning both referenced projects.)
+      #
+      # 🔴 The two emptiness guards are not defensive padding. A subset assertion
+      # over an empty left side passes vacuously, so "there are no test files" and
+      # "every test file is covered" would be the same green — the precise defect
+      # this gate exists to prevent, rebuilt inside the gate.
+      - name: Check typecheck covers every test file
+        run: |
+          set -euo pipefail
+          cd web
+
+          # What tsc really reads, as repo-relative paths.
+          pnpm exec tsc -b --listFiles \
+            | sed "s#^${PWD}/##" \
+            | sort -u > /tmp/tc-covered.txt
+
+          # What has to be covered. `git ls-files` and not `find`: the authority for
+          # "a test file in this repo" is the index, and find would also sweep up
+          # anything left in node_modules or dist.
+          git ls-files -- '*.test.ts' '*.test.tsx' '*.spec.ts' '*.spec.tsx' \
+            | sort -u > /tmp/tc-tests.txt
+
+          n_cov=$(grep -cv '^node_modules/' /tmp/tc-covered.txt || true)
+          n_tests=$(wc -l < /tmp/tc-tests.txt)
+          echo "typecheck reads ${n_cov} project file(s); repo has ${n_tests} test file(s) under web/"
+
+          if [[ "$n_tests" -eq 0 ]]; then
+            echo "FAIL: no test files found under web/." >&2
+            echo "      The subset check below would pass vacuously, which is the" >&2
+            echo "      blind-gate failure this step exists to prevent. If the suite" >&2
+            echo "      really is meant to be empty, delete this step deliberately." >&2
+            exit 1
+          fi
+          if [[ "$n_cov" -eq 0 ]]; then
+            echo "FAIL: 'tsc -b --listFiles' reported no project files at all." >&2
+            echo "      Typecheck is reading nothing — the tether#165 defect, back." >&2
+            exit 1
+          fi
+
+          uncovered=$(comm -23 /tmp/tc-tests.txt /tmp/tc-covered.txt)
+          if [[ -n "$uncovered" ]]; then
+            echo "FAIL: these test files are OUTSIDE the typecheck's coverage:" >&2
+            sed 's/^/  /' <<<"$uncovered" >&2
+            echo >&2
+            echo "      A test file no tsconfig 'include' reaches is never" >&2
+            echo "      type-checked, so type errors in it are invisible while" >&2
+            echo "      'pnpm typecheck' stays green. Add its directory to" >&2
+            echo "      web/tsconfig.app.json's include (that file's comment has the" >&2
+            echo "      measured history)." >&2
+            exit 1
+          fi
+          echo "OK: all ${n_tests} test file(s) are inside the typecheck coverage set"
 
       - name: Build web
         run: cd web && pnpm build

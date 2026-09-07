@@ -1,5 +1,5 @@
 .PHONY: all build codegen test go-test web-test check-artifacts check-vendor \
-        check-vendor-diff verify-vendor-upstream ci release clean
+        check-vendor-diff verify-vendor-upstream check-tailwind ci release clean
 
 BINARY  := bin/tether
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
@@ -71,6 +71,18 @@ verify-vendor-upstream:
 	@test -n "$(CLONE)" || { echo "usage: make verify-vendor-upstream CLONE=<upstream-clone>"; exit 2; }
 	bash scripts/check-vendor-provenance.sh verify-upstream "$(CLONE)"
 
+# Asserts the CSS pipeline actually ran, by reading web/dist (tether#194). Needs a
+# built web/dist, so it goes AFTER a build rather than beside check-vendor — and it
+# is not in `test` for that reason: `make test` builds nothing.
+#
+#   make build check-tailwind
+#
+# A green `pnpm build` does not imply any of this. Tailwind misconfigured emits a
+# stylesheet with no utility rules, or one on its own defaults with no vendored
+# tokens, and exits 0 either way.
+check-tailwind:
+	bash scripts/check-tailwind-emitted.sh
+
 # scripts/build.sh stamps web/dist and then verifies the binary against it
 # (scripts/spa-bundle.sh), so the embed hop is covered here without a separate line.
 #
@@ -80,6 +92,7 @@ verify-vendor-upstream:
 ci: codegen check-artifacts check-vendor
 	git diff --exit-code web/src/lib/wire.gen.ts
 	bash scripts/build.sh
+	bash scripts/check-tailwind-emitted.sh
 	$(GOTEST) ./...
 	cd web && pnpm test
 

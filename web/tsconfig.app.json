@@ -78,6 +78,39 @@
     "isolatedModules": true,
     "moduleDetection": "force",
     "noEmit": true,
+
+    // 🔴 Exists for exactly one file, and that file cannot be changed to remove
+    // the need for it — tether#194.
+    //
+    // web/src/vendor/cloudcli/src/lib/utils.js is upstream's `cn` helper, carried
+    // byte-for-byte (scripts/check-vendor-provenance.sh hashes it), and it is
+    // plain JavaScript with no annotations and no sibling .d.ts. Both vendored
+    // primitives import it. Measured on this worktree without this flag:
+    //
+    //     src/vendor/.../ui/Button.tsx(17,20): error TS7016: Could not find a
+    //       declaration file for module '../../../lib/utils'. [...]/utils.js
+    //       implicitly has an 'any' type.
+    //     src/vendor/.../ui/Input.tsx(16,20): error TS7016: (same)
+    //
+    // So the module RESOLVES without this flag; what it lacks is a type surface.
+    // The three ways to give it one that do not need this flag are all worse:
+    // a sibling .d.ts inside the vendor root is an undeclared file and reddens
+    // check B; editing the primitives to add a suppression is an in-place edit of
+    // a vendored file; and an ambient `declare module` cannot answer for a
+    // relative specifier. With allowJs, tsc reads the .js and infers
+    // `cn(...inputs: any[]): string`, which is what upstream's untyped helper
+    // actually is.
+    //
+    // NOT `checkJs`. That would type-check upstream's JavaScript under this
+    // project's `strict` — an opinion about upstream's code, enforced in tether's
+    // build, on files tether may not fix. The flag admits the file; it does not
+    // audit it.
+    //
+    // Cost, measured: it also admits the two vendored config .js files under
+    // src/ into the file set (they are matched by `include` and are not imported
+    // by anything). That is why the CI coverage step's `typecheck reads N project
+    // file(s)` number moves by more than one when this lands.
+    "allowJs": true,
     "jsx": "react-jsx",
     "strict": true,
     "noUnusedLocals": true,

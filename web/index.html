@@ -11,6 +11,17 @@
          to live in web/src/pwa/ went with the old SPA; re-adding it belongs to
          whichever wi rebuilds the shell, not to this one. -->
     <link rel="manifest" href="/manifest.webmanifest" />
+    <!-- The stylesheet's entry point (tether#194), and it is here rather than in
+         src/main.tsx deliberately. tether#186 holds main.tsx while it adds an
+         /auth branch, and tether#194's job is to make the CSS pipeline work in a
+         way that is provable on web/dist without touching that file — a
+         stylesheet no entry point reaches emits no CSS asset at all, so vite
+         would produce a green build with nothing to inspect.
+         It is also the more durable of the two homes: as an HTML <link> the
+         built CSS asset does not depend on which JS module imported it first.
+         Whichever wi builds the shell may move it into main.tsx; nothing here
+         depends on it staying. -->
+    <link rel="stylesheet" href="/src/ui/index.css" />
     <title>tether</title>
   </head>
   <body>

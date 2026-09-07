@@ -13,6 +13,7 @@
 // stale the way a hand-maintained array does.
 
 import { describe, expect, it } from 'vitest'
+import { stripCssComments as stripComments } from './cssText'
 
 const shellSources = import.meta.glob('./*.{ts,tsx,css}', {
   query: '?raw',
@@ -29,24 +30,12 @@ const cssLayers = import.meta.glob(['../ui/index.css', '../vendor/**/index.css']
   eager: true,
 }) as Record<string, string>
 
-/**
- * Strips comments before the rules are applied.
- *
- * 🔴 Narrow on purpose, because preprocessing is how a self-check comes to hide
- * the defect it is checking for. What is removed is exactly the two comment
- * syntaxes — `/* … *\/` and a `//` line comment — and nothing else: no
- * whitespace collapsing, no string removal, no minification. A `100vh` in a
- * DECLARATION still reaches the assertion, and the mutation proof for these rules
- * injects one to show that it does.
- *
- * It is needed because this file's own subject matter is the forbidden tokens:
- * shell.css's header explains why `100dvh` is used "never `100vh`", and on the
- * first run that sentence tripped the rule three times. A rule that cannot be
- * written down beside the code it governs is a rule that stops being written down.
- */
-function stripComments(text: string): string {
-  return text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '')
-}
+// The comment stripper used to be defined here. It now lives in ./cssText.ts,
+// because breakpoint.test.ts needs the same one — its own rules were tripped by
+// shell.css's header quoting the very `@media (min-width: …)` pattern it bans —
+// and two copies of a stripper is two things that can drift apart, in the one
+// place where drift is invisible. The guard test at the bottom of this file moved
+// with the responsibility: it now guards every caller rather than this file.
 
 /**
  * The declaration block a stylesheet opens for exactly `selector`, or null.
@@ -177,19 +166,24 @@ describe('mobile-first', () => {
     expect(shellAt).toBeGreaterThan(vendorAt)
   })
 
-  // Guards the stripper itself. If stripComments ever ate a declaration, the two
-  // rules above would go quietly green on a file that violates them — the
-  // preprocessing swallowing the very defect it was added to make expressible.
+  // Guards the stripper itself, for every gate that uses it — the rules above and
+  // breakpoint.test.ts's width-media-query rule, which is why it lives in
+  // ./cssText.ts. If it ever ate a declaration, all of them would go quietly green
+  // on a file that violates them: the preprocessing swallowing the very defect it
+  // was added to make expressible.
   it('the comment stripper removes comments and nothing else', () => {
     const sample = [
-      '/* a comment mentioning 100vh */',
+      '/* a comment mentioning 100vh and @media (min-width: 900px) */',
       '.x { height: 100vh; } /* trailing 100vh */',
       '// a line comment mentioning minWidth: 320',
       'const a = { minWidth: 320 }',
+      '@media (min-width: 900px) { .y { color: red } }',
     ].join('\n')
     const stripped = stripComments(sample)
     expect(stripped).toContain('height: 100vh;')
     expect(stripped).toContain('minWidth: 320')
+    // The token breakpoint.test.ts's rule is about, surviving in a real rule.
+    expect(stripped).toContain('@media (min-width: 900px) { .y')
     expect(stripped).not.toContain('a comment mentioning')
     expect(stripped).not.toContain('trailing')
     expect(stripped).not.toContain('a line comment')

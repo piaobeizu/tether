@@ -13,10 +13,12 @@
  *     while `kind` is Envelope's one required field, and an object literal typed
  *     as `ErrorPayload` is rejected for both a missing required field and an
  *     excess one. This half was DEAD in the pre-rewrite copy: web/test/ was in
- *     no tsconfig project (measured on baf7117 — tsconfig.app.json's include was
- *     ["src"], 82 files; the five web/test/*.spec.ts were in 0 projects), so
- *     every annotation and every `as EnvelopeKind` in that file was unchecked
- *     text. tether#174 put web/test/ inside tsconfig.app.json's include, and
+ *     no tsconfig project, so every annotation and every `as EnvelopeKind` in
+ *     that file was unchecked text. (Not re-measured here — the numbers are
+ *     tether#174's, recorded in web/tsconfig.app.json: on baf7117 this project's
+ *     include of ["src"] type-checked 82 files, tsconfig.node.json's 1, and the
+ *     five web/test/*.spec.ts were in neither.)
+ *     tether#174 put web/test/ inside tsconfig.app.json's include, and
  *     .github/workflows/ci.yml asserts that coverage by counting `tsc -b
  *     --listFiles` output rather than by reading the glob. That is why the
  *     annotations below are load-bearing NOW and were not before.
@@ -81,13 +83,15 @@ const hasServer = Boolean(testURL)
 
 // ─── Contract 1: GET /cert-hash returns a 64-char lowercase hex string ────────
 //
-// 🔴 The live half is NOT a CI gate and never has been. `TETHER_TEST_URL` appears
-// 0 times in this repository (workflows, Makefile, scripts/, sources — measured
-// in tether#189), so the test below is skipped on every CI run and only fires
-// when someone points it at a running daemon by hand. The format convention
-// itself ("64 lowercase hex, no colons, no prefix") is enforced nowhere
-// automatically; internal/wire/doc.go says so in those words rather than
-// claiming this file validates it.
+// 🔴 The live half is NOT a CI gate and never has been. NOTHING IN THIS REPO SETS
+// `TETHER_TEST_URL`: measured with `git grep TETHER_TEST_URL` over every tracked
+// file, the only occurrences are the read on the next line and the sentence in
+// internal/wire/doc.go describing this situation — 0 in .github/, the Makefile
+// and scripts/, and 0 anywhere at all at 64bde45, before this file existed. So
+// the test below is skipped on every CI run and fires only when someone points
+// it at a running daemon by hand. The format convention itself ("64 lowercase
+// hex, no colons, no prefix") is enforced nowhere automatically; doc.go says that
+// in those words rather than claiming this file validates it.
 
 describe('contract-1: cert-hash format', () => {
   it('matches ^[0-9a-f]{64}$', { skip: !hasServer }, async () => {
@@ -113,9 +117,13 @@ describe('contract-1: cert-hash format', () => {
 //
 // 🔴 UNCOVERED, and the pre-rewrite copy of this comment pointed at cover that
 // no longer exists — it said "Covered by Playwright e2e / web/test/e2e/smoke.spec.ts".
-// That file is one of the 84 tether#174 deleted, and `playwright` appears 0 times
-// in web/package.json, the Makefile and .github/ (measured, tether#189). There is
-// no browser harness in this project to host it.
+// That path is gone (one of the 84 tether#174 deleted; `git ls-files web/test/e2e`
+// is empty) and there is nothing left to host it: playwright is in neither
+// `dependencies` nor `devDependencies` of web/package.json, no playwright config
+// is tracked anywhere in the repo, and it is absent from node_modules. Its one
+// appearance in web/pnpm-lock.yaml is `@vitest/browser-playwright` inside
+// vitest's own OPTIONAL peerDependencies block — a declaration by vitest, not an
+// install here. (Measured with git grep + git ls-files, tether#189.)
 describe('contract-2: WT bidi echo', () => {
   it.skip('needs a browser WebTransport harness this project does not have', () => {
     // Intentionally empty. Kept as the record that D-22 §6 #2 exists and is

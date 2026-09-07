@@ -36,12 +36,20 @@ import * as wire from '../src/lib/wire.gen'
 //   test/latency.spec.ts         in flight, tether#187
 //   test/workspace-tree.spec.ts  in flight, tether#188
 //
-// So this file is already redundant, and it is kept only because the other two
-// wis are open on the same branch at the same time: deleting it here would put a
-// modify/delete conflict in front of whichever of them rebases next, to save two
-// assertions that cost nothing to run. DELETE IT — do not "update" it — as part
-// of whichever of tether#187 / tether#188 lands last. Nothing should be added to
-// it in the meantime; test/wire-contract.spec.ts is where wire assertions go.
+// So this file is already redundant. It is kept for two stated reasons and NOT
+// for a third one it would be easy to assume: neither tether#187 nor tether#188
+// declares this path (checked, not guessed), so a delete here would not have
+// collided with them.
+//
+//   1. The trigger the sentence names is "that port", and the port is 1 of 3.
+//   2. tether#189's own acceptance is that `tsc -b --listFiles` grows from the
+//      8 project files it reported on 64bde45. Deleting a file in the same
+//      change makes that number unreadable.
+//
+// DELETE IT — do not "update" it — with the last of those ports to land, or
+// unconditionally if they are abandoned; nothing else depends on it. Nothing
+// should be added to it meanwhile: test/wire-contract.spec.ts is where wire
+// assertions go.
 describe('phase-1 scaffold: web/test/ as a test root', () => {
   it('resolves imports from web/test into web/src', () => {
     expect(typeof wire.KindMessage).toBe('string')

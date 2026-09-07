@@ -4,6 +4,60 @@
 BINARY  := bin/tether
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 
+# Make the make targets hermetic against an enclosing Go workspace (tether#177).
+#
+# This only bites when the checkout sits *inside* someone else's workspace, and
+# in the polyforge workspace both checkouts do: a task worktree and the canonical
+# .repo/<repo> clone each resolve GOWORK to the workspace-root go.work, which
+# `use`s other repos there and not this module. It is not only the pf.* trees.
+# `go` then resolves in workspace mode against a workspace this module is not
+# part of, and every target that shells out to `go` fails:
+#
+#   make codegen  ->  go: no such tool "tygo"
+#   make go-test  ->  pattern ./...: directory prefix . does not contain modules
+#                     listed in go.work or their selected dependencies
+#
+# The codegen one is the trap: it names a *tool*, so it reads as a missing
+# dependency and invites `go install .../tygo`. The tool is not missing — go.mod
+# declares it and `GOWORK=off go tool` lists it. Single-module resolution is what
+# is missing. This used to be a hand-maintained rule in two step templates, i.e.
+# maintained by whoever remembered it.
+#
+# CI never invokes make (it runs scripts/*.sh and `go` directly), so this reaches
+# local make targets only. In an *unmodified* clone `off` merely restates what
+# `go` already concludes. Once you write your own go.work it no longer restates —
+# it overrides — and the two shapes of workspace differ sharply:
+#
+#   use-only:     a benefit. The package set of `make go-test` stays exactly this
+#                 module's, identical to CI's, instead of drifting with local
+#                 workspace state. (You cannot `use` both this module and v0/
+#                 regardless: v0/go.mod declares the same module path, so go
+#                 rejects the workspace outright — "module
+#                 github.com/piaobeizu/tether appears multiple times in
+#                 workspace".)
+#   with replace: SILENTLY IGNORED, and this is the case to know about. Pointing
+#                 a dependency at a local fork is the usual reason to write a
+#                 go.work, and every make target drops it: `make build` exits 0
+#                 and links the upstream module, with no warning and no error.
+#                 Measured by pointing a direct dependency at a local fork — the
+#                 recipe resolves the version go.mod pins, a bare `go` in the
+#                 same directory resolves the fork.
+#
+# `?=` yields to any outer value, so the way back in is to pass one explicitly:
+#
+#   GOWORK="$PWD/go.work" make build    # ABSOLUTE path required; a relative one
+#                                       # dies with `invalid GOWORK: not an
+#                                       # absolute path`
+#
+# `export` is load-bearing — a plain make variable is not in the recipe's
+# environment, which is where `go` reads it. `?=` does not assign to a
+# set-but-empty variable, so `GOWORK= make build` hands the recipe an empty
+# GOWORK, `go` falls back to auto-discovery, and the original failure comes back.
+# That is an unhandled edge, not a designed control: nothing exercises it.
+#
+# Scope: make targets only. A bare `go test ./...` in the shell is still on you.
+export GOWORK ?= off
+
 # `make build` is the only supported build. web/dist (the embedded SPA) is not in
 # git, so until it has been built every go command in this module — including
 # `go list ./...`, hence gopls — fails with "pattern all:dist: no matching files

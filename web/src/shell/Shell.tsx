@@ -34,7 +34,7 @@ import type { CSSProperties, ReactNode } from 'react'
 // yet, and inventing some here would be inventing design decisions that belong to
 // the shell wi").
 import { NavDrawer } from './NavDrawer'
-import { PanePlaceholder } from './PanePlaceholder'
+import { renderPane as defaultRenderPane } from './renderPane'
 import { COLUMN_IDS, PANE_LABEL, panesInColumn, type ColumnId, type PaneId } from './panes'
 import {
   loadSelection,
@@ -62,7 +62,7 @@ export interface ColumnLayout {
 }
 
 export interface ShellProps {
-  /** Renders a pane's contents. Defaults to a labelled placeholder. */
+  /** Renders a pane's contents. Defaults to `./renderPane`. */
   readonly renderPane?: (pane: PaneId) => ReactNode
   /** Where the selection is persisted. Defaults to `localStorage`. */
   readonly store?: SelectionStore
@@ -141,7 +141,7 @@ export function Shell({ renderPane, store, wide, columns }: ShellProps) {
     return () => window.removeEventListener('tether:select-tab', onSelectSurface)
   }, [commit])
 
-  const render = renderPane ?? ((pane: PaneId) => <PanePlaceholder pane={pane} />)
+  const render = renderPane ?? defaultRenderPane
   const current = narrowPane(selection)
 
   return (

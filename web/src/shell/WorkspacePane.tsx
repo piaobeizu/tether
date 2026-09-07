@@ -143,6 +143,12 @@ export function WorkspacePane({ fetchFn, storage, hide }: WorkspacePaneProps) {
     return () => {
       live = false
     }
+    // Deliberately mount-once: this loads the registry, and re-running it on a
+    // changed `doFetch` identity would re-read the list on every ancestor
+    // re-render — the same defect the memo above exists to stop, through the other
+    // door. The `live` flag is what makes that safe under StrictMode's
+    // effect → cleanup → effect (R5): the superseded run's response is discarded
+    // rather than racing the live one.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 

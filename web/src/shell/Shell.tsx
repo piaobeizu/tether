@@ -50,9 +50,18 @@ import { createWideSubscription, type WideSubscription } from './breakpoint'
 /**
  * The column-width rules, injected.
  *
- * The implementation is `web/src/shell/columns.ts` over `web/src/lib/layout.ts`.
- * Typed here rather than imported so this file compiles — and the shell runs —
- * before that module exists.
+ * 🔴 There is no implementation on this branch. It is meant to be a thin
+ * `web/src/shell/columns.ts` over `web/src/lib/layout.ts`, and NEITHER FILE
+ * EXISTS YET: layout.ts is still only on `main`, and tether#196 is the wi porting
+ * it here. The interface is declared rather than imported so this file compiles —
+ * and the shell runs — without it.
+ *
+ * That is also why LAY-10 (the drag path holding MIN_MID exactly, and the left
+ * divider not charging the right column) is NOT among the invariants tether#195
+ * delivers. It is owed by whoever wires this socket up, and it must import
+ * layout.ts rather than restate its arithmetic: `ACTIVITY_W` is deliberately not
+ * exported, and writing `+ 48` at a call site is the exact bug tether#102 made
+ * unexpressible.
  */
 export interface ColumnLayout {
   /** Current pixel width of a fixed-width column ('left' or 'right'). */
@@ -94,10 +103,9 @@ export function Shell({ renderPane, store, wide, columns }: ShellProps) {
   // LAY-14. A pane is mounted once it has been visited and stays mounted, hidden,
   // afterwards; a pane never visited is not in the DOM at all. Seeded with each
   // column's restored pane, because those are selected from the first paint.
-  const [visited, setVisited] = useState<readonly PaneId[]>(() => {
-    const initial = loadSelection(selectionStore)
-    return COLUMN_IDS.map(c => initial.active[c])
-  })
+  const [visited, setVisited] = useState<readonly PaneId[]>(() =>
+    COLUMN_IDS.map(c => selection.active[c]),
+  )
 
   const [drawerOpen, setDrawerOpen] = useState(false)
 

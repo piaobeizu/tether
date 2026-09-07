@@ -47,6 +47,21 @@ function widthSub(initial: boolean) {
   }
 }
 
+/** A button in the right column's pane strip. */
+function tabBtn(label: string): HTMLElement {
+  return within(screen.getByRole('navigation', { name: 'Right column panes' })).getByRole(
+    'button',
+    { name: label },
+  )
+}
+
+/** Every button in the right column's pane strip, in order. */
+function tabBtns(): HTMLElement[] {
+  return within(screen.getByRole('navigation', { name: 'Right column panes' })).getAllByRole(
+    'button',
+  )
+}
+
 /** The activity-bar button for a middle-column pane. Scoped to the nav because
  *  a pane's own placeholder is also labelled with its name, and an unscoped
  *  query matches both. */
@@ -130,7 +145,7 @@ describe('Shell — wide form', () => {
   it('LAY-14: a pane in another column that was never selected is not mounted either', () => {
     render(<Shell wide={wide()} store={store()} renderPane={placeholders} />)
     expect(mounted('skill')).toBeNull()
-    fireEvent.click(screen.getByRole('tab', { name: PANE_LABEL.skill }))
+    fireEvent.click(tabBtn(PANE_LABEL.skill))
     expect(mounted('skill')).not.toBeNull()
   })
 
@@ -147,13 +162,13 @@ describe('Shell — wide form', () => {
     fireEvent.click(activityBtn(PANE_LABEL.work))
     expect(crumb()).toBe(PANE_LABEL[showing(focused())!.getAttribute('data-pane') as PaneId])
 
-    fireEvent.click(screen.getByRole('tab', { name: PANE_LABEL.shell }))
+    fireEvent.click(tabBtn(PANE_LABEL.shell))
     expect(crumb()).toBe(PANE_LABEL[showing(focused())!.getAttribute('data-pane') as PaneId])
   })
 
   it('LAY-19: the right tab strip is exactly the right column, and has no Work tab', () => {
     render(<Shell wide={wide()} store={store()} renderPane={placeholders} />)
-    const rendered = screen.getAllByRole('tab').map(t => t.textContent)
+    const rendered = tabBtns().map(t => t.textContent)
     expect(rendered).toEqual(panesInColumn('right').map(p => PANE_LABEL[p]))
     expect(rendered).not.toContain(PANE_LABEL.work)
   })
@@ -162,7 +177,7 @@ describe('Shell — wide form', () => {
     for (const stored of ['work', 'chat', 'skill', 'shell', 'canvas', 'garbage', '']) {
       cleanup()
       render(<Shell wide={wide()} store={store({ [STORAGE_KEY_PANE.right]: stored })} renderPane={placeholders} />)
-      const selected = screen.getAllByRole('tab').filter(t => t.getAttribute('aria-selected') === 'true')
+      const selected = tabBtns().filter(t => t.getAttribute('aria-current') === 'page')
       expect(selected.length, `stored=${stored}`).toBe(1)
     }
   })
@@ -236,7 +251,7 @@ describe('Shell — narrow form', () => {
     expect(document.querySelectorAll('[data-showing="true"]')).toHaveLength(1)
     expect(document.querySelectorAll('.sh-column')).toHaveLength(1)
     expect(screen.queryByRole('navigation', { name: 'Main views' })).toBeNull()
-    expect(screen.queryAllByRole('tab')).toHaveLength(0)
+    expect(screen.queryByRole('navigation', { name: 'Right column panes' })).toBeNull()
   })
 
   it('LAY-16: restores the pane it was left on', () => {

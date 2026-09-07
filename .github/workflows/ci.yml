@@ -103,17 +103,28 @@ jobs:
         run: bash scripts/check-vendor-provenance.sh check-diff "@${{ github.event.pull_request.base.sha }}"
 
       # ── codegen drift gate (D-22 §2.6, K.7.1) ──────────────────────────────
-      - name: Run codegen
-        run: bash scripts/codegen.sh
-
-      # This step used to be, in full:
+      # This used to be two steps:
       #
-      #     run: git diff --exit-code web/src/lib/wire.gen.ts
+      #     - name: Run codegen
+      #       run: bash scripts/codegen.sh
+      #     - name: Check codegen drift
+      #       run: git diff --exit-code web/src/lib/wire.gen.ts
       #
-      # 🔴 Two independent ways that gate reports PASS while checking nothing.
-      # Both were measured, neither is reasoned, and the first one was about to
-      # fire: tether#174 deletes web/src, and tether#168 is adding a field to
-      # wire.Envelope at the same time.
+      # They are one step now because the split was itself a hole. The diff only
+      # means anything after codegen has run, and nothing in the YAML said so:
+      # measured in tether#174, running the check alone against a tree with an
+      # extra field on wire.Envelope printed "OK: web/src/lib/wire.gen.ts matches
+      # internal/wire/" and exited 0. It was reading a generated file that had
+      # simply not been regenerated yet. So deleting, disabling or reordering the
+      # generate step would have left a green gate asserting something false --
+      # the same "green because the check is absent" class as the two defects
+      # below, and invisible in review because both steps look fine on their own.
+      # Generating and comparing in one step makes the dependency unbreakable.
+      #
+      # 🔴 Two further independent ways the old gate reported PASS while checking
+      # nothing. Both were measured, neither is reasoned, and the first one was
+      # about to fire: tether#174 deletes web/src, and tether#168 is adding a
+      # field to wire.Envelope at the same time.
       #
       # (1) THE PATH IS NOT TRACKED. `git diff --exit-code <untracked-but-present
       #     path>` exits **0**. tygo's writer calls os.MkdirAll before
@@ -141,9 +152,13 @@ jobs:
       # gate rather than a path change — tether#174's own acceptance criterion is
       # that a mutant (edit internal/wire/ without regenerating) turns this red,
       # and that both untracking the file and moving output_path turn it red too.
-      - name: Check codegen drift
+      - name: Run codegen and check for drift
         run: |
           set -euo pipefail
+
+          # Generate first, in the same step, so the comparison below cannot be
+          # left comparing a file against itself. See the comment above.
+          bash scripts/codegen.sh
 
           mapfile -t outs < <(sed -n 's/^[[:space:]]*output_path:[[:space:]]*//p' tygo.yaml)
           if (( ${#outs[@]} != 1 )); then
@@ -222,29 +237,52 @@ jobs:
       # re-derivation of it that could drift. (Build mode does accept --listFiles;
       # verified, exit 0, output spanning both referenced projects.)
       #
+      # The left side is the UNION of two sources, because they answer "must be
+      # type-checked" in two different ways and each misses something the other
+      # catches:
+      #   `vitest list --filesOnly`  the files vitest will actually execute,
+      #                              enumerated by the runner itself rather than by
+      #                              this file's copy of its glob. A copy would go
+      #                              stale against vitest's own `include` — and a
+      #                              gate deriving its expectation from a copy of
+      #                              the thing it checks is WIRE-8's exact defect.
+      #   `git ls-files` on the      files that are test files by name but that
+      #   test/spec name patterns    vitest is NOT running. Those still have to
+      #                              type-check: a spec sitting in the repo
+      #                              unexecuted is a separate problem, but it is
+      #                              not an excuse to stop type-checking it.
+      #
       # 🔴 The two emptiness guards are not defensive padding. A subset assertion
       # over an empty left side passes vacuously, so "there are no test files" and
       # "every test file is covered" would be the same green — the precise defect
-      # this gate exists to prevent, rebuilt inside the gate.
+      # this gate exists to prevent, rebuilt inside the gate. It has already fired
+      # once for real, during tether#174, on a tree whose new specs were not yet
+      # staged.
       - name: Check typecheck covers every test file
         run: |
           set -euo pipefail
           cd web
 
-          # What tsc really reads, as repo-relative paths.
+          # LC_ALL=C throughout: `comm` compares byte-wise, so it silently
+          # mis-reports set membership if `sort` used a locale collation instead.
+          # Both sides have to agree, and only the byte order is guaranteed to.
+          export LC_ALL=C
+
+          # What tsc really reads, as web-relative paths.
           pnpm exec tsc -b --listFiles \
             | sed "s#^${PWD}/##" \
             | sort -u > /tmp/tc-covered.txt
 
-          # What has to be covered. `git ls-files` and not `find`: the authority for
-          # "a test file in this repo" is the index, and find would also sweep up
-          # anything left in node_modules or dist.
+          # What has to be covered (see the comment above for why this is a union).
+          pnpm exec vitest list --filesOnly > /tmp/tc-vitest.txt
           git ls-files -- '*.test.ts' '*.test.tsx' '*.spec.ts' '*.spec.tsx' \
-            | sort -u > /tmp/tc-tests.txt
+            > /tmp/tc-indexed.txt
+          sort -u /tmp/tc-vitest.txt /tmp/tc-indexed.txt > /tmp/tc-tests.txt
 
           n_cov=$(grep -cv '^node_modules/' /tmp/tc-covered.txt || true)
           n_tests=$(wc -l < /tmp/tc-tests.txt)
-          echo "typecheck reads ${n_cov} project file(s); repo has ${n_tests} test file(s) under web/"
+          echo "typecheck reads ${n_cov} project file(s) under web/"
+          echo "test files to cover: ${n_tests} (union of $(wc -l < /tmp/tc-vitest.txt) from vitest and $(wc -l < /tmp/tc-indexed.txt) from the git index)"
 
           if [[ "$n_tests" -eq 0 ]]; then
             echo "FAIL: no test files found under web/." >&2

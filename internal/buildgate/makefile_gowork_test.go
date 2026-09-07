@@ -14,6 +14,15 @@
 // This does not delegate a CI gate to make, which ci.yml's "Run Go tests"
 // comment warns against. Here make is the object under test, not the means of
 // testing something else.
+//
+// What this package needs beyond the Go toolchain: it shells out, so `go test
+// ./...` is no longer self-contained once it reaches here. The isolated copy
+// under test is built from `git ls-files`, which needs a real git working copy
+// rather than an export of one, and the probe runs the Makefile, which needs
+// make on PATH. A source tarball, or a container stage that COPYs the tree
+// without .git, therefore fails this package with `fatal: not a git repository`
+// — a missing prerequisite of the harness, not a defect in the code under test.
+// That failure is deliberately fatal rather than a skip; see copyTrackedTree.
 package buildgate
 
 import (
@@ -72,9 +81,13 @@ func TestMakeTargetsStayHermeticAgainstAnEnclosingGoWork(t *testing.T) {
 	// would get a pass, which is the failure mode this gate exists to prevent.
 	copyTrackedTree(t, root, mod)
 
-	// An enclosing workspace that does not `use` the copy. A go.work needs at
-	// least one usable module, so a decoy stands in for "somebody else's
-	// modules" — the role gmi-ws/go.work's three repos play in reality.
+	// An enclosing workspace that does not `use` the copy. The decoy is fidelity
+	// rather than necessity — measured, a go.work with no `use` at all is accepted
+	// by go and puts the copy in the same hazard, and removing the decoy's go.mod
+	// does not change this gate's verdict in either direction. It is here because
+	// it stands in for "somebody else's modules", the role gmi-ws/go.work's other
+	// repos play in reality, and a synthetic workspace shaped like the real one is
+	// the thing worth reproducing.
 	mustWriteFile(t, filepath.Join(decoy, "go.mod"),
 		fmt.Sprintf("module decoy\n\ngo %s\n", goVersion))
 	mustWriteFile(t, filepath.Join(base, "go.work"),
@@ -96,9 +109,17 @@ func TestMakeTargetsStayHermeticAgainstAnEnclosingGoWork(t *testing.T) {
 	out, err := runMake(t, mod, "codegen")
 	if err != nil {
 		t.Fatalf("`make codegen` failed inside an enclosing go.work: %v\n"+
-			"This is what the Makefile's `export GOWORK ?= off` prevents; if that line is gone, restore it.\n"+
-			"Note `export` is load-bearing (a plain make variable is not in the recipe's environment)\n"+
-			"and the value must survive into the recipe.\n--- output ---\n%s", err, out)
+			"Read the output below before editing anything — this line is reachable by more than\n"+
+			"one cause, and they need opposite fixes.\n"+
+			"  * The Makefile's `export GOWORK ?= off` is gone: restore it. `export` is\n"+
+			"    load-bearing (a plain make variable is not in the recipe's environment) and the\n"+
+			"    value must survive into the recipe. The tell is `go` reaching outside the module\n"+
+			"    — e.g. `go: no such tool \"tygo\"`.\n"+
+			"  * The recipe cannot find one of its own input files: that input exists in your\n"+
+			"    working tree but is not tracked by git, so it is absent from the copy under test,\n"+
+			"    which this gate builds from `git ls-files`. `git add` the file the output names.\n"+
+			"    The Makefile is not the problem, and restoring a line that is already there will\n"+
+			"    not fix it.\n--- output ---\n%s", err, out)
 	}
 }
 
@@ -114,7 +135,7 @@ func TestMakeTargetsStayHermeticAgainstAnEnclosingGoWork(t *testing.T) {
 //
 // `make --eval` defines a throwaway probe target without adding one to the
 // Makefile's public target list. Requires GNU make (>= 3.82); the Makefile is
-// already GNU-only, since line 5 uses `$(shell ...)`.
+// already GNU-only, since it uses `$(shell ...)`.
 func TestGoworkDefaultIsExportedAndYieldsToAnOuterValue(t *testing.T) {
 	root := repoRoot(t)
 	const probe = `pfprobe: ; @echo "$$GOWORK"`

@@ -7,15 +7,46 @@
 import { describe, expect, it, vi } from 'vitest'
 import defaultTheme from 'tailwindcss/defaultTheme'
 import { createWideSubscription, LG_MEDIA_QUERY, LG_MIN_WIDTH } from './breakpoint'
+import { stripCssComments } from './cssText'
 
 // `?raw` through vite's glob, so the assertions read the files that ship rather
-// than a fixture. A file added to this directory later is picked up without being
-// added to a list.
-const sources = import.meta.glob('./*.css', {
+// than a fixture. A file added to either directory later is picked up without
+// being added to a list.
+//
+// 🔴 `../ui/*.css` is in the set, and it was NOT at first. Scoped to `./*.css`
+// alone this glob resolved to exactly `['./shell.css']`, so web/src/ui/index.css —
+// the wrap layer, which tether#195 modifies — sat OUTSIDE the gate: appending
+// `@media (min-width: 900px){…}` to it left this file green (measured, before the
+// glob was widened). The gate has to cover every stylesheet tether writes, not
+// just the one the rule was first written for.
+//
+// The vendored sheet is deliberately NOT in the set. It is upstream's, may not be
+// edited, and it does carry width media queries of its own — including a
+// `max-width: 768px` block whose rules for `*` / `button` / `[role="button"]` / `a`
+// DO reach the shell's controls. Pulling it in would make this gate assert
+// something about upstream that tether cannot act on. The claim is scoped to
+// tether's own stylesheets and shell.css's header states it in that scoped form.
+const sources = import.meta.glob(['./*.css', '../ui/*.css'], {
   query: '?raw',
   import: 'default',
   eager: true,
 }) as Record<string, string>
+
+/**
+ * The same stylesheets with comments removed, which is what every rule below
+ * about the CONTENT of a stylesheet has to read.
+ *
+ * 🔴 Not an optimisation. shell.css's header quotes the exact pattern this file
+ * bans — it has to, because the header is where the "no width media query" rule
+ * and the `grep` that verifies its scope are written down — and reading raw text
+ * made every one of those sentences a false positive. Two of these rules failed
+ * on prose the moment that header was corrected. The stripper is shared with
+ * mobileFirst.test.ts (./cssText.ts) and guarded by that file's
+ * "removes comments and nothing else" case, because a stripper that ate a
+ * declaration would turn all of these green at once.
+ */
+const declarations = (): Record<string, string> =>
+  Object.fromEntries(Object.entries(sources).map(([path, css]) => [path, stripCssComments(css)]))
 
 const tailwindConfigs = import.meta.glob(['../ui/tailwind.config.mjs', '../vendor/**/tailwind.config.js'], {
   query: '?raw',
@@ -50,18 +81,34 @@ describe('breakpoint', () => {
     }
   })
 
-  // 🔴 The breakpoint exists ONCE, in TypeScript. A width media query in the shell
-  // stylesheet would be a second copy of it, free to disagree — the layout
-  // switching at one width while LAY-14's mounting switched at another, since the
-  // two forms are different trees and `display` cannot express a mount. So the
-  // assertion is not "the query matches the constant", it is "there is no query".
+  // 🔴 The breakpoint exists ONCE, in TypeScript. A width media query in a
+  // stylesheet tether writes would be a second copy of it, free to disagree — the
+  // layout switching at one width while LAY-14's mounting switched at another,
+  // since the two forms are different trees and `display` cannot express a mount.
+  // So the assertion is not "the query matches the constant", it is "there is no
+  // query".
   //
-  // Reading the shipped stylesheet rather than a fixture is what makes this hold
-  // for a file added later: the glob is resolved against the real directory.
-  it('is not duplicated into the stylesheet — the shell has no width media query', () => {
-    expect(Object.keys(sources).length).toBeGreaterThan(0)
-    for (const [path, css] of Object.entries(sources)) {
-      expect(css.length, `${path} read back empty — the raw import is stubbed`).toBeGreaterThan(0)
+  // Reading the shipped stylesheets rather than a fixture is what makes this hold
+  // for a file added later: the globs are resolved against the real directories.
+  it("is not duplicated into any stylesheet tether writes — none has a width media query", () => {
+    // Both halves of the glob have to have resolved. One emptiness guard over the
+    // union would be satisfied by shell.css alone, which is exactly the state
+    // this case was in before `../ui/*.css` was added: green, and blind to the
+    // file the PR was editing.
+    const paths = Object.keys(sources)
+    expect(paths.filter(p => p.startsWith('./')), 'the shell glob resolved to nothing').not.toEqual(
+      [],
+    )
+    expect(paths.filter(p => p.includes('/ui/')), 'the wrap-layer glob resolved to nothing').not.toEqual(
+      [],
+    )
+    for (const [path, raw] of Object.entries(sources)) {
+      // The emptiness check is on the RAW text: the stub state vite.config.ts's
+      // `test.css` guards against yields '', and a stripped '' is also '', so
+      // checking after the strip could not tell "nothing was read" from
+      // "everything was a comment".
+      expect(raw.length, `${path} read back empty — the raw import is stubbed`).toBeGreaterThan(0)
+      const css = declarations()[path]!
       const widthQueries = [...css.matchAll(/@media[^{]*\((?:min|max)-width:[^)]*\)/g)].map(
         m => m[0],
       )
@@ -70,16 +117,24 @@ describe('breakpoint', () => {
   })
 
   // The switch the stylesheet does use has to be the one the shell publishes, or
-  // the wide rules are dead code.
+  // the wide rules are dead code. Read off the declarations, not the prose: the
+  // header discusses the selector at length, so a raw `toContain` would pass on a
+  // file whose wide block had been deleted.
   it('drives the wide layout from the attribute the shell publishes', () => {
-    const css = sources['./shell.css']!
-    expect(css).toContain("[data-wide='true']")
+    expect(declarations()['./shell.css']!).toContain("[data-wide='true']")
   })
 
   // The narrow layout is what a browser applies before any JavaScript runs, so
   // "mobile-first" is a property of where the rules sit rather than a claim.
   it("keeps the wide rules behind the attribute, so the default cascade is the narrow form", () => {
-    const css = sources['./shell.css']!
+    // 🔴 Declarations, not raw text. This case slices the file at the FIRST
+    // occurrence of the selector, and the header names the selector while
+    // explaining which element carries the attribute — so on raw text the slice
+    // point landed inside a comment and the case failed on a correct file. Worse
+    // than failing: had the header happened to mention it after the rules, the
+    // slice would have covered the whole file and the case would have passed
+    // vacuously.
+    const css = declarations()['./shell.css']!
     const wideBlockStart = css.indexOf("[data-wide='true']")
     expect(wideBlockStart).toBeGreaterThan(-1)
     // `.sh-root`'s sizing is unconditional; the activity bar and the tab strip are

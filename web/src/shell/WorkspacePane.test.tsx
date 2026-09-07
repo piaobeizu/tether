@@ -1,4 +1,5 @@
-// Invariant IDs are docs/tether-ui-invariants.md §3.11; AC-R9 is tether#173 §6.
+// Invariant IDs are <workspace>/docs/tether-ui-invariants.md §3.11; AC-R9 is
+// tether#173 §6.
 //
 // 🔴 Every error assertion here lands on RENDERED TEXT, and no module is mocked —
 // only `fetch` is stubbed. That shape is AC-R9 arm 2 verbatim ("stub

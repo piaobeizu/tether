@@ -7,10 +7,11 @@
 // winning. Only ONE of them paginates: the cc-source store's cursor is a byte
 // offset into a jsonl file, while tether's own `LoadHistory` is an unbounded
 // `os.ReadFile` and answers any `?before=` with an empty page
-// (internal/session/sessionlist.go, measured for docs/tether-ui-invariants.md
-// §3.5). So on a tether-source session the five rounds of pagination work behind
-// PAGE-* do not fail — they silently never arrive. A spinner at the top of the
-// list waits for a page that structurally cannot come.
+// (internal/session/sessionlist.go, measured for
+// <workspace>/docs/tether-ui-invariants.md §3.5). So on a tether-source session
+// the five rounds of pagination work behind PAGE-* do not fail — they silently
+// never arrive. A spinner at the top of the list waits for a page that
+// structurally cannot come.
 //
 // Owner ruling ④: say so. The UI states plainly that there is no more history
 // rather than appearing to load some. Real backend pagination is a separate wi;

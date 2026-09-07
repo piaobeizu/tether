@@ -1,4 +1,5 @@
-// Invariant IDs are docs/tether-ui-invariants.md §3.9; the governing rule is §2 R10.
+// Invariant IDs are <workspace>/docs/tether-ui-invariants.md §3.9; the
+// governing rule is §2 R10.
 
 import { describe, expect, it } from 'vitest'
 import {

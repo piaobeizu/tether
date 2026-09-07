@@ -8,6 +8,20 @@
 - 仅当 v2 实施明确需要参考某个 v1 行为时（例如 `v0/internal/cc/` 里的 cc 集成踩坑），按需读单个文件，读完即止。
 - v0/ 不再修改、不再扩展、不再修 bug。如果 v1 有遗留 ticket，也当 v0 的事，新功能在 v2 重写。
 
+## `<workspace>/…` is a path OUTSIDE this repo
+
+`<workspace>` is the polyforge workspace root — the directory holding `.repo/`,
+`.polyforge/` and `docs/`. Files under it are deliberately absent from this repo:
+workspace-level design docs stay out of `.repo/`. **Grepping this checkout for one
+and finding nothing means it is where it belongs, not that it is missing.**
+
+`<workspace>/docs/tether-ui-invariants.md` is the UI invariant register — the
+`LAY-*` / `WS-*` / `SCROLL-*` / `PAGE-*` / `R*` IDs that `web/src/shell/` cites by
+ID. 🔴 Cite it WITH the prefix. Written bare it reads repo-relative: a reviewer of
+tether#195 searched this repo and `.repo/tether-doc` for it, found neither, and
+reported the document as non-existent — a wrong verdict from a correct
+observation, caused entirely by the citation not naming its own scope.
+
 ## Authoritative spec / plan
 
 - **Spec**: `../tether-doc/wiki/specs/2026-05-09-tether-simplified-design.md` §10.A–§10.K

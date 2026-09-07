@@ -1,10 +1,11 @@
-// Invariant IDs are docs/tether-ui-invariants.md §3.9; the governing rule is §2 R10.
+// Invariant IDs are <workspace>/docs/tether-ui-invariants.md §3.9; the
+// governing rule is §2 R10.
 //
 // These assertions land on RENDERED TEXT rather than on the return value of
 // historyStart(), because owner ruling ④ is about what the reader is told. The
 // pure function having the right variant and the screen saying the wrong sentence
-// is the exact gap docs/tether-ui-invariants.md §2 R9 records as "the acceptance
-// must walk to the eyes".
+// is the exact gap that document's §2 R9 records as "the acceptance must walk to
+// the eyes".
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'

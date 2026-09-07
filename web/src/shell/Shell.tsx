@@ -331,9 +331,10 @@ function ColumnView({
 /**
  * A divider, rendered only when something can act on the drag.
  *
- * With no `columns` there is no rule to clamp against — `web/src/lib/layout.ts`
- * owns MIN_MID and the bounds — so the divider is omitted rather than rendered
- * inert. R10: a control on screen is a claim that the capability is there.
+ * With no `columns` there is no rule to clamp against — MIN_MID and the bounds
+ * live in `web/src/lib/layout.ts`, which is on `main` and NOT on this branch yet
+ * (tether#196) — so the divider is omitted rather than rendered inert. R10: a
+ * control on screen is a claim that the capability is there.
  */
 function Resizer({ column, columns }: { column: 'left' | 'right'; columns?: ColumnLayout }) {
   const dragging = useRef(false)

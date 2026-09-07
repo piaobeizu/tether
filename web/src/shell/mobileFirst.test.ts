@@ -20,6 +20,15 @@ const shellSources = import.meta.glob('./*.{ts,tsx,css}', {
   eager: true,
 }) as Record<string, string>
 
+// The wrap layer and the pristine upstream stylesheet it consumes. Both are read
+// because the rules below are about the CASCADE, not about one file: the shell's
+// own root can be correct while an ancestor styled by the vendored sheet is not.
+const cssLayers = import.meta.glob(['../ui/index.css', '../vendor/**/index.css'], {
+  query: '?raw',
+  import: 'default',
+  eager: true,
+}) as Record<string, string>
+
 /**
  * Strips comments before the rules are applied.
  *
@@ -37,6 +46,20 @@ const shellSources = import.meta.glob('./*.{ts,tsx,css}', {
  */
 function stripComments(text: string): string {
   return text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '')
+}
+
+/**
+ * The declaration block a stylesheet opens for exactly `selector`, or null.
+ *
+ * "Exactly" is the whole job. The selector has to sit at a rule boundary — start
+ * of a line, or after a `}` or `;` — so that looking for `#root` does not find the
+ * `#root` inside `body.pwa-mode #root`. That substring match is what let the
+ * first version of the override check pass on a tree with the override deleted.
+ */
+function ruleFor(css: string, selector: string): string | null {
+  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const m = new RegExp(`(?:^|[};])\\s*${escaped}\\s*\\{([^}]*)\\}`, 'm').exec(css)
+  return m === null ? null : m[1]!
 }
 
 /** Test files describe the rules; the rules are about what ships. */
@@ -99,6 +122,59 @@ describe('mobile-first', () => {
     // list.
     expect(css!.length).toBeGreaterThan(0)
     expect(css).toMatch(/\.sh-root\s*\{[^}]*height:\s*100dvh/)
+  })
+
+  // 🔴 The rule above is about files this wi writes, and it was NOT sufficient:
+  // `.sh-root` was already `100dvh` and the built bundle still carried a `100vh`,
+  // because the vendored stylesheet pins `#root` — the shell's own parent — at the
+  // static unit. A rule scoped to "my files" cannot see that, so this is the same
+  // rule scoped to the cascade.
+  //
+  // The selector list is DERIVED from the vendored file rather than written out,
+  // which is what makes it hold for a pin upstream adds at the next tag. The
+  // vendored file cannot be edited (its body and header are hashed both ways), so
+  // the answer is an override in the wrap layer.
+  it('overrides every static-vh rule the vendored stylesheet applies', () => {
+    const vendorPath = Object.keys(cssLayers).find(p => p.includes('/vendor/'))
+    expect(vendorPath, 'the vendored stylesheet was not readable').toBeTypeOf('string')
+    const vendor = stripComments(cssLayers[vendorPath!]!)
+    expect(vendor.length).toBeGreaterThan(0)
+
+    const shell = stripComments(shellSources['./shell.css']!)
+
+    // Every selector block in the vendored sheet holding a static vh value.
+    const pinned = [...vendor.matchAll(/([^{}]+)\{([^}]*\b\d+vh\b[^}]*)\}/g)].map(m =>
+      m[1]!.trim().split('\n').pop()!.trim(),
+    )
+    expect(pinned.length, 'no vendored vh rule found — has the pin moved?').toBeGreaterThan(0)
+
+    for (const selector of pinned) {
+      // 🔴 A `toContain(selector)` here is NOT enough, and this is not a
+      // hypothetical: it was the first version, and deleting the whole
+      // `#root { min-height: 100dvh }` block left it GREEN — because
+      // `body.pwa-mode #root` still contains the substring `#root`. A selector
+      // has to be matched at a rule boundary, and the block it opens has to
+      // actually carry a dynamic unit, or this checks that a name appears
+      // somewhere rather than that a rule overrides anything.
+      const rule = ruleFor(shell, selector)
+      expect(rule, `nothing overrides the vendored \`${selector}\` vh rule`).not.toBeNull()
+      expect(rule!, `the \`${selector}\` override carries no dvh value`).toMatch(/\b\d+dvh\b/)
+      expect(rule!, `the \`${selector}\` override still uses a static vh`).not.toMatch(/\b\d+vh\b/)
+    }
+  })
+
+  // The override only wins because of import order, so the order is asserted
+  // rather than assumed. Reversing the two imports would leave every rule above
+  // green and the shipped page wrong.
+  it('imports the wrap layer after the vendored sheet, so overrides win', () => {
+    const wrap = Object.entries(cssLayers).find(([p]) => p.includes('/ui/'))
+    expect(wrap, 'the wrap stylesheet was not readable').toBeTruthy()
+    const text = wrap![1]
+    const vendorAt = text.indexOf("@import '../vendor/")
+    const shellAt = text.indexOf("@import '../shell/shell.css'")
+    expect(vendorAt).toBeGreaterThan(-1)
+    expect(shellAt).toBeGreaterThan(-1)
+    expect(shellAt).toBeGreaterThan(vendorAt)
   })
 
   // Guards the stripper itself. If stripComments ever ate a declaration, the two

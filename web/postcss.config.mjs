@@ -10,7 +10,13 @@
 // computed from node APIs, and web/vite.config.ts deliberately carries no
 // @types/node (see its header). One re-export is cheaper than that dependency.
 //
-// 🔴 Deleting this file does not produce an error. It produces a build with
-// tailwind never running. scripts/check-tailwind-emitted.sh is what goes red on
-// that, and it runs in CI after the web build.
+// 🔴 Deleting this file does not produce an error. Measured: `pnpm build` then
+// exits 0 and emits a 17,044-byte stylesheet that still contains all 42 design
+// tokens — they are plain CSS in the vendored file — plus the literal `@tailwind`
+// directive, unexpanded, and ZERO utility rules.
+//
+// That combination is worth reading twice, because it is what makes this the
+// nastiest of the failure modes: everything a spot-check would look at is present.
+// scripts/check-tailwind-emitted.sh goes red on it, on the utility half rather
+// than the token half, and it runs in CI after the web build.
 export { default } from './src/ui/postcss.config.mjs'

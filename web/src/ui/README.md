@@ -49,11 +49,14 @@ solved. Read the file, not this table — a table is a summary and summaries rot
 
 ## Two things that are easy to get wrong here
 
-**A green `pnpm build` does not mean the CSS pipeline works.** Tailwind
-misconfigured emits a stylesheet with no utility rules, or one built on its own
-defaults with none of the vendored tokens, and exits 0 either way. The check that
-can tell those apart reads `web/dist`, not the source:
-`scripts/check-tailwind-emitted.sh`, wired into CI after the web build.
+**A green `pnpm build` does not mean the CSS pipeline works.** Measured on this
+tree: losing the PostCSS config leaves a stylesheet with all 42 design tokens
+still in it and **zero** utility rules, at exit 0; losing the stylesheet's entry
+point emits no CSS asset at all, at exit 0. Note what the first one implies — the
+tokens survive it, so checking tokens alone would report green. The check that
+can tell these apart reads `web/dist`, not the source:
+`scripts/check-tailwind-emitted.sh`, wired into CI after the web build and into
+`make ci` / `make check-tailwind`.
 
 **jsdom cannot answer the same question.** vitest runs no PostCSS, so
 `getComputedStyle` in a test takes the same value whether the toolchain is wired

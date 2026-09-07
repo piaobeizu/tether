@@ -73,18 +73,27 @@ try {
 }
 
 // ── the one thing changed about it: content globs are made absolute ──────────
-// Upstream ships `content: ["./index.html", "./src/**/*.{js,ts,jsx,tsx}"]`, and
-// tailwind resolves relative globs against process.cwd(). That happens to be
-// right when the build is started from web/ (`cd web && pnpm build`, which is
-// what CI does) and wrong from anywhere else — and wrong here does not mean an
-// error. A content glob that matches nothing produces a stylesheet with no
-// utility rules at all, exit 0, which is precisely the failure tether#194 exists
-// to make visible rather than to inherit.
+// Upstream ships `content: ["./index.html", "./src/**/*.{js,ts,jsx,tsx}"]`.
+// Tailwind 3's `content.relative` defaults to false, which means a relative glob
+// is resolved against the process cwd rather than against the config file that
+// declares it. Anchoring the globs to web/ from THIS file's location removes that
+// dependency: the set of scanned files is then a property of the repo layout, not
+// of where someone launched the build.
 //
-// Anchored to web/ from this file's own location, so the answer no longer depends
-// on the caller's cwd. Mapped over upstream's list rather than restated, so a glob
-// upstream adds or moves is picked up instead of being silently dropped — the
-// expectation is derived from the vendored value, not a second copy of it.
+// ⚠️ Scoped honestly: this is hardening, NOT a bug that was reproduced here. Every
+// build path in this repo runs from web/ (`cd web && pnpm build` in ci.yml, the
+// same in the Makefile), where the relative globs resolve correctly — and an
+// attempt to drive a build from the repo root to demonstrate otherwise never
+// reached vite at all (`ERR_PNPM_RECURSIVE_EXEC_NO_PACKAGE`; there is no package
+// there). So do not read this as "a build from elsewhere was measured emitting
+// nothing". What is measured is the shape of the failure if content ever does
+// match nothing: tailwind emits the base layer and no utility rules, and exits 0.
+// That is why scripts/check-tailwind-emitted.sh checks utilities and not only
+// tokens.
+//
+// Mapped over upstream's list rather than restated, so a glob upstream adds or
+// moves is picked up instead of being silently dropped — derived from the vendored
+// value, not a second copy of it.
 if (!Array.isArray(vendorConfig.content)) {
   throw new Error(
     'vendored tailwind config no longer declares `content` as an array; ' +

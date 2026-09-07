@@ -77,9 +77,10 @@ verify-vendor-upstream:
 #
 #   make build check-tailwind
 #
-# A green `pnpm build` does not imply any of this. Tailwind misconfigured emits a
-# stylesheet with no utility rules, or one on its own defaults with no vendored
-# tokens, and exits 0 either way.
+# A green `pnpm build` does not imply any of this. Measured: with the postcss
+# config gone, the build exits 0 and emits a stylesheet that still carries every
+# design token and not one utility rule; with the stylesheet's entry point gone it
+# exits 0 and emits no CSS asset at all.
 check-tailwind:
 	bash scripts/check-tailwind-emitted.sh
 

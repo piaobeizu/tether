@@ -40,8 +40,17 @@ export default defineConfig({
   test: {
     // tether#195. Vitest's default (`css: false`) replaces every CSS module with
     // an empty stub, and it does so BEFORE vite's `?raw` query is honoured —
-    // measured here: `import css from './shell.css?raw'` yields a string of
-    // length 0 with this key absent and 5,901 with it present.
+    // measured here: `import css from './shell.css?raw'` yields the EMPTY STRING
+    // with this key absent, and the file's real contents with it present.
+    //
+    // Deliberately not stated as a byte count. The first version of this comment
+    // said "length 0 … and 5,901 with it present", which stopped being true the
+    // next time anyone edited shell.css — a sentence that changes its own truth
+    // value on every edit to a file it merely mentions. The property is
+    // "empty vs. non-empty", and that is what the assertions rely on:
+    // mobileFirst.test.ts and breakpoint.test.ts each assert
+    // `css.length > 0` before applying any rule, precisely so the stubbed state
+    // is a failure and not a vacuous pass.
     //
     // That matters because two of this shell's constraints are properties of a
     // stylesheet and of nothing else: the root is sized in `100dvh` rather than

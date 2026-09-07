@@ -88,7 +88,7 @@ describe('WorkspacePane — the registry', () => {
   it('says so plainly when the daemon has no workspaces, rather than showing an empty tree', async () => {
     render(<WorkspacePane fetchFn={stubFetch({ '/api/v1/workspaces': () => json([]) })} storage={memStore()} />)
     await screen.findByText(/no workspaces are registered/i)
-    expect(screen.queryByRole('tree')).toBeNull()
+    expect(screen.queryByRole('list', { name: 'Files' })).toBeNull()
   })
 
   // AC-R9. The daemon's sentence, on the screen. Not "an error occurred", not the
@@ -144,7 +144,7 @@ describe('WorkspacePane — the file tree', () => {
         storage={memStore()}
       />,
     )
-    const tree = await screen.findByRole('tree', { name: 'Files' })
+    const tree = await screen.findByRole('list', { name: 'Files' })
     await waitFor(() => expect(within(tree).getByText('README.md')).toBeTruthy())
     expect(within(tree).getByText('src')).toBeTruthy()
   })
@@ -244,7 +244,7 @@ describe('WorkspacePane — the file tree', () => {
         )
       }
       render(<Parent />)
-      const tree = await screen.findByRole('tree', { name: 'Files' })
+      const tree = await screen.findByRole('list', { name: 'Files' })
       await waitFor(() => expect(within(tree).getByText('src')).toBeTruthy())
 
       const listings = () => calls.filter(u => u.includes('/files')).length
@@ -266,6 +266,59 @@ describe('WorkspacePane — the file tree', () => {
     }
   })
 
+  // 🔴 R10 aimed at the ACCESSIBILITY TREE rather than at a sentence, and it is
+  // the same standard `ea2093e` applied to the pane strip's `role="tablist"`.
+  //
+  // `role="tree"` / `role="group"` / `role="treeitem"` carry a keyboard contract:
+  // Up/Down between visible rows, Right/Left to expand and collapse, Home/End to
+  // the ends, and the whole widget as ONE tab stop with a roving tabindex. None of
+  // it is implemented — every row is a plain `<button>` in natural tab order — so
+  // announcing the roles told assistive technology the widget works a way it does
+  // not. `aria-expanded` made that MORE specific, not less.
+  //
+  // The assertion is the absence of the roles plus the presence of the honest
+  // pattern, so re-adding a role without the behaviour turns red here instead of
+  // shipping. It reads the whole document rather than a list of elements, because
+  // the point is that NO node claims it.
+  it('R10 in the accessibility tree: claims no role whose keyboard contract is unimplemented', async () => {
+    render(
+      <WorkspacePane
+        fetchFn={stubFetch({
+          '/api/v1/workspaces/w1/files': () =>
+            json([
+              { name: 'src', isDir: true, dirty: false },
+              { name: 'README.md', isDir: false, dirty: false },
+            ]),
+          ...listOK,
+        })}
+        storage={memStore()}
+      />,
+    )
+    const tree = await screen.findByRole('list', { name: 'Files' })
+    await waitFor(() => expect(within(tree).getByText('README.md')).toBeTruthy())
+
+    expect(document.querySelectorAll('[role="tree"]')).toHaveLength(0)
+    expect(document.querySelectorAll('[role="treeitem"]')).toHaveLength(0)
+    expect(document.querySelectorAll('[role="group"]')).toHaveLength(0)
+    // Nothing sets a tabindex either, which is the other half of the contract the
+    // roles would have promised. If this stops being true the roles may come back.
+    expect(document.querySelectorAll('[tabindex]')).toHaveLength(0)
+
+    // A file row is not a toggle and does not claim to be one. Asserted before
+    // the expansion below, so the query cannot become ambiguous.
+    expect(within(tree).getByText('README.md').hasAttribute('aria-expanded')).toBe(false)
+
+    // `aria-expanded` stays, on the element it is genuinely true of: the button
+    // that toggles the subtree. Read off the DOM in both states rather than
+    // asserted once, so a hard-coded attribute would not satisfy it. The element
+    // is captured before the click and re-read after, never re-queried — the
+    // expanded child level lists the same fixture names.
+    const dir = within(tree).getByRole('button', { name: 'src' })
+    expect(dir.getAttribute('aria-expanded')).toBe('false')
+    fireEvent.click(dir)
+    expect(dir.getAttribute('aria-expanded')).toBe('true')
+  })
+
   // R10 at the surface: with no hide policy supplied nothing is being withheld, so
   // there is no hide control and no "+N hidden" row. An inert one would claim
   // entries are hidden when none are.
@@ -280,7 +333,7 @@ describe('WorkspacePane — the file tree', () => {
         storage={memStore()}
       />,
     )
-    const tree = await screen.findByRole('tree', { name: 'Files' })
+    const tree = await screen.findByRole('list', { name: 'Files' })
     await waitFor(() => expect(within(tree).getByText('node_modules')).toBeTruthy())
     expect(within(tree).queryByText(/hidden$/)).toBeNull()
     expect(within(tree).queryByRole('button', { name: /^Hide / })).toBeNull()

@@ -38,10 +38,34 @@
 // supplied the tree shows every entry and renders no hide control at all: a
 // button that cannot change what is shown is a control claiming a capability, and
 // an inert "+N hidden" row is worse — it claims entries are being withheld. R10.
+//
+// ── a labelled list, NOT `role="tree"` ──────────────────────────────────────
+//
+// 🔴 The first version of this file announced `role="tree"`, `role="group"` and
+// `role="treeitem"`. All three were removed, for the same reason `ea2093e`
+// removed `role="tablist"` from the pane strip: those roles carry a keyboard
+// contract — Up/Down move between visible rows, Right/Left expand and collapse,
+// Home/End jump to the ends, and the whole tree is ONE tab stop with a roving
+// tabindex — and none of it is implemented here. Every row is a plain `<button>`
+// in natural tab order. `aria-expanded` made the announcement MORE specific, not
+// less, because it named a widget that answers to arrow keys.
+//
+//     grep -nE 'onKeyDown|onKeyUp|tabIndex|roving' web/src/shell/WorkspacePane.tsx
+//
+// returns nothing, which is the check: the day someone implements the contract,
+// that command stops being empty and the roles become true. Until then a
+// `<ul>`/`<li>` with an accessible name is a complete and honest pattern, and
+// `aria-expanded` sits on the element it is actually true of — the button that
+// toggles the subtree. WorkspacePane.test.tsx pins the absence of the roles, so
+// re-adding them without the behaviour turns red rather than shipping.
+//
+// This is R10 applied to the accessibility tree instead of to a sentence, and it
+// is the standard the rest of this branch is held to.
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { createFileTreeCache, type FileEntry, type FileTreeCache } from '../lib/fileTreeCache'
 import { httpErrorMessage } from '../lib/httpError'
+import { Button } from '../ui/primitives'
 import {
   resolveSelection,
   SELECTED_WORKSPACE_KEY,
@@ -229,9 +253,13 @@ function FileTree({ workspaceId, fetchFn, hide }: FileTreeProps) {
   )
 
   return (
-    <div className="sh-tree" role="tree" aria-label="Files">
+    // The accessible name goes on the root `<ul>` rather than on this wrapper: a
+    // bare `<div>` with an `aria-label` and no role exposes nothing, so the name
+    // would be unreachable. `.sh-tree` is the styling container and nothing else.
+    <div className="sh-tree">
       <Directory
         dir=""
+        label="Files"
         cache={cache}
         hide={hide}
         patterns={patterns}
@@ -249,9 +277,11 @@ interface DirectoryProps {
   readonly patterns: readonly string[]
   readonly onPatterns: (next: readonly string[]) => void
   readonly depth: number
+  /** Accessible name for this level's list. Only the root level has one. */
+  readonly label?: string
 }
 
-function Directory({ dir, cache, hide, patterns, onPatterns, depth }: DirectoryProps) {
+function Directory({ dir, cache, hide, patterns, onPatterns, depth, label }: DirectoryProps) {
   const [entries, setEntries] = useState<FileEntry[] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [open, setOpen] = useState<readonly string[]>([])
@@ -291,18 +321,24 @@ function Directory({ dir, cache, hide, patterns, onPatterns, depth }: DirectoryP
   const siblings = entries.map(e => e.name)
 
   return (
-    <ul className="sh-tree-level" role="group" data-dir={dir} data-depth={depth}>
+    <ul className="sh-tree-level" aria-label={label} data-dir={dir} data-depth={depth}>
       {shown.map(entry => {
         const path = dir === '' ? entry.name : `${dir}/${entry.name}`
         const expanded = open.includes(path)
         const hidingBy = hide ? hide.hidingPattern(entry.name, patterns) : ''
         return (
-          <li key={path} className="sh-tree-row" role="treeitem" aria-expanded={entry.isDir ? expanded : undefined}>
+          <li key={path} className="sh-tree-row" data-dirty={String(entry.dirty)}>
             <span className="sh-tree-line">
               {entry.isDir ? (
                 <button
                   type="button"
                   className="sh-tree-name"
+                  data-kind="dir"
+                  // On the BUTTON, not on the row: `aria-expanded` is true of the
+                  // control that toggles the subtree. On an `<li>` it was part of
+                  // a `role="treeitem"` announcement whose keyboard contract does
+                  // not exist here — see this file's header.
+                  aria-expanded={expanded}
                   onClick={() =>
                     setOpen(prev =>
                       prev.includes(path) ? prev.filter(p => p !== path) : [...prev, path],
@@ -312,7 +348,9 @@ function Directory({ dir, cache, hide, patterns, onPatterns, depth }: DirectoryP
                   {entry.name}
                 </button>
               ) : (
-                <span className="sh-tree-name">{entry.name}</span>
+                <span className="sh-tree-name" data-kind="file">
+                  {entry.name}
+                </span>
               )}
               {hide && (
                 // WS-12/WS-13/WS-14 all live in this one button, because the
@@ -320,8 +358,16 @@ function Directory({ dir, cache, hide, patterns, onPatterns, depth }: DirectoryP
                 // on: on a shown row it hides (with whatever glob covers the most
                 // siblings), on a revealed hidden row it drops the glob that is
                 // hiding it — not the name, which a glob would not match.
-                <button
+                //
+                // The vendored `Button` primitive rather than a bare `<button>`:
+                // this is a real control and web/src/ui/primitives.ts is the seam
+                // that exists so tether's controls look like one system. The
+                // structural rules (where it sits, how it reveals on hover) are
+                // shell.css's; the control's own appearance is the primitive's.
+                <Button
                   type="button"
+                  variant="ghost"
+                  size="icon"
                   className="sh-tree-hide"
                   aria-label={
                     hidingBy === ''
@@ -338,7 +384,7 @@ function Directory({ dir, cache, hide, patterns, onPatterns, depth }: DirectoryP
                   }
                 >
                   {hidingBy === '' ? '×' : '+'}
-                </button>
+                </Button>
               )}
             </span>
             {entry.isDir && expanded && (
@@ -359,9 +405,15 @@ function Directory({ dir, cache, hide, patterns, onPatterns, depth }: DirectoryP
           is actually hidden, so it is never a claim about nothing. */}
       {!revealed && split.hidden.length > 0 && (
         <li className="sh-tree-hidden-row">
-          <button type="button" onClick={() => setRevealed(true)}>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="sh-tree-reveal"
+            onClick={() => setRevealed(true)}
+          >
             {`+${split.hidden.length} hidden`}
-          </button>
+          </Button>
         </li>
       )}
     </ul>

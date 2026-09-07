@@ -17,11 +17,24 @@
 //   `tailwindcss/resolveConfig`, the vendored config and its `createRequire`
 //   shim into the browser bundle, to learn one integer that is fixed at build
 //   time.
-//   Why it cannot drift: breakpoint.test.ts resolves the config tether actually
-//   builds with (web/src/ui/tailwind.config.mjs — the same file postcss loads)
-//   and asserts this constant equals its `theme.screens.lg`. The config is the
-//   authority; this is the value checked against it. If the config ever declares
-//   its own `theme.screens`, the test moves and this constant has to follow.
+//   Why it cannot drift: breakpoint.test.ts pins it in TWO steps whose
+//   conjunction is the guarantee. There is no `resolveConfig` call anywhere —
+//   this description used to say the test "resolves the config tether actually
+//   builds with … the config is the authority", and it does neither, which sent
+//   a reader hunting for a call that is not there.
+//     · step 1 (`equals Tailwind's lg`) compares this constant against
+//       `tailwindcss/defaultTheme`'s `screens.lg`, so a Tailwind upgrade that
+//       moved `lg` reddens instead of leaving the shell branching at a width its
+//       own stylesheet no longer uses.
+//     · step 2 (`is not overridden by either Tailwind config`) reads both configs
+//       as `?raw` TEXT — the vendored one and web/src/ui/tailwind.config.mjs, the
+//       file postcss actually loads — and asserts neither declares
+//       `theme.screens`. That is what makes step 1's default the EFFECTIVE value
+//       rather than merely a default.
+//   So the authority is `defaultTheme`, conditional on the configs staying quiet
+//   about `screens`. If either ever declares `theme.screens`, step 2 fails and
+//   this constant has to be derived from the resolved config instead.
+//   Check: `cd web && pnpm vitest run src/shell/breakpoint.test.ts`
 //
 // Stated in px rather than as a Tailwind class because the shell branches on it
 // in JavaScript — which panes are MOUNTED differs between the two forms

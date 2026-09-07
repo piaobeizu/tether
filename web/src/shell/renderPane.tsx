@@ -8,9 +8,17 @@
 // 🔴 Everything except `workspace` is a labelled placeholder, and the placeholders
 // are honest about it — see PanePlaceholder.tsx. `workspace` is real because owner
 // ruling ③ requires the file tree and its hide control: hiding is read-only, and
-// without it the tree is unusable on the workspace acceptance is judged against
-// (41 `pf.*` directories at its root), which would leave phase 1 with no feedback
-// loop at all.
+// without it the tree is unusable on the workspace acceptance is judged against —
+// one whose root listing is DOMINATED BY GENERATED SIBLINGS, a `pf.<project>-<seq>`
+// task worktree per work item plus `node_modules`, so the hand-written directories
+// are a minority of it. That leaves phase 1 with no feedback loop at all.
+//
+//     ls -d /root/code/aicoding/gmi-ws/pf.*
+//
+// Stated as a property rather than as a number on purpose: the first version of
+// this comment said "41 `pf.*` directories at its root", which was already false
+// by the time it was reviewed — a claim whose truth value changes every time
+// somebody claims a work item, in a file that has nothing to do with that.
 
 import type { ReactNode } from 'react'
 import { PanePlaceholder } from './PanePlaceholder'

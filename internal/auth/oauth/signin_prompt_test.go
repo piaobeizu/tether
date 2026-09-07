@@ -306,12 +306,11 @@ func loadSignInCorpus(t *testing.T) []signInCorpusEntry {
 //
 // The consumer of these strings is safeRedirectTarget() in
 // web/src/lib/safeRedirectTarget.ts, which is JS and cannot call this handler.
-// The alternative — a list of literals
-// hand-copied into each language — is how two sides end up holding different
-// subsets while both look complete, so the file is the single copy: this test
-// asserts the handler still produces it, and
-// web/src/lib/oauthSignInRedirect.test.ts
-// asserts the real consumer still accepts it. Change the producer and this goes
+// The alternative — a list of literals hand-copied into each language — is how
+// two sides end up holding different subsets while both look complete, so the
+// file is the single copy: this test asserts the handler still produces it, and
+// web/src/lib/oauthSignInRedirect.test.ts asserts the real consumer still
+// accepts it. Change the producer and this goes
 // red until the file is updated, at which point the JS side re-validates the new
 // strings.
 func TestSignInRedirectCorpus_MatchesHandlerOutput(t *testing.T) {

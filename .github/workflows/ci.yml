@@ -343,13 +343,19 @@ jobs:
         run: cd web && pnpm build
 
       # ── CSS pipeline gate (tether#194) ──────────────────────────────────────
-      # "Build web" going green says nothing about whether Tailwind ran. Every way
-      # of misconfiguring it is silent and exits 0: no postcss config found,
-      # tailwind running on its built-in defaults instead of the vendored config,
-      # content globs resolving against the wrong cwd and matching nothing, or the
-      # vendored stylesheet having no entry point reaching it. In each case vite
-      # emits a bundle, the step above passes, and the shipped UI has no design
-      # tokens — so the only place the difference is observable is web/dist.
+      # "Build web" going green says nothing about whether Tailwind ran, and three
+      # of the four ways of misconfiguring it exit 0 with no complaint. Measured:
+      # losing the postcss config leaves a stylesheet with every design token still
+      # in it and ZERO utility rules; losing the stylesheet's entry point emits no
+      # CSS asset at all; content globs that match nothing emit the base layer and
+      # nothing else. (The fourth — handing tailwind no config object — does fail
+      # here, but only because the vendored CSS @applies a themed class, which is
+      # luck rather than a guarantee.)
+      #
+      # In the silent cases vite emits a bundle, the step above passes, and the
+      # shipped UI has no styling — so the only place the difference is observable
+      # is web/dist. Note the first case in particular: the tokens survive it, so a
+      # check that looked only at tokens would pass on it.
       #
       # Hence a step that reads the artifact, positioned immediately after the
       # build that produces it and before "Stamp SPA bundle" (which only needs to

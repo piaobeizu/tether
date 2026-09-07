@@ -19,7 +19,7 @@ declare const process: { env: Record<string, string | undefined> }
 // the reason for the indirection is in the stub's own comment.
 //
 // The obvious alternative — an inline `css: { postcss: { plugins: [...] } }` here,
-// importing src/ui/tailwind.config.mjs — does not work and does not fail loudly.
+// importing src/ui/tailwind.config.mjs — does not work.
 // Vite bundles THIS file with esbuild into a temp file written beside it
 // (vite.config.ts.timestamp-*.mjs), inlining relative imports. The tailwind wrap
 // resolves the vendored config against its own `import.meta.url`, which would then

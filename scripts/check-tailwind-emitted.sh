@@ -2,17 +2,29 @@
 # check-tailwind-emitted.sh — assert the CSS pipeline actually ran, on the artifact.
 #
 # Why this exists (tether#194). `pnpm build` going green proves nothing about
-# Tailwind. Every way of getting the wiring wrong is silent:
+# Tailwind, because the ways of getting this wiring wrong do not agree on whether
+# they are loud. Measured on this tree, all four:
 #
-#   - no postcss config found        -> tailwind never runs
-#   - tailwind runs with NO config   -> its built-in defaults; no vendored tokens
-#   - content globs match nothing    -> base layer emitted, zero utility rules
-#   - the vendored index.css has no  -> no @tailwind directives reached postcss,
-#     entry point reaching it           so no CSS asset at all
+#   no postcss config found      SILENT. exit 0, a 17,044-byte stylesheet, all 42
+#                                design tokens present (they are plain CSS in the
+#                                vendored file), the literal `@tailwind` directive
+#                                left sitting in the output, and ZERO utility
+#                                rules. Nothing anywhere goes red.
+#   no entry point reaches the   SILENT. exit 0 and no CSS asset emitted at all
+#   vendored stylesheet          (31,286 bytes -> 0).
+#   content globs match nothing  SILENT by construction: the base layer is emitted
+#                                and no utility rule is, at exit 0.
+#   tailwind gets no config      LOUD, here. The build fails on
+#   object                       `The 'border-border' class does not exist` at
+#                                src/vendor/cloudcli/src/index.css:14:1, because
+#                                that stylesheet @applies a themed class. That is a
+#                                property of the vendored CSS, not a guarantee — a
+#                                stylesheet without such an @apply would take the
+#                                same wrong turn quietly.
 #
-# Not one of those is an error. PostCSS with a misconfigured Tailwind emits a
-# stylesheet, exits 0, and the build succeeds — so the only place the difference
-# is visible is web/dist. Hence a check that reads the artifact.
+# Three of the four are invisible to every source-level check, and the first one
+# shows why tokens alone are not enough: they survive it intact. So the check has
+# to read web/dist, and it has to look at utilities as well as tokens.
 #
 # ── how the expectations are derived, and why that matters ───────────────────
 # The tempting shape is a list of class names and token names written down here.

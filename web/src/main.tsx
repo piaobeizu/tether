@@ -1,4 +1,5 @@
 import { createRoot } from 'react-dom/client'
+import AuthPage from './AuthPage'
 
 // Phase-1 scaffold (tether#174). The old SPA — 82 files under web/src plus five
 // specs under web/test — was deleted on this branch; tether#173 decision 3 keeps
@@ -23,8 +24,13 @@ import { createRoot } from 'react-dom/client'
 // what makes `pnpm build` prove the JSX transform and @vitejs/plugin-react are
 // actually wired — a plain-DOM placeholder would build green with the react plugin
 // misconfigured.
+//
+// tether#186 carves out an exception for requests landing on `/auth`: they
+// render the restored login page instead of this placeholder, matching the
+// pathname check the deleted old main.tsx used, and what
+// internal/server/static.go still serves index.html for.
 const root = document.getElementById('root')
 if (!root) {
   throw new Error('#root missing from index.html')
 }
-createRoot(root).render(<p>tether</p>)
+createRoot(root).render(window.location.pathname === '/auth' ? <AuthPage /> : <p>tether</p>)

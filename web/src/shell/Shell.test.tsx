@@ -7,7 +7,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
-import { Shell, type ColumnLayout } from './Shell'
+import { RESIZE_STEP, Shell, type ColumnLayout } from './Shell'
 import { PanePlaceholder } from './PanePlaceholder'
 import { PANE_LABEL, panesInColumn, type PaneId } from './panes'
 import { STORAGE_KEY_FOCUS, STORAGE_KEY_PANE, type SelectionStore } from './selection'
@@ -166,6 +166,62 @@ describe('Shell — wide form', () => {
     expect(crumb()).toBe(PANE_LABEL[showing(focused())!.getAttribute('data-pane') as PaneId])
   })
 
+  // 🔴 LAY-16's WRITE half, which nothing pinned. selection.test.ts pins
+  // `saveSelection` as a pure function, and the restore cases below hand the
+  // component a PRE-SEEDED store — so "the shell never persists anything" was a
+  // GREEN state. Measured: deleting `saveSelection(selectionStore, next)` from
+  // Shell.tsx left the whole suite at 25 files / 247 passed. The wiring hop across
+  // that seam was untested from both sides at once.
+  //
+  // So the assertion crosses the seam: it writes through the component and reads
+  // back through a SECOND mount of the component over the same store, with nothing
+  // seeded by the test. That is the reload, not a stand-in for one, and it does
+  // not name a storage key — a rename would still be caught.
+  //
+  // Check: delete `saveSelection(selectionStore, next)` from Shell.tsx and this
+  // case fails.
+  it('LAY-16: the shell PERSISTS what it commits, so a remount restores it', () => {
+    const s = store()
+    render(<Shell wide={wide()} store={s} renderPane={placeholders} />)
+    fireEvent.click(activityBtn(PANE_LABEL.work))
+    fireEvent.click(tabBtn(PANE_LABEL.shell))
+    cleanup()
+
+    render(<Shell wide={wide()} store={s} renderPane={placeholders} />)
+    expect(showing('middle')?.getAttribute('data-pane')).toBe('work')
+    expect(showing('right')?.getAttribute('data-pane')).toBe('shell')
+    // The focused column is persisted too, and it is what the narrow form reads.
+    expect(document.querySelector('[data-focus]')!.getAttribute('data-focus')).toBe('right')
+  })
+
+  // W3. WHICH element carries `data-wide` is load-bearing, not cosmetic. The rule
+  // it drives is `[data-wide='true'] { .sh-nav-toggle { display: none } }`, which
+  // compiles to the DESCENDANT selector `[data-wide=true] .sh-nav-toggle` — and
+  // `.sh-nav-toggle` lives in `.sh-header`, a SIBLING of `.sh-body`. On `.sh-body`
+  // the rule matches nothing and the drawer's entry point stays visible in the
+  // wide form. shell.css's header said `.sh-body`, and breakpoint.test.ts matches
+  // the attribute SELECTOR only, so nothing reddened either way: measured, moving
+  // the attribute to `.sh-body` left the suite at 25 files / 247 passed.
+  //
+  // Check: move `data-wide` from `.sh-root` to `.sh-body` in Shell.tsx and this
+  // case fails.
+  it('publishes data-wide on .sh-root, the ancestor of every element the wide rules select', () => {
+    const { container } = render(<Shell wide={wide()} store={store()} renderPane={placeholders} />)
+    expect([...container.querySelectorAll('[data-wide]')].map(e => e.className)).toEqual([
+      'sh-root',
+    ])
+
+    // …and the containment fact that makes that the only workable choice.
+    const root = container.querySelector('.sh-root')!
+    const header = container.querySelector('.sh-header')!
+    const body = container.querySelector('.sh-body')!
+    const toggle = container.querySelector('.sh-nav-toggle')!
+    expect(header.parentElement).toBe(root)
+    expect(body.parentElement).toBe(root)
+    expect(header.contains(toggle)).toBe(true)
+    expect(body.contains(toggle), '.sh-body cannot select the drawer toggle').toBe(false)
+  })
+
   it('LAY-19: the right tab strip is exactly the right column, and has no Work tab', () => {
     render(<Shell wide={wide()} store={store()} renderPane={placeholders} />)
     const rendered = tabBtns().map(t => t.textContent)
@@ -237,6 +293,41 @@ describe('Shell — wide form', () => {
     fireEvent.pointerMove(left, { clientX: 137, pointerId: 1 })
     expect(resize).toHaveBeenCalledWith('left', 37)
   })
+
+  // 🔴 `role="separator"` has two forms in ARIA and they are distinguished by
+  // exactly one thing: focusability. A non-focusable separator is structural and
+  // promises no keys; a focusable one is a WIDGET and promises that the arrow keys
+  // move it. The divider was `role="separator"` + `aria-orientation="vertical"`
+  // with pointer-only handling and no `tabIndex`, so resizing was a capability
+  // only pointer users had.
+  //
+  // The contract is implemented rather than the announcement narrowed, because the
+  // delta an arrow key produces is the same delta the drag path produces — one
+  // resize path, not two — and because clamping still belongs to
+  // web/src/lib/layout.ts. That is what the last assertion is about: this file
+  // hands over a raw step and does not decide whether it is allowed.
+  it('lets the keyboard move a divider, which is what a focusable separator promises', () => {
+    const resize = vi.fn()
+    const columns: ColumnLayout = { width: () => 240, resize }
+    render(<Shell wide={wide()} store={store()} columns={columns} renderPane={placeholders} />)
+    const left = screen.getAllByRole('separator')[0]!
+    expect(left.tabIndex, 'a separator that is not a tab stop is unreachable').toBe(0)
+
+    fireEvent.keyDown(left, { key: 'ArrowRight' })
+    fireEvent.keyDown(left, { key: 'ArrowLeft' })
+    expect(resize.mock.calls).toEqual([
+      ['left', RESIZE_STEP],
+      ['left', -RESIZE_STEP],
+    ])
+
+    // Every other key falls through: a separator that swallowed Tab would trap the
+    // keyboard on a divider, which is worse than not being reachable.
+    resize.mockClear()
+    for (const key of ['Tab', 'Enter', ' ', 'ArrowUp', 'Home']) {
+      fireEvent.keyDown(left, { key })
+    }
+    expect(resize).not.toHaveBeenCalled()
+  })
 })
 
 describe('Shell — narrow form', () => {
@@ -285,6 +376,95 @@ describe('Shell — narrow form', () => {
     expect(screen.queryByRole('dialog')).toBeNull()
     expect(document.querySelector('[data-showing="true"]')?.getAttribute('data-pane')).toBe(
       'workspace',
+    )
+  })
+
+  // LAY-16's write half again, on the phone path — the same `commit` as the wide
+  // case, reached through the drawer instead of the activity bar. Nothing is
+  // seeded; the first mount is what fills the store.
+  it('LAY-16: a drawer selection survives a remount', () => {
+    const s = store()
+    render(<Shell wide={widthSub(false).sub} store={s} renderPane={placeholders} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Panes' }))
+    fireEvent.click(
+      within(screen.getByRole('dialog', { name: 'Panes' })).getByRole('button', {
+        name: PANE_LABEL.work,
+      }),
+    )
+    cleanup()
+
+    render(<Shell wide={widthSub(false).sub} store={s} renderPane={placeholders} />)
+    expect(document.querySelector('[data-showing="true"]')?.getAttribute('data-pane')).toBe('work')
+  })
+
+  // 🔴 The shell's half of NavDrawer's `aria-modal="true"` — see that file's
+  // header for why the attribute is a contract and not decoration. The drawer owns
+  // the keyboard trap and the backdrop; the elements that have to leave the
+  // accessibility tree are the SHELL's, so only the shell can inert them.
+  //
+  // ⚠️ jsdom implements the attribute, not the behaviour: it neither blocks focus
+  // nor prunes the a11y tree, so this asserts that the attribute tracks the
+  // drawer's state and no more. The behaviour is the browser's.
+  it('inerts its own chrome while the drawer is open, and only while it is open', () => {
+    const { container } = render(
+      <Shell wide={widthSub(false).sub} store={store()} renderPane={placeholders} />,
+    )
+    const inerted = () =>
+      [...container.querySelectorAll('[inert]')].map(e => e.className).sort()
+
+    expect(inerted()).toEqual([])
+    fireEvent.click(screen.getByRole('button', { name: 'Panes' }))
+    expect(inerted()).toEqual(['sh-body', 'sh-header'])
+    // …and the drawer itself is NOT inside anything inert, or it would be
+    // unreachable too.
+    const dialog = screen.getByRole('dialog', { name: 'Panes' })
+    expect(container.querySelector('.sh-body')!.contains(dialog)).toBe(false)
+    expect(container.querySelector('.sh-header')!.contains(dialog)).toBe(false)
+
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(inerted()).toEqual([])
+  })
+
+  // 🔴 KNOWN LIMITATION, asserted rather than left to a comment nobody reads: in
+  // the narrow form LAY-14 holds only WITHIN a column. See Shell.tsx's note beside
+  // the narrow `ColumnView`. This case is here so the boundary is a recorded fact
+  // and a later "LAY-14 holds everywhere" claim has to argue with a test.
+  it('LAY-14 is column-scoped in the narrow form: a cross-column switch remounts', () => {
+    render(<Shell wide={widthSub(false).sub} store={store()} renderPane={placeholders} />)
+    const paneNode = () => document.querySelector('[data-showing="true"]')
+    const chatFirst = paneNode()
+    expect(chatFirst?.getAttribute('data-pane')).toBe('chat')
+
+    // Same column (chat and skill are both `panesInColumn('right')`): the pane
+    // element survives, which is LAY-14 doing its job.
+    fireEvent.click(screen.getByRole('button', { name: 'Panes' }))
+    fireEvent.click(
+      within(screen.getByRole('dialog', { name: 'Panes' })).getByRole('button', {
+        name: PANE_LABEL.skill,
+      }),
+    )
+    expect(mounted('chat')).toBe(chatFirst)
+
+    // Across columns: the whole ColumnView is replaced, so the right column's
+    // panes leave the DOM and come back as new nodes on the way home.
+    fireEvent.click(screen.getByRole('button', { name: 'Panes' }))
+    fireEvent.click(
+      within(screen.getByRole('dialog', { name: 'Panes' })).getByRole('button', {
+        name: PANE_LABEL.canvas,
+      }),
+    )
+    expect(mounted('chat'), 'the narrow form renders one column, so chat unmounted').toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Panes' }))
+    fireEvent.click(
+      within(screen.getByRole('dialog', { name: 'Panes' })).getByRole('button', {
+        name: PANE_LABEL.chat,
+      }),
+    )
+    expect(mounted('chat')).not.toBeNull()
+    expect(mounted('chat'), 'and came back as a NEW node — scroll and local state are gone').not.toBe(
+      chatFirst,
     )
   })
 })

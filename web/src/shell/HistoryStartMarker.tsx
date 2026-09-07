@@ -32,7 +32,9 @@
 //
 //   more     no sentence at all — the affordance to load is the message, and a
 //            label saying "there is more" beside a button that loads more is one
-//            more thing to keep true.
+//            more thing to keep true. 🔴 With no `onLoadEarlier` there is no
+//            affordance either, and then this component renders NOTHING — see
+//            below.
 //   start    a plain statement of the end of the record.
 //   startOf  names WHOSE beginning this is, because another store also has
 //            records for this session and "the beginning" would be false of the
@@ -61,6 +63,28 @@ export interface HistoryStartMarkerProps {
 
 export function HistoryStartMarker({ state, onLoadEarlier }: HistoryStartMarkerProps) {
   if (state.kind === 'none') return null
+
+  // 🔴 The same standard Shell.tsx's `Resizer` holds itself to (`if (!columns)
+  // return null`), and it was NOT held here at first: the 'more' case rendered a
+  // "Load earlier messages" button with `onClick={undefined}` whenever no handler
+  // was passed, and the test pinned that the button EXISTED with no handler. A
+  // control on screen is a claim that the capability is there — the one sentence
+  // this file's header spends forty lines on — and a button that does nothing
+  // when pressed is the loudest form of it. Same PR, same argument, opposite
+  // standard, on the ruling ④ / R10 axis the whole component exists for.
+  //
+  // Silence rather than a substitute sentence, deliberately. The alternative
+  // considered was a note like "there is earlier history, but it cannot be
+  // loaded here", and it was rejected: `more` is not a state a mounted consumer
+  // can be IN without a handler — the handler and the page request are the same
+  // wiring — so the sentence would describe a misconfiguration to the reader
+  // instead of to the developer. Rendering nothing claims nothing, which is
+  // what 'none' already does and is R10's floor.
+  //
+  // Check: restore `onClick={onLoadEarlier}` without the guard and
+  // HistoryStartMarker.test.tsx's "renders no control when it has no way to load"
+  // case fails.
+  if (state.kind === 'more' && onLoadEarlier === undefined) return null
 
   return (
     <div className="sh-history-start" data-history-start={state.kind}>

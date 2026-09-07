@@ -6,8 +6,8 @@
 // is the exact gap docs/tether-ui-invariants.md §2 R9 records as "the acceptance
 // must walk to the eyes".
 
-import { afterEach, describe, expect, it } from 'vitest'
-import { cleanup, render, screen } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { HistoryStartMarker } from './HistoryStartMarker'
 
 afterEach(cleanup)
@@ -19,8 +19,33 @@ describe('HistoryStartMarker', () => {
   })
 
   it('SCROLL-1: offers a way to load an earlier page, and claims nothing else', () => {
-    render(<HistoryStartMarker state={{ kind: 'more' }} />)
-    expect(screen.getByRole('button', { name: /load earlier/i })).toBeTruthy()
+    const onLoadEarlier = vi.fn()
+    render(<HistoryStartMarker state={{ kind: 'more' }} onLoadEarlier={onLoadEarlier} />)
+    const button = screen.getByRole('button', { name: /load earlier/i })
+    expect(document.body.textContent ?? '').not.toMatch(/no more history|beginning|cannot tell/i)
+    // The control ACTS. Its existence is not the assertion — that is what the
+    // previous version of this file pinned, and it pinned it with no handler
+    // passed at all.
+    fireEvent.click(button)
+    expect(onLoadEarlier).toHaveBeenCalledTimes(1)
+  })
+
+  // 🔴 R10, and the same standard Shell.tsx's `Resizer` already holds itself to
+  // (`if (!columns) return null`, mutation-proven). Before this case, the 'more'
+  // state rendered "Load earlier messages" with `onClick={undefined}` and the test
+  // above PINNED that the button existed with no handler — a control on screen
+  // that cannot act, in the one component whose entire subject is not making
+  // claims the code cannot support.
+  //
+  // Check: drop the `state.kind === 'more' && onLoadEarlier === undefined` guard
+  // from HistoryStartMarker.tsx and this case fails.
+  it('R10: renders no control at all when it has no way to load a page', () => {
+    const { container } = render(<HistoryStartMarker state={{ kind: 'more' }} />)
+    expect(screen.queryByRole('button')).toBeNull()
+    // Nothing at all, not an empty container: an empty `.sh-history-start` still
+    // occupies a grid cell and still says `data-history-start="more"` to anyone
+    // reading the DOM.
+    expect(container.innerHTML).toBe('')
   })
 
   it('SCROLL-1: says plainly that there is no more history at the beginning', () => {

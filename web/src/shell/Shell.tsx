@@ -159,7 +159,17 @@ export function Shell({ renderPane, store, wide, columns }: ShellProps) {
     // the stylesheet has; the breakpoint behind it is LG_MIN_WIDTH and lives
     // nowhere else.
     <div className="sh-root" data-wide={String(isWide)}>
-      <header className="sh-header">
+      {/* `inert` while the drawer is open, which is the third channel
+          NavDrawer's `aria-modal="true"` presupposes — see that file's header.
+          The keyboard channel is the drawer's own focus trap and the pointer
+          channel is its full-viewport backdrop; this is the one that has to be
+          done from OUT HERE, because the elements being taken out of the
+          accessibility tree are the shell's, not the drawer's.
+
+          ⚠️ jsdom does not implement what `inert` DOES (it neither blocks focus
+          nor prunes the a11y tree there), so Shell.test.tsx can only assert that
+          the attribute tracks `drawerOpen`. The behaviour is the browser's. */}
+      <header className="sh-header" inert={drawerOpen}>
         <button
           type="button"
           className="sh-nav-toggle"
@@ -185,6 +195,7 @@ export function Shell({ renderPane, store, wide, columns }: ShellProps) {
           active panes and a single `mv-` class can only describe one of them. */}
       <div
         className="sh-body"
+        inert={drawerOpen}
         data-focus={selection.focus}
         data-active-left={selection.active.left}
         data-active-middle={selection.active.middle}
@@ -239,6 +250,27 @@ export function Shell({ renderPane, store, wide, columns }: ShellProps) {
             />
           </>
         ) : (
+          // 🔴 KNOWN LIMITATION, and it bites hardest on the form this phase is
+          // primarily for. LAY-14 ("a visited pane stays mounted, hidden") holds
+          // only WITHIN a column: the narrow form renders exactly one
+          // `ColumnView`, for `selection.focus`, so a switch that changes the
+          // focused column — Chat (right) → Canvas (middle) → Chat — unmounts and
+          // remounts the pane and loses the scroll position and local state that
+          // LAY-14 exists to preserve. Inside a column it holds: Chat → Skills →
+          // Chat keeps both mounted, because both are `panesInColumn('right')`.
+          //
+          // Not claimed for the narrow form anywhere — LAY-14's test is wide-form
+          // and mutation-proven, and the invariant was extracted from a
+          // desktop-only suite (docs/tether-ui-invariants.md §3.10) — but silence
+          // is how a reader concludes it holds everywhere. It is written here
+          // rather than fixed because the fix is a design decision this wi does
+          // not own: keeping all three columns mounted on a phone means every
+          // visited pane's subscriptions and DOM stay live behind the one on
+          // screen, and Chat is a 3,241-line transcript pane. Whoever rewrites
+          // Chat measures that and decides.
+          //
+          // Reproduce: switch Chat → Canvas → Chat in the narrow form and the
+          // Chat pane's `.sh-pane` element is a new node.
           <ColumnView
             column={selection.focus}
             selection={selection}
@@ -329,12 +361,36 @@ function ColumnView({
 }
 
 /**
+ * Pixels one arrow-key press moves a divider.
+ *
+ * A step size, deliberately NOT a bound: `web/src/lib/layout.ts` owns MIN_MID and
+ * the clamping, and this file passes it a delta exactly as the drag path does.
+ * Restating any of layout.ts's arithmetic here is the bug tether#102 made
+ * unexpressible, and `ACTIVITY_W` being unexported is what keeps it that way.
+ */
+export const RESIZE_STEP = 16
+
+/**
  * A divider, rendered only when something can act on the drag.
  *
  * With no `columns` there is no rule to clamp against — MIN_MID and the bounds
  * live in `web/src/lib/layout.ts`, which is on `main` and NOT on this branch yet
  * (tether#196) — so the divider is omitted rather than rendered inert. R10: a
  * control on screen is a claim that the capability is there.
+ *
+ * 🔴 `role="separator"` has two forms and this is the WIDGET one, because the
+ * element is focusable. ARIA splits them exactly on that: a non-focusable
+ * separator is structural and carries no keyboard contract, a focusable one is a
+ * widget and its contract is that the arrow keys move it. The first version of
+ * this component had `role="separator"` plus `aria-orientation="vertical"`, no
+ * `tabIndex` and pointer-only handling — so the ROLE was defensible as structural,
+ * but the divider was unreachable without a mouse and resizing was a capability
+ * only pointer users had.
+ *
+ * Rather than narrow the announcement (the tack `ea2093e` took with the pane
+ * strip, where a keyboard contract was genuinely not wanted at that size), the
+ * contract is implemented: the delta the drag path computes is the same delta an
+ * arrow key produces, so there is one resize path and not two.
  */
 function Resizer({ column, columns }: { column: 'left' | 'right'; columns?: ColumnLayout }) {
   const dragging = useRef(false)
@@ -349,6 +405,15 @@ function Resizer({ column, columns }: { column: 'left' | 'right'; columns?: Colu
       aria-orientation="vertical"
       aria-label={`Resize ${column} column`}
       data-resizer={column}
+      tabIndex={0}
+      onKeyDown={e => {
+        const dx = e.key === 'ArrowLeft' ? -RESIZE_STEP : e.key === 'ArrowRight' ? RESIZE_STEP : 0
+        // Every other key falls through untouched — a separator that swallowed
+        // Tab would trap the keyboard on a divider.
+        if (dx === 0) return
+        e.preventDefault()
+        columns.resize(column, dx)
+      }}
       onPointerDown={e => {
         dragging.current = true
         lastX.current = e.clientX

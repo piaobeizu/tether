@@ -31,9 +31,61 @@
 // does not, Escape closes when the drawer is the active layer). They are cited as
 // prior art rather than claimed as a taken ID — WORK-20 belongs to
 // panes/work/DetailDrawer, which phase 2 owns.
+//
+// ── `aria-modal="true"` is a CONTRACT, so it is implemented ─────────────────
+//
+// 🔴 The first version of this file set `aria-modal="true"` with no modal
+// behaviour behind it: Tab walked straight out of the panel into the page the
+// backdrop was covering, and closing the drawer left focus wherever the DOM
+// happened to put it. That is the same defect `ea2093e` removed from the pane
+// strip's `role="tablist"` — announcing a contract to assistive technology that
+// the code does not implement — which is R10 aimed at the accessibility tree
+// instead of at a sentence.
+//
+// The author's half of `aria-modal` is that interaction with what is behind the
+// dialog is actually prevented. All three channels are now answered:
+//
+//   keyboard  the Tab handler below cycles within the panel, and focus is
+//             restored to whatever had it when the drawer opened.
+//   pointer   `.sh-drawer-backdrop` is `position: fixed; inset: 0`, so a click
+//             aimed at the page behind lands on the backdrop (and closes).
+//   AT        the shell marks its header and body `inert` while the drawer is
+//             open (Shell.tsx), which takes them out of the accessibility tree
+//             for assistive technology that does not honour `aria-modal` itself.
+//
+// NavDrawer.test.tsx pins the keyboard half; Shell.test.tsx pins the `inert`
+// half, because it is the shell that owns the elements being inerted. Neither
+// jsdom nor a unit test can observe what a screen reader does with `aria-modal`,
+// so the attribute is not "tested" — what is tested is that the author-side
+// behaviour it presupposes is there. If a later edit drops the trap, the
+// attribute goes with it.
 
 import { useEffect, useRef } from 'react'
 import { PANE_IDS, PANE_LABEL, type PaneId } from './panes'
+
+/**
+ * Everything a browser would make a tab stop, in DOM order.
+ *
+ * The `tabIndex >= 0` filter is not redundant with the selector: the selector
+ * cannot express "an element whose tabindex attribute is absent but whose
+ * default tab index is -1", and the panel itself carries `tabIndex={-1}` so that
+ * it can be focused programmatically without becoming a stop.
+ */
+const FOCUSABLE = [
+  'a[href]',
+  'area[href]',
+  'button:not([disabled])',
+  'input:not([disabled])',
+  'select:not([disabled])',
+  'textarea:not([disabled])',
+  'iframe',
+  '[contenteditable]',
+  '[tabindex]:not([tabindex="-1"])',
+].join(', ')
+
+function focusStops(panel: HTMLElement): HTMLElement[] {
+  return [...panel.querySelectorAll<HTMLElement>(FOCUSABLE)].filter(el => el.tabIndex >= 0)
+}
 
 export interface NavDrawerProps {
   readonly open: boolean
@@ -44,20 +96,62 @@ export interface NavDrawerProps {
 
 export function NavDrawer({ open, current, onSelect, onClose }: NavDrawerProps) {
   const panelRef = useRef<HTMLDivElement | null>(null)
+  const returnFocusTo = useRef<Element | null>(null)
 
   useEffect(() => {
     if (!open) return
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
+      if (e.key === 'Escape') {
+        onClose()
+        return
+      }
+      if (e.key !== 'Tab') return
+      const panel = panelRef.current
+      if (panel === null) return
+      const stops = focusStops(panel)
+      // A panel with no tab stops at all still must not leak focus outward; the
+      // panel itself is focusable programmatically, so it absorbs the Tab.
+      if (stops.length === 0) {
+        e.preventDefault()
+        panel.focus()
+        return
+      }
+      const first = stops[0]!
+      const last = stops[stops.length - 1]!
+      const active = document.activeElement
+      const inside = active !== null && panel.contains(active)
+      if (e.shiftKey) {
+        // `active === panel` is its own case: the panel contains itself, so the
+        // generic "inside" test passes and the browser's default would then move
+        // focus BACKWARDS past the panel and out of the dialog.
+        if (!inside || active === first || active === panel) {
+          e.preventDefault()
+          last.focus()
+        }
+        return
+      }
+      if (!inside || active === last) {
+        e.preventDefault()
+        first.focus()
+      }
     }
     document.addEventListener('keydown', onKeyDown)
     return () => document.removeEventListener('keydown', onKeyDown)
   }, [open, onClose])
 
   // Move focus into the panel when it opens, so a keyboard or screen-reader user
-  // is not left behind on the toggle with an overlay covering the page.
+  // is not left behind on the toggle with an overlay covering the page — and put
+  // it back where it was on close, because the drawer is a detour and not a
+  // destination. Without the restore, dismissing with Escape drops the keyboard
+  // user at the top of the document.
   useEffect(() => {
-    if (open) panelRef.current?.focus()
+    if (!open) return
+    returnFocusTo.current = document.activeElement
+    panelRef.current?.focus()
+    return () => {
+      const previous = returnFocusTo.current
+      if (previous instanceof HTMLElement && previous.isConnected) previous.focus()
+    }
   }, [open])
 
   if (!open) return null

@@ -25,7 +25,23 @@ import * as wire from '../src/lib/wire.gen'
 //    So the import below is the point of the test, not incidental: it is the hop
 //    those files depend on, checked here before anything is ported onto it.
 //
-// Replace this file when that port lands. It has no reason to outlive it.
+// ── Status of that port, updated by tether#189 ──────────────────────────────
+//
+// The sentence that used to close this comment was "Replace this file when that
+// port lands. It has no reason to outlive it." One of the three has now landed:
+//
+//   test/wire-contract.spec.ts   LANDED (tether#189) — imports ../src/lib/wire.gen
+//                                and pins the ErrCode*/FencedBlock* sets, so it
+//                                discharges BOTH jobs above on its own.
+//   test/latency.spec.ts         in flight, tether#187
+//   test/workspace-tree.spec.ts  in flight, tether#188
+//
+// So this file is already redundant, and it is kept only because the other two
+// wis are open on the same branch at the same time: deleting it here would put a
+// modify/delete conflict in front of whichever of them rebases next, to save two
+// assertions that cost nothing to run. DELETE IT — do not "update" it — as part
+// of whichever of tether#187 / tether#188 lands last. Nothing should be added to
+// it in the meantime; test/wire-contract.spec.ts is where wire assertions go.
 describe('phase-1 scaffold: web/test/ as a test root', () => {
   it('resolves imports from web/test into web/src', () => {
     expect(typeof wire.KindMessage).toBe('string')

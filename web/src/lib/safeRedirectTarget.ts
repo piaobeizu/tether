@@ -45,13 +45,24 @@
  * over a generated corpus in safeRedirectTarget.test.ts rather than argued here.
  *
  * That file is only half the gate, and the halves are not interchangeable. It
- * generates adversarial input and asserts nothing escapes, so it answers "does
- * this refuse correctly" — and a degenerate implementation returning `/` for
- * every input satisfies every one of its assertions. oauthSignInRedirect.test.ts
- * next to it answers the other direction, "does this ACCEPT what the real
- * producer emits", by running the Go-side corpus through this function and
- * asserting the result is not `/`. Do not merge them; each is blind to what the
- * other catches.
+ * generates adversarial input and asserts nothing escapes, so what it mostly
+ * answers is "does this refuse correctly" — and a degenerate implementation
+ * returning `/` for every input still satisfies every REFUSAL assertion in it.
+ * Two cases in that file do catch such an implementation, and are load-bearing
+ * for exactly that reason: `keeps a same-origin path, with its query and hash`
+ * and `round-trips what redirectToAuth produces`. They are that file's whole
+ * acceptance half. Do not delete them as redundant with the corpus suite next
+ * door: delete them and safeRedirectTarget.test.ts stops being able to tell this
+ * function from `return '/'`.
+ *
+ *   Check: replace this function's body with `return '/'` and run, from web/,
+ *   `pnpm vitest run src/lib/safeRedirectTarget.test.ts` — those two names are
+ *   what redden; every refusal assertion stays green.
+ *
+ * oauthSignInRedirect.test.ts next to it answers the other direction at scale,
+ * "does this ACCEPT what the real producer emits", by running the Go-side corpus
+ * through this function and asserting the result is not `/`. Do not merge them;
+ * each is blind to what the other catches.
  */
 export function safeRedirectTarget(raw: string | null, origin: string): string {
   if (!raw) return '/'

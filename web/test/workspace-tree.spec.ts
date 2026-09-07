@@ -19,9 +19,28 @@
  * NOT cover it. Two hand-written sides, and these assertions in between. Change
  * a literal here only together with internal/workspace/files.go.
  *
- * Two server guarantees this client relies on and does NOT reproduce: listFiles
- * sorts directories-first-then-name, and `.git` is never listed
- * (internal/workspace/files.go). They are asserted server-side, not here.
+ * Two server guarantees this client relies on and does NOT reproduce. Only one
+ * of the two is actually asserted anywhere, so do not read them as one sentence.
+ * Break each one in internal/workspace/files.go and run
+ * `GOWORK=off go test ./internal/workspace/` — one command, two outcomes:
+ *
+ *   - listFiles sorts directories-first-then-name. Invert the `return
+ *     entries[i].IsDir` in its sort comparator and the package goes RED, on
+ *     files_test.go's `TestFilesHandler_SortOrderDirsFirstThenAlpha`. Asserted
+ *     server-side, as advertised.
+ *   - listFiles never lists `.git`. Delete the `if e.Name() == ".git"` continue
+ *     and the package stays GREEN. So does this file. Asserted NOWHERE — not
+ *     server-side, not here. The `.git` case that IS asserted lives in
+ *     tree_test.go and drives listFilesRecursive, i.e. the /tree route, which
+ *     screens through its own `skipDirsRecursive` map and not through the route
+ *     this cache calls. Do not try to establish this by grepping for the string
+ *     `.git`: tests that `runGit(t, root, "init")` put a real `.git` on disk and
+ *     then list the root without ever spelling the name, so a grep both misses
+ *     them and looks conclusive. ⇒ Drop that continue and `.git/` appears in
+ *     every user's file tree with the whole Go + web suite still green.
+ *     tether#193 owns closing that hole (it declares files_test.go). Whoever
+ *     lands it must come back and edit this bullet, because landing it is what
+ *     makes "Asserted NOWHERE" false.
  *
  * ── The filename ───────────────────────────────────────────────────────────
  *

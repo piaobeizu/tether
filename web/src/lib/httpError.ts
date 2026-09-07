@@ -48,12 +48,29 @@ const MESSAGE_FIELDS = ['error', 'message', 'detail', 'reason'] as const
  * used to throw, and what is still correct when there is genuinely nothing else
  * to say.
  *
- * Exported so the tests can name the value the defect produced rather than
- * spelling it again: a test that only asserts the new wording is present passes
- * on the old build the moment the wording appears for some other reason. Both
- * this file's tests and web/test/workspace-tree.spec.ts derive their expected
- * fallback from this function for that reason — do not inline `HTTP ${status}`
- * into an assertion.
+ * Exported so a test can name the value the defect produced rather than spelling
+ * it again: a test that only asserts the new wording is present passes on the old
+ * build the moment the wording appears for some other reason.
+ *
+ * Only ONE file actually takes it up. web/test/workspace-tree.spec.ts derives its
+ * expected fallback from this function, so its tether#161 arms move with the
+ * wording. httpError.test.ts does NOT: its fallback cases spell the expected
+ * string out as a `'HTTP <n>'` literal, and its single reference to
+ * httpStatusFallback is a `.not.toBe`, i.e. naming the value that must NOT
+ * appear. So changing the wording here reddens httpError.test.ts rather than
+ * being absorbed by it.
+ *
+ *   Check: change this body to `Status ${status}` and run, from web/,
+ *   `pnpm vitest run src/lib/httpError.test.ts test/workspace-tree.spec.ts` —
+ *   workspace-tree.spec.ts stays fully green, httpError.test.ts goes red.
+ *   `grep -n "toBe('HTTP\|httpStatusFallback" src/lib/httpError.test.ts` shows
+ *   the same split without running anything.
+ *
+ * ⇒ Deriving those literals from httpStatusFallback is an open cleanup, left
+ *   undone by tether#190 because httpError.test.ts is outside its declared
+ *   resources. Until then the instruction is descriptive, not established
+ *   practice: a NEW assertion should derive, and if you are already editing an
+ *   old one, convert it.
  */
 export function httpStatusFallback(status: number): string {
   return `HTTP ${status}`

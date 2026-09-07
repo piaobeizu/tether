@@ -26,6 +26,26 @@
 // constants and is pinned by a Go test (TestTranscriptPageHeadersAreMirroredInTypeScript)
 // — so this module reads the daemon's own vocabulary rather than a copy of it.
 //
+// ── which combinations the daemon can actually produce ─────────────────────
+//
+// Read off internal/session/sessionlist.go's `MessagePage` (2026-09-07), because
+// it narrows the state space more than tether#173 §3.5 says:
+//
+//   · on the TETHER branch `HasEarlier` is always false — `LoadHistory` is an
+//     unbounded `os.ReadFile`, so a `before` returns an EMPTY page — and
+//     `OtherRecord` is set here and ONLY here. That function's own comment says
+//     why it is not an omission: "tether HAVING the sid is exactly what selects
+//     tether, so a cc-served page cannot have a tether record sitting behind it."
+//   · on the CC branch the window and cursor are real, and `OtherRecord` is never
+//     set.
+//
+// ⇒ the daemon never sends BOTH headers. `'more'` taking precedence below is
+// therefore defensive ordering rather than a case seen in the wild, and the test
+// covering it is labelled as such. It is kept because the precedence has to be
+// SOME order and "a page exists to fetch" is the only one that cannot strand a
+// reader; picking the other order would mean a future daemon that sets both makes
+// the UI announce an end while a page is still available.
+//
 // ── R10 ─────────────────────────────────────────────────────────────────────
 //
 // §2 R10 requires the three states (known-true / known-false / unknown) to be

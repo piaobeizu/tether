@@ -45,12 +45,17 @@
 #              checking nothing.
 #
 # ── the assertion that carries the most ──────────────────────────────────────
-# `.rounded-md` must emit `calc(var(--radius) - 2px)`. Default Tailwind emits
-# `border-radius:0.375rem` for that class. So this one comparison separates three
-# states a build cannot otherwise tell apart: tailwind did not run (no rule),
+# `.rounded-md` must emit `calc(var(--radius) - 2px)`. Default Tailwind's value for
+# that class is `0.375rem` — which vite then minifies to `.375rem`, so do not go
+# looking for the leading zero in a built artifact. So this one comparison separates
+# three states a build cannot otherwise tell apart: tailwind did not run (no rule),
 # tailwind ran on defaults (a rule with the wrong value), tailwind ran on the
 # vendored config (the value below). "Tailwind ran" is not the property worth
 # checking; "tailwind ran on OUR config" is.
+#
+# Measured against a mutant that passes a config with the borderRadius extend
+# dropped: build exit 0, a 19 kB stylesheet, `.rounded-md{border-radius:.375rem}`,
+# and this assertion is the one that fires.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -70,6 +75,13 @@ command -v node >/dev/null 2>&1 || { echo "missing required tool: node" >&2; exi
 # failure for a missing directory.
 [[ -d "$WEB/dist" ]] || { echo "$WEB/dist does not exist — run 'cd web && pnpm build' first" >&2; exit 2; }
 
+# ⚠️ This reads whatever is in web/dist and has no way to tell a fresh bundle from
+# a stale one — `make check-tailwind` on its own will happily validate yesterday's
+# dist against today's broken source. Both callers that matter build first (CI's
+# step sits directly after "Build web"; `make ci` runs scripts/build.sh), and CI
+# starts from a clean checkout where no stale dist can exist, so the gap is not
+# reachable there. It is reachable locally, which is what this note is for.
+# (scripts/spa-bundle.sh is the pattern that closes this for the Go embed hop.)
 mapfile -t css_files < <(find "$WEB/dist" -type f -name '*.css' | sort)
 if (( ${#css_files[@]} == 0 )); then
 	red "no .css file under $WEB/dist."
@@ -81,7 +93,10 @@ if (( ${#css_files[@]} == 0 )); then
 	exit 1
 fi
 css=$(cat "${css_files[@]}")
-echo "reading ${#css_files[@]} css file(s) under $WEB/dist ($(printf '%s' "$css" | wc -c) bytes)"
+# Size reported from the FILES, not from "$css". Command substitution strips
+# trailing newlines, so the string is a byte or two shorter than the artifact and
+# the number printed here would not match the one `ls` or a comment quotes.
+echo "reading ${#css_files[@]} css file(s) under $WEB/dist ($(cat "${css_files[@]}" | wc -c) bytes)"
 
 # ── 1. design tokens: every custom property the vendored stylesheet declares ──
 # These live in `@layer base { :root { ... } }`, which tailwind emits
@@ -144,8 +159,14 @@ probes=$(
 # quotes and commas only (NOT on ':' or '/') keeps `hover:bg-accent` and
 # `bg-accent/80` as single tokens, so neither can pass for a bare use of
 # `bg-accent`.
+#
+# `find -type f` rather than `cat "$PRIMITIVES"/*`: the glob form breaks the day a
+# subdirectory appears under the primitives directory — `cat` fails on it inside a
+# process substitution, the failure does not propagate, and the token set comes out
+# quietly partial rather than empty, which the guard below would not catch.
 mapfile -t used_classes < <(
-	cat "$PRIMITIVES"/* | tr '"'"'"'`,' '    ' | tr -s ' \t' '\n\n' | sort -u
+	find "$PRIMITIVES" -type f -exec cat {} + \
+		| tr '"'"'"'`,' '    ' | tr -s ' \t' '\n\n' | sort -u
 )
 if (( ${#used_classes[@]} == 0 )); then
 	red "no class tokens could be read out of $PRIMITIVES."
@@ -153,7 +174,18 @@ if (( ${#used_classes[@]} == 0 )); then
 	echo "      gate would report a green it did not earn." >&2
 fi
 
+# Two counters, not one. `n_checked` answers "did this half of the gate examine
+# anything at all", which is what the non-vacuity guard below needs; `n_passed`
+# answers "how many were right", which is what the success line may report.
+#
+# They were one variable at first, incremented before the assertion, so the final
+# `else` printed `OK: 5 utility class(es) carry the value the vendored config
+# declares` on a run where zero of the five did and five FAILs were on stderr
+# directly above it. The exit code was still 1 — but a gate that emits a false
+# sentence into the CI log is doing the specific thing this script exists to stop,
+# one level up.
 n_checked=0
+n_passed=0
 while IFS=$'\t' read -r cls want; do
 	[[ -n "$cls" && -n "$want" ]] || continue
 
@@ -165,11 +197,13 @@ while IFS=$'\t' read -r cls want; do
 	rule=$(printf '%s' "$css" | grep -oE "\.${cls}\{[^}]*\}" | head -1 || true)
 	if [[ -z "$rule" ]]; then
 		red ".$cls is used in $PRIMITIVES but no rule for it is in the built CSS."
-		echo "      Tailwind emits utilities on demand by scanning the content globs," >&2
-		echo "      so an absent rule means the globs did not reach that source. They" >&2
-		echo "      are made absolute in web/src/ui/tailwind.config.mjs precisely" >&2
-		echo "      because upstream's relative ones silently match nothing when the" >&2
-		echo "      build runs from anywhere but web/." >&2
+		echo "      Tailwind emits utilities on demand, so an absent rule means the" >&2
+		echo "      generated stylesheet never saw that source. Any of the silent modes" >&2
+		echo "      in this script's header produces it — most often the postcss config" >&2
+		echo "      having gone missing (tailwind never ran; note the tokens above still" >&2
+		echo "      pass in that state), and otherwise content globs that reached" >&2
+		echo "      nothing. Check web/postcss.config.mjs exists first, then the globs" >&2
+		echo "      in web/src/ui/tailwind.config.mjs." >&2
 	elif [[ "$rule" != *"$want"* ]]; then
 		red ".$cls emits a value the vendored config did not ask for."
 		echo "        built:    $rule" >&2
@@ -178,6 +212,8 @@ while IFS=$'\t' read -r cls want; do
 		echo "      rule is present, so nothing is missing and nothing is red, but the" >&2
 		echo "      vendored theme is not in effect. web/src/ui/postcss.config.mjs has" >&2
 		echo "      the reason the vendored postcss.config.js cannot be used directly." >&2
+	else
+		n_passed=$(( n_passed + 1 ))
 	fi
 done <<<"$probes"
 
@@ -186,8 +222,10 @@ if (( n_checked == 0 )); then
 	echo "      Either the vendored tailwind config declares no theme.extend" >&2
 	echo "      borderRadius/colors entries, or no vendored primitive uses any of" >&2
 	echo "      them. Both leave this half of the gate asserting nothing." >&2
+elif (( n_passed == n_checked )); then
+	echo "OK: $n_passed utility class(es) carry the value the vendored config declares"
 else
-	echo "OK: $n_checked utility class(es) carry the value the vendored config declares"
+	echo "$n_passed of $n_checked utility class(es) carry the value the vendored config declares" >&2
 fi
 
 if (( fail )); then

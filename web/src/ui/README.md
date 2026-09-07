@@ -43,16 +43,16 @@ opened the `2-primitives` layer next door.
 | `index.css` | tether's stylesheet — `@import`s the vendored one for the tokens |
 | `primitives.ts` | the barrel application code imports primitives from |
 
-Each of those four files carries its own reasoning in a header comment, including
+Every file in that table carries its own reasoning in a header comment, including
 the two upstream adoption blockers and the measurements behind how they are
 solved. Read the file, not this table — a table is a summary and summaries rot.
 
 ## Two things that are easy to get wrong here
 
 **A green `pnpm build` does not mean the CSS pipeline works.** Measured on this
-tree: losing the PostCSS config leaves a stylesheet with all 42 design tokens
-still in it and **zero** utility rules, at exit 0; losing the stylesheet's entry
-point emits no CSS asset at all, at exit 0. Note what the first one implies — the
+tree: losing the PostCSS config leaves a stylesheet with every design token still
+in it and **zero** utility rules, at exit 0; losing the stylesheet's entry point
+emits no CSS asset at all, at exit 0. Note what the first one implies — the
 tokens survive it, so checking tokens alone would report green. The check that
 can tell these apart reads `web/dist`, not the source:
 `scripts/check-tailwind-emitted.sh`, wired into CI after the web build and into

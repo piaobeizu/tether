@@ -1,8 +1,12 @@
 // The PostCSS config tether actually builds with. tether#194.
 //
-// web/vite.config.ts points `css.postcss` at this directory, so postcss-load-config
-// finds this file and `import()`s it from disk. See the header of
-// ./tailwind.config.mjs for why that route is load-bearing rather than a detail.
+// Reached as ../../postcss.config.mjs -> here. postcss-load-config searches from
+// vite's `root` (web/) upward and never descends into this directory, so the file
+// at web/ is a re-export stub whose only job is to point down here;
+// web/vite.config.ts sets no `css.postcss` key at all. What matters about that
+// route is that postcss-load-config `import()`s these files from their real paths
+// on disk — see the header of ./tailwind.config.mjs for why that is load-bearing
+// rather than a detail.
 //
 // Same two plugins in the same order as the vendored
 // web/src/vendor/cloudcli/postcss.config.js, which cannot be used directly: that

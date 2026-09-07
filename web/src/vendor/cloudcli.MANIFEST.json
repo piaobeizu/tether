@@ -66,7 +66,7 @@
       "fetched": "2026-09-07",
       "status": "pristine",
       "layer": "2-primitives",
-      "note": "upstream's `cn` (clsx + tailwind-merge). It sits outside src/shared/view/ui/ but is inside the primitive layer's dependency closure: every primitive imports it as '../../../lib/utils', so it is not optional and it is not a separate layer. Carried here rather than reimplemented in the wrap because the relative specifier lives inside the vendored primitives, which cannot be edited — and because the mirrored-path convention (see the note above) is exactly what makes that specifier resolve to this file with no alias and no mapping table. Plain .js with no annotations, which is why web/tsconfig.app.json sets allowJs; that flag's only consumer is this file.",
+      "note": "upstream's `cn` (clsx + tailwind-merge). It sits outside src/shared/view/ui/ but is inside the primitive layer's dependency closure: every primitive imports it as '../../../lib/utils', so it is not optional and it is not a separate layer. Carried here rather than reimplemented in the wrap because the relative specifier lives inside the vendored primitives, which cannot be edited — and because the mirrored-path convention (see the note above) is exactly what makes that specifier resolve to this file with no alias and no mapping table. Plain .js with no annotations, which is the reason web/tsconfig.app.json sets allowJs: this is the only file that flag is needed FOR. It is not the only file the flag admits — measured, it also pulls in four unimported ones that `include` happens to match, which that file's own comment enumerates.",
       "body_sha256": "ba252326d87fbe9144ec41063847d1a50c161c65c8134b1c12c909d1cc2eae5a",
       "header_sha256": "135fe2e9ff47a0406f1caea18b2cb83d2c554d51b845dc2ce3ee6f79c8a2a2f9"
     },
@@ -78,7 +78,7 @@
       "fetched": "2026-09-07",
       "status": "pristine",
       "layer": "2-primitives",
-      "note": "First entry in the 2-primitives layer that LAYERS_ALLOWED has permitted since tether#171 without anything having used it. Brought in by tether#194 for two reasons at once: it is what a login form and any shell need, and its cva variant table is the widest utility-class surface in the layer, so it is what makes the build pipeline's emit observable on the artifact rather than merely plausible. Consumed through web/src/ui/, never imported from application code directly.",
+      "note": "LAYERS_ALLOWED has permitted a 2-primitives layer since tether#171; tether#194 is what first put anything in it. Brought in for two reasons at once: it is what a login form and any shell need, and its cva variant table is the widest utility-class surface in the layer, so it is what makes the build pipeline's emit observable on the artifact rather than merely plausible. Consumed through web/src/ui/, never imported from application code directly.",
       "body_sha256": "3a1025de23cc58adeb2fb0fb822563926e32ca4410afabb4d71cb3a164bf61b4",
       "header_sha256": "61ac46639296e7446eba3fb297f1c0c26d5a3eff7d594e3b3cf4e22ff9317e6f"
     },
@@ -90,7 +90,7 @@
       "fetched": "2026-09-07",
       "status": "pristine",
       "layer": "2-primitives",
-      "note": "Paired with Button: a form needs both, and between them they cover the two primitive shapes (a cva variant table and a single fixed class string). Deliberately not accompanied by the rest of src/shared/view/ui/ — the remainder is vendored when something needs it, one file at a time, whole. Note that the layer's own barrel (upstream's src/shared/view/ui/index.ts) is NOT carried: it re-exports every sibling, so vendoring it would drag in the whole directory or break. web/src/ui/ provides tether's barrel instead.",
+      "note": "Paired with Button: a form needs both, and between them they cover a cva variant table and a single fixed class string, which are the two ways a primitive in this layer composes its classes. Deliberately not accompanied by the rest of src/shared/view/ui/ — the remainder is vendored when something needs it, one file at a time, whole. Note that the layer's own barrel (upstream's src/shared/view/ui/index.ts) is NOT carried: it re-exports nearly every sibling in that directory, so vendoring it would drag almost all of them in or ship imports that do not resolve. web/src/ui/primitives.ts is tether's barrel instead, and it lists only what is actually here.",
       "body_sha256": "b6269d83f7e1469412653b753eebb6a5fa3e3873314701a73f9f1fe9506ee735",
       "header_sha256": "489f495e0b01c0eee5da57983c5bf014bd3d8fbd631b55a5c1388eb606b39da4"
     }

@@ -12,10 +12,16 @@
 //
 // 🔴 What is NOT here, deliberately:
 //
-//   · the Chat panel. It is `web/src/panes/chat/index.tsx` on `main`, a single
-//     3,241-line file, and rewriting it is a separate wi (tether#173 §2 lists the
+//   · the Chat panel. It is `web/src/panes/chat/index.tsx` on `main` — one file,
+//     large enough that rewriting it is a separate wi (tether#173 §2 lists the
 //     shell and the Chat panel as two parallel scope lines). This file routes to
 //     it; `renderPane` is the seam that wi plugs into.
+//
+//     🔴 Deliberately no line count. This comment used to carry one, and a
+//     measurement of a file on ANOTHER BRANCH is a sentence nothing in this repo
+//     can ever redden on: it was exact when written and drifts silently from the
+//     next commit to `main` onwards. "Large enough to be its own wi" is the
+//     property the paragraph actually needs, and it stays true as the file moves.
 //   · column WIDTHS. They belong to web/src/lib/layout.ts, which tether#196 is
 //     porting onto this branch and which is not here yet. `columns` below is the
 //     socket it plugs into: when it is absent the columns fall back to their CSS
@@ -266,8 +272,8 @@ export function Shell({ renderPane, store, wide, columns }: ShellProps) {
           // rather than fixed because the fix is a design decision this wi does
           // not own: keeping all three columns mounted on a phone means every
           // visited pane's subscriptions and DOM stay live behind the one on
-          // screen, and Chat is a 3,241-line transcript pane. Whoever rewrites
-          // Chat measures that and decides.
+          // screen — a whole Chat transcript among them, with its own streaming
+          // subscription. Whoever rewrites Chat measures that and decides.
           //
           // Reproduce: switch Chat → Canvas → Chat in the narrow form and the
           // Chat pane's `.sh-pane` element is a new node.
@@ -361,36 +367,56 @@ function ColumnView({
 }
 
 /**
- * Pixels one arrow-key press moves a divider.
- *
- * A step size, deliberately NOT a bound: `web/src/lib/layout.ts` owns MIN_MID and
- * the clamping, and this file passes it a delta exactly as the drag path does.
- * Restating any of layout.ts's arithmetic here is the bug tether#102 made
- * unexpressible, and `ACTIVITY_W` being unexported is what keeps it that way.
- */
-export const RESIZE_STEP = 16
-
-/**
  * A divider, rendered only when something can act on the drag.
  *
  * With no `columns` there is no rule to clamp against — MIN_MID and the bounds
  * live in `web/src/lib/layout.ts`, which is on `main` and NOT on this branch yet
  * (tether#196) — so the divider is omitted rather than rendered inert. R10: a
- * control on screen is a claim that the capability is there.
+ * control on screen is a claim that the capability is there. `main.tsx` renders
+ * `<Shell />` with no `columns`, so on this branch that is every shipped
+ * configuration: the divider exists in Shell.test.tsx and nowhere else yet.
  *
- * 🔴 `role="separator"` has two forms and this is the WIDGET one, because the
- * element is focusable. ARIA splits them exactly on that: a non-focusable
- * separator is structural and carries no keyboard contract, a focusable one is a
- * widget and its contract is that the arrow keys move it. The first version of
- * this component had `role="separator"` plus `aria-orientation="vertical"`, no
- * `tabIndex` and pointer-only handling — so the ROLE was defensible as structural,
- * but the divider was unreachable without a mouse and resizing was a capability
- * only pointer users had.
+ * 🔴 `role="separator"` has two forms and this is the STRUCTURAL one, because the
+ * element is not a tab stop. ARIA splits them on exactly that: a non-focusable
+ * separator is a boundary and carries no keyboard contract, while a focusable one
+ * is a WIDGET whose contract is both that the arrow keys move it and that it
+ * publishes its position in `aria-valuenow` — kept up to date as the position
+ * changes.
  *
- * Rather than narrow the announcement (the tack `ea2093e` took with the pane
- * strip, where a keyboard contract was genuinely not wanted at that size), the
- * contract is implemented: the delta the drag path computes is the same delta an
- * arrow key produces, so there is one resize path and not two.
+ * The widget form was built on this branch (`tabIndex={0}` plus arrow keys) and
+ * then taken back out, because the state it requires cannot be published from
+ * anything that is here:
+ *
+ *   the value   `columns.width(column)` is the position, but the RANGE it sits in
+ *               is not on the interface, and ARIA defaults a missing
+ *               `aria-valuemin`/`aria-valuemax` to 0 and 100 — so a pixel
+ *               `aria-valuenow` would announce a position on a scale it is not
+ *               on. Writing the range here as literals is the tether#102 bug:
+ *               layout.ts's own note says MAX_LEFT is "a preference, not the
+ *               guarantee", because the effective maximum is computed from the
+ *               live window by clampLeftWidth.
+ *   the updates `ColumnLayout` carries no change notification and `resize()`
+ *               returns nothing, so whether a move is observable at all is the
+ *               INJECTOR's business — and nothing on this branch is that
+ *               injector. Measured here: a pointer drag takes the rule's
+ *               `width('left')` from 240 to 340 and leaves the rendered inline
+ *               width at 240px, because nothing schedules a render. An
+ *               `aria-valuenow` published from this file would be frozen at
+ *               whatever the last unrelated render saw, which is an attribute
+ *               that is present and wrong — worse than absent, and the same
+ *               defect one step further in.
+ *
+ * So the announcement is narrowed rather than the contract half-implemented — the
+ * tack `ea2093e` took with the pane strip's `role="tablist"` and the workspace
+ * tree took with `role="tree"`. Resizing is pointer-only until the wi that brings
+ * layout.ts brings the range and a way to observe a change with it; that wi owes
+ * the `tabIndex`, the arrow keys and the value state as ONE change, and
+ * Shell.test.tsx's "stays structural" case is what makes adding the first without
+ * the third turn red instead of shipping.
+ *
+ * `aria-label` stays. The element really is the resize affordance for the pointer
+ * users who can reach it, and naming it is how a reading-order traversal learns
+ * what the boundary is for; it claims no key.
  */
 function Resizer({ column, columns }: { column: 'left' | 'right'; columns?: ColumnLayout }) {
   const dragging = useRef(false)
@@ -405,15 +431,10 @@ function Resizer({ column, columns }: { column: 'left' | 'right'; columns?: Colu
       aria-orientation="vertical"
       aria-label={`Resize ${column} column`}
       data-resizer={column}
-      tabIndex={0}
-      onKeyDown={e => {
-        const dx = e.key === 'ArrowLeft' ? -RESIZE_STEP : e.key === 'ArrowRight' ? RESIZE_STEP : 0
-        // Every other key falls through untouched — a separator that swallowed
-        // Tab would trap the keyboard on a divider.
-        if (dx === 0) return
-        e.preventDefault()
-        columns.resize(column, dx)
-      }}
+      // No `tabIndex` and no `onKeyDown`, deliberately — see this function's
+      // docblock. A `<div>` with no tabindex cannot become `activeElement` at
+      // all (`.focus()` on one is a no-op), so a key handler here would be
+      // unreachable code claiming a capability.
       onPointerDown={e => {
         dragging.current = true
         lastX.current = e.clientX

@@ -93,6 +93,13 @@ describe('WorkspacePane — the registry', () => {
 
   // AC-R9. The daemon's sentence, on the screen. Not "an error occurred", not the
   // status code — R9 is "show what the daemon said, not its status code".
+  //
+  // This case uses the `{"error": …}` envelope, which is the OTHER shape the
+  // daemon really sends: measured live on 2026-09-07, `/api/v1/auth/verify`
+  // without a token answers `{"error":"unauthorized"}` with 401. The plain-text
+  // shape the files route uses is covered separately below. Both are asserted
+  // because httpErrorMessage has to answer for both and the daemon picks per
+  // route, not per product.
   it('AC-R9: a refused workspace listing puts the daemon\'s own sentence on the screen', async () => {
     const said = 'the workspace registry is not writable right now'
     render(
@@ -145,13 +152,30 @@ describe('WorkspacePane — the file tree', () => {
   // AC-R9 again, on the path fileTreeCache.ts's own header says has had no
   // renderer since tether#174. Three of tether#159's read refusals are reachable
   // only here and all three used to arrive as "HTTP 400".
+  //
+  // 🔴 The fixture is a PLAIN-TEXT body, and that is measured rather than
+  // guessed. The first version of this test stubbed
+  // `JSON.stringify({ error: said })` — a shape I invented — and it passed, while
+  // proving nothing about the real path. Captured live against a real daemon
+  // (isolated HOME, port 19443) on 2026-09-07:
+  //
+  //     GET /api/v1/workspaces/<id>/files?dir=README.md
+  //       -> HTTP 400, body: `workspace: that path is not a directory`
+  //     GET /api/v1/workspaces/<id>/files?dir=%2Fetc
+  //       -> HTTP 400, body: `workspace: that path must be relative to the workspace root`
+  //
+  // No JSON envelope, no `error` key: the daemon writes `http.Error`, i.e. the
+  // sentence and nothing else. The `{error: …}` form IS real on other routes
+  // (`/api/v1/auth/verify` answers `{"error":"unauthorized"}` with 401, also
+  // measured), which is why httpErrorMessage handles both and why asserting only
+  // the shape I happened to imagine was a gate agreeing with my own copy.
   it("AC-R9: a refused directory listing shows the daemon's sentence, not its status", async () => {
-    const said = 'that path is not a directory'
+    // The daemon's exact bytes, including the `workspace:` prefix.
+    const said = 'workspace: that path is not a directory'
     render(
       <WorkspacePane
         fetchFn={stubFetch({
-          '/api/v1/workspaces/w1/files': () =>
-            new Response(JSON.stringify({ error: said }), { status: 400 }),
+          '/api/v1/workspaces/w1/files': () => new Response(said, { status: 400 }),
           ...listOK,
         })}
         storage={memStore()}
@@ -161,6 +185,26 @@ describe('WorkspacePane — the file tree', () => {
       const alerts = screen.getAllByRole('alert').map(a => a.textContent)
       expect(alerts.some(t => t?.includes(said))).toBe(true)
       expect(alerts.some(t => t?.trim() === 'HTTP 400')).toBe(false)
+    })
+  })
+
+  // The other refusal the same route can send, in the same plain-text form.
+  // Enumerated rather than folded into the case above because the two are
+  // different daemon sentinels and tether#159's whole output is that the sentence
+  // names WHICH one was hit.
+  it("AC-R9: the relative-path refusal reaches the screen too, verbatim", async () => {
+    const said = 'workspace: that path must be relative to the workspace root'
+    render(
+      <WorkspacePane
+        fetchFn={stubFetch({
+          '/api/v1/workspaces/w1/files': () => new Response(said, { status: 400 }),
+          ...listOK,
+        })}
+        storage={memStore()}
+      />,
+    )
+    await waitFor(() => {
+      expect(screen.getAllByRole('alert').some(a => a.textContent?.includes(said))).toBe(true)
     })
   })
 

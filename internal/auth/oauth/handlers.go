@@ -120,12 +120,12 @@ const authorizePath = "/oauth/authorize"
 // signInURL builds the /auth?redirect= link that returns the browser to this
 // exact authorization request once it has signed in.
 //
-// The consumer is safeRedirectTarget() in web/src/lib/safeRedirectTarget.ts, and it is a
-// validator, not a sanitiser: it hands back "/" unless the decoded target
-// resolves to this origin AND begins with exactly one "/". So the target is built
-// to satisfy that by construction — constant path first, the raw query appended
-// after a "?", the whole thing percent-encoded into a single parameter, which is
-// what keeps the inner query from being read as /auth's own.
+// The consumer is safeRedirectTarget() in web/src/lib/safeRedirectTarget.ts,
+// and it is a validator, not a sanitiser: it hands back "/" unless the decoded
+// target resolves to this origin AND begins with exactly one "/". So the target
+// is built to satisfy that by construction — constant path first, the raw query
+// appended after a "?", the whole thing percent-encoded into a single parameter,
+// which is what keeps the inner query from being read as /auth's own.
 //
 // url.QueryEscape emits only [A-Za-z0-9-_.~%+], so the value carries nothing that
 // is significant in an HTML attribute and nothing that could open a second
@@ -138,16 +138,15 @@ const authorizePath = "/oauth/authorize"
 // safeRedirectTarget — including the two shapes A3 got wrong, `..` segments and
 // same-origin absolute URLs.
 //
-// 🔴 That sentence names a file in another language's tree, so it is an
-// assertion about the repo and not about this function, and it has already been
-// false once: tether#174 deleted web/src on the phase-1 UI branch and took the
-// consumer test with it, leaving this paragraph pointing at nothing while
-// claiming to name the gate. tether#185 put it back, at the path above. The Go
-// side cannot cover for it — this package asserts string equality against the
-// corpus and has no idea what safeRedirectTarget does with those strings, so
-// "the producer still emits these" going green says nothing about "the consumer
-// still accepts these". If you find this path dangling again, the gate is gone,
-// not merely misnamed.
+// That sentence names a file in another language's tree, so it asserts something
+// about the repo rather than about this function, and it has been false once
+// already: tether#174 deleted web/src on the phase-1 UI branch and took the
+// consumer test with it, leaving this paragraph naming a gate that no longer
+// existed. tether#185 put it back, at the path above. Nothing on the Go side can
+// stand in for it — this package compares strings against the corpus and has no
+// idea what safeRedirectTarget does with them, so "the producer still emits
+// these" going green says nothing about "the consumer still accepts these". If
+// that path is dangling again, the gate is gone, not merely misnamed.
 func signInURL(rawQuery string) string {
 	target := authorizePath
 	if rawQuery != "" {

@@ -13,5 +13,12 @@
  *
  * `@import` has to come first in a CSS file (only `@charset` and `@layer` may
  * precede it), which is why the comment above is a comment and not a rule.
+ *
+ * The second import is tether#195's shell layout. It is imported HERE rather than
+ * from web/src/shell/Shell.tsx for the reason web/index.html gives for holding the
+ * <link> at all: with one stylesheet entry point the built CSS asset does not
+ * depend on which JS module imported it first. It comes second because it uses
+ * the custom properties the first one declares.
  */
 @import '../vendor/cloudcli/src/index.css';
+@import '../shell/shell.css';

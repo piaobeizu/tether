@@ -38,6 +38,24 @@ export default defineConfig({
     strictPort: true,
   },
   test: {
+    // tether#195. Vitest's default (`css: false`) replaces every CSS module with
+    // an empty stub, and it does so BEFORE vite's `?raw` query is honoured —
+    // measured here: `import css from './shell.css?raw'` yields a string of
+    // length 0 with this key absent and 5,901 with it present.
+    //
+    // That matters because two of this shell's constraints are properties of a
+    // stylesheet and of nothing else: the root is sized in `100dvh` rather than
+    // `100vh`, and the layout declares no width floor. src/shell/mobileFirst.test.ts
+    // asserts both by reading the real files through vite's raw glob, so that a
+    // file added to that directory later inherits the rules instead of having to
+    // be added to a list. With the stub in place those assertions would read ''
+    // and pass vacuously — a gate that is green because it can see nothing.
+    //
+    // Cost is small and bounded: nothing in web/src imports a stylesheet from
+    // JavaScript (the entry point is web/index.html's <link>, deliberately — see
+    // that file), so the only CSS vitest processes is what a test asks for by
+    // name.
+    css: true,
     environment: 'jsdom',
 
     // ── the run writes down what failed, whatever the caller did with stdout

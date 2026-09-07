@@ -34,14 +34,19 @@ describe('main entry point routing', () => {
     })
   })
 
-  it('renders the plain tether placeholder (no login form) on any other pathname', async () => {
+  // tether#195 replaced tether#174's bare `<p>tether</p>` with the real shell, so
+  // this case now asserts the shell root rather than a word. The old assertion was
+  // `textContent` containing 'tether', which the shell does not print anywhere and
+  // which would also have passed on any page that happened to say "tether"
+  // somewhere — the structural check is both correct now and stronger then.
+  it('renders the shell (no login form) on any other pathname', async () => {
     document.body.innerHTML = '<div id="root"></div>'
     stubPathname('/')
     vi.resetModules()
     await import('./main')
 
     await waitFor(() => {
-      expect(document.body.textContent).toContain('tether')
+      expect(document.querySelector('.sh-root')).not.toBeNull()
     })
     expect(document.querySelector('#tether-access-token')).toBeNull()
   })

@@ -9,7 +9,8 @@
 // touched by a test.
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { useState } from 'react'
 import { WorkspacePane } from './WorkspacePane'
 import { resolveSelection, SELECTED_WORKSPACE_KEY } from './workspaces'
 
@@ -160,6 +161,64 @@ describe('WorkspacePane — the file tree', () => {
       expect(alerts.some(t => t?.includes(said))).toBe(true)
       expect(alerts.some(t => t?.trim() === 'HTTP 400')).toBe(false)
     })
+  })
+
+  // 🔴 The production path, and it is here because every OTHER test in this file
+  // avoids it. Injecting `fetchFn` hands the component a STABLE function identity;
+  // the shipped default is a fresh arrow per render, and on that path a new
+  // identity discards the memoised tree cache and re-reads every open directory.
+  //
+  // Two things about the shape of this test are the point:
+  //
+  //  · it drives the pane from a PARENT that re-renders. `setEntries` lives in a
+  //    descendant, so the pane's own state changes do not reproduce this — only
+  //    an ancestor's do, and Shell re-renders on every pane switch.
+  //  · it counts requests, so the assertion is a measurement rather than a
+  //    threshold picked to pass. Measured differentially, over five parent
+  //    re-renders: 1 listing with the memo, 6 without it.
+  it('an ancestor re-render does not re-read the tree (the shipped, un-injected path)', async () => {
+    const calls: string[] = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input)
+        calls.push(url)
+        if (url.includes('/files')) return json([{ name: 'src', isDir: true, dirty: false }])
+        return json(WS)
+      }),
+    )
+    try {
+      function Parent() {
+        const [n, setN] = useState(0)
+        return (
+          <div>
+            <button onClick={() => setN(n + 1)}>bump</button>
+            {/* No fetchFn and no storage: exactly what renderPane mounts. */}
+            <WorkspacePane />
+          </div>
+        )
+      }
+      render(<Parent />)
+      const tree = await screen.findByRole('tree', { name: 'Files' })
+      await waitFor(() => expect(within(tree).getByText('src')).toBeTruthy())
+
+      const listings = () => calls.filter(u => u.includes('/files')).length
+      const afterMount = listings()
+      expect(afterMount).toBe(1)
+
+      const bumps = 5
+      for (let i = 0; i < bumps; i++) fireEvent.click(screen.getByRole('button', { name: 'bump' }))
+      await new Promise(r => setTimeout(r, 80))
+
+      // Exactly the mount's listing, still. Phrased against `afterMount` rather
+      // than against the literal 1 so the assertion is "the re-renders cost
+      // nothing", which is the claim, and not "the number is 1".
+      expect(listings(), `listings grew by ${listings() - afterMount} over ${bumps} re-renders`).toBe(
+        afterMount,
+      )
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 
   // R10 at the surface: with no hide policy supplied nothing is being withheld, so

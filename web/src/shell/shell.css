@@ -205,9 +205,15 @@ body.pwa-mode #root {
     display: flex;
     flex-direction: column;
     /* 48px mirrors ACTIVITY_W in web/src/lib/layout.ts, which is not exported and
-     * cannot be imported. columns.test.ts solves for the width layout.ts really
-     * charges and compares it with this number, so the pairing that layout.ts's
-     * own comment calls "still a convention" is checked here. */
+     * cannot be imported, so this is a duplicated stylesheet literal.
+     *
+     * 🔴 NOTHING CHECKS THE PAIRING. layout.ts's own comment says so of the old
+     * SPA ("a pure CSS change to `.dt-activity`'s width turns no test red, here
+     * or anywhere else") and it is still true here. It is checkable — layout.ts
+     * charges the bar inside `defaultRightWidth`, so the width it really uses can
+     * be solved for through the public functions — but layout.ts is not on this
+     * branch yet (tether#196), so the check is OWED, not written. Whoever wires
+     * the drag path owes it along with LAY-10. */
     flex: 0 0 48px;
     border-right: 1px solid hsl(var(--border));
   }

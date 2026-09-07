@@ -4,9 +4,10 @@
 // only `fetch` is stubbed. That shape is AC-R9 arm 2 verbatim ("stub
 // globalThis.fetch, mock no module, assert the textContent of a visible element,
 // so fetch → extraction → render is all load-bearing"), and it is the arm the old
-// suite never had: WorkspacePane.test.tsx's three DELETE tests all stubbed
-// `{ok:true,status:204}`, which is why the defect tether#164 recorded was never
-// touched by a test.
+// suite never had: the three DELETE tests in `web/src/panes/workspace/WorkspacePane.test.tsx`
+// ON `main` — a different file from this one, despite the shared basename — all
+// stubbed `{ok:true,status:204}`, which is why the defect tether#164 recorded was
+// never touched by a test.
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'

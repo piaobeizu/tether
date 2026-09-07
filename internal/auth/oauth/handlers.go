@@ -120,7 +120,7 @@ const authorizePath = "/oauth/authorize"
 // signInURL builds the /auth?redirect= link that returns the browser to this
 // exact authorization request once it has signed in.
 //
-// The consumer is safeRedirectTarget() in web/src/AuthPage.tsx, and it is a
+// The consumer is safeRedirectTarget() in web/src/lib/safeRedirectTarget.ts, and it is a
 // validator, not a sanitiser: it hands back "/" unless the decoded target
 // resolves to this origin AND begins with exactly one "/". So the target is built
 // to satisfy that by construction — constant path first, the raw query appended
@@ -133,9 +133,21 @@ const authorizePath = "/oauth/authorize"
 // something this has to survive.
 //
 // That argument is not the gate, though. testdata/signin_redirect_corpus.json
-// pins the exact strings this produces, and web/src/oauthSignInRedirect.test.ts
-// feeds that same file through the real safeRedirectTarget — including the two
-// shapes A3 got wrong, `..` segments and same-origin absolute URLs.
+// pins the exact strings this produces, and
+// web/src/lib/oauthSignInRedirect.test.ts feeds that same file through the real
+// safeRedirectTarget — including the two shapes A3 got wrong, `..` segments and
+// same-origin absolute URLs.
+//
+// 🔴 That sentence names a file in another language's tree, so it is an
+// assertion about the repo and not about this function, and it has already been
+// false once: tether#174 deleted web/src on the phase-1 UI branch and took the
+// consumer test with it, leaving this paragraph pointing at nothing while
+// claiming to name the gate. tether#185 put it back, at the path above. The Go
+// side cannot cover for it — this package asserts string equality against the
+// corpus and has no idea what safeRedirectTarget does with those strings, so
+// "the producer still emits these" going green says nothing about "the consumer
+// still accepts these". If you find this path dangling again, the gate is gone,
+// not merely misnamed.
 func signInURL(rawQuery string) string {
 	target := authorizePath
 	if rawQuery != "" {

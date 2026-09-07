@@ -2,7 +2,7 @@
   "_comment": [
     "Cross-language contract for the tether#153 sign-in redirect.",
     "PRODUCER: signInURL() in internal/auth/oauth/handlers.go, asserted end to end (handler + html/template) by internal/auth/oauth/signin_prompt_test.go.",
-    "CONSUMER: safeRedirectTarget() in web/src/AuthPage.tsx, asserted by web/src/oauthSignInRedirect.test.ts.",
+    "CONSUMER: safeRedirectTarget() in web/src/lib/safeRedirectTarget.ts, asserted by web/src/lib/oauthSignInRedirect.test.ts.",
     "Both sides READ this file; neither generates it. A producer change turns the Go test red until wantAuthURL is updated here, and the updated string is then re-validated against the real consumer. That is the whole point: two hand-copied lists would each hold a different subset and both look complete.",
     "rawQuery is assigned to r.URL.RawQuery verbatim, so it is the exact byte string the handler sees."
   ],

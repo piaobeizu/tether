@@ -1,3 +1,7 @@
+// 🔴 DO NOT ADD `"composite": true` TO THIS PROJECT EITHER. The measured argument
+// is in tsconfig.app.json's header; it applies to every project tsconfig.json
+// references, because `tsc -b` decides per project and the poisoning only needs
+// one of them.
 {
   "compilerOptions": {
     "target": "ES2022",

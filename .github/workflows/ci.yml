@@ -209,6 +209,15 @@ jobs:
       # Also not redundant with "Build web": `pnpm build` is `tsc -b && vite build`,
       # so type errors are already gated. Running the named script is what keeps the
       # script itself honest.
+      #
+      # 🔴 This step and "Build web" below are a `tsc -b --noEmit` immediately
+      # followed by a `tsc -b` that must emit, sharing one tsbuildinfo. On a
+      # COMPOSITE project that pair poisons itself and the emitting run silently
+      # skips emit at exit 0 — measured, tether#165/#174. What makes the order safe
+      # is that neither referenced project sets `composite`, and the prohibition is
+      # recorded in web/tsconfig.app.json's header, i.e. in the file someone would
+      # have to edit to break it. Do not "fix" the redundancy by reordering these
+      # two: the order is not what protects it.
       - name: Typecheck web
         run: cd web && pnpm typecheck
 

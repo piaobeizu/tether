@@ -215,6 +215,42 @@ func TestFilesHandler_UnknownWorkspace404(t *testing.T) {
 	}
 }
 
+// TestFilesHandler_DoesNotListGitDir drives the flat GET
+// /api/v1/workspaces/{id}/files listing — a directory's direct children, which
+// is what the web file tree loads — against a workspace root holding a real
+// .git directory, and asserts .git never appears among the returned entries.
+// The recursive /tree route skips .git through skipDirsRecursive, a separate
+// mechanism this test does not exercise.
+func TestFilesHandler_DoesNotListGitDir(t *testing.T) {
+	root := t.TempDir()
+	runGit(t, root, "init")
+	if err := os.WriteFile(filepath.Join(root, "visible.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reg, id := newTestRegistry(t, root)
+	mux := http.NewServeMux()
+	RegisterAPI(mux, reg)
+
+	entries := getFiles(t, mux, id, "")
+
+	if len(entries) == 0 {
+		t.Fatalf("expected a non-empty listing, got %+v", entries)
+	}
+	var sawVisible bool
+	for _, e := range entries {
+		if e.Name == ".git" {
+			t.Errorf("listing must not include .git, got %+v", entries)
+		}
+		if e.Name == "visible.txt" {
+			sawVisible = true
+		}
+	}
+	if !sawVisible {
+		t.Errorf("expected visible.txt in listing, got %+v", entries)
+	}
+}
+
 func TestFilesHandler_SortOrderDirsFirstThenAlpha(t *testing.T) {
 	root := t.TempDir()
 	names := []string{"zeta.txt", "alpha.txt"}

@@ -1,51 +1,30 @@
-import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
-import App from './App'
-import AuthPage from './AuthPage'
-import './index.css'
 
-// Dark mode: persist + restore theme on load.
+// Phase-1 scaffold (tether#174). The old SPA — 82 files under web/src plus five
+// specs under web/test — was deleted on this branch; tether#173 decision 3 keeps
+// it running on `main` as the visual/behavioural control while the replacement is
+// written.
 //
-// This runs BEFORE createRoot below, and it has to: the attribute must be on
-// <html> before first paint or every dark-mode load flashes light. That is also
-// why the theme is not a store field — see the theme note in Settings.tsx.
-const savedTheme = localStorage.getItem('tether_theme')
-if (savedTheme === 'dark') {
-  document.documentElement.setAttribute('data-theme', 'dark')
-}
-
-// Cmd+Shift+D (Mac) / Ctrl+Shift+D toggles dark mode.
+// What has to survive that deletion is the BUILD, not the UI. web/embed.go is a Go
+// package (`//go:embed all:dist`) imported by internal/server/lifecycle.go:35 and
+// internal/server/static.go:12, and `all:dist` cannot be satisfied by a committed
+// placeholder — vite's emptyOutDir wipes web/dist on every build, which is
+// tether#81's conclusion and is argued out in embed.go's own header. So an empty
+// web/ would stop `go build`, `go vet`, `go test`, `go list ./...` and gopls dead,
+// for every commit on this branch until the new shell lands. This file is the
+// smallest thing that keeps `pnpm build` producing a dist/, and therefore the
+// acceptance criterion "GOWORK=off go build ./... passes on every commit of the UI
+// branch".
 //
-// Setting the attribute is the whole notification (tether#129). Settings.tsx
-// observes `data-theme` with a MutationObserver rather than being told, so this
-// handler owes it nothing — do not add an event dispatch here to "keep Settings
-// in sync". Before tether#129 Settings held a mount-time COPY of the attribute
-// and this handler silently made it stale.
-document.addEventListener('keydown', (e) => {
-  const mod = e.metaKey || e.ctrlKey
-  if (mod && e.shiftKey && e.key.toLowerCase() === 'd') {
-    e.preventDefault()
-    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
-    if (isDark) {
-      document.documentElement.removeAttribute('data-theme')
-      localStorage.setItem('tether_theme', 'light')
-    } else {
-      document.documentElement.setAttribute('data-theme', 'dark')
-      localStorage.setItem('tether_theme', 'dark')
-    }
-  }
-})
-
-if (window.location.pathname === '/auth') {
-  createRoot(document.getElementById('root')!).render(
-    <StrictMode>
-      <AuthPage />
-    </StrictMode>,
-  )
-} else {
-  createRoot(document.getElementById('root')!).render(
-    <StrictMode>
-      <App />
-    </StrictMode>,
-  )
+// Deliberately not a component and deliberately not styled. A placeholder
+// component is something a reviewer of the shell wi has to decide whether to keep,
+// and a styled placeholder invites the next person to extend it instead of
+// replacing it. It does go through React rather than plain DOM, because that is
+// what makes `pnpm build` prove the JSX transform and @vitejs/plugin-react are
+// actually wired — a plain-DOM placeholder would build green with the react plugin
+// misconfigured.
+const root = document.getElementById('root')
+if (!root) {
+  throw new Error('#root missing from index.html')
 }
+createRoot(root).render(<p>tether</p>)

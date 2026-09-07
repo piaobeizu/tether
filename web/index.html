@@ -2,20 +2,23 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <!-- Mobile-first is tether#173 decision 5, so the viewport tag is scaffold,
+         not decoration: the new shell is written against this width. -->
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#0f0f0f" />
+    <!-- web/public/ is still tracked and still copied into dist/ by vite, so the
+         manifest link keeps resolving. The service-worker registration that used
+         to live in web/src/pwa/ went with the old SPA; re-adding it belongs to
+         whichever wi rebuilds the shell, not to this one. -->
     <link rel="manifest" href="/manifest.webmanifest" />
-    <!-- Design typefaces (tokens reference these three families). Offline / air-gapped
-         deployments fall back to the system stacks declared in index.css. -->
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&family=Instrument+Serif:ital@0;1&display=swap"
-      rel="stylesheet"
-    />
     <title>tether</title>
   </head>
   <body>
+    <!-- Phase-1 scaffold (tether#174). The Geist / Geist Mono / Instrument Serif
+         <link>s that used to sit here referenced font families declared in
+         web/src/index.css, which this wi deleted. A remote font dependency with
+         no consumer is worse than no font dependency, so they are gone; the shell
+         wi re-adds whatever the new tokens actually reference. -->
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

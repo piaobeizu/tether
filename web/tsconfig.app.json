@@ -17,5 +17,28 @@
     "noFallthroughCasesInSwitch": true,
     "noUncheckedSideEffectImports": true
   },
-  "include": ["src"]
+
+  // "test" as well as "src" — tether#174.
+  //
+  // Measured on this worktree at baf7117, reproducing tether#165's numbers: this
+  // project's include of ["src"] type-checked 82 files, tsconfig.node.json's
+  // ["vite.config.ts"] checked 1, and the five web/test/*.spec.ts were in NEITHER
+  // project, i.e. 0 files. tether#165 landed a typecheck gate that can genuinely go
+  // red, and its acceptance ("typecheck must be shown red") was satisfiable
+  // entirely inside src/ — so the gate shipped real and the test files stayed
+  // outside it, wearing the label of a fixed gate.
+  //
+  // That gap was about to be re-inherited: tether#173 §4 ports 11 A-grade test
+  // files into the new project, three of them into web/test/. They would have
+  // landed outside the type coverage again, and nothing would have said so.
+  //
+  // Kept in this project rather than given a third referenced project: the specs
+  // import across the boundary (web/test/*.spec.ts -> ../src/lib/...) and need the
+  // same lib/jsx/strictness, so a separate project would be the same options
+  // written twice, with drift as its only possible future.
+  //
+  // 🔴 This include is NOT the gate. `include` is a claim about coverage; the gate
+  // in .github/workflows/ci.yml counts `tsc -b --listFiles` output, because reading
+  // a glob is how the 0 above went unnoticed for as long as it did.
+  "include": ["src", "test"]
 }

@@ -6,10 +6,10 @@
 // outright, this file changes and its callers do not.
 //
 // Upstream has its own barrel at src/shared/view/ui/index.ts. It is deliberately
-// NOT vendored — it re-exports every sibling in that directory, so carrying it
-// would mean either carrying all of them or shipping a file with imports that do
-// not resolve. This is the tether-side equivalent, and it lists only what is
-// actually vendored.
+// NOT vendored — it re-exports nearly every sibling in that directory (all but one
+// of them, at this pin), so carrying it would mean either carrying almost the whole
+// directory or shipping a file with imports that do not resolve. This is the
+// tether-side equivalent, and it lists only what is actually vendored.
 //
 // Deliberately no `import './index.css'` here. The stylesheet's entry point is
 // web/index.html, so the built CSS asset does not depend on which JS module

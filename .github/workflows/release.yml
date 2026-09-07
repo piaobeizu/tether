@@ -55,6 +55,21 @@ jobs:
         run: |
           cd web && pnpm install --frozen-lockfile && pnpm build
 
+      # ── the CSS pipeline gate, on the path that actually reaches users ──────
+      # The step above exits 0 with an unstyled bundle in three measured ways: no
+      # postcss config (tailwind never runs, every design token still present,
+      # zero utility rules), no entry point reaching the vendored stylesheet (no
+      # CSS asset at all), content globs matching nothing. ci.yml runs this check
+      # for the same reason, but CI gates a PR and this gates a shipped binary —
+      # and a release is the worst place to discover it, because the artifact is
+      # already downloadable by the time anyone looks.
+      #
+      # Reads web/dist, so it has to sit after the build; before the stamp only
+      # because that keeps the two web/dist steps adjacent. Offline, and the whole
+      # cost is a grep over ~31 kB plus one node invocation.
+      - name: Check the CSS pipeline emitted what the vendored config asks for
+        run: bash scripts/check-tailwind-emitted.sh
+
       # web/dist is not in git (tether#81); the stamp writes web/dist/BUILD-ID so
       # the artifact people download can be tied to the bundle inside it.
       - name: Stamp SPA bundle

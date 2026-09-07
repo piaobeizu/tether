@@ -8,12 +8,19 @@
 // and each of those is one block below with the measurement behind it.
 //
 // ── why .mjs and not .ts, and why postcss loads it rather than vite ─────────
-// This module is loaded by web/src/ui/postcss.config.mjs, which vite finds via
-// `css.postcss` in web/vite.config.ts. That route matters and is not incidental:
+// The load path, which is worth having exactly right because every hop in it is
+// load-bearing:
 //
-//   postcss-load-config `import()`s the file from disk, so `import.meta.url`
-//   below is really this file's path, and the relative specifier for the vendored
-//   config resolves from web/src/ui/.
+//   postcss-load-config searches from vite's `root` (web/) UPWARD and finds
+//   web/postcss.config.mjs -> which re-exports web/src/ui/postcss.config.mjs
+//   -> which imports THIS file -> which imports the vendored config.
+//
+// vite.config.ts sets no `css.postcss` key at all; an earlier draft of this
+// comment said it pointed at this directory, and it does not. The property that
+// matters is the same either way and it is why the config is not loaded from
+// vite.config.ts: postcss-load-config `import()`s these files from disk, so
+// `import.meta.url` below is really this file's path and the relative specifier
+// for the vendored config resolves from web/src/ui/.
 //
 //   Importing this module from vite.config.ts instead would NOT have that
 //   property. Vite bundles vite.config.ts with esbuild into a temp file written
@@ -48,10 +55,28 @@ const VENDOR_CONFIG = new URL('../vendor/cloudcli/tailwind.config.js', import.me
 // fix. Measured: with the binding in place the same import resolves and the
 // config arrives with its one plugin present (`__pluginFunction` on it).
 //
-// Bound around the import and then removed, rather than left in place: this is a
+// Bound around the import and then put back, rather than left in place: this is a
 // property of loading one file, not of the process. Nothing is shadowed while it
 // is set — CJS modules get `require` as a local binding, so they never see this
 // one.
+//
+// Save-and-restore rather than "inject only if absent". The earlier form skipped
+// injection whenever anything had already put a `require` on globalThis, which
+// silently handed the vendored config a stranger's resolver with a different base
+// — a wrong answer where this wants either the right one or a loud failure.
+//
+// The base is the VENDORED CONFIG's own URL, not this file's. It only shows up
+// today for a relative specifier, and upstream's config has none — but if it ever
+// gains `require('./plugins/x')`, resolving that from web/src/ui/ would quietly
+// look inside the wrap layer for a file that belongs to the vendor tree. Bare
+// specifiers such as '@tailwindcss/typography' resolve identically either way,
+// by walking up to web/node_modules.
+//
+// ⚠️ One-shot: node caches a FAILED module job too. Importing the vendored config
+// without the shim throws, and installing the shim afterwards and re-importing in
+// the same process throws the identical ReferenceError from the cache. Nothing
+// but this file imports that config, so it is unreachable today — but the symptom
+// (a correct shim, a permanent error) is confusing enough to be worth the line.
 //
 // NOT solved by dropping the plugin instead. @tailwindcss/typography is installed
 // (web/package.json), because the plugin is load-bearing inside the layer this wi
@@ -59,17 +84,26 @@ const VENDOR_CONFIG = new URL('../vendor/cloudcli/tailwind.config.js', import.me
 // `not-prose`, a class only that plugin registers. So "the config is the only
 // reference to it" — recorded as an inference on tether#194 — is false, and
 // dropping the plugin would have changed rendering with nothing going red.
-const injectedRequire = !('require' in globalThis)
-if (injectedRequire) {
-  globalThis.require = createRequire(import.meta.url)
-}
+const hadRequire = 'require' in globalThis
+const previousRequire = globalThis.require
+globalThis.require = createRequire(VENDOR_CONFIG)
 let vendorConfig
 try {
   vendorConfig = (await import(VENDOR_CONFIG.href)).default
 } finally {
-  if (injectedRequire) {
+  if (hadRequire) {
+    globalThis.require = previousRequire
+  } else {
     delete globalThis.require
   }
+}
+
+if (!vendorConfig || typeof vendorConfig !== 'object') {
+  throw new Error(
+    `vendored tailwind config at ${VENDOR_CONFIG.href} has no default export; ` +
+      'nothing below can be salvaged from that, so fail here rather than three ' +
+      'lines down with a TypeError about `content`',
+  )
 }
 
 // ── the one thing changed about it: content globs are made absolute ──────────

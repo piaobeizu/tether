@@ -106,10 +106,18 @@
     // build, on files tether may not fix. The flag admits the file; it does not
     // audit it.
     //
-    // Cost, measured: it also admits the two vendored config .js files under
-    // src/ into the file set (they are matched by `include` and are not imported
-    // by anything). That is why the CI coverage step's `typecheck reads N project
-    // file(s)` number moves by more than one when this lands.
+    // Cost, measured by diffing `tsc -b --force --listFiles` with the flag on and
+    // off: it admits FIVE files, and only the first is the one it exists for.
+    //
+    //     src/vendor/cloudcli/src/lib/utils.js      <- imported; the reason
+    //     src/vendor/cloudcli/tailwind.config.js    <- matched by `include`,
+    //     src/vendor/cloudcli/postcss.config.js        imported by nothing
+    //     src/ui/tailwind.config.mjs                <- likewise; allowJs covers
+    //     src/ui/postcss.config.mjs                    .mjs as well as .js
+    //
+    // The four unimported ones are inert here (no `checkJs`, so they are admitted
+    // and not analysed), but they are why the CI coverage step's `typecheck reads
+    // N project file(s)` number moves by five rather than by one when this lands.
     "allowJs": true,
     "jsx": "react-jsx",
     "strict": true,

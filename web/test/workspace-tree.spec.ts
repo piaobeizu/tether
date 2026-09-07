@@ -53,6 +53,23 @@ function mockFetchOnce(entries: FileEntry[]) {
   })) as unknown as typeof fetch
 }
 
+/**
+ * The message of the Error `p` rejects with, or a failure if it resolves.
+ *
+ * Used instead of `rejects.toThrow(...)` for the two tether#161 arms so they can
+ * assert the message EXACTLY. `toThrow('x')` is a substring match, which would
+ * also accept a build that buried the daemon's sentence inside `HTTP 400: …`,
+ * and the anchored-regex alternative had to build a RegExp out of the expected
+ * value — safe only while that value contains no regex metacharacters. Exact
+ * equality needs neither escape hatch.
+ */
+async function rejectionMessage(p: Promise<unknown>): Promise<string> {
+  const resolvedMarker = Symbol('resolved')
+  const outcome = await p.then(() => resolvedMarker, (e: unknown) => e)
+  if (outcome === resolvedMarker) throw new Error('expected a rejection, but the promise resolved')
+  return (outcome as Error).message
+}
+
 describe('createFileTreeCache', () => {
   afterEach(() => {
     vi.restoreAllMocks()
@@ -140,7 +157,7 @@ describe('createFileTreeCache', () => {
   // Both arms are needed and they are each other's negative control: arm 1 fails
   // if the passthrough is removed, arm 2 fails if the degradation is removed.
   // Neither alone distinguishes those two builds.
-  it('passes the daemon refusal through to Error.message (tether#161, arm 1)', async () => {
+  it('passes the daemon refusal through to Error.message, and does not cache the failure (tether#161, arm 1)', async () => {
     // A real internal/workspace/api.go refusal, reachable ONLY on this route —
     // http.Error writes the trailing newline, which the wording must survive.
     const fetchMock = vi.fn()
@@ -152,10 +169,10 @@ describe('createFileTreeCache', () => {
       .mockResolvedValueOnce({ ok: true, json: async () => [{ name: 'ok.txt', isDir: false, dirty: false }] })
     const cache = createFileTreeCache('ws-1', fetchMock as unknown as typeof fetch)
 
-    // Anchored: an unanchored substring match would also pass on a build that
-    // buried the sentence inside `HTTP 400: …`, and "the wording appears
-    // somewhere" is a weaker claim than "the wording IS the message".
-    await expect(cache.load('x')).rejects.toThrow(/^workspace: that path is not a directory$/)
+    // Exact, not a substring: "the wording appears somewhere in the message" is
+    // a weaker claim than "the wording IS the message", and only the second one
+    // rules out a build that prefixed it with the status.
+    expect(await rejectionMessage(cache.load('x'))).toBe('workspace: that path is not a directory')
 
     // Still the failure-is-not-cached assertion this test started life as.
     const result = await cache.load('x')
@@ -176,8 +193,8 @@ describe('createFileTreeCache', () => {
 
     // Derived from httpStatusFallback rather than restating 'HTTP 500' — a gate
     // whose expected value is a COPY of the thing under test stops moving when
-    // the thing moves (tether#173 §5). Anchored for the reason given in arm 1.
-    await expect(cache.load('x')).rejects.toThrow(new RegExp(`^${httpStatusFallback(500)}$`))
+    // the thing moves (tether#173 §5).
+    expect(await rejectionMessage(cache.load('x'))).toBe(httpStatusFallback(500))
   })
 
   it('invalidate() clears the cache for a directory so it re-fetches', async () => {

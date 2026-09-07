@@ -5,15 +5,30 @@ import { safeRedirectTarget } from './lib/safeRedirectTarget'
 
 // This page's styling is deliberately provisional and self-contained: literal
 // inline colour values, no CSS custom properties, no Tailwind classes, no new
-// stylesheet. The shadcn-style token vocabulary vendored under
-// web/src/vendor/cloudcli is not wired into this build — web/package.json has
-// no tailwindcss/postcss/class-variance-authority, and nothing under
-// web/src, web/index.html or web/vite.config.ts imports any stylesheet — so
-// referencing those tokens today would fail exactly the way the deleted
-// pre-#173 page's `var(--x)` references failed: silently, falling back to UA
-// defaults, with nothing erroring and nothing reddening. tether#194 lands the
-// toolchain and the vendored primitives; the shell wi that follows restyles
-// this page then. Do not extend this styling — replace it.
+// stylesheet. Do not extend this styling — replace it.
+//
+// 🔴 The REASON recorded here was true when it was written and is not true now,
+// so it is corrected rather than left to mislead. It read: "The shadcn-style
+// token vocabulary vendored under web/src/vendor/cloudcli is not wired into this
+// build — web/package.json has no tailwindcss/postcss/class-variance-authority,
+// and nothing under web/src, web/index.html or web/vite.config.ts imports any
+// stylesheet." Every clause of that has since been falsified on this branch:
+// tether#194 added tailwindcss, postcss and class-variance-authority to
+// web/package.json, and web/index.html links web/src/ui/index.css, which imports
+// the vendored tokens. A comment saying the toolchain is absent, sitting in a
+// tree where it is present, is an invitation to add it a second time.
+//
+// What is still true is the CONCLUSION, for a different reason: this page has not
+// been restyled onto the tokens. tether#194's note said "the shell wi that
+// follows restyles this page then", and tether#195 — that wi — did not: its scope
+// is the shell skeleton (routing, breakpoint, pane containers, narrow
+// navigation), and AuthPage is neither a pane nor reachable from the shell. It
+// is a separate surface behind its own pathname. So the restyle is still owed,
+// and it is owed by whoever takes the login page rather than by "the shell wi".
+//
+// `minHeight: '100dvh'` below is the mobile-first reference the shell was written
+// against (never `100vh`); web/src/shell/mobileFirst.test.ts enforces the same
+// rule over web/src/shell/, and does NOT reach this file.
 
 const NETWORK_ERROR_MESSAGE = 'Network error.'
 

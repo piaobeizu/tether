@@ -2,9 +2,13 @@
 //
 // At `lg` and above the shell is three columns; below it, one. There is exactly
 // one size breakpoint on purpose — the old SPA also had exactly one
-// (`@media (max-width: 768px)` in web/src/index.css; its four other `@media`
-// blocks were all `prefers-reduced-motion`), and a second one is a design
-// decision, not a detail.
+// (`@media (max-width: 768px)` in `web/src/index.css` **on `main`**, where that
+// file still exists; its four other `@media` blocks were all
+// `prefers-reduced-motion`), and a second one is a design decision, not a detail.
+//
+// The branch qualifier is not pedantry: that path does not resolve on THIS branch,
+// because tether#174 deleted it, and a path cited without saying which branch it
+// was read on is wrong the moment the two branches differ.
 //
 // 🔴 `LG_MIN_WIDTH` is a COPY of a value the vendored Tailwind config owns, and
 // it is a copy for a reason that does not extend to letting it drift.

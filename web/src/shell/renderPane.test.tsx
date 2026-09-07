@@ -43,9 +43,11 @@ describe('renderPane', () => {
   })
 
   // The hide policy is threaded, not consulted here: what it DOES is
-  // web/src/lib/hidden.ts's job and is pinned by that module's own suite.
-  // Asserting behaviour against a stand-in would be a gate deriving from a copy
-  // of the thing under test, which is the WIRE-8 defect.
+  // `web/src/lib/hidden.ts`'s job — a module tether#196 is porting onto this
+  // branch and which IS NOT HERE YET, so "pinned by its own suite" is a statement
+  // about `main`, not about this tree. Asserting its behaviour against a stand-in
+  // would be a gate deriving from a copy of the thing under test, which is the
+  // WIRE-8 defect, so this case asserts only that the prop is threaded.
   it('threads a hide policy through to the workspace pane', async () => {
     vi.stubGlobal('fetch', emptyFetch())
     const loadHidePatterns = vi.fn(() => ['node_modules'])

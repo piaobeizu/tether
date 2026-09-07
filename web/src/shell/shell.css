@@ -14,7 +14,19 @@
  *
  * 🔴 There is NO width media query in this file, and adding one would be a
  * regression. The shell's breakpoint lives in exactly one place — LG_MIN_WIDTH in
- * web/src/shell/breakpoint.ts — and reaches the DOM as `data-wide` on `.sh-body`.
+ * web/src/shell/breakpoint.ts — and reaches the DOM as `data-wide` on `.sh-root`.
+ *
+ *     grep -n 'data-wide' web/src/shell/Shell.tsx
+ *
+ * ⚠️ `.sh-root`, not `.sh-body`, and the difference is load-bearing rather than
+ * pedantic. `[data-wide='true'] { .sh-nav-toggle { … } }` below compiles to the
+ * DESCENDANT selector `[data-wide=true] .sh-nav-toggle`, and `.sh-nav-toggle`
+ * lives in `.sh-header` — a SIBLING of `.sh-body`. On `.sh-body` the rule would
+ * match nothing and the drawer's entry point would stay visible in the wide form.
+ * This comment said `.sh-body` and was wrong in exactly that direction;
+ * breakpoint.test.ts matches the attribute SELECTOR only, so nothing reddened
+ * either way until Shell.test.tsx's "publishes data-wide on .sh-root" case was
+ * added.
  *
  * The reason is not tidiness. The wide and narrow forms are DIFFERENT TREES, not
  * one tree styled two ways: the narrow form renders a single `.sh-column` and no
@@ -23,7 +35,22 @@
  * JavaScript already branches on, free to disagree with it — the layout switching
  * at one width while the MOUNTING switched at another. Selecting on the attribute
  * the shell publishes means there is one decision and the stylesheet follows it.
- * breakpoint.test.ts reads this file and fails if a width query appears in it.
+ * breakpoint.test.ts reads this file and web/src/ui/*.css and fails if a width
+ * query appears in either.
+ *
+ * ⚠️ Scoped precisely, because the broad version of this claim is FALSE. It is
+ * about the stylesheets tether writes; it is not about the built bundle.
+ * web/src/vendor/cloudcli/src/index.css is upstream's and unmodifiable, and it
+ * carries width media queries of its own:
+ *
+ *     grep -nE '@media[^{]*\((min|max)-width' web/src/vendor/cloudcli/src/index.css
+ *
+ * They are not all inert on the shell, either: the `@media (max-width: 768px)`
+ * block sets `touch-action`, `user-select` and the tap-highlight colour on `*`,
+ * `button`, `[role="button"]` and `a`, and the shell's own controls match those
+ * selectors. So the honest statement is "tether's own stylesheets declare no width
+ * breakpoint, and the shell's LAYOUT switches on `data-wide` rather than on a
+ * width" — not "the shipped CSS contains no width media query".
  *
  * Mobile-first falls out of that rather than being asserted alongside it: every
  * rule outside the attribute selector is the narrow layout, and that is what a
@@ -146,6 +173,246 @@ body.pwa-mode #root {
 .sh-tabstrip,
 .sh-resizer {
   display: none;
+}
+
+/* ── shared pane surfaces ─────────────────────────────────────────────────── */
+
+/* Used by both the workspace pane and PanePlaceholder, so it is defined once
+ * outside either section. */
+.sh-pane-title {
+  margin: 0;
+  padding: 0.625rem 0.75rem 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: hsl(var(--muted-foreground));
+}
+
+/* A statement of fact with no affordance attached (R10 — see PanePlaceholder.tsx
+ * and WorkspacePane.tsx). Styled as prose on purpose: anything that reads as a
+ * control would be the claim those files exist to avoid. */
+.sh-note,
+.sh-placeholder-note {
+  margin: 0;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  color: hsl(var(--muted-foreground));
+}
+
+/* The daemon's own sentence (R9/AC-R9). It has to be legible as an error without
+ * looking like a retry button, because on the refused-listing path there is
+ * nothing to retry. */
+.sh-error {
+  margin: 0.5rem 0.75rem;
+  padding: 0.5rem 0.625rem;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  border: 1px solid hsl(var(--destructive) / 0.4);
+  border-left: 3px solid hsl(var(--destructive));
+  border-radius: var(--radius);
+  background: hsl(var(--destructive) / 0.08);
+  color: hsl(var(--foreground));
+  overflow-wrap: anywhere;
+}
+
+.sh-placeholder {
+  display: block;
+  padding-bottom: 0.5rem;
+}
+
+/* ── workspace pane and file tree (owner ruling ③) ────────────────────────── */
+
+/* 🔴 Styled rather than left to browser defaults, and that is acceptance
+ * machinery rather than polish. Ruling ③ made the tree real *because acceptance
+ * is judged by the owner's eyes*, on a workspace root dominated by generated
+ * sibling directories (`ls -d /root/code/aicoding/gmi-ws/pf.*`). Unstyled it
+ * renders as nested `<ul>` bullets with no indent guides — which degrades exactly
+ * the feedback loop ruling ③ exists to create. Placeholders may be unstyled; the
+ * one pane that is not a placeholder may not.
+ *
+ * Colours are the vendored tokens throughout — no literal hex. web/src/AuthPage.tsx's
+ * literals were provisional because tether#194 had not wired the toolchain when it
+ * was written; it is wired now, and its own header records that correction. The
+ * two CONTROLS in the tree (hide/unhide, and the reveal row) come from the
+ * vendored `Button` primitive via web/src/ui/primitives.ts, so what is here is
+ * only where they sit — see WorkspacePane.tsx. */
+
+.sh-workspace {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.sh-ws-list {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 0 0.375rem 0.375rem;
+  list-style: none;
+  border-bottom: 1px solid hsl(var(--border));
+}
+
+.sh-ws-row {
+  display: block;
+  width: 100%;
+  padding: 0.4375rem 0.5rem;
+  text-align: left;
+  font-size: 0.8125rem;
+  background: none;
+  border: none;
+  border-radius: calc(var(--radius) - 2px);
+  color: hsl(var(--foreground));
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sh-ws-row:hover {
+  background: hsl(var(--accent));
+  color: hsl(var(--accent-foreground));
+}
+
+.sh-ws-row[aria-current='page'] {
+  background: hsl(var(--accent));
+  color: hsl(var(--accent-foreground));
+  font-weight: 600;
+}
+
+/* The tree scrolls, the registry above it does not. Without `min-height: 0` a
+ * flex child refuses to shrink below its content and the whole pane scrolls
+ * instead, taking the workspace list off the top. */
+.sh-tree {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 0.25rem 0.375rem 0.75rem;
+  font-size: 0.8125rem;
+}
+
+.sh-tree-level {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* The indent guide. A left border on the nested list rather than per-row padding,
+ * so depth is drawn once by the nesting the DOM already has — and so a deeply
+ * nested row cannot drift out of alignment with its own ancestors, which is the
+ * failure that makes a padding-per-depth tree unreadable at depth. */
+.sh-tree-level .sh-tree-level {
+  margin-left: 0.625rem;
+  padding-left: 0.5rem;
+  border-left: 1px solid hsl(var(--border));
+}
+
+.sh-tree-line {
+  display: flex;
+  align-items: center;
+  gap: 0.125rem;
+  border-radius: calc(var(--radius) - 2px);
+}
+
+.sh-tree-line:hover {
+  background: hsl(var(--accent) / 0.6);
+}
+
+/* One rule for both, because a name is a name whether or not it is clickable:
+ * a directory renders a `<button>` and a file a `<span>`, and they must line up.
+ * `text-align: left` is what a `<button>` needs and a `<span>` ignores. */
+.sh-tree-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0.3125rem 0.25rem;
+  text-align: left;
+  background: none;
+  border: none;
+  color: hsl(var(--foreground));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sh-tree-name[data-kind='dir'] {
+  cursor: pointer;
+  font-weight: 500;
+}
+
+.sh-tree-name[data-kind='file'] {
+  color: hsl(var(--muted-foreground));
+}
+
+/* The daemon reports it; showing it costs nothing and a tree that hides it is
+ * lying by omission on the one axis this pane can see. */
+.sh-tree-row[data-dirty='true'] > .sh-tree-line > .sh-tree-name::after {
+  content: '•';
+  margin-left: 0.375rem;
+  color: hsl(var(--primary));
+}
+
+/* The hide control is present only when a hide policy is wired (R10), and it is
+ * revealed on hover or focus so that a tree of many rows is not a wall of
+ * buttons. `focus-visible` is what keeps it reachable by keyboard: opacity 0 is
+ * still focusable, and a control you can focus but cannot see is worse than one
+ * that is always visible. */
+.sh-tree-hide {
+  flex: 0 0 auto;
+  width: 1.5rem;
+  height: 1.5rem;
+  opacity: 0;
+  color: hsl(var(--muted-foreground));
+}
+
+.sh-tree-line:hover .sh-tree-hide,
+.sh-tree-hide:focus-visible {
+  opacity: 1;
+}
+
+.sh-tree-hidden-row {
+  padding: 0.125rem 0;
+}
+
+.sh-tree-reveal {
+  height: 1.625rem;
+  padding: 0 0.5rem;
+  font-size: 0.75rem;
+  color: hsl(var(--muted-foreground));
+}
+
+/* ── history-start marker (owner ruling ④) ────────────────────────────────── */
+
+/* One element with one visible child, which is what SCROLL-10 asks of the
+ * transcript viewport. Not claimed here — the viewport belongs to the Chat
+ * rewrite — but written so as not to make it harder. */
+.sh-history-start {
+  display: flex;
+  justify-content: center;
+  padding: 0.75rem 0.75rem 0.5rem;
+}
+
+.sh-history-start-note {
+  margin: 0;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  text-align: center;
+  color: hsl(var(--muted-foreground));
+}
+
+.sh-history-start-more {
+  padding: 0.3125rem 0.75rem;
+  font-size: 0.75rem;
+  background: none;
+  border: 1px solid hsl(var(--border));
+  border-radius: var(--radius);
+  color: hsl(var(--foreground));
+  cursor: pointer;
+}
+
+.sh-history-start-more:hover {
+  background: hsl(var(--accent));
+  color: hsl(var(--accent-foreground));
 }
 
 /* ── drawer (narrow navigation) ───────────────────────────────────────────── */

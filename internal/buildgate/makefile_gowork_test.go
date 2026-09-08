@@ -170,6 +170,40 @@ func TestGoworkDefaultIsExportedAndYieldsToAnOuterValue(t *testing.T) {
 	})
 }
 
+// TestGoworkProbeSurvivesAmbientMakeState is the CI-side arm of the fix for
+// tether#199: probeEnv must strip the sub-make state GNU make exports to
+// recipe children, or the probes above read banner-wrapped output whenever the
+// test binary itself was started from a make recipe — which `make test` and
+// `make go-test` always are, and which left both red on a clean checkout while
+// CI, which never invokes make, stayed green.
+//
+// CI cannot meet that condition by itself, so this test reconstructs it the
+// way TestMakeTargetsStayHermeticAgainstAnEnclosingGoWork reconstructs the
+// enclosing-workspace hazard: t.Setenv injects the two variables measured (GNU
+// Make 4.3) to each re-enable the "Entering/Leaving directory" banners on
+// their own — MAKELEVEL, which marks the probe make as a sub-make, and
+// MAKEFLAGS=w, which asks for the banners outright. If probeEnv ever stops
+// stripping them, this reddens in CI rather than only on the next developer's
+// `make test`.
+func TestGoworkProbeSurvivesAmbientMakeState(t *testing.T) {
+	root := repoRoot(t)
+	const probe = `pfprobe: ; @echo "$$GOWORK"`
+	// t.Setenv mutates process-global state; it also asserts this test is not
+	// parallel, which is what makes that safe here.
+	t.Setenv("MAKELEVEL", "1")
+	t.Setenv("MAKEFLAGS", "w")
+	got, err := runMake(t, root, "--eval="+probe, "pfprobe")
+	if err != nil {
+		t.Fatalf("probe failed: %v\n%s", err, got)
+	}
+	if strings.TrimSpace(got) != "off" {
+		t.Fatalf("recipe environment has GOWORK=%q, want \"off\".\n"+
+			"The probe inherited ambient make state: probeEnv must keep stripping MAKELEVEL\n"+
+			"and MAKEFLAGS (and their siblings), or every probe in this package reads\n"+
+			"banner-wrapped output when the test binary runs from a make recipe.", strings.TrimSpace(got))
+	}
+}
+
 // repoRoot walks up from the working directory to the module root, identified by
 // holding both go.mod and the Makefile under test.
 func repoRoot(t *testing.T) string {
@@ -275,17 +309,39 @@ func mustWriteFile(t *testing.T, path, content string) {
 	}
 }
 
-// envWithoutGowork returns the ambient environment with GOWORK removed.
+// probeEnv returns the ambient environment scrubbed of the two variable
+// families that let the process tree this test binary happens to run under
+// leak into a probe's result.
 //
-// Stripping it is what makes the measurement mean anything. An inherited
-// GOWORK=off would make the probe pass with the Makefile line deleted, and an
-// inherited path would poison the enclosing-workspace setup — either way both
-// directions go green and the gate stops discriminating while still reporting a
-// pass. Extra values may be appended to override it deliberately.
-func envWithoutGowork(extra ...string) []string {
+// GOWORK: stripping it is what makes the measurement mean anything. An
+// inherited GOWORK=off would make the probe pass with the Makefile line
+// deleted, and an inherited path would poison the enclosing-workspace setup —
+// either way both directions go green and the gate stops discriminating while
+// still reporting a pass.
+//
+// MAKELEVEL, MAKEFLAGS, MFLAGS, MAKE_TERMOUT, MAKE_TERMERR: the state GNU make
+// hands to sub-makes. `make test` and `make go-test` are recipe lines, so this
+// test binary usually runs with MAKELEVEL set — and a make that sees MAKELEVEL
+// believes it is a sub-make and prints the "Entering/Leaving directory"
+// banners into the probe's output, which is exactly what
+// TestGoworkDefaultIsExportedAndYieldsToAnOuterValue compares. Measured on GNU
+// Make 4.3: MAKELEVEL=1 with no make anywhere in the chain reproduces the
+// failure, and MAKEFLAGS=w alone does too, so each strip is load-bearing on
+// its own; MFLAGS repeats MAKEFLAGS, and MAKE_TERMOUT/MAKE_TERMERR would make
+// the probe's environment depend on whether a human was watching. The same
+// five names, for the same reason, are what the Makefile's own `make ci`
+// driver strips from every step it runs. Stripping them means every probe runs
+// as a top-level make, however this test binary itself was started — the tree
+// under test is isolated by copyTrackedTree, and this is the same isolation
+// for the environment.
+//
+// Extra values may be appended to override a strip deliberately.
+func probeEnv(extra ...string) []string {
 	env := make([]string, 0, len(os.Environ())+len(extra))
 	for _, kv := range os.Environ() {
-		if strings.HasPrefix(kv, "GOWORK=") {
+		name, _, _ := strings.Cut(kv, "=")
+		switch name {
+		case "GOWORK", "MAKELEVEL", "MAKEFLAGS", "MFLAGS", "MAKE_TERMOUT", "MAKE_TERMERR":
 			continue
 		}
 		env = append(env, kv)
@@ -302,7 +358,7 @@ func runMakeWithEnv(t *testing.T, dir string, extraEnv []string, args ...string)
 	t.Helper()
 	cmd := exec.Command("make", args...)
 	cmd.Dir = dir
-	cmd.Env = envWithoutGowork(extraEnv...)
+	cmd.Env = probeEnv(extraEnv...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -311,7 +367,7 @@ func runGo(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("go", args...)
 	cmd.Dir = dir
-	cmd.Env = envWithoutGowork()
+	cmd.Env = probeEnv()
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
